@@ -1,10 +1,21 @@
 mod auth;
+mod vault;
 
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+
+use auth::codex::CodexTokens;
+use vault::Vault;
 
 #[derive(Parser)]
 #[command(name = "leek", version, about = "L.E.E.K — Logic-Enhanced Equity Kernel")]
 struct Cli {
+    /// Vault SQLite path (per-user data store)
+    #[arg(long, global = true, default_value = "./vault.db")]
+    vault: PathBuf,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -15,8 +26,6 @@ enum Command {
     Serve {
         #[arg(long, default_value_t = 8964)]
         port: u16,
-        #[arg(long, default_value = "./vault.db")]
-        vault: String,
     },
 
     /// LLM provider 认证管理
@@ -30,14 +39,14 @@ enum Command {
 enum AuthProvider {
     /// Codex OAuth (ChatGPT subscription)
     Codex {
-        /// 从 ~/.codex/auth.json 一次性导入 token（注意：之后 codex CLI 若 refresh 会让 leek 失效）
+        /// 从 ~/.codex/auth.json 一次性导入 token（之后 codex CLI 若 refresh 会让 leek 失效）
         #[arg(long)]
         import_from_codex_cli: bool,
     },
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -47,35 +56,101 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { port, vault } => {
-            tracing::info!(port, vault, "leek serve (placeholder — Task #48)");
-            anyhow::bail!("serve 还没接入，等待 gateway HTTP/SSE 切片完成");
+        Command::Serve { port } => {
+            tracing::info!(port, vault = %cli.vault.display(), "leek serve (placeholder — Task #48)");
+            bail!("serve 还没接入，等待 gateway HTTP/SSE 切片完成");
         }
         Command::Auth { provider } => match provider {
             AuthProvider::Codex {
                 import_from_codex_cli,
-            } => run_auth_codex(import_from_codex_cli).await,
+            } => run_auth_codex(&cli.vault, import_from_codex_cli).await,
         },
     }
 }
 
-async fn run_auth_codex(import_from_codex_cli: bool) -> anyhow::Result<()> {
-    if import_from_codex_cli {
-        anyhow::bail!("--import-from-codex-cli 等 vault 持久化切片完成（Task #50）");
-    }
+async fn run_auth_codex(vault_path: &Path, import_from_codex_cli: bool) -> Result<()> {
+    let vault = Vault::open(vault_path).await?;
 
-    println!("Signing in to OpenAI Codex...");
-    println!("(leek runs its own device flow — won't interfere with codex CLI / VS Code)");
+    let tokens = if import_from_codex_cli {
+        let imported = read_codex_cli_auth()?
+            .ok_or_else(|| anyhow!("~/.codex/auth.json not found"))?;
+        println!("Imported tokens from ~/.codex/auth.json");
+        println!();
+        println!("\x1b[93m⚠  WARNING\x1b[0m: codex CLI / VS Code 扩展接下来若 refresh 会让 leek 失效。");
+        println!("    使用 leek 期间避免在终端跑 `codex` 或在 VS Code 用 codex 扩展。");
+        println!();
+        imported
+    } else {
+        println!("Signing in to OpenAI Codex...");
+        println!("(leek runs its own device flow — won't interfere with codex CLI / VS Code)");
+        auth::codex::device_flow_login().await?
+    };
 
-    let tokens = auth::codex::device_flow_login().await?;
+    vault::provider_configs::upsert_codex(&vault.pool, vault::LOCAL_USER_ID, &tokens).await?;
 
     println!();
     println!("\x1b[92m✓ Login successful\x1b[0m");
-    println!("  expires at:    {}", tokens.expires_at.to_rfc3339());
-    println!("  access_token:  {}…", &tokens.access_token[..tokens.access_token.len().min(20)]);
-    println!("  refresh_token: {}…", &tokens.refresh_token[..tokens.refresh_token.len().min(20)]);
-    println!();
-    println!("\x1b[93mNote: token persistence to vault.db is wired up in next slice (Task #50).\x1b[0m");
+    println!("  vault:       {}", vault_path.display());
+    println!("  expires_at:  {}", tokens.expires_at.to_rfc3339());
+    println!(
+        "  access:      {}…",
+        &tokens.access_token[..tokens.access_token.len().min(20)]
+    );
+    println!(
+        "  refresh:     {}…",
+        &tokens.refresh_token[..tokens.refresh_token.len().min(20)]
+    );
 
     Ok(())
+}
+
+/// Read tokens from `~/.codex/auth.json` (or `$CODEX_HOME/auth.json` if set).
+/// Returns `Ok(None)` if file doesn't exist; bails on malformed / expired contents.
+fn read_codex_cli_auth() -> Result<Option<CodexTokens>> {
+    let codex_home: PathBuf = std::env::var("CODEX_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))
+        .ok_or_else(|| anyhow!("could not resolve CODEX_HOME nor ~/.codex/"))?;
+    let path = codex_home.join("auth.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let payload: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    let tokens_obj = payload
+        .get("tokens")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow!("{}: missing 'tokens' object", path.display()))?;
+    let access_token = tokens_obj
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("{}: missing access_token", path.display()))?
+        .to_string();
+    let refresh_token = tokens_obj
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("{}: missing refresh_token", path.display()))?
+        .to_string();
+
+    let expires_at = auth::jwt::decode_exp(&access_token)
+        .context("decoding exp from imported access_token")?;
+
+    if expires_at < chrono::Utc::now() {
+        bail!(
+            "imported codex CLI access_token already expired ({}). \
+             Run `codex` to refresh, then retry.",
+            expires_at.to_rfc3339()
+        );
+    }
+
+    Ok(Some(CodexTokens {
+        access_token,
+        refresh_token,
+        expires_at,
+    }))
 }
