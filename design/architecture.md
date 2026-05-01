@@ -6,11 +6,14 @@
 
 L.E.E.K 是一个 **gateway 模式的投研操作系统**：长跑 daemon 自带 agent 思考能力，把一份策划过的投资智慧 corpus 转化成可执行的研究、决策与复盘，通过多种 adapter（Web / CLI / MCP HTTP / 未来 TUI / Claude Code skill）暴露给人和其他 agent。
 
+**用户视角**：用户是基金经理 (manager)，L.E.E.K 是他指挥的研究团队。主交互单元是 **任务（task）** 而非 message/turn。详见 [`interaction-model.md`](interaction-model.md)。
+
 **它不是什么**：
 - 不是一个 agent —— 是 agent core + 数据双核 + 多 frontend 的系统
 - 不是 corpus —— corpus 是它消费的静态资源，住在 sibling 仓库 `~/playground/finance-giant/corpus/`
 - 不是另一个 agent harness 的 frontend —— L.E.E.K 自己实现 agent loop，自己持有 LLM provider 抽象，不把思考 delegate 给 Claude Code / Codex
 - 不是模拟交易系统 —— 投资动作的输出是决策草稿（仓位 / 止损 / 期限 / 复盘 schedule），由人最终落地
+- 不是 chatbot —— 主交互单元是 task，agent 输出 typed deliverable（决策草稿 / 调研简报 / 复盘）
 
 ## 2. 整体架构图
 
@@ -34,11 +37,23 @@ L.E.E.K 是一个 **gateway 模式的投研操作系统**：长跑 daemon 自带
 │  └──────────────────────┘  └──────────────────────────────────┘  │
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐    │
-│  │ Agent Core (自实现 harness)                              │    │
-│  │  · Loop (think → tool_call → observe → reply)            │    │
-│  │  · Scratchpad (per-session)                              │    │
-│  │  · Thinking traces                                       │    │
-│  │  · Multi-turn conversation context                       │    │
+│  │ Agent Core (自实现 harness, task-driven)                 │    │
+│  │                                                          │    │
+│  │  ┌────────────────────────────────────────────────────┐  │    │
+│  │  │ Main Agent (Coordinator / Lead)                    │  │    │
+│  │  │  · Loop (think → tool_call → observe → reply)      │  │    │
+│  │  │  · Scratchpad + Thinking traces                    │  │    │
+│  │  │  · Task lifecycle 管理                              │  │    │
+│  │  │  · 直接调用 tools / 写 vault / 撰写 deliverable     │  │    │
+│  │  └────────────┬───────────────────────────────────────┘  │    │
+│  │               │ subagent.spawn (with scope)              │    │
+│  │               ▼ (map-reduce)                             │    │
+│  │  ┌────────────────────────────────────────────────────┐  │    │
+│  │  │ Subagents (on-demand, short-lived)                 │  │    │
+│  │  │  · 独立 context、限定工具子集、限定预算              │  │    │
+│  │  │  · 返回 structured result                           │  │    │
+│  │  │  · 不写 vault / 不嵌套 spawn                         │  │    │
+│  │  └────────────────────────────────────────────────────┘  │    │
 │  └──────────────┬─────────────────┬────────────────┬────────┘    │
 │                 │                 │                │             │
 │   ┌─────────────▼─────┐  ┌────────▼────────┐  ┌────▼─────────┐   │
@@ -78,25 +93,29 @@ L.E.E.K 是一个 **gateway 模式的投研操作系统**：长跑 daemon 自带
 
 部署单元：**单二进制**（`leek-gateway`），静态链接 SQLite，启动即用。详见 [ADR-0001](decisions/0001-rust-gateway.md)。
 
-### 3.2 Agent Core（自实现 harness）
+### 3.2 Agent Core（自实现 harness, task-driven）
 
-跑在 gateway 进程内，不是独立服务。每个 session 一个 loop instance。核心循环：
+跑在 gateway 进程内，不是独立服务。**每个 active task 一个 loop instance**——而不是每个 session 一个。核心循环：
 
 ```
-user input
+task created (by user / cron / agent_proposed)
   ↓
-[ Agent Loop ]
-  · 拼装 system prompt（含 corpus 上下文 + vault 上下文 + mandate）
+[ Main Agent Loop ]
+  · 拼装 system prompt（含 team charter + portfolio 快照 + corpus 上下文 + 当前 task）
   · LLM 调用（流式接收）
   · 解析 tool calls
-  · 并行执行 tools（每个 tool 一个 task）
-  · tool 结果回填上下文
-  · 决定继续思考还是返回最终回复
+  · 并行执行 tools 或 spawn subagent（map-reduce）
+  · 收集 observation 回填 context
+  · 决定继续思考、调用 clarify.ask_user、还是输出 deliverable
   ↓
-最终回复 / 中间事件流 → Event Bus → 订阅的 transport → adapter
+deliverable (decision_draft / research_brief / review / ...)
+  ↓ user review
+confirmed / rejected
 ```
 
-详见 [ADR-0005](decisions/0005-self-implemented-harness.md) 和后续的 `p1-spec/agent-loop.md`。
+**Subagent 调度**：当主 agent 判断有可分解的子任务（多标的并行、消化大量文档、避免 anchoring 的 clean-room 推理、参数 sweep）时，可以 `subagent.spawn` 启动独立 context 的临时小组（详见 [ADR-0010](decisions/0010-single-agent-coordinator-subagent.md)）。Subagent 返回 structured result，由主 agent 负责 merge。**Subagent 不写 vault**——所有持久化都通过主 agent。
+
+详见 [ADR-0005](decisions/0005-self-implemented-harness.md)、[ADR-0010](decisions/0010-single-agent-coordinator-subagent.md)、[`p1-spec/agent-loop.md`](p1-spec/agent-loop.md)。
 
 ### 3.3 LLM Provider 抽象
 
@@ -223,43 +242,55 @@ Event {
 ## 7. Agent Loop 概览
 
 ```
-                 ┌───────────────────────────────────────────────┐
-                 │ Session State (in memory + persisted to vault)│
-                 │  · messages[]                                 │
-                 │  · scratchpad                                 │
-                 │  · open panels[]                              │
-                 │  · reasoning DAG (current task)               │
-                 └───────────────┬───────────────────────────────┘
-                                 │
-        user_message             │
-            │                    ▼
-            ▼            ┌──────────────────┐
-   ┌──────────────────┐  │ Build Context    │
-   │ Loop Iteration   │←─│  · system prompt │
-   │  ┌────────────┐  │  │  · corpus refs   │
-   │  │ LLM Stream │  │  │  · vault state   │
-   │  └─────┬──────┘  │  │  · mandate       │
-   │        │ events  │  └──────────────────┘
-   │        ▼         │
-   │ ┌────────────┐   │
-   │ │ Detect Tool│   │
-   │ │ Calls      │   │
-   │ └─────┬──────┘   │  no calls → reply finalized → done
-   │       │ has calls│
-   │       ▼          │
-   │ ┌────────────┐   │
-   │ │Execute     │   │ tool 结果回填 messages[]
-   │ │Tools 并行  │───┼──────────────────────┐
-   │ └─────┬──────┘   │                      │
-   │       │          │                      │
-   └───────┴──────────┘                      │
-           ▲                                 │
-           └─────────────────────────────────┘
+            task created
+                 │
+                 ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │ Task State (in memory + persisted to vault)                 │
+   │  · task metadata + constraints + expected_deliverable       │
+   │  · messages[] (含 user / agent / tool / subagent_result)    │
+   │  · scratchpad + thinking traces                             │
+   │  · reasoning DAG                                            │
+   │  · open panels[]                                            │
+   │  · control_inbox (用户中途的命令)                            │
+   └────────────────────┬────────────────────────────────────────┘
+                        │
+                        ▼
+          ┌─────────────────────────────────┐
+          │ Build Context                   │
+          │  · system prompt                │
+          │  · team charter                 │
+          │  · portfolio snapshot           │
+          │  · corpus / vault state         │
+          │  · current task constraints     │
+          │  · message history (裁剪)        │
+          └────────────────┬────────────────┘
+                           │
+                           ▼
+                ┌──────────────────┐
+                │ LLM Stream       │
+                │ (流式事件:       │
+                │  thinking /     │
+                │  text / tool)   │
+                └────────┬─────────┘
+                         │
+        ┌────────────────┼────────────────┬─────────────────┐
+        ▼                ▼                ▼                 ▼
+  ┌──────────┐   ┌──────────────┐  ┌──────────────┐  ┌─────────────────┐
+  │ Tool     │   │ Subagent     │  │ Final Reply  │  │ clarify.ask_user│
+  │ Calls    │   │ Spawn        │  │ /Deliverable │  │ → awaiting_user │
+  │ (并行)    │   │ (map-reduce) │  │              │  │                 │
+  └────┬─────┘   └──────┬───────┘  └──────┬───────┘  └─────────────────┘
+       │                │                 │
+       └──── reduce ────┘                 ▼
+              │                       task delivered
+              ▼                       → user review
+       继续下一轮                      → confirmed / rejected
 ```
 
-每个内部 phase 都向 Event Bus 推一条事件 → 订阅的 transport → 前端 panel 更新。
+每个内部 phase 都向 Event Bus 推事件 → 订阅的 transport → 前端 panel / DAG 更新。
 
-详见 `p1-spec/agent-loop.md`（待写）。
+详见 [`p1-spec/agent-loop.md`](p1-spec/agent-loop.md)。
 
 ## 8. Multi-user from Day 1
 
@@ -296,8 +327,12 @@ Event {
 
 - Gateway 长跑（Rust）
 - Agent Core 自实现 harness（loop + scratchpad + thinking + tool use）
+- **Subagent 调度**（map-reduce 风格的 on-demand spawn，[ADR-0010](decisions/0010-single-agent-coordinator-subagent.md)）
+- **Task lifecycle 完整支持**（draft / queued / in_progress / awaiting_user / delivered / confirmed / rejected / cancelled / failed）
+- **Team Charter**（用户的工作章程；agent 执行时硬约束）
+- **Deliverable 类型**：decision_draft / research_brief / review / comparison / morning_brief / free_form
 - LLM provider：codex_oauth + anthropic_api_key + openai_api_key
-- Tool 集：行情 / 资讯 / 技术指标 / corpus 检索 / vault 读写
+- Tool 集：行情 / 资讯 / 技术指标 / corpus 检索 / vault 读写 / task 操作 / subagent spawn / clarify
 - Adapter：Web (chat-canvas SolidJS) + MCP HTTP
 - Vault：SQLite 单库多 user_id
 - Corpus 只读消费
@@ -331,19 +366,22 @@ Event {
 | 0007 | 事件协议 + SSE/WebSocket 双 transport | [→](decisions/0007-event-protocol-and-transports.md) |
 | 0008 | P1 不做 paper trading | [→](decisions/0008-no-paper-trading.md) |
 | 0009 | Portfolio = 投研参考视图 | [→](decisions/0009-portfolio-as-research-context.md) |
+| 0010 | 单 agent + on-demand subagent (map-reduce) | [→](decisions/0010-single-agent-coordinator-subagent.md) |
 
-## 12. 后续 spec 文档（依赖此架构）
+## 12. 设计文档索引
 
-| 文档 | 状态 | 阻塞什么 |
-|--|--|--|
-| `frontend/concept.md` | 第 1 波 | UX 设计起点 |
-| `frontend/panels.md` | 第 1 波 | UX 设计 panel 类型清单 |
-| `p1-spec/api.md` | 第 2 波 | 前端连真数据、外部 agent 接入 |
-| `p1-spec/agent-loop.md` | 第 2 波 | harness 实现 + 前端事件渲染 |
-| `p1-spec/tools.md` | 第 2 波 | tool 实现排期 |
-| `p1-spec/data-schema.md` | 第 2 波 | vault 实现 + migration |
-| `p1-spec/llm-provider.md` | 第 2 波 | provider 实现 + Codex OAuth 流程 |
-| `roadmap.md` | 第 2 波 | 实施排期 |
+| 文档 | 内容 |
+|--|--|
+| [`architecture.md`](architecture.md) | 本文件——系统架构总览 |
+| [`interaction-model.md`](interaction-model.md) | Manager + Team 交互模型（task lifecycle、用户角色、agent 角色） |
+| [`frontend/concept.md`](frontend/concept.md) | chat-canvas 形态、用户旅程、视觉与交互原则 |
+| [`frontend/panels.md`](frontend/panels.md) | 完整 panel 类型清单与详细设计 |
+| [`p1-spec/api.md`](p1-spec/api.md) | Gateway HTTP / SSE / WebSocket / MCP API 完整定义 |
+| [`p1-spec/agent-loop.md`](p1-spec/agent-loop.md) | Harness 主循环 + subagent 调度 |
+| [`p1-spec/tools.md`](p1-spec/tools.md) | 工具清单 + I/O schema + 权限分层 |
+| [`p1-spec/data-schema.md`](p1-spec/data-schema.md) | SQLite 完整 schema + migration |
+| [`p1-spec/llm-provider.md`](p1-spec/llm-provider.md) | Provider 抽象 + Codex OAuth 流程 + UI 配置形态 |
+| [`roadmap.md`](roadmap.md) | P1 实施排期与里程碑 |
 
 ## 13. 历史与演化
 
