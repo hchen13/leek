@@ -6,6 +6,7 @@ pub mod events;
 pub mod messages;
 pub mod provider_configs;
 pub mod sessions;
+pub mod tasks;
 
 use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};

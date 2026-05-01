@@ -1,6 +1,8 @@
-//! Agent pipeline — for the chat_reply slice this is just "call provider,
-//! stream deltas to EventBus, persist final message". When the routing layer
-//! and tool dispatch land, this module grows to host the full main agent loop.
+//! Agent pipeline — call provider, stream deltas to EventBus, persist final
+//! message. When tool dispatch lands, this module grows to host the full main
+//! agent loop.
+
+pub mod routing;
 
 use std::sync::Arc;
 
@@ -10,11 +12,19 @@ use sqlx::SqlitePool;
 
 use crate::events::{EventBus, EventEnvelope};
 use crate::llm::{ChatMessage, ChatRequest, LlmEvent, LlmProvider, Role};
-use crate::vault::{events as vault_events, messages as vault_messages};
+use crate::vault::{events as vault_events, messages as vault_messages, tasks as vault_tasks};
 
 const DEFAULT_MODEL: &str = "gpt-5.5";
 const SYSTEM_PROMPT: &str = "You are L.E.E.K — a helpful, concise \
 investment-research assistant. Reply briefly in the user's language.";
+
+/// When set, the agent's reply is treated as the deliverable for that task —
+/// vault.deliverables row is written and the task is marked delivered.
+#[derive(Debug, Clone)]
+pub struct TaskBinding {
+    pub task_id: String,
+    pub expected_deliverable: String,
+}
 
 /// Run a one-shot chat reply: invoke provider with full session history,
 /// stream events, persist final message.
@@ -29,6 +39,7 @@ pub async fn run_chat_reply(
     session_id: String,
     provider: Arc<dyn LlmProvider>,
     event_bus: EventBus,
+    task: Option<TaskBinding>,
 ) -> Result<()> {
     // Load full history. P1: cap at last 100 messages — context-trimming logic
     // (data-schema.md / agent-loop.md §4.3) lands when token budgets matter.
@@ -63,9 +74,10 @@ pub async fn run_chat_reply(
         &pool,
         &user_id,
         &session_id,
+        task.as_ref().map(|t| t.task_id.as_str()),
         &event_bus,
         "agent_message_start",
-        serde_json::json!({}),
+        serde_json::json!({ "task_id": task.as_ref().map(|t| &t.task_id) }),
     )
     .await?;
 
@@ -81,6 +93,7 @@ pub async fn run_chat_reply(
                     &pool,
                     &user_id,
                     &session_id,
+                    task.as_ref().map(|t| t.task_id.as_str()),
                     &event_bus,
                     "agent_message_delta",
                     serde_json::json!({ "text": text }),
@@ -92,6 +105,7 @@ pub async fn run_chat_reply(
                     &pool,
                     &user_id,
                     &session_id,
+                    task.as_ref().map(|t| t.task_id.as_str()),
                     &event_bus,
                     "llm_usage",
                     serde_json::json!({
@@ -111,6 +125,7 @@ pub async fn run_chat_reply(
                     &pool,
                     &user_id,
                     &session_id,
+                    task.as_ref().map(|t| t.task_id.as_str()),
                     &event_bus,
                     "error",
                     serde_json::json!({ "message": e.to_string() }),
@@ -127,13 +142,54 @@ pub async fn run_chat_reply(
         &session_id,
         "agent",
         &serde_json::json!({ "type": "text", "text": full_text }),
+        task.as_ref().map(|t| t.task_id.as_str()),
     )
     .await?;
+
+    // If this run was bound to a task, write the deliverable + mark delivered
+    // before announcing message_end so subscribers see a coherent terminal state.
+    if let Some(t) = task.as_ref() {
+        let deliverable_id = vault_tasks::write_deliverable(
+            &pool,
+            &user_id,
+            &t.task_id,
+            &t.expected_deliverable,
+            &full_text,
+        )
+        .await?;
+        vault_tasks::mark_delivered(&pool, &user_id, &t.task_id).await?;
+
+        publish_and_persist(
+            &pool,
+            &user_id,
+            &session_id,
+            Some(&t.task_id),
+            &event_bus,
+            "deliverable_ready",
+            serde_json::json!({
+                "deliverable_id": deliverable_id,
+                "task_id": t.task_id,
+                "kind": t.expected_deliverable,
+            }),
+        )
+        .await?;
+        publish_and_persist(
+            &pool,
+            &user_id,
+            &session_id,
+            Some(&t.task_id),
+            &event_bus,
+            "task_delivered",
+            serde_json::json!({ "task_id": t.task_id }),
+        )
+        .await?;
+    }
 
     publish_and_persist(
         &pool,
         &user_id,
         &session_id,
+        task.as_ref().map(|t| t.task_id.as_str()),
         &event_bus,
         "agent_message_end",
         serde_json::json!({
@@ -146,10 +202,11 @@ pub async fn run_chat_reply(
     Ok(())
 }
 
-async fn publish_and_persist(
+pub async fn publish_and_persist(
     pool: &SqlitePool,
     user_id: &str,
     session_id: &str,
+    task_id: Option<&str>,
     event_bus: &EventBus,
     kind: &str,
     payload: serde_json::Value,
@@ -159,7 +216,7 @@ async fn publish_and_persist(
         pool,
         user_id,
         session_id,
-        None,
+        task_id,
         kind,
         &payload,
         Some("main_agent"),

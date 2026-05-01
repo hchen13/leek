@@ -19,6 +19,7 @@ pub async fn insert(
     session_id: &str,
     role: &str,
     content_json: &serde_json::Value,
+    task_id: Option<&str>,
 ) -> Result<i64> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = pool.begin().await?;
@@ -33,12 +34,13 @@ pub async fn insert(
     .context("computing next message seq")?;
 
     sqlx::query(
-        "INSERT INTO messages (user_id, session_id, seq, role, content_json, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO messages (user_id, session_id, seq, task_id, role, content_json, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(user_id)
     .bind(session_id)
     .bind(seq)
+    .bind(task_id)
     .bind(role)
     .bind(content_json.to_string())
     .bind(&now)
