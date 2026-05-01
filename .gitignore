@@ -37,6 +37,9 @@ tmp/
 target/
 **/*.rs.bk
 
+# Build artifacts
+crates/gateway/assets/corpus.graph.json
+
 # Local SQLite vault
 vault.db
 vault.db-shm

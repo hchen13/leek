@@ -36,3 +36,6 @@ tracing-subscriber = { workspace = true }
 dirs = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
+serde_yaml = { workspace = true }
+regex = { workspace = true }
+walkdir = { workspace = true }

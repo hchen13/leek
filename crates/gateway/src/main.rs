@@ -1,6 +1,7 @@
 mod agent;
 mod api;
 mod auth;
+mod corpus;
 mod events;
 mod llm;
 mod vault;
@@ -51,6 +52,25 @@ enum Command {
         #[arg(long, default_value = "gpt-5")]
         model: String,
     },
+
+    /// Corpus 工具
+    Corpus {
+        #[command(subcommand)]
+        action: CorpusAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CorpusAction {
+    /// 扫描 corpus/ 生成 corpus.graph.json
+    RebuildGraph {
+        /// corpus 仓库根目录
+        #[arg(long, default_value = "./corpus")]
+        root: PathBuf,
+        /// 输出 JSON 文件路径
+        #[arg(long, default_value = "./crates/gateway/assets/corpus.graph.json")]
+        output: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -81,7 +101,41 @@ async fn main() -> Result<()> {
             } => run_auth_codex(&cli.vault, import_from_codex_cli).await,
         },
         Command::Chat { prompt, model } => run_chat(&cli.vault, prompt, model).await,
+        Command::Corpus { action } => match action {
+            CorpusAction::RebuildGraph { root, output } => run_corpus_rebuild(&root, &output),
+        },
     }
+}
+
+fn run_corpus_rebuild(root: &Path, output: &Path) -> Result<()> {
+    let graph = corpus::build::build_graph(root)?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(&graph).context("serializing corpus graph")?;
+    std::fs::write(output, json).with_context(|| format!("writing {}", output.display()))?;
+
+    let mut by_cluster: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for n in &graph.nodes {
+        *by_cluster.entry(n.cluster.as_str()).or_insert(0) += 1;
+    }
+
+    println!(
+        "\x1b[92m✓\x1b[0m {} nodes · {} edges → {}",
+        graph.nodes.len(),
+        graph.edges.len(),
+        output.display()
+    );
+    let mut keys: Vec<&&str> = by_cluster.keys().collect();
+    keys.sort();
+    for k in keys {
+        println!("    · {:<22} {:>3}", k, by_cluster[k]);
+    }
+    if let Some(commit) = &graph.corpus_commit {
+        println!("    corpus@{}", &commit[..commit.len().min(12)]);
+    }
+    Ok(())
 }
 
 async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
