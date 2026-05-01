@@ -460,7 +460,9 @@ const scene = createMemo<Scene>(() => {
 
 - [`../interaction-model.md`](../interaction-model.md) —— Manager + Team 交互模型完整定义
 - [`panels.md`](panels.md) —— 完整 panel 清单 + 每类 panel 的详细设计
-- `tech-stack.md`（待写） —— 技术栈（SolidJS / Tailwind / Kobalte / Canvas 库选型）
+- [`../tech-stack.md`](../tech-stack.md) —— 技术栈（SolidJS / vanilla CSS / 自实现 force graph / Solid signal）
 - [`../p1-spec/api.md`](../p1-spec/api.md) —— 前端要消费的事件协议
 - [`../p1-spec/agent-loop.md`](../p1-spec/agent-loop.md) —— agent 的 phase 模型决定 panel 的状态机
-- [`../p1-spec/llm-provider.md`](../p1-spec/llm-provider.md) §10 —— Provider 配置 UI 形态描述
+- [`../p1-spec/module-contracts.md`](../p1-spec/module-contracts.md) —— Panel + 11 typed module 数据契约
+- [`../p1-spec/corpus-brain.md`](../p1-spec/corpus-brain.md) —— corpus 大脑后端规约
+- [`../p1-spec/llm-provider.md`](../p1-spec/llm-provider.md) §10 —— Provider 配置 UI 形态
