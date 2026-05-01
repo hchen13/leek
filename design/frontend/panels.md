@@ -1224,7 +1224,7 @@ agent 生成的复盘草稿，用户编辑 + confirm。
 
 设置 LLM provider 凭证（API key / OAuth）+ 优先级 / 降级链。是 onboarding 必经，也是 Settings page 的一部分。
 
-详细形态见 [`../p1-spec/llm-provider.md`](../p1-spec/llm-provider.md) §10。
+视觉与 UX craft 见 [`../p1-spec/llm-provider.md`](../p1-spec/llm-provider.md) §10；表单 schema / validation / OAuth device flow polling 协议 / error states 见同文 §10.6。
 
 ### 18f.2 关键 UX 约束（重申）
 
@@ -1291,6 +1291,46 @@ agent 生成的复盘草稿，用户编辑 + confirm。
 - Preview：显示如果 apply 后，最近一个 task 的 mandate_check 会怎么变（让用户感知影响）
 - Apply：创建新 active charter（旧版本保留为非 active）
 - 历史版本可查（Charter History sub-page）
+
+### 18g.5 表单 ↔ YAML schema 映射
+
+每个 UI 控件对应 charter_json 的一个字段（API 见 [`../p1-spec/api.md`](../p1-spec/api.md) §4.9）：
+
+| UI Control | YAML Path | Validation |
+|--|--|--|
+| ✓ checklist of style tags | `style: [str]` | 1-5 items |
+| Max position size input | `hard_limits.max_position_pct` | int 1-100 |
+| Max drawdown input | `hard_limits.max_drawdown_tolerance` | int 1-100 |
+| Forbidden instruments checklist | `hard_limits.forbidden_instruments: [str]` | values ∈ `["options", "leveraged_etfs", "futures", "crypto", "penny_stocks"]` |
+| Preferred sectors chips | `soft_preferences.preferred_sectors: [str]` | each chip 1-30 chars |
+| Avoid sectors chips | `soft_preferences.avoid_sectors: [str]` | 同上 |
+| Avoid geos chips | `soft_preferences.avoid_geos: [str]` | 国家名 / ISO code |
+| Decision verbosity radio | `work_style.decision_verbosity` | enum: `brief` \| `standard` \| `detailed` |
+| Cite corpus toggle | `work_style.cite_corpus_always` | boolean |
+| Challenge bias toggle | `work_style.challenge_my_bias` | boolean |
+
+Apply 流程：
+
+1. 客户端 validation 通过 → enable [Apply] 按钮
+2. 点 [Apply] → `PUT /api/v1/charter { charter_json }` → 旧 active charter 标记 inactive；新 charter `active=true`、`version++`
+3. 成功 → 关 modal，刷新顶部 banner（"v3 → v4 已生效"）
+4. 失败 → inline error，保留未保存的修改
+
+### 18g.6 Preview 行为
+
+[Preview] 按钮：用最近一个 confirmed deliverable（如果有）跑一次 mandate check 模拟，显示如果以**当前未保存的 charter** 应用，violations 会变成什么。
+
+- API：`POST /api/v1/charter/preview { charter_json, simulate_against?: deliverable_id }`
+- 返回：`{ violations: [{kind, severity, message}, ...] }`
+- UI：右侧弹出 before/after 对比 panel；如果没有 confirmed deliverable，按钮 disabled + tooltip "需要至少一个 confirmed deliverable 才能预览"
+
+### 18g.7 错误状态
+
+| Error | 触发 | UI 形态 |
+|--|--|--|
+| Network error | PUT / POST 失败 | inline banner + 保留未保存修改 |
+| Schema validation 失败 | server 返回 422 | 高亮违规字段 + inline error |
+| Concurrent modification | server 返回 409（charter 被另一会话改过） | 弹 modal "Charter 已被其他会话更新，是否覆盖？" + [Reload latest] [Force overwrite] |
 
 ---
 

@@ -395,6 +395,8 @@ Response 200
 
 ### 4.9 Team Charter
 
+UI 契约（form schema / validation / preview / 错误状态）见 [`../frontend/panels.md`](../frontend/panels.md) §18g.5-§18g.7。
+
 ```
 GET /api/v1/charter
 Response: { id, version, charter_json, updated_at }
@@ -402,10 +404,18 @@ Response: { id, version, charter_json, updated_at }
 PUT /api/v1/charter
 Body: { charter_json: {...} }
 Response: { id, version, updated_at }
-# 创建一个新 active charter（旧版本保留为非 active）
+# 创建一个新 active charter（旧版本保留为非 active）；
+# server 端做 schema validation，违规返回 422 + 字段级 errors
+# 并发控制：可选传 if_match_version；不匹配返回 409
 
 GET /api/v1/charter/history
 Response: [{id, version, charter_json, updated_at}, ...]
+
+POST /api/v1/charter/preview
+Body: { charter_json, simulate_against?: deliverable_id }
+Response: { violations: [{kind, severity, message}, ...] }
+# 用未保存的 charter 跑一次 mandate check 模拟，不写 vault；
+# simulate_against 缺省 = 最近一个 confirmed deliverable
 ```
 
 ### 4.10 Corpus

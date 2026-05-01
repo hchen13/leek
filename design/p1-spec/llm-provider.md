@@ -689,6 +689,68 @@ Step 3: 成功 / 失败页
 6. **OAuth 重新授权要单独按钮**：refresh_token 失效后专门走"re-authorize"按钮，不是退到 device flow 的"Add new"
 7. **风险提示的文字要醒目但不恐吓**——Codex OAuth 的 best-effort 警告必须可见，但不要让用户觉得"一定会失效"
 
+### 10.6 表单字段 schema 与 validation
+
+#### API Key 表单（`POST /providers/:name/configure` with `auth_kind="api_key"`）
+
+| Field | UI Control | Validation | Error message |
+|--|--|--|--|
+| `api_key` | password input + 👁 toggle | non-empty；prefix match per provider:<br>· anthropic: `sk-ant-`<br>· openai: `sk-`（含 `sk-proj-` 等变体） | "API key 格式不匹配 ${provider}" |
+| `default_model` | dropdown | 必选；options 从 §4.1/4.2 静态 list（前端 hardcode + 升级时同步） | "请选择默认模型" |
+| `model_aliases.reasoning` | dropdown | 可选 | — |
+| `model_aliases.fast` | dropdown | 可选 | — |
+
+提交前必须执行：
+
+1. 客户端 validation 通过
+2. `POST /providers/:name/test` 返回 `{ ok: true }`（如果失败：禁用 [Save] 按钮，显示 inline `error.message`）
+3. Save 时 `POST /providers/:name/configure` 写入
+
+#### OAuth Device Flow 前端 polling 协议
+
+```
+Step 1  用户点 [Add Codex OAuth]
+   │
+   ▼
+Step 2  POST /providers/codex_oauth/configure { auth_kind: "oauth" }
+        ← 拿到 { device_flow: { user_code, verification_uri_complete,
+                                  polling_endpoint, expires_in, flow_id } }
+   │
+   ▼
+Step 3  UI 显示 user_code + verification URL（点击 [Open in browser]）
+        显示倒计时（expires_in - elapsed）
+   │
+   ▼
+Step 4  前端 polling：每 5 秒 GET ${polling_endpoint}
+        响应：{ status: "pending" | "authorized" | "expired" | "denied" }
+   │
+   ▼
+Step 5  Polling 终止条件：
+        · status = "authorized" → GET /providers/codex_oauth → 显示成功页
+        · status = "expired"     → "授权超时（15 分钟未完成）" + [Try again]
+        · status = "denied"      → "授权被拒绝" + [Try again]
+        · 用户点 [Cancel]        → 停止 poll，DELETE /providers/codex_oauth
+        · 浏览器关闭 / tab 切换  → 暂停 poll，回前台时立即 trigger 一次 poll 恢复
+```
+
+| 参数 | 值 |
+|--|--|
+| Polling 频率 | 5 秒 (与 OpenAI device endpoint rate limit 一致) |
+| Total timeout | 15 分钟 (`device_flow.expires_in`) |
+| 倒计时显示 | "⟳ Waiting for authorization (X min remaining)" |
+| 手动检查按钮 | "已完成？检查" 立即触发一次 poll |
+
+#### Error states UI
+
+| Error | 触发 | UI 形态 |
+|--|--|--|
+| Network error | configure / test / poll 请求失败 | inline banner: "网络错误，请重试 · [重试]" |
+| API key invalid | test 返回 `{ ok: false, error: "401 unauthorized" }` | inline error 在 `api_key` 输入框下方 |
+| Provider quota exceeded | test 返回 quota error | warn banner: "Provider quota 已用完，可暂时切换到其他 fallback" |
+| OAuth expired | poll 返回 `expired` | replace device flow 卡片为 "授权超时" + [Try again] CTA |
+| OAuth concurrent flow | configure 时已有 pending flow | "已有进行中的授权流程，是否取消并重新开始？" + [Cancel current] [Continue old] |
+| Save 时 server reject | `POST /configure` 返回 4xx | top banner with error message + 保留表单状态 |
+
 ## 11. 资源使用 / 配额 UI（关联 Settings 页面）
 
 可视化用户的 LLM 使用情况（从 `llm_usage_log` 聚合）：
