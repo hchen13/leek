@@ -395,7 +395,68 @@ Charter 的可视化是产品的另一个温柔的 detail——让用户感到"�
 12. **暗色为默认**——金融工作场景常态
 13. **键盘优先**——目标用户是有耐心 / 注重效率的散户，键盘文化欢迎
 
-## 11. 后续依赖文档
+## 11. Scene 派生规则
+
+claude design 出的 5 个 demo scene（`idle` / `thinking-shallow` / `clarify` / `deep` / `delivered`）**不是后端的状态机**——而是**前端从 `task.status` + loop events + panel count 派生的视觉状态**。后端不直接 emit "scene"，前端 reducer 计算。
+
+当前 SolidJS 实现把 5 scene 作为开发期 fixture（URL hash `#deep` / `#delivered` 等），便于设计 review。production 模式 scene 完全 derived。
+
+### 11.1 Scene 与后端状态的派生表
+
+| Scene | 派生条件 | UI 呈现 |
+|--|--|--|
+| `idle` | session 内无 `in_progress` task | canvas 空 / 上次 task DAG 折叠；CorpusBrain 缓慢自转；TaskBar 显示"提个问题或下达任务"；输入框聚焦 |
+| `thinking-shallow` | 当前 task `loop_iteration ≤ 2` 且 `panel_count ≤ 2` | DAG 上 1-2 个 panel 流式生长；agent message stream 在 chat 主轴打字；TaskBar "⟳ in_progress · turn 1/N" |
+| `clarify` | `task.status = awaiting_user`（loop.status = `AwaitingUser`） | DAG 上 clarification 节点高亮；chat 显示 agent 的反问；输入框 placeholder 改为 "回答 agent 的问题..." |
+| `deep` | `loop_iteration > 2` 或 `panel_count > 2` 或存在 active subagent | DAG 多 panel + 边连接；可能有 📌 subagent 容器；CorpusBrain 高频激活；TaskBar 显示进度详情 |
+| `delivered` | `task.status = delivered` | DAG 末端有 decision_draft / review_draft / research_brief 等 deliverable 节点（chrome 上有 Confirm/Discuss/Reject 按钮）；TaskBar "✓ delivered" |
+
+### 11.2 Scene 转换的事件触发
+
+```
+event 流                                              scene 转换
+─────────────────────────────────────────────────────────────────
+(无 in_progress task)                                → idle
+task_created + task_started                          → thinking-shallow
+agent_message_start / panel_open（早期）              → 维持 thinking-shallow
+panel_count 跨过 2 OR loop_iter 跨过 2 OR subagent_started → deep
+clarification_requested                              → clarify
+clarification_answered（control: UserResponse）       → 回到 deep / thinking-shallow
+deliverable_ready                                    → delivered
+deliverable_confirmed / rejected                     → idle（task closed）
+task_cancelled / task_failed                         → idle
+```
+
+### 11.3 前端实现
+
+scene 是 derived signal（SolidJS createMemo）：
+
+```typescript
+const scene = createMemo<Scene>(() => {
+  const t = currentTask();
+  if (!t) return "idle";
+  if (t.status === "awaiting_user") return "clarify";
+  if (t.status === "delivered") return "delivered";
+  if (t.status === "in_progress") {
+    const panels = activePanelCount();
+    const iter = t.loop_iteration ?? 0;
+    if (panels > 2 || iter > 2 || hasActiveSubagent()) return "deep";
+    return "thinking-shallow";
+  }
+  return "idle";
+});
+```
+
+派生计算每帧 ≤ O(1)，不是性能热点。
+
+### 11.4 边界约定
+
+- **不存 scene** 到 vault——它是 UI 派生的 view state
+- **不发 `scene_changed` 事件**——scene 转换由前端从原子事件 reduce 出
+- **scene 不影响 agent 行为**——agent 只看 task / loop status，不知道 UI 当前在哪个 scene
+- demo / fixture 模式用 URL hash（如 `#deep`）强制 set scene，便于设计 review；production 模式 scene 完全 derived
+
+## 12. 后续依赖文档
 
 - [`../interaction-model.md`](../interaction-model.md) —— Manager + Team 交互模型完整定义
 - [`panels.md`](panels.md) —— 完整 panel 清单 + 每类 panel 的详细设计
