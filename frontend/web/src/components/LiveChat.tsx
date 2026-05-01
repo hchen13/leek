@@ -19,6 +19,15 @@ interface UsageInfo {
   outTokens: number;
 }
 
+type TaskStatus = "in_progress" | "delivered";
+
+interface CurrentTask {
+  id: string;
+  title: string;
+  expectedDeliverable: string;
+  status: TaskStatus;
+}
+
 function fmtTime(d = new Date()) {
   return d.toTimeString().slice(0, 5);
 }
@@ -29,6 +38,7 @@ export function LiveChat() {
   const [error, setError] = createSignal<string | null>(null);
   const [pending, setPending] = createSignal(false);
   const [connected, setConnected] = createSignal(false);
+  const [currentTask, setCurrentTask] = createSignal<CurrentTask | null>(null);
 
   let evtSrc: EventSource | undefined;
   let agentBuffer = "";
@@ -124,6 +134,43 @@ export function LiveChat() {
       });
     });
 
+    evtSrc.addEventListener("task_created", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        setCurrentTask({
+          id: data.task_id,
+          title: data.title,
+          expectedDeliverable: data.expected_deliverable,
+          status: "in_progress",
+        });
+      } catch {
+        // skip malformed
+      }
+    });
+
+    evtSrc.addEventListener("task_delivered", () => {
+      setCurrentTask((prev) => (prev ? { ...prev, status: "delivered" } : prev));
+    });
+
+    evtSrc.addEventListener("clarification_requested", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        // Mark the *next* agent message as a clarification — set a flag the
+        // chat list can pick up. P1: just surface it in the existing flow;
+        // visual differentiation is handled by adding a "clarify" hint here.
+        setError(null);
+        if (typeof data.question === "string") {
+          // No-op for now; agent_message_delta will deliver the same text.
+          // This handler exists so the listener is registered (and the event
+          // is acknowledged) — visual styling for clarifications can land
+          // when the design calls for it.
+          void data.question;
+        }
+      } catch {
+        // skip
+      }
+    });
+
     evtSrc.addEventListener("error", (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data);
@@ -172,10 +219,11 @@ export function LiveChat() {
         display: "flex",
         "align-items": "center",
         "justify-content": "space-between",
+        gap: "12px",
         "font-family": "var(--font-mono)",
         "font-size": "11px",
       }}>
-        <span style={{ color: "var(--ink-2)" }}>
+        <span style={{ color: "var(--ink-2)", "white-space": "nowrap" }}>
           <span style={{
             "display": "inline-block",
             width: "8px",
@@ -187,8 +235,39 @@ export function LiveChat() {
           }} />
           LIVE · session={SESSION_ID}
         </span>
+        <Show when={currentTask()}>
+          <span style={{
+            flex: 1,
+            "min-width": 0,
+            display: "flex",
+            "align-items": "center",
+            gap: "8px",
+            padding: "4px 10px",
+            background: "rgba(217,119,87,0.12)",
+            border: "1px solid rgba(217,119,87,0.25)",
+            "border-radius": "6px",
+            color: "var(--ink-1)",
+            "font-size": "11px",
+            "overflow": "hidden",
+          }}>
+            <span style={{ color: currentTask()!.status === "delivered" ? "#6fb98a" : "#e8b86c" }}>
+              {currentTask()!.status === "delivered" ? "✓" : "⟳"}
+            </span>
+            <span style={{
+              "white-space": "nowrap",
+              "text-overflow": "ellipsis",
+              "overflow": "hidden",
+              flex: 1,
+            }}>
+              {currentTask()!.title}
+            </span>
+            <span style={{ color: "var(--ink-3)", "white-space": "nowrap" }}>
+              {currentTask()!.expectedDeliverable} · {currentTask()!.status}
+            </span>
+          </span>
+        </Show>
         <Show when={usage()}>
-          <span style={{ color: "var(--ink-3)" }}>
+          <span style={{ color: "var(--ink-3)", "white-space": "nowrap" }}>
             in={usage()!.inTokens} · out={usage()!.outTokens}
           </span>
         </Show>
