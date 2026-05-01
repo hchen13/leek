@@ -355,9 +355,9 @@ violations 不阻断 deliverable 提交——但用户必须**显式看到**才�
 
 ### 7.1 Reactive（用户下达任务）
 
-- 用户主动创建 task → agent 执行 → deliverable
+- 用户在 chat 主轴输入自然语言 → main agent 隐式提取 task → 在 canvas 上工作 → 输出 deliverable 节点
 - 这是最主要的工作流（80%+ 使用场景）
-- 任务可以是显式的（用 task creator）或隐式的（quick task → 自动 promote）
+- **前端不暴露 task 概念**——没有 task creator form / task board，agent 自动从 user message 推断 goal / constraints / expected_deliverable（详见 §4 输入形态）
 
 ### 7.2 Proactive（系统创建任务给用户）
 

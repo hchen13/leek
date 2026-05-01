@@ -143,8 +143,17 @@ Response 204  # 实际是 status=archived（软删除）
 
 ### 4.2 Tasks
 
+> **前端不直接 POST /tasks**。在 chat-first UX 下，task 由 main agent 从 user message 隐式提取（详见 [`agent-loop.md`](agent-loop.md) §10 first-turn extraction）。本节 endpoints 的实际用途：
+> - `POST /tasks`：cron / agent_proposed / 外部 MCP client 等**系统路径**创建 task
+> - `POST /tasks/:id/submit`：用户在 TaskBar 接受 proactive task（draft → queued）
+> - `POST /tasks/:id/cancel` / `control`：用户对 in_progress task 的干预（TaskBar 上的"中断 / 追加约束"按钮）
+> - `GET` / `PATCH`：管理界面查看 / 编辑历史 task
+>
+> 前端发起新工作的主入口在 §4.3 `POST /sessions/:id/messages`。
+
 ```
 POST /api/v1/tasks
+# 系统路径创建 task（cron / agent_proposed / 外部 MCP client）
 Body: {
   "session_id": "...",
   "title": "...",
@@ -153,7 +162,8 @@ Body: {
   "context_refs"?: ["@NVDA", ...],
   "expected_deliverable": "decision_draft" | ... ,
   "priority"?: "normal",
-  "submit": true | false  // false = 仅创建为 draft
+  "source": "cron" | "agent_proposed" | "mcp_client",
+  "submit": true | false  // false = draft（等待用户在 TaskBar 接受）
 }
 Response 201: { "task_id": "...", "status": "draft" | "queued" }
 
@@ -172,7 +182,7 @@ Conditions:
 Response 200
 
 POST /api/v1/tasks/:id/submit
-# 把 draft → queued
+# 把 draft → queued（用户在 TaskBar 接受 proactive task 时调用）
 Response 200
 
 POST /api/v1/tasks/:id/cancel
@@ -199,11 +209,12 @@ Gateway 将 ControlCommand 写入 `vault.events`（kind=control_received），�
 
 #### Task 状态转换 API
 
-| API | 允许的源状态 | 目标状态 |
+| API / 触发 | 允许的源状态 | 目标状态 |
 |--|--|--|
-| `POST /tasks` (submit=true) | — | `queued` |
-| `POST /tasks` (submit=false) | — | `draft` |
-| `POST /tasks/:id/submit` | `draft` | `queued` |
+| `POST /sessions/:id/messages` → main agent 第一轮决定开 task | — | `in_progress`（直接进 loop，跳过 queued） |
+| `POST /tasks` (submit=true) — cron / agent_proposed | — | `queued` |
+| `POST /tasks` (submit=false) — cron / agent_proposed 待用户接受 | — | `draft` |
+| `POST /tasks/:id/submit` — 用户在 TaskBar 接受 proactive task | `draft` | `queued` |
 | `POST /tasks/:id/cancel` | `queued` / `in_progress` / `awaiting_user` | `cancelled` |
 | `POST /tasks/:id/control { kind: "interrupt" }` | `in_progress` | `cancelled`（loop 自然结束） |
 | `POST /deliverables/:id/confirm` | task `delivered` | task `confirmed` |
@@ -217,13 +228,19 @@ Query: task_id?, since_seq?, limit
 Response: { items: [{seq, role, content_json, created_at, task_id?}] }
 
 POST /api/v1/sessions/:id/messages
-# 在 task thread 内追问 / 普通 chat（不创建新 task）
+# **前端的主入口**——所有用户在 chat 输入框敲入的内容都从这里进。
+# Gateway 接收后路由给该 session 的 main agent loop：
+#   · task_id 为空 → main agent 第一轮决定：开新 task / 闲聊回复 / 追加到当前 in_progress task
+#   · task_id 非空 → 直接进入指定 task thread（chat 内追问、追加约束等）
+# 路由的最终结果通过 SSE / WS 的事件流揭晓（task_created / agent_message_start / 等）
 Body: {
-  "task_id": "...",         # 可空
+  "task_id"?: "...",        # 可选；缺省 = 让 main agent 自己判断（详见 agent-loop.md §10）
   "content": { "type": "text", "text": "..." }
 }
 Response 201: { "message_seq": number }
 ```
+
+详细的 first-turn extraction 协议（main agent 如何从 user message 决定路由）见 [`agent-loop.md`](agent-loop.md) §10。
 
 ### 4.4 Events（历史 / 续传）
 

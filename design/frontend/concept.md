@@ -17,10 +17,10 @@ L.E.E.K 对用户来说**不是一个 chat 工具**，更像他指挥的**研究
 
 这个定位带来的关键产品语义：
 
-- 主交互单元 = **任务（task）**，而非 message/turn
-- 主输入区 = **Task Creator 卡片**（结构化），而非单行 chat 框
-- Agent 输出 = **typed deliverable**，而非对话回复
-- 用户 ownership = **决策由我做出，团队是我的研究资源**
+- **任务（task）是后端的核心交互单元**——但在前端**隐式**，用户感知到的是 chat 主轴 + canvas DAG
+- **主输入是 chat 主轴的自然语言输入框**——agent 从 user message 自动提取 task.goal / constraints / expected_deliverable
+- **Agent 工作过程在 canvas DAG 上展开**——chat 主轴只放 user input 与 agent 的最终简短回复，typed deliverable 节点是仪式性产出
+- **用户 ownership = 决策由我做出，团队是我的研究资源**
 
 它**不是**：
 - 不是聊天机器人（chat thread 只是 task 内追问的形态）
@@ -271,7 +271,8 @@ Step 3  用户点 CorpusBrain → 全屏接管主区域，进入大脑全景视�
 Step 4  用户被某个概念吸引（如 "owners-earnings"）
         - 弹出 Article popover 显示 corpus 内容
         - 旁边推荐："基于这个概念，给团队起一个分析任务?"
-        - 用户点击 → 跳转到 Task Creator，预填 context_refs=["@corpus:owners-earnings"]
+        - 用户点击 → chat 输入框聚焦并预填 mention chip `@corpus:owners-earnings`，
+          光标停在后面让用户接着写自然语言（如"用这个框架看看 BABA"）
 ```
 
 ## 5. 视觉与交互原则
