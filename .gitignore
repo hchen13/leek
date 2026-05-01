@@ -1,0 +1,34 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node (if any tooling appears later)
+node_modules/
+
+# Local scratch — see AGENTS.md §"Temporary files"
+tmp/
+
+# Logs
+*.log
+
+# Local environment
+.env
+.env.*
