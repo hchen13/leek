@@ -4,6 +4,8 @@
 
 先读 [`concept.md`](concept.md) 再读这份。
 
+> **数据契约**（panel chrome + 11 typed module 的 JSON schema、tool result → module 映射、panel_open / panel_update payload）见 [`../p1-spec/module-contracts.md`](../p1-spec/module-contracts.md)。本文专注 visual / interaction craft，不重复 schema。
+
 ## 1. 核心心智模型：Canvas = Reasoning DAG，Panel = Typed Node
 
 L.E.E.K 的主 canvas **不是 dashboard 风格的多窗格摆放**，也不是 chat 流的纵向消息列表。它是一棵**活的、可视化的、流动的 Reasoning DAG**——agent 的全部工作过程（思考 / 调工具 / 看数据 / 引用 corpus / 派遣 subagent / 提交 deliverable）都是 DAG 上长出来的 typed 节点，节点之间的边是因果连接。

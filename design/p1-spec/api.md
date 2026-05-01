@@ -740,16 +740,24 @@ type EventKind =
 
 #### `panel_open`
 
+完整 payload（含 11 种 typed module 与 chrome schema）见 [`module-contracts.md`](module-contracts.md) §3 + §4。简化形态：
+
 ```json
 {
   "panel_id": "...",
-  "kind": "quote" | "chart" | "decision_draft" | ...,
-  "payload": { ... },
-  "layout_hint": { "size": "M" }
+  "kind": "quote-card" | "chart" | "fundamentals" | "evidence" | "corpus"
+        | "compare" | "news" | "subagent" | "valuation" | "decision" | "watch",
+  "title": "...",
+  "sub": "...",
+  "modules": [ /* Module[]，详见 module-contracts.md §4 */ ],
+  "layout_hint": { "x": 0, "y": 0, "w": 360, "h": 200 },
+  "version": 1
 }
 ```
 
 #### `panel_update`
+
+JSON Merge Patch 语义详见 [`module-contracts.md`](module-contracts.md) §6.1（关键：`modules` 数组按整体替换，不做 element merge）。
 
 ```json
 {
