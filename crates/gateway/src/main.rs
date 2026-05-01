@@ -1,3 +1,5 @@
+mod auth;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -50,13 +52,30 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("serve 还没接入，等待 gateway HTTP/SSE 切片完成");
         }
         Command::Auth { provider } => match provider {
-            AuthProvider::Codex { import_from_codex_cli } => {
-                tracing::info!(
-                    import_from_codex_cli,
-                    "leek auth codex (placeholder — Task #49)"
-                );
-                anyhow::bail!("auth codex 还没接入，等待 device flow 切片完成");
-            }
+            AuthProvider::Codex {
+                import_from_codex_cli,
+            } => run_auth_codex(import_from_codex_cli).await,
         },
     }
+}
+
+async fn run_auth_codex(import_from_codex_cli: bool) -> anyhow::Result<()> {
+    if import_from_codex_cli {
+        anyhow::bail!("--import-from-codex-cli 等 vault 持久化切片完成（Task #50）");
+    }
+
+    println!("Signing in to OpenAI Codex...");
+    println!("(leek runs its own device flow — won't interfere with codex CLI / VS Code)");
+
+    let tokens = auth::codex::device_flow_login().await?;
+
+    println!();
+    println!("\x1b[92m✓ Login successful\x1b[0m");
+    println!("  expires at:    {}", tokens.expires_at.to_rfc3339());
+    println!("  access_token:  {}…", &tokens.access_token[..tokens.access_token.len().min(20)]);
+    println!("  refresh_token: {}…", &tokens.refresh_token[..tokens.refresh_token.len().min(20)]);
+    println!();
+    println!("\x1b[93mNote: token persistence to vault.db is wired up in next slice (Task #50).\x1b[0m");
+
+    Ok(())
 }
