@@ -322,114 +322,190 @@ impl ProviderError {
 
 **核心**：复用用户 ChatGPT 订阅的 quota，不消耗 platform.openai.com 配额。
 
-**Endpoint**：与 `openai_api_key` 同——`https://api.openai.com/v1/responses`，但 auth 走 OAuth bearer token 而非 API key。
+**Endpoint**：`https://chatgpt.com/backend-api/codex/responses` —— **与 `openai_api_key` 不同**（后者是 `api.openai.com`）。OAuth token 走 ChatGPT subscription 后端，不是 platform API。
 
 **Headers**：
 - `Authorization: Bearer <oauth_access_token>`
-- `OpenAI-Beta: <可能需要的 codex 特有 beta 标志，详见 §5>`
-- 其他可能的 codex client identification headers（详见 §5）
+- `Content-Type: application/json`
 
-**capabilities**：与 `openai_api_key` 一致（同模型 backend）。
+**Body**：OpenAI Responses API 标准 schema（与 `openai_api_key` 一致；详见 §5.4）。
+
+**capabilities**：与 `openai_api_key` 同 backend；但模型清单受 ChatGPT subscription 限制（OAuth 路径暴露的是用户订阅 plan 包含的模型）。
 
 ## 5. Codex OAuth 详细流程
 
-### 5.1 Device Authorization Flow
+> **协议来源**：[hermes-agent](https://github.com/NousResearch/hermes-agent) `hermes_cli/auth.py` 已验证。
+> hermes 与 codex CLI 共享 client_id `app_EMoamEEZ73f0CkXaXp7hrann`——OpenAI 给 codex 公开的 device flow client。
 
-参考 OpenAI Codex CLI 的实现（`openai/codex` 仓库）。**手抄进 leek，不 vendor**——理由见 [ADR-0005](../decisions/0005-self-implemented-harness.md)。
+**关键约束**：codex CLI / VS Code 扩展 / leek **不能共享** `refresh_token`——任一方先 refresh 会让其他方失效（OAuth refresh token rotation）。leek 因此**自己存 token**，不动 `~/.codex/auth.json`（详见 §5.3）。
 
-**Step 1: 启动 device flow**
+### 5.1 Device Authorization Flow（PKCE）
+
+**Step 1: 请求 user code**
 
 ```http
-POST https://auth.openai.com/oauth/device/code
-Content-Type: application/x-www-form-urlencoded
+POST https://auth.openai.com/api/accounts/deviceauth/usercode
+Content-Type: application/json
 
-client_id=<codex_client_id>
-&scope=<openai+offline_access>
+{ "client_id": "app_EMoamEEZ73f0CkXaXp7hrann" }
 ```
 
 返回：
 ```json
 {
-  "device_code": "...",
   "user_code": "ABCD-1234",
-  "verification_uri": "https://chat.openai.com/auth/device",
-  "verification_uri_complete": "https://chat.openai.com/auth/device?user_code=ABCD-1234",
-  "expires_in": 900,
+  "device_auth_id": "<opaque token>",
   "interval": 5
 }
 ```
 
-**Step 2: 用户在浏览器授权**
+**Step 2: 引导用户授权**
 
-leek CLI / Web Settings 显示 `verification_uri_complete` 给用户（生成二维码也可），用户点击在 ChatGPT 登录环境授权。
+CLI / UI 显示：
 
-**Step 3: leek 长轮询拿 token**
+```
+1. Open in browser:  https://auth.openai.com/codex/device
+2. Enter code:       ABCD-1234
+```
+
+> verification URL 是 `auth.openai.com/codex/device`——专门的 codex device login 页，不是通用 ChatGPT auth。
+
+**Step 3: 长轮询拿 authorization_code**
+
+每 `interval` 秒（min 3、default 5）：
+
+```http
+POST https://auth.openai.com/api/accounts/deviceauth/token
+Content-Type: application/json
+
+{
+  "device_auth_id": "<from step 1>",
+  "user_code": "ABCD-1234"
+}
+```
+
+| 响应 | 含义 |
+|--|--|
+| `200` + `{ authorization_code, code_verifier }` | 用户已授权（PKCE 配对） |
+| `403` / `404` | 用户未完成，继续 poll |
+| 其他 | error |
+
+总 timeout：15 分钟。
+
+**Step 4: 用 PKCE 换 token**
 
 ```http
 POST https://auth.openai.com/oauth/token
 Content-Type: application/x-www-form-urlencoded
 
-grant_type=urn:ietf:params:oauth:grant-type:device_code
-&device_code=<device_code>
-&client_id=<codex_client_id>
+grant_type=authorization_code
+&code=<authorization_code from step 3>
+&redirect_uri=https://auth.openai.com/deviceauth/callback
+&client_id=app_EMoamEEZ73f0CkXaXp7hrann
+&code_verifier=<code_verifier from step 3>
 ```
 
-每 `interval` 秒询问一次，直到拿到：
+返回：
 ```json
 {
-  "access_token": "...",
+  "access_token": "<JWT>",
   "refresh_token": "...",
   "expires_in": 3600,
-  "token_type": "Bearer",
-  "scope": "openai offline_access"
+  "token_type": "Bearer"
 }
 ```
 
-或 `expires_in` 超时报错。
-
-**Step 4: 持久化**
-
-写入 `vault.llm_provider_configs`（auth_kind = "oauth"，oauth_access_token / oauth_refresh_token / oauth_expires_at）。
-
-注：access_token 是敏感凭证，**必须**：
-- 文件权限 0600（如果落到文件而非 vault）
-- 走 OS keyring（macOS Keychain / Linux Secret Service）作为 P2 升级
+`access_token` 是 JWT，含 `exp` 字段——可本地 decode 判断是否 expiring 而无需调 server。
 
 ### 5.2 Token Refresh
 
-每次发 LLM 请求前 check `oauth_expires_at`。如果距过期 < 5 分钟，先 refresh：
+每次发 LLM 请求前 check JWT 的 `exp` 字段。距过期 < 60s 时先 refresh：
 
 ```http
 POST https://auth.openai.com/oauth/token
 Content-Type: application/x-www-form-urlencoded
 
 grant_type=refresh_token
-&refresh_token=<refresh_token>
-&client_id=<codex_client_id>
+&refresh_token=<current>
+&client_id=app_EMoamEEZ73f0CkXaXp7hrann
 ```
 
-返回新的 access_token + refresh_token + expires_in，覆盖旧值。
+响应：
 
-如果 refresh 失败（HTTP 401 / 400 invalid_grant），意味着用户在 ChatGPT 端 revoke 了授权——降级到 fallback chain，并把这个 provider 标记为 `oauth_invalid`，同时通知用户重新授权。
+```json
+{
+  "access_token": "<new JWT>",
+  "refresh_token": "<可能是新的，可能没有>"
+}
+```
 
-### 5.3 走 Responses API 的细节
+**关键**：`refresh_token` 可能 rotate——响应里有就用新的，没有沿用旧的。
 
-OpenAI Responses API 接受 OAuth token 的具体行为可能与 API key 略有不同（rate limit 计算 / quota 归属）。具体差异需要在实现期验证：
+#### Error 处理
 
-- **可能需要的额外 headers**：`OpenAI-Beta`, `User-Agent`（codex 特有 UA）, 等。具体值参考 codex CLI 源码运行时 inspect 网络请求
-- **模型清单可能不同**：OAuth 路径可能只暴露用户订阅 plan 包含的模型（GPT-5 / o1-mini 等），而非 platform 全集
-- **rate limit 形态可能不同**：可能基于 ChatGPT plan 的 message-per-day 而非 platform 的 token-per-minute
+| HTTP / error code | 含义 | leek 行为 |
+|--|--|--|
+| `200` | 成功 | 写新 token（含可能 rotate 的 refresh_token） |
+| `400 invalid_grant` / `invalid_token` / `invalid_request` | refresh_token 失效 | 标 `oauth_invalid`，要求重登 |
+| `400 refresh_token_reused` | 另一客户端（codex CLI / VS Code）已用同 token | 同上，提示"先 run `codex` 终端登录，然后重新 `leek auth codex`" |
+| `401` / `403` | refresh_token 失效（保险栅） | 同 `invalid_grant` |
+| `5xx` / network error | 暂时性 | 沿用旧 token + 下次请求 retry |
 
-实现时第一步是手动用 `curl` 验证最简调用能跑通，再写 Rust 实现。
+### 5.3 Token Storage
 
-### 5.4 政策风险与防御
+token 写入 `vault.llm_provider_configs`：
 
-OpenAI 政策上可以随时通过指纹检查 / UA 校验 / 签名机制限制非 codex 客户端复用 OAuth token。leek 的防御策略：
+| 字段 | 值 |
+|--|--|
+| `provider_name` | `"codex_oauth"` |
+| `auth_kind` | `"oauth"` |
+| `oauth_access_token` | JWT 字符串 |
+| `oauth_refresh_token` | refresh token |
+| `oauth_expires_at` | 从 JWT `exp` 字段 decode |
+| `oauth_scope` | 通常为 `null`（codex device flow 不显式给 scope） |
 
-1. **侵入性最低**：只复用 codex 已经在做的 HTTP 请求形态，不发 codex 不发的请求
-2. **快速降级**：发现 OAuth path 失败（HTTP 4xx with specific error codes）立即切到 API key path
-3. **明确告知用户**：UI 上明确说明"Codex OAuth 是依赖 OpenAI 政策的 best-effort 路径，可能在某次 OpenAI 更新后失效，请配置 API key 作为兜底"
-4. **不绑死**：API key 路径在功能上必须等价（不能出现"功能 X 仅 OAuth 可用"）
+#### 不复用 `~/.codex/auth.json`
+
+OAuth refresh token rotation 让 codex CLI / VS Code 扩展 / leek **不能**共享一个 refresh_token——任一方先 refresh 会 invalidate 其他方的 token，导致 `refresh_token_reused` 错误。
+
+leek 走 hermes-agent 验证过的方案：自己跑一次 device flow，token 存进 vault，与 codex CLI 隔离。
+
+#### Onboarding 快速路径：`--import-from-codex-cli`
+
+`leek auth codex --import-from-codex-cli` 命令：
+
+1. 读 `~/.codex/auth.json`，拷贝 access/refresh token 进 vault.llm_provider_configs
+2. 警告用户："codex CLI 接下来若 refresh 会让 leek token 失效——使用 leek 期间避免在终端跑 `codex`"
+3. 一次性，不持续同步
+
+如果用户更愿意保持 codex CLI 可用，跑 `leek auth codex` 走完整 device flow（5min 完成），两方独立。
+
+### 5.4 走 Responses API 的细节
+
+```http
+POST https://chatgpt.com/backend-api/codex/responses
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+<OpenAI Responses API 标准 body>
+```
+
+观察（来自 hermes-agent 的运行经验）：
+
+- **模型清单**：与 platform.openai.com 不完全一致；OAuth 路径主要给 ChatGPT subscription 包含的模型（如 `gpt-5`、`gpt-5-codex`）。具体清单运行时 inspect。
+- **Rate limit 形态**：基于 ChatGPT plan 的 quota，不是 platform token-per-minute；具体规则不公开。
+- **SSE 协议**：与 platform Responses API 一致（OpenAI 标准事件类型 `response.output_text.delta` / `response.completed` 等，详见 §7.2）。
+
+### 5.5 政策风险与防御
+
+OpenAI 政策上可以随时通过指纹 / UA 校验 / 签名机制限制非 codex 客户端复用 OAuth token。leek 的防御策略：
+
+1. **复用 codex 公开 client_id**：`app_EMoamEEZ73f0CkXaXp7hrann`——OpenAI 知道有第三方客户端用这个（hermes / continue / aider 等都在用）
+2. **快速降级**：OAuth path 失败立即切到 API key path（如果用户配置了）
+3. **明确告知用户**：UI 上说明"Codex OAuth 是依赖 OpenAI 政策的 best-effort 路径，建议同时配 API key 兜底"
+4. **不绑死功能**：API key 路径在功能上必须等价
+
+实施基线：以"OpenAI 不主动封"为前提工作（hermes / continue / aider 等都在用，目前未见大规模封禁）；某次 OpenAI 政策变化导致 device flow 不可用，用户切到 API key 即可。
 
 ## 6. Prompt Caching 策略
 
