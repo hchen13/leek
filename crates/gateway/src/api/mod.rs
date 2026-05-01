@@ -2,6 +2,7 @@
 
 pub mod health;
 pub mod messages;
+pub mod static_files;
 pub mod stream;
 
 use std::sync::Arc;
@@ -37,6 +38,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/stream/sessions/{id}/events", get(stream::handler))
         .with_state(state)
+        // Anything not matched above falls through to the embedded SPA
+        .fallback(static_files::handler)
         .layer(cors)
 }
 
