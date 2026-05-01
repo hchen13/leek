@@ -635,14 +635,167 @@ fn process_control_messages(state: &mut AgentLoopState) {
 
 Control message 由 gateway 的 control endpoint 接收（HTTP POST /sessions/:id/control 或 WebSocket frame），写入 vault.events 并 push 到对应 AgentLoop 实例的 control_inbox（tokio mpsc channel）。
 
-## 10. Task Lifecycle 与 Loop 的对接
+## 10. First-turn Routing & Task Extraction
+
+> 前端通过 `POST /sessions/:id/messages` 提交用户输入（详见 [`api.md`](api.md) §4.3）。
+> Gateway 接到 message 后**不直接创建 task**——而是经过一层 routing 决定该开 task 还是闲聊回复。
+> Task 概念在前端隐式（[interaction-model.md §3.2](../interaction-model.md)）就是靠这层 routing 实现的。
+
+### 10.1 Routing 决策树
 
 ```
-Task lifecycle           AgentLoop 状态           Vault 写入
-─────────────────────────────────────────────────────────────
-queued                                            tasks.status='queued'
-   ↓ scheduler 调度
-                         init_state               
+POST /sessions/:id/messages 进 gateway
+        │
+        ├─ body.task_id 显式给定？
+        │     ├─ Yes → 注入该 task 的 in-progress AgentLoop control_inbox
+        │     │         （详见 §10.4 in-thread routing）
+        │     └─ No  → 看 session 是否有 in_progress task
+        │               ├─ 有 → 默认按 task_id 给定处理（attach 到当前 task）
+        │               └─ 无 → 启动 extraction LLM call（§10.2）
+        │
+        └─ extraction 输出三态：
+              ├─ new_task    → 创建 task（status=in_progress, source='user'）+ 启动 AgentLoop
+              ├─ chat_reply  → 直接 chat 文本回复，不开 task
+              └─ ambiguous   → 推一条 clarification message，不开 task；
+                                 等用户下一条 message 重走 routing
+```
+
+### 10.2 Extraction Prompt
+
+启动一次轻量 LLM call（小 max_tokens、复用主 system prompt cache 的前缀部分）。System prompt：
+
+```
+[Persona]
+你是 L.E.E.K main agent 的 routing layer。你只做一件事：
+决定用户这条消息要起任务还是闲聊。不要执行实际研究——只做意图分类。
+
+[Context]
+- Session 历史最近 N 条 message（默认 N=5）
+- Team Charter（用户的偏好与硬约束）
+- Session 中最近 confirmed deliverables 的摘要
+
+[User Message]
+{user_input}
+
+[Output Schema] — 严格 JSON
+{
+  "decision": "new_task" | "chat_reply" | "ambiguous",
+  "reason": "...",
+  "task_draft"?: {                    // decision=new_task 时必填
+    "title": "...",
+    "goal": "...",
+    "constraints"?: { ... },
+    "expected_deliverable":
+        "decision_draft" | "research_brief" | "review"
+      | "comparison" | "morning_brief" | "free_form",
+    "context_refs"?: [...]
+  },
+  "chat_reply_text"?: "...",          // decision=chat_reply 时必填
+  "clarification_question"?: "..."    // decision=ambiguous 时必填
+}
+
+[Decision Rules]
+- new_task：用户表达了具体研究目标 / 决策需求 / 复盘需求
+  · "NVDA 现在能加仓吗" / "复盘上周 META 决策" / "看看 BABA 最近"
+- chat_reply：闲聊 / 问候 / 元问题
+  · "你好" / "今天日期"
+  · "你刚才做到哪一步了"——task 元状态查询走这里，
+    因为 TaskBar 已经显示进度，agent 只需要补一句话
+- ambiguous：意图不明，需要 1 个澄清问题
+  · "看看我的持仓" → 复盘 / 加仓建议 / 风险评估?
+
+[expected_deliverable 推断启发式]
+- 含 "买 / 卖 / 加仓 / 减仓 / 止损"   → decision_draft
+- 含 "复盘 / 看看上次 / 当时怎么"     → review
+- 含 "对比 / vs / 哪个 / 比较"         → comparison
+- 含 "了解 / 调研 / 看看"              → research_brief
+- 含 "晨报 / 早报 / 今天关注"          → morning_brief
+- 否则                                  → free_form
+```
+
+成本估算：~500-2000 input tokens（命中 system prompt cache 后实际计费 ~200 tokens） + 200-500 output tokens。
+
+### 10.3 三态 decision 后的动作
+
+| decision | Gateway 动作 |
+|--|--|
+| `new_task` | 1. 用 task_draft 创建 task（status=`in_progress`, source=`user`）<br>2. 写入 `vault.tasks` + `task_assignments`<br>3. 启动 AgentLoop（绕过 queued state——reactive 路径直接执行）<br>4. emit `task_created` + `task_started` events<br>5. AgentLoop 第一轮 LLM call 用 main system prompt（§4.1） |
+| `chat_reply` | 1. 把 `chat_reply_text` 作为 agent message 写入 vault.messages（content_json type=text）<br>2. emit `agent_message_start` / `agent_message_delta` / `agent_message_end`（按字符 chunk 流出）<br>3. 不创建 task |
+| `ambiguous` | 1. 把 `clarification_question` 作为 agent message 写入<br>2. emit 同上 + `clarification_requested` event<br>3. 不创建 task；下次 user message 进来重走 routing |
+
+### 10.4 In-thread message routing
+
+当 message 已有 task_id（显式或推断 = session 中存在 in_progress task）时，gateway 把它注入对应 AgentLoop 的 `control_inbox`：
+
+```rust
+match loop_status {
+    LoopStatus::AwaitingUser => ControlMessage::UserResponse(text),
+    _                        => ControlMessage::AppendConstraint(text),
+}
+```
+
+main agent 在下一个 yield point 处理（详见 §9）。在 `build_chat_request` 中追加一段提示让 agent 自己判断这条 in-thread message 的性质：
+
+```
+[In-thread Message Handling]
+用户在当前 task thread 内追加: "{text}"
+请判断是哪一种：
+  A. 当前 task 的追加约束（"也考虑 BABA"）→ 直接纳入 context，下一轮工作中体现
+  B. 要 fork 新 task（"另开一个看 GOOGL"）→ 调 task.fork 工具
+  C. 闲聊 / 元问题（"做到哪一步了"）→ 简短文本回复，继续工作
+默认按 A 处理，仅在明确换方向时按 B。
+```
+
+这个判断是 in-loop 的，不再走 routing layer——routing layer 只在 "session 无 in_progress task" 时启动。
+
+### 10.5 与 Proactive task 的关系
+
+cron / agent_proposed 创建的 task 走 `POST /api/v1/tasks`（[`api.md`](api.md) §4.2）——
+**不经过** routing layer，直接进 vault 的 `draft` / `queued` state。
+
+- `draft` task 在前端显示为 TaskBar 顶部 banner（"🔔 1 个待复盘任务"）等用户接受
+- 用户点 [立即开始] → `POST /tasks/:id/submit` → status=`queued` → scheduler pickup → AgentLoop in_progress
+
+implicit extraction（reactive）+ POST /tasks（proactive）这两条路径互补，覆盖所有 task 来源
+（详见 [interaction-model.md §3.2](../interaction-model.md)）。
+
+### 10.6 Routing layer 的实施位置
+
+routing layer 是 gateway 的一部分，不是独立 service：
+
+```rust
+// crate::gateway::router
+
+async fn handle_user_message(session_id, body) -> Response {
+    let route = decide_route(session_id, body.task_id).await?;
+    match route {
+        Route::ExistingTask(tid) => inject_to_loop(tid, body.content).await?,
+        Route::NewExtraction => {
+            let extraction = run_extraction_llm(session_id, body.content).await?;
+            apply_extraction(session_id, extraction).await?
+        }
+    }
+}
+```
+
+extraction LLM call 复用 `LlmRegistry`——同 main loop 一个 provider chain；fallback 同样适用。
+extraction call 的 usage log invoker 字段标 `system:routing`，便于审计。
+
+## 11. Task Lifecycle 与 Loop 的对接
+
+```
+Task source              Task lifecycle           AgentLoop 状态           Vault 写入
+─────────────────────────────────────────────────────────────────────────────────────
+implicit (§10.3)         (跳过 queued)
+  POST /messages →                                init_state
+  routing → new_task                              状态=Running            tasks.status='in_progress'
+                                                                          tasks.source='user'
+                                                                          tasks.started_at=now
+
+proactive
+  POST /tasks            queued                                            tasks.status='queued'
+  cron / agent_proposed     ↓ user submit / scheduler 调度
+                         init_state
                          状态=Running            tasks.status='in_progress'
                                                   tasks.started_at=now
                          loop iteration 1..N
@@ -669,52 +822,59 @@ delivered → confirmed                            decisions.* (派生写入)
                                                   tasks.closed_at=now
 ```
 
-## 11. 错误处理与恢复
+## 12. 错误处理与恢复
 
-### 11.1 Agent loop 崩溃
+### 12.1 Agent loop 崩溃
 
 如果 loop 因为 panic / 不可恢复错误崩了：
 - 写 `tasks.status='failed'` + `status_reason`
 - emit `Event::TaskFailed { reason }`
 - 不自动重试（除非用户主动 retry）
 
-### 11.2 LLM provider 错误
+### 12.2 LLM provider 错误
 
 - Auth invalid / rate limited / quota exceeded → registry 自动 fallback 到下一 provider（详见 llm-provider.md §3）
 - 全部 provider 失败 → loop 状态变 Failed + emit Error 事件
+- Routing layer extraction call 同样走 fallback；全部失败 → 直接当 chat_reply 处理（保底回复"抱歉服务暂不可用"），不创建 task
 
-### 11.3 Tool 错误
+### 12.3 Tool 错误
 
 - 单次 tool call 失败 → ToolError 作为 ToolResult 内容回填给 LLM，agent 决定怎么处理（重试 / 换参数 / 放弃）
 - 多次同一 tool 错误 → agent 应当自己判断放弃，但 loop 不强制阻断
 
-### 11.4 中断恢复
+### 12.4 中断恢复
 
 - Task 状态 `cancelled` 后所有 state 持久化保留
 - 用户可以从 cancelled state 恢复（task 状态 → queued，loop 重新启动会读 vault.events 重建 messages）
 - P1 简化：cancelled 后允许 fork 新 task（带 context），但**不允许真正"continue from where left off"**——因为 LLM 状态难以完美恢复
 - 真正的 continue 是 P2 议题
 
-## 12. 性能与并发
+## 13. 性能与并发
 
-### 12.1 Loop 并发模型
+### 13.1 Loop 并发模型
 
 - 每个 active task 一个 `AgentLoop` 实例（tokio task）
 - 一个用户最多同时跑 5 个 active task（防止 quota 耗尽）；超出排队
 - 全 gateway 最多 50 个 active loop（防止单机过载）；超出 task 进 queued 等位
 
-### 12.2 Yield Point
+### 13.2 Yield Point
 
 每次 LLM 调用之间都是 yield point；每个 tool dispatch 之间也是 yield point。Control message 在 yield point 才生效——意味着用户中断 agent 后**最多等一个 LLM call 时间**（典型 1-3s）才看到 ack。
 
 P2 增强：流式中也能中断（让 LLM provider 主动 close 流），但实施成本高，P1 不做。
 
-### 12.3 Token 预算追踪
+### 13.3 Token 预算追踪
 
 每次 LLM 调用结束写 `llm_usage_log` + 累计 `task.tokens_used`。task 超 budget → emit warning 但不强制停（让 agent 自己判断）。
 
-## 13. 实施 checklist
+Routing layer 的 extraction call 也写 usage log，invoker 字段标 `system:routing`（不计入任何 task 的 tokens_used，便于审计 routing 总成本）。
 
+## 14. 实施 checklist
+
+- [ ] **Routing layer**：`handle_user_message` + 决策树 + extraction LLM call
+- [ ] **Extraction prompt template**（§10.2）+ JSON schema 校验
+- [ ] **Three-way decision dispatcher**：new_task / chat_reply / ambiguous → vault 写入 + event 发射
+- [ ] **In-thread message handling** prompt 注入（§10.4）
 - [ ] `AgentLoop` struct + `AgentLoopState`
 - [ ] Loop 主循环（含 control message 处理 / outcome 解析）
 - [ ] `build_chat_request` + system prompt template
@@ -724,9 +884,9 @@ P2 增强：流式中也能中断（让 LLM provider 主动 close 流），但�
 - [ ] `spawn_subagent` 子循环
 - [ ] Reasoning DAG 自动节点生成
 - [ ] Control message inbox（mpsc channel + control endpoint）
-- [ ] Task lifecycle 状态机（queued / in_progress / awaiting_user / delivered / ...）
-- [ ] 错误处理 + provider fallback
+- [ ] Task lifecycle 状态机（implicit 直进 in_progress / proactive 走 queued / awaiting_user / delivered / ...）
+- [ ] 错误处理 + provider fallback（loop + routing 双路径）
 - [ ] Loop 实例池 + 并发上限
-- [ ] 单元测试：每个 outcome 类型 + control message 处理
+- [ ] 单元测试：每个 outcome 类型 + control message 处理 + extraction 三态
 - [ ] 集成测试：完整 task 端到端（mock LLM provider）
 - [ ] e2e 测试：真实 LLM + 真实 tools，跑一个 decision_draft 类型 task
