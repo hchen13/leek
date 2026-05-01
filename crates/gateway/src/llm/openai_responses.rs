@@ -108,11 +108,13 @@ fn find_event_boundary(buf: &str) -> Option<EventBoundary> {
 }
 
 #[derive(Deserialize)]
-struct DataEnvelope<'a> {
+struct DataEnvelope {
     #[serde(rename = "type")]
-    type_: Option<&'a str>,
-    #[serde(default, borrow)]
-    delta: Option<&'a str>,
+    type_: Option<String>,
+    /// Owned String (not borrowed `&str`): the codex backend ships text
+    /// containing escapes like `\n`, which serde_json can't zero-copy borrow.
+    #[serde(default)]
+    delta: Option<String>,
     #[serde(default)]
     response: Option<ResponseObject>,
 }
@@ -163,14 +165,12 @@ fn parse_one_event(raw: &str) -> Result<Vec<LlmEvent>> {
         format!("parsing SSE data line as JSON: {}", truncate(&data, 200))
     })?;
 
-    match env.type_ {
+    match env.type_.as_deref() {
         Some("response.output_text.delta") => {
             let text = env
                 .delta
                 .ok_or_else(|| anyhow!("output_text.delta event missing 'delta'"))?;
-            Ok(vec![LlmEvent::TextDelta {
-                text: text.to_string(),
-            }])
+            Ok(vec![LlmEvent::TextDelta { text }])
         }
         Some("response.completed") => {
             let response = env

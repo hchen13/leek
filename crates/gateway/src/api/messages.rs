@@ -73,15 +73,16 @@ pub async fn post_handler(
         )
         .await;
 
-    // Fire-and-forget agent reply — events stream out via EventBus
+    // Fire-and-forget agent reply — events stream out via EventBus.
+    // The agent reads full history from vault, so multi-turn context flows naturally.
+    let _ = user_text; // kept to make intent explicit; agent reads from vault.
     let pool = state.pool.clone();
     let user_id = state.user_id.clone();
     let sess = session_id.clone();
     let provider = state.provider.clone();
     let bus = state.event_bus.clone();
     tokio::spawn(async move {
-        if let Err(e) = agent::run_chat_reply(pool, user_id, sess, provider, bus, user_text).await
-        {
+        if let Err(e) = agent::run_chat_reply(pool, user_id, sess, provider, bus).await {
             tracing::error!(error = %e, "agent reply failed");
         }
     });

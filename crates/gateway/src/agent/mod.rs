@@ -16,24 +16,44 @@ const DEFAULT_MODEL: &str = "gpt-5.5";
 const SYSTEM_PROMPT: &str = "You are L.E.E.K — a helpful, concise \
 investment-research assistant. Reply briefly in the user's language.";
 
-/// Run a one-shot chat reply: invoke provider, stream events, persist final message.
+/// Run a one-shot chat reply: invoke provider with full session history,
+/// stream events, persist final message.
 ///
 /// All emitted events go to both `vault.events` (durable) and `event_bus`
-/// (live SSE subscribers). User message is expected to already be persisted
-/// by the caller (the POST handler).
+/// (live SSE subscribers). The triggering user message is expected to already
+/// be persisted by the caller (the POST handler) — we read it back from vault
+/// as part of the message history, so multi-turn context flows naturally.
 pub async fn run_chat_reply(
     pool: SqlitePool,
     user_id: String,
     session_id: String,
     provider: Arc<dyn LlmProvider>,
     event_bus: EventBus,
-    user_text: String,
 ) -> Result<()> {
+    // Load full history. P1: cap at last 100 messages — context-trimming logic
+    // (data-schema.md / agent-loop.md §4.3) lands when token budgets matter.
+    let history = vault_messages::list(&pool, &user_id, &session_id, None, 100).await?;
+
+    let messages: Vec<ChatMessage> = history
+        .iter()
+        .filter_map(|row| {
+            let content: serde_json::Value = serde_json::from_str(&row.content_json).ok()?;
+            let text = content.get("text")?.as_str()?.to_string();
+            let role = match row.role.as_str() {
+                "user" => Role::User,
+                "agent" => Role::Assistant,
+                _ => return None, // skip system / tool rows in this slice
+            };
+            Some(ChatMessage { role, content: text })
+        })
+        .collect();
+
+    if messages.is_empty() {
+        anyhow::bail!("run_chat_reply called with no user messages in session");
+    }
+
     let req = ChatRequest {
-        messages: vec![ChatMessage {
-            role: Role::User,
-            content: user_text,
-        }],
+        messages,
         system: Some(SYSTEM_PROMPT.to_string()),
         model: DEFAULT_MODEL.to_string(),
         max_output_tokens: None,
