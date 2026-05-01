@@ -2,8 +2,8 @@
 // Uses the same chat primitives as the fixture scenes (UserMsg / AgentMsg /
 // StreamText / Composer); only the data source is different.
 
-import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
-import { AgentMsg, Composer, StreamText, UserMsg } from "./Chat";
+import { For, Show, createEffect, createSignal, onCleanup, onMount } from "solid-js";
+import { AgentMsg, Composer, UserMsg } from "./Chat";
 
 const SESSION_ID = "live";
 
@@ -32,6 +32,20 @@ export function LiveChat() {
 
   let evtSrc: EventSource | undefined;
   let agentBuffer = "";
+  let chatScrollEl: HTMLDivElement | undefined;
+
+  // Auto-scroll to bottom whenever messages change (length OR last text changes
+  // during streaming). Without this, new replies render below the viewport.
+  createEffect(() => {
+    const list = messages();
+    if (list.length > 0) {
+      // touch the last message's text so the effect re-runs on every delta
+      void list[list.length - 1].text;
+    }
+    if (chatScrollEl) {
+      chatScrollEl.scrollTop = chatScrollEl.scrollHeight;
+    }
+  });
 
   function appendDelta(text: string) {
     agentBuffer += text;
@@ -207,7 +221,10 @@ export function LiveChat() {
         </Show>
       </div>
 
-      <div style={{ flex: 1, overflow: "auto", "padding-right": "8px" }}>
+      <div
+        ref={(el) => (chatScrollEl = el)}
+        style={{ flex: 1, overflow: "auto", "padding-right": "8px" }}
+      >
         <Show when={messages().length === 0}>
           <div style={{
             color: "var(--ink-3)",
@@ -225,12 +242,13 @@ export function LiveChat() {
             fallback={<UserMsg time={m.ts}>{m.text}</UserMsg>}
           >
             <AgentMsg time={m.ts}>
-              <Show
-                when={m.streaming}
-                fallback={<span>{m.text}</span>}
-              >
-                <StreamText text={m.text} live={true} perTok={0} />
-              </Show>
+              {/* Plain text + blinker for streaming. We deliberately don't use
+                  StreamText here: its lk-tok fade-in animation re-triggers on
+                  every delta (esp. CJK where /\s+/ split produces one token),
+                  causing visual glitches. StreamText is reserved for fixture
+                  scenes where text is pre-rendered. */}
+              <span>{m.text}</span>
+              <Show when={m.streaming}><span class="lk-stream" /></Show>
             </AgentMsg>
           </Show>
         )}</For>
