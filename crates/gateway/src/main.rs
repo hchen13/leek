@@ -1,12 +1,16 @@
 mod auth;
+mod llm;
 mod vault;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use futures::StreamExt;
 
 use auth::codex::CodexTokens;
+use llm::LlmProvider;
 use vault::Vault;
 
 #[derive(Parser)]
@@ -32,6 +36,15 @@ enum Command {
     Auth {
         #[command(subcommand)]
         provider: AuthProvider,
+    },
+
+    /// 一次性 chat 调用（开发期 verify codex_oauth provider 用）
+    Chat {
+        /// User prompt
+        prompt: String,
+        /// Model name
+        #[arg(long, default_value = "gpt-5")]
+        model: String,
     },
 }
 
@@ -65,7 +78,53 @@ async fn main() -> Result<()> {
                 import_from_codex_cli,
             } => run_auth_codex(&cli.vault, import_from_codex_cli).await,
         },
+        Command::Chat { prompt, model } => run_chat(&cli.vault, prompt, model).await,
     }
+}
+
+async fn run_chat(vault_path: &Path, prompt: String, model: String) -> Result<()> {
+    let vault = Vault::open(vault_path).await?;
+    let provider =
+        llm::codex_oauth::CodexOauthProvider::new(vault.pool.clone(), vault::LOCAL_USER_ID)?;
+
+    let req = llm::ChatRequest {
+        messages: vec![llm::ChatMessage {
+            role: llm::Role::User,
+            content: prompt,
+        }],
+        system: None,
+        model,
+        max_output_tokens: Some(2048),
+    };
+
+    let mut stream = provider.chat(req).await?;
+    let mut total_chars: usize = 0;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+
+    while let Some(event) = stream.next().await {
+        match event? {
+            llm::LlmEvent::TextDelta { text } => {
+                handle.write_all(text.as_bytes()).ok();
+                handle.flush().ok();
+                total_chars += text.chars().count();
+            }
+            llm::LlmEvent::Usage(u) => {
+                eprintln!();
+                eprintln!(
+                    "\x1b[90m[usage] in={} out={} cache_read={}\x1b[0m",
+                    u.input_tokens, u.output_tokens, u.cache_read_tokens
+                );
+            }
+            llm::LlmEvent::MessageEnd { stop_reason } => {
+                eprintln!(
+                    "\x1b[90m[end] reason={:?} chars_streamed={}\x1b[0m",
+                    stop_reason, total_chars
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn run_auth_codex(vault_path: &Path, import_from_codex_cli: bool) -> Result<()> {
