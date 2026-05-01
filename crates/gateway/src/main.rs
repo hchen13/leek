@@ -1,9 +1,14 @@
+mod agent;
+mod api;
 mod auth;
+mod events;
 mod llm;
 mod vault;
 
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -69,10 +74,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { port } => {
-            tracing::info!(port, vault = %cli.vault.display(), "leek serve (placeholder — Task #48)");
-            bail!("serve 还没接入，等待 gateway HTTP/SSE 切片完成");
-        }
+        Command::Serve { port } => run_serve(&cli.vault, port).await,
         Command::Auth { provider } => match provider {
             AuthProvider::Codex {
                 import_from_codex_cli,
@@ -80,6 +82,34 @@ async fn main() -> Result<()> {
         },
         Command::Chat { prompt, model } => run_chat(&cli.vault, prompt, model).await,
     }
+}
+
+async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
+    let vault = Vault::open(vault_path).await?;
+    let provider: Arc<dyn LlmProvider> = Arc::new(llm::codex_oauth::CodexOauthProvider::new(
+        vault.pool.clone(),
+        vault::LOCAL_USER_ID,
+    )?);
+    let event_bus = events::EventBus::new();
+
+    let state = api::AppState {
+        pool: vault.pool.clone(),
+        provider,
+        event_bus,
+        user_id: vault::LOCAL_USER_ID.to_string(),
+    };
+
+    let app = api::router(state);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
+
+    tracing::info!(%addr, vault = %vault_path.display(), "leek serve listening");
+    axum::serve(listener, app)
+        .await
+        .context("axum serve")?;
+    Ok(())
 }
 
 async fn run_chat(vault_path: &Path, prompt: String, model: String) -> Result<()> {

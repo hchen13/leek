@@ -2,7 +2,10 @@
 //!
 //! See `design/p1-spec/data-schema.md` for the full schema reference.
 
+pub mod events;
+pub mod messages;
 pub mod provider_configs;
+pub mod sessions;
 
 use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
