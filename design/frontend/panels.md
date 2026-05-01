@@ -210,6 +210,8 @@ user_input、task_start、thinking、tool_call、observation:quote / chart_ohlc 
 
 **这是 L.E.E.K 的产品 signature。投入最多 craft 在这里。**
 
+> 后端规约（graph 数据来源、节点/边 schema、激活事件协议、persistence）见 [`../p1-spec/corpus-brain.md`](../p1-spec/corpus-brain.md)。本节专注 visual / interaction craft。
+
 ### 3.1 用途
 
 可视化 corpus 知识图谱，并在 agent 思考过程中**实时展示哪些"神经元"被激活**——把抽象的"AI 在思考"变成可见的过程，把用户自己策划的智慧库可视化为大脑。

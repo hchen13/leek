@@ -410,10 +410,13 @@ Response: [{id, version, charter_json, updated_at}, ...]
 
 ### 4.10 Corpus
 
+graph schema（nodes / edges / cluster 派生规则）+ 激活事件 + build pipeline 详见 [`corpus-brain.md`](corpus-brain.md)。
+
 ```
 GET /api/v1/corpus/graph
 Query: cluster?[]
-Response: { nodes: [...], edges: [...] }
+Response: { version, generated_at, corpus_commit, nodes: [...], edges: [...] }
+Cache-Control: max-age=86400
 
 GET /api/v1/corpus/search
 Query: q, cluster?, limit
