@@ -1,7 +1,7 @@
 // Chat column — messages, agent thinking trace, clarifications, token-stream reveals.
 // Ported from prototype/leek-chat.jsx → SolidJS.
 
-import { For, Show, type JSX } from "solid-js";
+import { For, Show, createSignal, type JSX } from "solid-js";
 import { Icon } from "./Icon";
 
 /* ---------- token-stream rendering ---------- */
@@ -127,22 +127,51 @@ export function ClarifyCard(props: { question: string; opts: string[]; picked?: 
 
 /* ---------- composer ---------- */
 
-export function Composer(props: { value?: string; placeholder?: string; focus?: boolean }) {
+export function Composer(props: {
+  value?: string;
+  placeholder?: string;
+  focus?: boolean;
+  onSubmit?: (text: string) => void;
+  disabled?: boolean;
+}) {
+  const [text, setText] = createSignal(props.value ?? "");
   const placeholder = () => props.placeholder ?? "Ask the kernel — query a name, draft a thesis, or run a screen…";
+  const canSend = () => !props.disabled && text().trim().length > 0;
+  const submit = () => {
+    if (!canSend()) return;
+    const t = text();
+    setText("");
+    props.onSubmit?.(t);
+  };
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      submit();
+    }
+  };
   return (
     <div class="lk-composer">
       <div
         class="lk-composer-box"
         style={props.focus ? { "border-color": "rgba(217,119,87,0.45)", "box-shadow": "0 0 0 3px rgba(217,119,87,0.07)" } : {}}
       >
-        <textarea value={props.value ?? ""} placeholder={placeholder()} rows={2} />
+        <textarea
+          value={text()}
+          placeholder={placeholder()}
+          rows={2}
+          disabled={props.disabled}
+          onInput={(e) => setText(e.currentTarget.value)}
+          onKeyDown={onKey}
+        />
         <div class="lk-composer-row">
           <button class="lk-composer-tool" title="Attach"><Icon name="paperclip" class="ic-sm" /></button>
           <button class="lk-composer-tool" title="Reference"><Icon name="pin" class="ic-sm" /></button>
           <button class="lk-composer-tool" title="Voice"><Icon name="mic" class="ic-sm" /></button>
           <span class="lk-chip-mini">corpus · 14.2K docs</span>
           <span class="lk-chip-mini">tools · 9</span>
-          <button class="lk-composer-send"><Icon name="send" class="ic-xs" /> SEND</button>
+          <button class="lk-composer-send" onClick={submit} disabled={!canSend()}>
+            <Icon name="send" class="ic-xs" /> SEND
+          </button>
         </div>
       </div>
       <div class="lk-composer-hint" style={{ "margin-top": "8px" }}>
