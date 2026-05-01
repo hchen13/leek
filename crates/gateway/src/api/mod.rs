@@ -2,15 +2,19 @@
 
 pub mod health;
 pub mod messages;
+pub mod sessions;
 pub mod static_files;
 pub mod stream;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::events::EventBus;
@@ -22,6 +26,9 @@ pub struct AppState {
     pub provider: Arc<dyn LlmProvider>,
     pub event_bus: EventBus,
     pub user_id: String,
+    /// Per-session cancellation token for the active agent reply (if any).
+    /// Inserted by `messages::post_handler`, cancelled by `sessions::abort`.
+    pub active_replies: Arc<Mutex<HashMap<String, CancellationToken>>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -35,6 +42,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/sessions/{id}/messages",
             post(messages::post_handler).get(messages::list_handler),
+        )
+        .route(
+            "/api/v1/sessions/{id}/abort",
+            post(sessions::abort_handler),
         )
         .route("/stream/sessions/{id}/events", get(stream::handler))
         .with_state(state)

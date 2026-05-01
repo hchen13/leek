@@ -97,6 +97,9 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
         provider,
         event_bus,
         user_id: vault::LOCAL_USER_ID.to_string(),
+        active_replies: std::sync::Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
     };
 
     let app = api::router(state);

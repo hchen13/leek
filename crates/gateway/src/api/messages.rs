@@ -2,6 +2,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use super::{AppError, AppState};
 use crate::agent::routing::{self, DecisionKind};
@@ -78,15 +79,34 @@ pub async fn post_handler(
         )
         .await;
 
+    // Each session has at most one in-flight reply. New POST cancels the previous.
+    let cancel = CancellationToken::new();
+    {
+        let mut map = state.active_replies.lock().await;
+        if let Some(prev) = map.insert(session_id.clone(), cancel.clone()) {
+            prev.cancel();
+        }
+    }
+
     // Route + reply in the background — POST returns 201 immediately.
     let pool = state.pool.clone();
     let user_id = state.user_id.clone();
     let sess = session_id.clone();
     let provider = state.provider.clone();
     let bus = state.event_bus.clone();
+    let cancel_for_task = cancel.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            handle_user_message(pool, user_id, sess, provider, bus, user_text, user_seq).await
+        if let Err(e) = handle_user_message(
+            pool,
+            user_id,
+            sess,
+            provider,
+            bus,
+            user_text,
+            user_seq,
+            cancel_for_task,
+        )
+        .await
         {
             tracing::error!(error = %e, "agent dispatch failed");
         }
@@ -108,6 +128,7 @@ async fn handle_user_message(
     event_bus: crate::events::EventBus,
     user_text: String,
     user_message_seq: i64,
+    cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     // P1 simplification: routing layer fires only when there's no in-progress
     // task. With one, attach to it directly (in-thread chat_reply).
@@ -123,6 +144,7 @@ async fn handle_user_message(
             event_bus,
             // Existing task: don't re-mark as delivered (it already is or in-flight)
             None,
+            cancel,
         )
         .await;
     }
@@ -134,8 +156,16 @@ async fn handle_user_message(
         Err(e) => {
             tracing::warn!(error = %e, "routing failed; falling back to chat_reply");
             // Fallback: just run the main reply pipeline
-            return agent::run_chat_reply(pool, user_id, session_id, provider, event_bus, None)
-                .await;
+            return agent::run_chat_reply(
+                pool,
+                user_id,
+                session_id,
+                provider,
+                event_bus,
+                None,
+                cancel,
+            )
+            .await;
         }
     };
 
@@ -202,12 +232,14 @@ async fn handle_user_message(
                     task_id,
                     expected_deliverable: draft.expected_deliverable,
                 }),
+                cancel,
             )
             .await
         }
 
         DecisionKind::ChatReply => {
-            agent::run_chat_reply(pool, user_id, session_id, provider, event_bus, None).await
+            agent::run_chat_reply(pool, user_id, session_id, provider, event_bus, None, cancel)
+                .await
         }
 
         DecisionKind::Ambiguous => {

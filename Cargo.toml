@@ -15,6 +15,7 @@ clap = { version = "4.5", features = ["derive"] }
 
 # Async runtime + HTTP
 tokio = { version = "1.47", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures = "0.3"
 async-trait = "0.1"

@@ -132,11 +132,12 @@ export function Composer(props: {
   placeholder?: string;
   focus?: boolean;
   onSubmit?: (text: string) => void;
-  disabled?: boolean;
+  onStop?: () => void;
+  pending?: boolean;
 }) {
   const [text, setText] = createSignal(props.value ?? "");
   const placeholder = () => props.placeholder ?? "Ask the kernel — query a name, draft a thesis, or run a screen…";
-  const canSend = () => !props.disabled && text().trim().length > 0;
+  const canSend = () => !props.pending && text().trim().length > 0;
   const submit = () => {
     if (!canSend()) return;
     const t = text();
@@ -144,7 +145,12 @@ export function Composer(props: {
     props.onSubmit?.(t);
   };
   const onKey = (e: KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Escape" && props.pending) {
+      e.preventDefault();
+      props.onStop?.();
+      return;
+    }
+    if (e.key === "Enter" && !e.shiftKey && !props.pending) {
       e.preventDefault();
       submit();
     }
@@ -159,7 +165,6 @@ export function Composer(props: {
           value={text()}
           placeholder={placeholder()}
           rows={2}
-          disabled={props.disabled}
           onInput={(e) => setText(e.currentTarget.value)}
           onKeyDown={onKey}
         />
@@ -169,14 +174,26 @@ export function Composer(props: {
           <button class="lk-composer-tool" title="Voice"><Icon name="mic" class="ic-sm" /></button>
           <span class="lk-chip-mini">corpus · 14.2K docs</span>
           <span class="lk-chip-mini">tools · 9</span>
-          <button class="lk-composer-send" onClick={submit} disabled={!canSend()}>
-            <Icon name="send" class="ic-xs" /> SEND
-          </button>
+          {props.pending ? (
+            <button
+              class="lk-composer-send"
+              style={{ background: "rgba(217,112,112,0.85)" }}
+              onClick={() => props.onStop?.()}
+              title="Stop generating (Esc)"
+            >
+              <Icon name="close" class="ic-xs" /> STOP
+            </button>
+          ) : (
+            <button class="lk-composer-send" onClick={submit} disabled={!canSend()}>
+              <Icon name="send" class="ic-xs" /> SEND
+            </button>
+          )}
         </div>
       </div>
       <div class="lk-composer-hint" style={{ "margin-top": "8px" }}>
         <span class="kbd">↵</span> send
         <span class="kbd">⇧↵</span> newline
+        <span class="kbd">Esc</span> stop
         <span style={{ "margin-left": "auto" }}>Logic-Enhanced Equity Kernel · v0.4.1</span>
       </div>
     </div>

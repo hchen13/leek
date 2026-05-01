@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::StreamExt;
 use sqlx::SqlitePool;
+use tokio_util::sync::CancellationToken;
 
 use crate::events::{EventBus, EventEnvelope};
 use crate::llm::{ChatMessage, ChatRequest, LlmEvent, LlmProvider, Role};
@@ -40,6 +41,7 @@ pub async fn run_chat_reply(
     provider: Arc<dyn LlmProvider>,
     event_bus: EventBus,
     task: Option<TaskBinding>,
+    cancel: CancellationToken,
 ) -> Result<()> {
     // Load full history. P1: cap at last 100 messages — context-trimming logic
     // (data-schema.md / agent-loop.md §4.3) lands when token budgets matter.
@@ -85,94 +87,116 @@ pub async fn run_chat_reply(
     let mut full_text = String::new();
     let mut stop_reason = "end_turn".to_string();
 
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(LlmEvent::TextDelta { text }) => {
-                full_text.push_str(&text);
-                publish_and_persist(
-                    &pool,
-                    &user_id,
-                    &session_id,
-                    task.as_ref().map(|t| t.task_id.as_str()),
-                    &event_bus,
-                    "agent_message_delta",
-                    serde_json::json!({ "text": text }),
-                )
-                .await?;
+    'stream: loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                stop_reason = "user_aborted".to_string();
+                break 'stream;
             }
-            Ok(LlmEvent::Usage(u)) => {
-                publish_and_persist(
-                    &pool,
-                    &user_id,
-                    &session_id,
-                    task.as_ref().map(|t| t.task_id.as_str()),
-                    &event_bus,
-                    "llm_usage",
-                    serde_json::json!({
-                        "provider": provider.name(),
-                        "input_tokens": u.input_tokens,
-                        "output_tokens": u.output_tokens,
-                        "cache_read_tokens": u.cache_read_tokens,
-                    }),
-                )
-                .await?;
-            }
-            Ok(LlmEvent::MessageEnd { stop_reason: sr }) => {
-                stop_reason = format!("{sr:?}").to_lowercase();
-            }
-            Err(e) => {
-                publish_and_persist(
-                    &pool,
-                    &user_id,
-                    &session_id,
-                    task.as_ref().map(|t| t.task_id.as_str()),
-                    &event_bus,
-                    "error",
-                    serde_json::json!({ "message": e.to_string() }),
-                )
-                .await?;
-                return Err(e);
+            evt_opt = stream.next() => {
+                let Some(event) = evt_opt else { break 'stream };
+                match event {
+                    Ok(LlmEvent::TextDelta { text }) => {
+                        full_text.push_str(&text);
+                        publish_and_persist(
+                            &pool,
+                            &user_id,
+                            &session_id,
+                            task.as_ref().map(|t| t.task_id.as_str()),
+                            &event_bus,
+                            "agent_message_delta",
+                            serde_json::json!({ "text": text }),
+                        )
+                        .await?;
+                    }
+                    Ok(LlmEvent::Usage(u)) => {
+                        publish_and_persist(
+                            &pool,
+                            &user_id,
+                            &session_id,
+                            task.as_ref().map(|t| t.task_id.as_str()),
+                            &event_bus,
+                            "llm_usage",
+                            serde_json::json!({
+                                "provider": provider.name(),
+                                "input_tokens": u.input_tokens,
+                                "output_tokens": u.output_tokens,
+                                "cache_read_tokens": u.cache_read_tokens,
+                            }),
+                        )
+                        .await?;
+                    }
+                    Ok(LlmEvent::MessageEnd { stop_reason: sr }) => {
+                        stop_reason = format!("{sr:?}").to_lowercase();
+                    }
+                    Err(e) => {
+                        publish_and_persist(
+                            &pool,
+                            &user_id,
+                            &session_id,
+                            task.as_ref().map(|t| t.task_id.as_str()),
+                            &event_bus,
+                            "error",
+                            serde_json::json!({ "message": e.to_string() }),
+                        )
+                        .await?;
+                        return Err(e);
+                    }
+                }
             }
         }
     }
 
-    let msg_seq = vault_messages::insert(
-        &pool,
-        &user_id,
-        &session_id,
-        "agent",
-        &serde_json::json!({ "type": "text", "text": full_text }),
-        task.as_ref().map(|t| t.task_id.as_str()),
-    )
-    .await?;
+    let has_content = !full_text.is_empty();
 
-    // If this run was bound to a task, write the deliverable + mark delivered
-    // before announcing message_end so subscribers see a coherent terminal state.
+    // Only persist a message + deliverable when there's actually content. An
+    // abort that fires before the first delta produces an empty `full_text`
+    // — we treat that as a clean cancel: no orphan empty message, no empty
+    // deliverable. The task is still marked delivered (no `cancelled` state
+    // by design — see memory:feedback_stop_is_stream_abort).
+    let msg_seq = if has_content {
+        Some(
+            vault_messages::insert(
+                &pool,
+                &user_id,
+                &session_id,
+                "agent",
+                &serde_json::json!({ "type": "text", "text": full_text }),
+                task.as_ref().map(|t| t.task_id.as_str()),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     if let Some(t) = task.as_ref() {
-        let deliverable_id = vault_tasks::write_deliverable(
-            &pool,
-            &user_id,
-            &t.task_id,
-            &t.expected_deliverable,
-            &full_text,
-        )
-        .await?;
+        if has_content {
+            let deliverable_id = vault_tasks::write_deliverable(
+                &pool,
+                &user_id,
+                &t.task_id,
+                &t.expected_deliverable,
+                &full_text,
+            )
+            .await?;
+            publish_and_persist(
+                &pool,
+                &user_id,
+                &session_id,
+                Some(&t.task_id),
+                &event_bus,
+                "deliverable_ready",
+                serde_json::json!({
+                    "deliverable_id": deliverable_id,
+                    "task_id": t.task_id,
+                    "kind": t.expected_deliverable,
+                }),
+            )
+            .await?;
+        }
         vault_tasks::mark_delivered(&pool, &user_id, &t.task_id).await?;
-
-        publish_and_persist(
-            &pool,
-            &user_id,
-            &session_id,
-            Some(&t.task_id),
-            &event_bus,
-            "deliverable_ready",
-            serde_json::json!({
-                "deliverable_id": deliverable_id,
-                "task_id": t.task_id,
-                "kind": t.expected_deliverable,
-            }),
-        )
-        .await?;
         publish_and_persist(
             &pool,
             &user_id,

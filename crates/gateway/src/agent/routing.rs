@@ -54,6 +54,7 @@ Respond with the JSON object only.
 const ROUTING_HISTORY_LIMIT: usize = 5;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // chat_reply_text not consumed — chat_reply path uses main pipeline for full history
 pub struct RouteDecision {
     pub kind: DecisionKind,
     pub reason: String,

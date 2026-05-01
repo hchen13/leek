@@ -47,5 +47,4 @@ vault.db-wal
 
 # Playwright debug artifacts (root-level only — don't catch design assets)
 /.playwright-mcp/
-/leek-*.png
-/prototype-*.png
+/*.png
