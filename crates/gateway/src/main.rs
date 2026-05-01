@@ -1,0 +1,62 @@
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "leek", version, about = "L.E.E.K — Logic-Enhanced Equity Kernel")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// 启动 gateway HTTP / SSE server
+    Serve {
+        #[arg(long, default_value_t = 8964)]
+        port: u16,
+        #[arg(long, default_value = "./vault.db")]
+        vault: String,
+    },
+
+    /// LLM provider 认证管理
+    Auth {
+        #[command(subcommand)]
+        provider: AuthProvider,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthProvider {
+    /// Codex OAuth (ChatGPT subscription)
+    Codex {
+        /// 从 ~/.codex/auth.json 一次性导入 token（注意：之后 codex CLI 若 refresh 会让 leek 失效）
+        #[arg(long)]
+        import_from_codex_cli: bool,
+    },
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "leek_gateway=info,info".into()),
+        )
+        .init();
+
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Serve { port, vault } => {
+            tracing::info!(port, vault, "leek serve (placeholder — Task #48)");
+            anyhow::bail!("serve 还没接入，等待 gateway HTTP/SSE 切片完成");
+        }
+        Command::Auth { provider } => match provider {
+            AuthProvider::Codex { import_from_codex_cli } => {
+                tracing::info!(
+                    import_from_codex_cli,
+                    "leek auth codex (placeholder — Task #49)"
+                );
+                anyhow::bail!("auth codex 还没接入，等待 device flow 切片完成");
+            }
+        },
+    }
+}

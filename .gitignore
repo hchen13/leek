@@ -32,3 +32,20 @@ tmp/
 # Local environment
 .env
 .env.*
+
+# Rust
+target/
+**/*.rs.bk
+
+# Local SQLite vault
+vault.db
+vault.db-shm
+vault.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Playwright debug artifacts (root-level only — don't catch design assets)
+/.playwright-mcp/
+/leek-*.png
+/prototype-*.png
