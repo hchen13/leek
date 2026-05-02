@@ -2,9 +2,13 @@
 // Uses the same chat primitives as the fixture scenes (UserMsg / AgentMsg /
 // StreamText / Composer); only the data source is different.
 
-import { For, Show, createEffect, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { AgentMsg, Composer, UserMsg } from "./Chat";
 import { EventsPanel } from "./EventsPanel";
+import { BrainWidget } from "./BrainWidget";
+import { Rail, TopBar } from "./Workbench";
+import { Icon } from "./Icon";
+import type { Scene } from "../scenes";
 
 const SESSION_ID = "live";
 
@@ -372,152 +376,180 @@ export function LiveChat() {
     }
   }
 
-  return (
-    <div style={{
-      width: "min(880px, 96vw)",
-      height: "min(820px, 92vh)",
-      display: "flex",
-      "flex-direction": "column",
-      gap: "16px",
-      padding: "24px",
-      background: "var(--bg-1)",
-      "border-radius": "10px",
-      border: "1px solid var(--bg-2)",
-    }}>
-      <div style={{
-        display: "flex",
-        "align-items": "center",
-        "justify-content": "space-between",
-        "font-family": "var(--font-mono)",
-        "font-size": "11px",
-      }}>
-        <span style={{ color: "var(--ink-2)" }}>
-          <span style={{
-            "display": "inline-block",
-            width: "8px",
-            height: "8px",
-            "border-radius": "50%",
-            background: connected() ? "#6fb98a" : "#d97070",
-            "margin-right": "6px",
-            "vertical-align": "middle",
-          }} />
-          LIVE · session={SESSION_ID}
-        </span>
-        <div style={{ display: "flex", gap: "12px", "align-items": "center" }}>
-          <Show when={usage()}>
-            <span style={{ color: "var(--ink-3)" }}>
-              in={usage()!.inTokens} · out={usage()!.outTokens}
-            </span>
-          </Show>
-          <button
-            onClick={() => setEventsOpen((v) => !v)}
-            title="Cmd/Ctrl+E"
-            style={{
-              background: eventsOpen() ? "var(--bg-2)" : "transparent",
-              border: "1px solid var(--bg-2)",
-              color: "var(--ink-2)",
-              "border-radius": "6px",
-              padding: "2px 10px",
-              cursor: "pointer",
-              "font-family": "var(--font-mono)",
-              "font-size": "11px",
-            }}
-          >events</button>
-        </div>
-      </div>
+  // Derive a Scene from real session state so the Workbench shell (canvas
+  // header / brain meta / etc) shows the right form. `idle` until a turn
+  // happens; `thinking-shallow` while pending; `delivered` once a reply
+  // exists. `clarify` / `deep` are reserved for routing-layer signals
+  // (clarification_requested) and active multi-turn task work — wired
+  // when those events surface in the UI.
+  const derivedScene = createMemo<Scene>(() => {
+    if (pending()) return "thinking-shallow";
+    if (messages().some((m) => m.role === "agent")) return "delivered";
+    return "idle";
+  });
 
-      <div
-        ref={(el) => (chatScrollEl = el)}
-        style={{ flex: 1, overflow: "auto", "padding-right": "8px" }}
-      >
-        <Show when={messages().length === 0}>
-          <div style={{
-            color: "var(--ink-3)",
-            "font-size": "13px",
-            "font-family": "var(--font-mono)",
-            padding: "32px 0",
-            "text-align": "center",
-          }}>
-            No messages yet. Type below to start a conversation.
-          </div>
-        </Show>
-        <For each={messages()}>{(m) => (
-          <Show
-            when={m.role === "agent"}
-            fallback={<UserMsg time={m.ts}>{m.text}</UserMsg>}
-          >
-            <AgentMsg time={m.ts}>
-              <Show when={m.streaming || m.total_sec != null}>
-                <div style={{
-                  "font-family": "var(--font-mono)",
-                  "font-size": "10.5px",
-                  color: "var(--ink-3)",
-                  "margin-bottom": "6px",
-                  opacity: m.streaming ? 1 : 0.55,
-                }}>
-                  {m.streaming
-                    ? `▸ thinking · ${elapsedSec()}s`
-                    : `✓ done · ${m.total_sec}s`}
-                </div>
+  // Most recent agent message — its tool_calls drive the canvas panels
+  // (each tool invocation renders as one panel artifact).
+  const lastAgent = createMemo(() => {
+    const list = messages();
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].role === "agent") return list[i];
+    }
+    return null;
+  });
+
+  const headTitle = () => messages().length === 0
+    ? "NEW SESSION"
+    : "CHAT · LIVE";
+  const headMeta = () => {
+    const turns = messages().filter((m) => m.role === "user").length;
+    if (turns === 0) return "0 turns";
+    return `${turns} turn${turns > 1 ? "s" : ""} · ${pending() ? "live" : "ready"}`;
+  };
+  const route = () => `~/sessions/${SESSION_ID}`;
+
+  return (
+    <div class="lk-app" data-screen-label="L.E.E.K · live">
+      <Rail active="chat" />
+      <div class="lk-main">
+        <TopBar route={route()} />
+
+        <section class="lk-chat">
+          <div class="lk-chat-head">
+            <span class="lk-chat-head-title">{headTitle()}</span>
+            <div style={{ display: "flex", gap: "12px", "align-items": "center" }}>
+              <Show when={usage()}>
+                <span style={{ color: "var(--ink-3)", "font-size": "11px", "font-family": "var(--font-mono)" }}>
+                  in={usage()!.inTokens} · out={usage()!.outTokens}
+                </span>
               </Show>
-              <Show when={(m.searches?.length ?? 0) + (m.tool_calls?.length ?? 0) > 0}>
-                <div style={{
-                  display: "flex",
-                  "flex-direction": "column",
-                  gap: "2px",
-                  "margin-bottom": "8px",
+              <button
+                onClick={() => setEventsOpen((v) => !v)}
+                title="Cmd/Ctrl+E"
+                style={{
+                  background: eventsOpen() ? "var(--bg-2)" : "transparent",
+                  border: "1px solid var(--bg-2)",
+                  color: "var(--ink-2)",
+                  "border-radius": "6px",
+                  padding: "2px 10px",
+                  cursor: "pointer",
                   "font-family": "var(--font-mono)",
                   "font-size": "11px",
-                  color: "var(--ink-3)",
-                }}>
-                  <For each={m.searches!}>{(s) => (
+                }}
+              >events</button>
+              <span class="lk-chat-head-meta">
+                <span style={{
+                  "display": "inline-block",
+                  width: "8px",
+                  height: "8px",
+                  "border-radius": "50%",
+                  background: connected() ? "#6fb98a" : "#d97070",
+                  "margin-right": "6px",
+                  "vertical-align": "middle",
+                }} />
+                {headMeta()}
+              </span>
+            </div>
+          </div>
+
+          <div class="lk-chat-body" ref={(el) => (chatScrollEl = el)}>
+            <Show when={messages().length === 0}>
+              <div style={{
+                color: "var(--ink-3)",
+                "font-size": "13px",
+                "font-family": "var(--font-mono)",
+                padding: "32px 0",
+                "text-align": "center",
+              }}>
+                No messages yet. Type below to start a conversation.
+              </div>
+            </Show>
+            <For each={messages()}>{(m) => (
+              <Show
+                when={m.role === "agent"}
+                fallback={<UserMsg time={m.ts}>{m.text}</UserMsg>}
+              >
+                <AgentMsg time={m.ts}>
+                  <Show when={m.streaming || m.total_sec != null}>
                     <div style={{
-                      opacity: s.status === "completed" ? 1 : 0.7,
+                      "font-family": "var(--font-mono)",
+                      "font-size": "10.5px",
+                      color: "var(--ink-3)",
+                      "margin-bottom": "6px",
+                      opacity: m.streaming ? 1 : 0.55,
                     }}>
-                      {summarizeSearch(s)}
+                      {m.streaming
+                        ? `▸ thinking · ${elapsedSec()}s`
+                        : `✓ done · ${m.total_sec}s`}
                     </div>
-                  )}</For>
-                  <For each={m.tool_calls!}>{(t) => (
+                  </Show>
+                  <Show when={(m.searches?.length ?? 0) + (m.tool_calls?.length ?? 0) > 0}>
                     <div style={{
-                      opacity: t.status === "completed" ? 1 : t.status === "error" ? 1 : 0.7,
-                      color: t.status === "error" ? "#d97070" : "var(--ink-3)",
+                      display: "flex",
+                      "flex-direction": "column",
+                      gap: "2px",
+                      "margin-bottom": "8px",
+                      "font-family": "var(--font-mono)",
+                      "font-size": "11px",
+                      color: "var(--ink-3)",
                     }}>
-                      {summarizeTool(t)}
+                      <For each={m.searches!}>{(s) => (
+                        <div style={{
+                          opacity: s.status === "completed" ? 1 : 0.7,
+                        }}>
+                          {summarizeSearch(s)}
+                        </div>
+                      )}</For>
+                      <For each={m.tool_calls!}>{(t) => (
+                        <div style={{
+                          opacity: t.status === "completed" ? 1 : t.status === "error" ? 1 : 0.7,
+                          color: t.status === "error" ? "#d97070" : "var(--ink-3)",
+                        }}>
+                          {summarizeTool(t)}
+                        </div>
+                      )}</For>
                     </div>
-                  )}</For>
-                </div>
+                  </Show>
+                  {/* Plain text + blinker for streaming. We deliberately don't use
+                      StreamText here: its lk-tok fade-in animation re-triggers on
+                      every delta (esp. CJK where /\s+/ split produces one token),
+                      causing visual glitches. StreamText is reserved for fixture
+                      scenes where text is pre-rendered. */}
+                  <span>{m.text}</span>
+                  <Show when={m.streaming}><span class="lk-stream" /></Show>
+                </AgentMsg>
               </Show>
-              {/* Plain text + blinker for streaming. We deliberately don't use
-                  StreamText here: its lk-tok fade-in animation re-triggers on
-                  every delta (esp. CJK where /\s+/ split produces one token),
-                  causing visual glitches. StreamText is reserved for fixture
-                  scenes where text is pre-rendered. */}
-              <span>{m.text}</span>
-              <Show when={m.streaming}><span class="lk-stream" /></Show>
-            </AgentMsg>
-          </Show>
-        )}</For>
+            )}</For>
+
+            <Show when={error()}>
+              <div style={{
+                color: "#d97070",
+                "font-size": "11px",
+                "font-family": "var(--font-mono)",
+                padding: "6px 10px",
+                margin: "8px 0",
+                background: "rgba(217,112,112,0.08)",
+                "border-radius": "6px",
+              }}>
+                ⚠ {error()}
+              </div>
+            </Show>
+          </div>
+
+          <Composer
+            placeholder="跟 L.E.E.K 说点什么…"
+            onSubmit={send}
+            onStop={stop}
+            pending={pending()}
+          />
+        </section>
+
+        <CanvasArea
+          scene={derivedScene()}
+          tools={lastAgent()?.tool_calls ?? []}
+          searches={lastAgent()?.searches ?? []}
+        />
       </div>
-
-      <Show when={error()}>
-        <div style={{
-          color: "#d97070",
-          "font-size": "11px",
-          "font-family": "var(--font-mono)",
-          padding: "6px 10px",
-          background: "rgba(217,112,112,0.08)",
-          "border-radius": "6px",
-        }}>
-          ⚠ {error()}
-        </div>
-      </Show>
-
-      <Composer
-        placeholder="跟 L.E.E.K 说点什么…"
-        onSubmit={send}
-        onStop={stop}
-        pending={pending()}
-      />
 
       <EventsPanel
         sessionId={SESSION_ID}
@@ -525,6 +557,152 @@ export function LiveChat() {
         onClose={() => setEventsOpen(false)}
         liveTick={liveTick()}
       />
+    </div>
+  );
+}
+
+/** Live canvas — currently shows the most recent tool call activity as a
+ *  list of "artifact" rows on the left, plus the brain on the right. As we
+ *  wire richer tool outputs (charts, tables, filings preview) each kind
+ *  will render its own Panel-style component. */
+function CanvasArea(props: {
+  scene: Scene;
+  tools: ToolCall[];
+  searches: SearchCall[];
+}) {
+  const subtitle = () => props.scene === "thinking-shallow"
+    ? "reasoning · live"
+    : props.scene === "delivered"
+    ? "ready · cached"
+    : "no thread";
+
+  const hasArtifacts = () => props.tools.length + props.searches.length > 0;
+
+  return (
+    <div class="lk-canvas">
+      <Show when={props.scene !== "idle"}>
+        <div class="lk-canvas-head">
+          <span class="crumb">
+            <b>Live session</b>
+            <span class="sep">/</span>
+            {subtitle()}
+          </span>
+          <div class="actions">
+            <button class="iconbtn" title="Layers"><Icon name="layer" class="ic-sm" /></button>
+            <button class="iconbtn" title="Search"><Icon name="search" class="ic-sm" /></button>
+            <button class="iconbtn" title="Expand"><Icon name="expand" class="ic-sm" /></button>
+          </div>
+        </div>
+      </Show>
+
+      <Show
+        when={hasArtifacts()}
+        fallback={
+          <div class="lk-canvas-empty">
+            <div class="label">CANVAS · {props.scene === "idle" ? "IDLE" : "QUIET"}</div>
+            <div class="sub">Tool outputs and reasoning artifacts materialize here as the agent works.</div>
+          </div>
+        }
+      >
+        <div style={{
+          position: "absolute",
+          top: "70px",
+          left: "36px",
+          width: "min(480px, 60%)",
+          display: "flex",
+          "flex-direction": "column",
+          gap: "10px",
+        }}>
+          <For each={props.searches}>{(s) => (
+            <ArtifactCard
+              kind="search"
+              title={s.action === "search" ? "web_search" : s.action}
+              detail={s.detail}
+              status={s.status}
+            />
+          )}</For>
+          <For each={props.tools}>{(t) => (
+            <ArtifactCard
+              kind="tool"
+              title={t.name}
+              detail={extractDetail(t)}
+              status={t.status}
+              preview={t.output_preview}
+            />
+          )}</For>
+        </div>
+      </Show>
+
+      <BrainWidget scene={props.scene} fireIds={undefined} />
+    </div>
+  );
+}
+
+function extractDetail(t: ToolCall): string {
+  if (!t.arguments) return "";
+  try {
+    const a = JSON.parse(t.arguments);
+    if (typeof a.url === "string") return a.url;
+    if (typeof a.query === "string") return a.query;
+    if (typeof a.ts_code === "string") return a.ts_code;
+    if (typeof a.ticker === "string") return a.ticker;
+    if (Array.isArray(a.tickers)) return a.tickers.join(", ");
+    return JSON.stringify(a).slice(0, 80);
+  } catch {
+    return t.arguments.slice(0, 80);
+  }
+}
+
+function ArtifactCard(props: {
+  kind: "search" | "tool";
+  title: string;
+  detail: string;
+  status: string;
+  preview?: string;
+}) {
+  const dotColor = () =>
+    props.status === "completed" ? "#9eb78f" :
+    props.status === "error" ? "#d97070" :
+    "#d9a76c";
+  return (
+    <div style={{
+      background: "var(--bg-1)",
+      border: "1px solid var(--bg-2)",
+      "border-radius": "8px",
+      padding: "10px 12px",
+      "font-family": "var(--font-mono)",
+      "font-size": "11px",
+    }}>
+      <div style={{ display: "flex", "align-items": "center", gap: "8px", "margin-bottom": "4px" }}>
+        <span style={{
+          width: "6px",
+          height: "6px",
+          "border-radius": "50%",
+          background: dotColor(),
+          display: "inline-block",
+        }} />
+        <span style={{ color: "var(--ink-2)", "font-weight": 600 }}>{props.title}</span>
+        <span style={{ color: "var(--ink-3)", "font-size": "10px" }}>{props.status}</span>
+      </div>
+      <div style={{
+        color: "var(--ink-3)",
+        "font-size": "11px",
+        overflow: "hidden",
+        "text-overflow": "ellipsis",
+        "white-space": "nowrap",
+      }}>{props.detail}</div>
+      <Show when={props.preview}>
+        <div style={{
+          "margin-top": "6px",
+          padding: "6px 8px",
+          background: "rgba(0,0,0,0.18)",
+          "border-radius": "4px",
+          "font-size": "10.5px",
+          color: "var(--ink-2)",
+          "max-height": "80px",
+          overflow: "hidden",
+        }}>{props.preview}</div>
+      </Show>
     </div>
   );
 }

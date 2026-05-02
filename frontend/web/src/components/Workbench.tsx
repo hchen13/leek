@@ -9,15 +9,12 @@ import { BrainWidget } from "./BrainWidget";
 import { canvasFor } from "./CanvasScenes";
 import { transcriptFor } from "./Transcripts";
 
-function TopBar(props: { scene: Scene }) {
-  const route = () => props.scene === "idle"
-    ? "~/sessions/2026-04-29/scratch"
-    : "~/sessions/2026-04-29/nvda-thesis";
+export function TopBar(props: { route: string }) {
   return (
     <div class="lk-top">
       <span class="lk-top-brand"><b>L.E.E.K</b> · LOGIC-ENHANCED EQUITY KERNEL</span>
       <span class="lk-top-sep">/</span>
-      <span class="lk-top-route">{route()}</span>
+      <span class="lk-top-route">{props.route}</span>
       <div class="lk-top-spacer" />
       <span class="lk-top-stat"><span class="lk-pulse" /> MKT OPEN · NYSE</span>
       <span class="lk-top-stat">SPX <b>5,612.41</b> <span style={{ color: "var(--up)" }}>+0.42%</span></span>
@@ -27,7 +24,7 @@ function TopBar(props: { scene: Scene }) {
   );
 }
 
-function Rail(props: { active?: string }) {
+export function Rail(props: { active?: string }) {
   const items: Array<{ k: string; icon: "chat" | "canvas" | "book" | "grid" | "branch"; label: string }> = [
     { k: "chat", icon: "chat", label: "Chat" },
     { k: "canvas", icon: "canvas", label: "Canvas" },
@@ -132,7 +129,7 @@ export function Workbench(props: { scene: Scene }) {
     <div class="lk-app" data-screen-label={`L.E.E.K · ${props.scene}`}>
       <Rail active="chat" />
       <div class="lk-main">
-        <TopBar scene={props.scene} />
+        <TopBar route={props.scene === "idle" ? "~/sessions/2026-04-29/scratch" : "~/sessions/2026-04-29/nvda-thesis"} />
         <section class="lk-chat">
           <div class="lk-chat-head">
             <span class="lk-chat-head-title">{headTitle()}</span>
