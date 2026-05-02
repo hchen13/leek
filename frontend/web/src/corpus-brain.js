@@ -323,7 +323,16 @@
       activeUntil: 0,
       tStart: performance.now(),
       // physics on/off
-      cooling: 1
+      cooling: 1,
+      // viewport pan offset (canvas coords). user can drag empty area to pan.
+      view: { x: 0, y: 0 },
+      // session-scoped activation set — node ids the agent has actually
+      // touched this session. Drives the "lit vs dim" rendering, persists
+      // until cleared via setActivated([]).
+      activatedSet: new Set(),
+      // mouse drag tracking — distinguishes pan from click and prevents
+      // mouseup-on-node from triggering an accidental modal.
+      drag: null, // { startX, startY, lastX, lastY, moved, kind }
     };
 
     // physics step
@@ -384,6 +393,25 @@
       if (state.cooling > 0.18) state.cooling *= 0.997;
     }
 
+    // helper: which set of nodes is "lit"? When activatedSet is empty
+    // (fresh session), every node is lit equally — so the brain still
+    // looks alive at idle. Once the agent touches anything, the lit set
+    // narrows to those (+ their direct neighbours) and everything else
+    // dims dramatically.
+    function isLit(s) {
+      if (state.activatedSet.size === 0) return true;
+      if (state.activatedSet.has(s.ref.id)) return true;
+      // Light up direct neighbours so context lines stay readable
+      for (const e of edges) {
+        if ((e.a === s && state.activatedSet.has(e.b.ref.id)) ||
+            (e.b === s && state.activatedSet.has(e.a.ref.id))) return true;
+      }
+      return false;
+    }
+    function isActivated(s) {
+      return state.activatedSet.has(s.ref.id);
+    }
+
     // render
     function draw(now) {
       const C = colors();
@@ -396,16 +424,23 @@
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, W, H);
 
+      // Apply pan offset so all geometry below renders translated.
+      ctx.save();
+      ctx.translate(state.view.x, state.view.y);
+
       // edges
       edges.forEach(e => {
-        const isActive = state.activeNode && (e.a === state.activeNode || e.b === state.activeNode);
-        ctx.strokeStyle = isActive ? C.lineHi : C.line;
-        ctx.lineWidth = isActive ? 0.9 : 0.5;
+        const isActiveEdge = state.activeNode && (e.a === state.activeNode || e.b === state.activeNode);
+        const litEdge = isLit(e.a) && isLit(e.b);
+        ctx.strokeStyle = isActiveEdge ? C.lineHi : C.line;
+        ctx.lineWidth = isActiveEdge ? 0.9 : 0.5;
+        ctx.globalAlpha = litEdge ? 1 : 0.18;
         ctx.beginPath();
         ctx.moveTo(e.a.x, e.a.y);
         ctx.lineTo(e.b.x, e.b.y);
         ctx.stroke();
       });
+      ctx.globalAlpha = 1;
 
       // pulses
       for (let i = pulses.length - 1; i >= 0; i--) {
@@ -429,14 +464,17 @@
       sim.forEach(s => {
         const C2 = colors();
         const col = C2[s.ref.t];
-        const isActive = (state.activeNode === s) && (now < state.activeUntil);
+        const isActiveLegacy = (state.activeNode === s) && (now < state.activeUntil);
         const isHover  = state.hover === s;
+        const lit      = isLit(s);
+        const activated = isActivated(s);
         const breathe = 1 + Math.sin((now - state.tStart) * 0.001 + s.x * 0.01) * 0.06;
-        const r = s.r * breathe * (isActive ? 1.7 : (isHover ? 1.4 : 1));
+        const r = s.r * breathe * (activated ? 1.4 : (isActiveLegacy ? 1.7 : (isHover ? 1.4 : 1)));
 
-        if (isActive || isHover) {
+        ctx.globalAlpha = lit ? 1 : 0.22;
+        if (isActiveLegacy || isHover || activated) {
           ctx.shadowColor = col;
-          ctx.shadowBlur = 14;
+          ctx.shadowBlur = activated ? 18 : 14;
         }
         ctx.fillStyle = col;
         ctx.beginPath();
@@ -444,37 +482,48 @@
         ctx.fill();
         ctx.shadowBlur = 0;
 
-        // outer ring on active
-        if (isActive) {
+        // outer ring on activated nodes (persistent halo) + legacy active pulse
+        if (activated || isActiveLegacy) {
           ctx.strokeStyle = col;
-          ctx.lineWidth = 0.6;
-          ctx.globalAlpha = 0.5;
+          ctx.lineWidth = 0.7;
+          ctx.globalAlpha = (lit ? 1 : 0.22) * 0.55;
           ctx.beginPath();
           ctx.arc(s.x, s.y, r + 4, 0, Math.PI * 2);
           ctx.stroke();
-          ctx.globalAlpha = 1;
         }
+        ctx.globalAlpha = 1;
       });
 
-      // node label for active node
-      if (state.activeNode && now < state.activeUntil) {
+      // hover label — small tooltip near the hovered node only.
+      // (Activated nodes don't permanently show their label; only hover does.)
+      if (state.hover) {
         const C2 = colors();
-        const s = state.activeNode;
+        const s = state.hover;
         const text = s.ref.l;
         ctx.font = '9.5px "JetBrains Mono", monospace';
         const w = ctx.measureText(text).width;
-        const padX = 5, padY = 3;
-        let bx = s.x + 8, by = s.y - 14;
-        if (bx + w + padX * 2 > W - 4) bx = s.x - w - padX * 2 - 8;
-        if (by < 4) by = s.y + 10;
+        const padX = 6, padY = 3;
+        const bw = w + padX * 2, bh = 16;
+        // Position tooltip above the node by default; flip if near edges
+        // (use unpanned canvas coords so tooltip never escapes the widget).
+        let bx = s.x + 10, by = s.y - bh - 6;
+        const screenLeft = -state.view.x;
+        const screenRight = -state.view.x + W;
+        const screenTop = -state.view.y;
+        const screenBottom = -state.view.y + H;
+        if (bx + bw > screenRight - 4) bx = s.x - bw - 10;
+        if (bx < screenLeft + 4) bx = screenLeft + 4;
+        if (by < screenTop + 4) by = s.y + 10;
+        if (by + bh > screenBottom - 4) by = s.y - bh - 6;
         ctx.fillStyle = 'rgba(33, 29, 25, 0.95)';
         ctx.strokeStyle = 'rgba(217, 119, 87, 0.4)';
         ctx.lineWidth = 0.5;
-        const bw = w + padX * 2, bh = 14;
         roundRect(ctx, bx, by, bw, bh, 3); ctx.fill(); ctx.stroke();
         ctx.fillStyle = C2.pw;
-        ctx.fillText(text, bx + padX, by + 10);
+        ctx.fillText(text, bx + padX, by + bh - padY - 1);
       }
+
+      ctx.restore();
     }
 
     function roundRect(ctx, x, y, w, h, r) {
@@ -490,31 +539,78 @@
       ctx.quadraticCurveTo(x, y, x + r, y);
     }
 
-    // hover detection
-    cvs.addEventListener('mousemove', (ev) => {
+    // ----- pointer interaction -----
+    // Convert raw client coords → world coords (cancel pan offset).
+    function toWorld(ev) {
       const r = cvs.getBoundingClientRect();
-      const mx = ev.clientX - r.left, my = ev.clientY - r.top;
-      let best = null, bd = 100;
-      sim.forEach(s => {
+      return {
+        mx: ev.clientX - r.left - state.view.x,
+        my: ev.clientY - r.top  - state.view.y,
+      };
+    }
+    function pickNode(mx, my, radius) {
+      let best = null, bd = radius;
+      for (const s of sim) {
         const d = Math.hypot(s.x - mx, s.y - my);
-        if (d < 8 && d < bd) { bd = d; best = s; }
-      });
-      state.hover = best;
-      cvs.style.cursor = best ? 'pointer' : 'default';
-    });
-    cvs.addEventListener('mouseleave', () => { state.hover = null; });
+        if (d < bd) { bd = d; best = s; }
+      }
+      return best;
+    }
+    const CLICK_DRAG_THRESHOLD = 5; // px
 
-    // click → caller's preview (e.g. open modal with wiki content)
-    cvs.addEventListener('click', (ev) => {
+    cvs.addEventListener('mousedown', (ev) => {
+      if (ev.button !== 0) return;
+      state.drag = {
+        startClientX: ev.clientX,
+        startClientY: ev.clientY,
+        lastX: ev.clientX,
+        lastY: ev.clientY,
+        moved: false,
+      };
+    });
+
+    cvs.addEventListener('mousemove', (ev) => {
+      if (state.drag) {
+        const totalDx = ev.clientX - state.drag.startClientX;
+        const totalDy = ev.clientY - state.drag.startClientY;
+        if (!state.drag.moved && Math.hypot(totalDx, totalDy) > CLICK_DRAG_THRESHOLD) {
+          state.drag.moved = true;
+          cvs.style.cursor = 'grabbing';
+        }
+        if (state.drag.moved) {
+          state.view.x += ev.clientX - state.drag.lastX;
+          state.view.y += ev.clientY - state.drag.lastY;
+          state.drag.lastX = ev.clientX;
+          state.drag.lastY = ev.clientY;
+          state.hover = null; // suppress tooltip while panning
+          return;
+        }
+      }
+      // hover (no active drag — or the drag hasn't moved past threshold)
+      const { mx, my } = toWorld(ev);
+      const best = pickNode(mx, my, 9);
+      state.hover = best;
+      cvs.style.cursor = best ? 'pointer' : (state.drag ? 'grabbing' : 'default');
+    });
+
+    cvs.addEventListener('mouseup', (ev) => {
+      const drag = state.drag;
+      state.drag = null;
+      cvs.style.cursor = state.hover ? 'pointer' : 'default';
+      if (!drag) return;
+      // True drag — never fire click.
+      if (drag.moved) return;
+      // Treat as click only when the pointer barely moved.
       if (typeof opts.onNodeClick !== 'function') return;
-      const r = cvs.getBoundingClientRect();
-      const mx = ev.clientX - r.left, my = ev.clientY - r.top;
-      let best = null, bd = 100;
-      sim.forEach(s => {
-        const d = Math.hypot(s.x - mx, s.y - my);
-        if (d < 10 && d < bd) { bd = d; best = s; }
-      });
-      if (best) opts.onNodeClick(best.ref.id, { title: best.ref.l, tier: best.ref.t });
+      const { mx, my } = toWorld(ev);
+      const hit = pickNode(mx, my, 10);
+      if (hit) opts.onNodeClick(hit.ref.id, { title: hit.ref.l, tier: hit.ref.t });
+    });
+
+    cvs.addEventListener('mouseleave', () => {
+      state.hover = null;
+      state.drag = null;
+      cvs.style.cursor = 'default';
     });
 
     // raf loop
@@ -530,10 +626,21 @@
     requestAnimationFrame(loop);
 
     return {
-      // public: light up specific concepts as the agent reasons
+      // public: light up specific concepts as the agent reasons (transient pulse)
       fire(ids) {
         (ids || []).forEach(id => state.fireQueue.push(id));
         state.cooling = Math.max(state.cooling, 0.6);
+      },
+      // public: set the persistent activation set — the agent's running
+      // record of which corpus nodes have been touched this session. Pass
+      // [] to reset (e.g. on /clear). Empty set = "everything dimly lit".
+      setActivated(ids) {
+        state.activatedSet = new Set(ids || []);
+      },
+      // public: reset viewport pan to default (no offset).
+      recenter() {
+        state.view.x = 0;
+        state.view.y = 0;
       },
       stats() {
         return {

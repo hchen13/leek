@@ -24,24 +24,17 @@ export function TopBar(props: { route: string }) {
   );
 }
 
-export function Rail(props: { active?: string }) {
-  const items: Array<{ k: string; icon: "chat" | "canvas" | "book" | "grid" | "branch"; label: string }> = [
-    { k: "chat", icon: "chat", label: "Chat" },
-    { k: "canvas", icon: "canvas", label: "Canvas" },
-    { k: "corpus", icon: "book", label: "Corpus" },
-    { k: "screener", icon: "grid", label: "Screener" },
-    { k: "agents", icon: "branch", label: "Agents" },
-  ];
+export function Rail(_props: { active?: string }) {
+  // P2 ships only the chat surface — canvas / corpus / screener / agents
+  // pages aren't real yet, so the rail is just the brand mark + avatar.
+  // We'll grow this back when those views are wired.
   return (
     <aside class="lk-rail">
       <div class="lk-rail-logo">L</div>
-      {items.map((it) => (
-        <button class="lk-rail-btn" data-active={(props.active ?? "chat") === it.k} title={it.label}>
-          <Icon name={it.icon} />
-        </button>
-      ))}
+      <button class="lk-rail-btn" data-active="true" title="Chat">
+        <Icon name="chat" />
+      </button>
       <div class="lk-rail-spacer" />
-      <button class="lk-rail-btn" title="Settings"><Icon name="settings" /></button>
       <div class="lk-rail-avatar">JC</div>
     </aside>
   );
@@ -126,21 +119,23 @@ export function Workbench(props: { scene: Scene }) {
   };
 
   return (
-    <div class="lk-app" data-screen-label={`L.E.E.K · ${props.scene}`}>
-      <Rail active="chat" />
-      <div class="lk-main">
-        <TopBar route={props.scene === "idle" ? "~/sessions/2026-04-29/scratch" : "~/sessions/2026-04-29/nvda-thesis"} />
-        <section class="lk-chat">
-          <div class="lk-chat-head">
-            <span class="lk-chat-head-title">{headTitle()}</span>
-            <span class="lk-chat-head-meta">{headMeta()}</span>
-          </div>
-          <div class="lk-chat-body">
-            {transcriptFor(props.scene)}
-          </div>
-          <Composer value={composerVal()} focus={props.scene === "delivered"} />
-        </section>
-        <CanvasArea scene={props.scene} />
+    <div class="lk-demo-frame">
+      <div class="lk-app" data-screen-label={`L.E.E.K · ${props.scene}`}>
+        <Rail active="chat" />
+        <div class="lk-main">
+          <TopBar route={props.scene === "idle" ? "~/sessions/2026-04-29/scratch" : "~/sessions/2026-04-29/nvda-thesis"} />
+          <section class="lk-chat">
+            <div class="lk-chat-head">
+              <span class="lk-chat-head-title">{headTitle()}</span>
+              <span class="lk-chat-head-meta">{headMeta()}</span>
+            </div>
+            <div class="lk-chat-body">
+              {transcriptFor(props.scene)}
+            </div>
+            <Composer value={composerVal()} focus={props.scene === "delivered"} />
+          </section>
+          <CanvasArea scene={props.scene} />
+        </div>
       </div>
     </div>
   );

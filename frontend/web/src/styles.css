@@ -121,14 +121,12 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
 
 /* ---------- workbench shell ---------- */
 .lk-app {
-  width: 1480px;
-  height: 940px;
+  width: 100%;
+  height: 100%;
   background:
     radial-gradient(ellipse 50% 40% at 80% -10%, rgba(217, 119, 87, 0.07), transparent 60%),
     radial-gradient(ellipse 35% 50% at -5% 110%, rgba(232, 184, 108, 0.04), transparent 60%),
     var(--bg-1);
-  border: 1px solid var(--line-1);
-  border-radius: var(--r-4);
   overflow: hidden;
   display: grid;
   grid-template-columns: 56px 1fr;
@@ -136,6 +134,17 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
   position: relative;
   isolation: isolate;
   color: var(--ink-0);
+}
+
+/* Demo mode keeps the original framed look so it's visually distinct
+   from LIVE — wraps lk-app inside a centered box. */
+.lk-demo-frame {
+  width: min(1480px, 96vw);
+  height: min(940px, 92vh);
+  margin: 16px auto;
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-4);
+  overflow: hidden;
 }
 
 /* faint warm grain */
@@ -212,7 +221,7 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
 /* ---------- main area (2 columns now: chat | canvas with brain overlay) ---------- */
 .lk-main {
   display: grid;
-  grid-template-columns: 380px 1fr;
+  grid-template-columns: 460px 1fr;
   grid-template-rows: 44px 1fr;
   height: 100%;
   position: relative;
@@ -299,8 +308,72 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
 .lk-chat-body::-webkit-scrollbar { width: 6px; }
 .lk-chat-body::-webkit-scrollbar-thumb { background: var(--bg-4); border-radius: 3px; }
 
+/* rendered markdown inside agent messages */
+.lk-md { display: contents; }
+.lk-md p { margin: 0 0 8px; }
+.lk-md p:last-child { margin-bottom: 0; }
+.lk-md ul, .lk-md ol { margin: 6px 0 8px; padding-left: 22px; }
+.lk-md li { margin: 2px 0; }
+.lk-md h1, .lk-md h2, .lk-md h3, .lk-md h4 {
+  margin: 12px 0 6px; line-height: 1.3; font-weight: 600;
+}
+.lk-md h1 { font-size: 17px; }
+.lk-md h2 { font-size: 15px; }
+.lk-md h3 { font-size: 13.5px; color: var(--clay-soft); }
+.lk-md h4 { font-size: 13px; color: var(--ink-1); }
+.lk-md strong { color: var(--ink-0); font-weight: 600; }
+.lk-md em { font-style: italic; color: var(--ink-1); }
+.lk-md a { color: var(--clay-soft); text-decoration: underline; text-decoration-color: rgba(217, 119, 87, 0.4); }
+.lk-md a:hover { text-decoration-color: var(--clay-soft); }
+.lk-md blockquote {
+  border-left: 3px solid var(--clay);
+  margin: 8px 0;
+  padding: 4px 12px;
+  background: rgba(217, 119, 87, 0.05);
+  color: var(--ink-1);
+}
+.lk-md pre {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--line-1);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-1);
+}
+.lk-md code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--bg-3);
+  border: 1px solid var(--line-1);
+  border-radius: 4px;
+  padding: 1px 5px;
+  color: var(--clay-soft);
+}
+.lk-md pre code { background: none; border: 0; padding: 0; color: inherit; }
+.lk-md table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+.lk-md th, .lk-md td {
+  border: 1px solid var(--line-1);
+  padding: 4px 8px;
+  text-align: left;
+}
+.lk-md th {
+  background: rgba(255, 255, 255, 0.03);
+  font-weight: 500;
+  color: var(--ink-1);
+}
+.lk-md hr { border: 0; border-top: 1px solid var(--line-1); margin: 10px 0; }
+
 /* messages */
-.lk-msg { display: flex; flex-direction: column; gap: 6px; }
+.lk-msg { display: flex; flex-direction: column; gap: 4px; }
+.lk-msg[data-who="user"] { align-items: flex-end; }
 .lk-msg-head {
   display: flex; align-items: center; gap: 6px;
   font-size: 10px;
@@ -321,7 +394,16 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
   color: var(--ink-0);
   text-wrap: pretty;
 }
-.lk-msg-body.user { color: var(--ink-1); }
+/* User messages render as right-aligned bubbles so the speaker is
+   instantly distinguishable from the agent's left-aligned plain text. */
+.lk-msg-body.user {
+  color: var(--ink-0);
+  background: rgba(217, 119, 87, 0.10);
+  border: 1px solid rgba(217, 119, 87, 0.22);
+  border-radius: 10px 10px 2px 10px;
+  padding: 8px 12px;
+  max-width: 86%;
+}
 .lk-msg-body code, .lk-msg-body kbd {
   font-family: var(--font-mono);
   font-size: 12px;

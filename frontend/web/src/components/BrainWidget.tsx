@@ -5,7 +5,12 @@
 import { Show, createEffect, createSignal, onCleanup } from "solid-js";
 import type { Scene } from "../scenes";
 
-interface BrainAPI { fire(ids: string[]): void; stats(): unknown; }
+interface BrainAPI {
+  fire(ids: string[]): void;
+  setActivated(ids: string[]): void;
+  recenter(): void;
+  stats(): unknown;
+}
 interface NodeMeta { title: string; tier: string }
 interface BrainGlobal {
   mount(
@@ -51,7 +56,7 @@ const stats = (s: Scene) =>
     { k: "TIERS", v: "P·K" },
   ];
 
-export function BrainWidget(props: { scene: Scene; fireIds?: string[] }) {
+export function BrainWidget(props: { scene: Scene; fireIds?: string[]; activatedIds?: string[] }) {
   let host!: HTMLDivElement;
   let api: BrainAPI | null = null;
   let mounting = false;
@@ -118,6 +123,12 @@ export function BrainWidget(props: { scene: Scene; fireIds?: string[] }) {
         if (ids && api) api.fire(ids);
       });
       return;
+    }
+
+    // Push session-scoped activation set whenever it changes. Empty array
+    // resets the brain to "all dimly lit" (idle / fresh session).
+    if (api && props.activatedIds) {
+      api.setActivated(props.activatedIds);
     }
 
     const ids = props.fireIds;

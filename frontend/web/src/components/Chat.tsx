@@ -64,7 +64,7 @@ function MsgHead(props: { who: "user" | "agent" | "system"; role: string; time: 
 
 export function UserMsg(props: { time: string; children: JSX.Element }) {
   return (
-    <div class="lk-msg">
+    <div class="lk-msg" data-who="user">
       <MsgHead who="user" role="YOU" time={props.time} />
       <div class="lk-msg-body user">{props.children}</div>
     </div>
@@ -73,7 +73,7 @@ export function UserMsg(props: { time: string; children: JSX.Element }) {
 
 export function AgentMsg(props: { time: string; children: JSX.Element }) {
   return (
-    <div class="lk-msg">
+    <div class="lk-msg" data-who="agent">
       <MsgHead who="agent" role="L.E.E.K" time={props.time} />
       <div class="lk-msg-body">{props.children}</div>
     </div>
@@ -82,7 +82,7 @@ export function AgentMsg(props: { time: string; children: JSX.Element }) {
 
 export function SystemMsg(props: { time: string; children: JSX.Element }) {
   return (
-    <div class="lk-msg">
+    <div class="lk-msg" data-who="system">
       <MsgHead who="system" role="SYSTEM" time={props.time} />
       <div class="lk-msg-body" style={{ "font-size": "11.5px", color: "var(--ink-2)", "font-family": "var(--font-mono)" }}>
         {props.children}
@@ -144,6 +144,14 @@ export function Composer(props: {
     setText("");
     props.onSubmit?.(t);
   };
+  // Track IME composition state so Enter doesn't fire while picking
+  // pinyin / kana candidates — the textarea sees Enter both as
+  // "select candidate" AND as the keydown event we wire submit to,
+  // so without this guard a Chinese user typing 'corpus' (which the
+  // IME may interpret as pinyin) loses their input on commit.
+  let composing = false;
+  const onCompositionStart = () => { composing = true; };
+  const onCompositionEnd = () => { composing = false; };
   const onKey = (e: KeyboardEvent) => {
     if (e.key === "Escape" && props.pending) {
       e.preventDefault();
@@ -151,6 +159,10 @@ export function Composer(props: {
       return;
     }
     if (e.key === "Enter" && !e.shiftKey && !props.pending) {
+      // `isComposing` is the spec field; `composing` is our local flag
+      // (some browsers fire keydown after compositionend in the same
+      // tick before isComposing flips back, so we belt-and-suspenders).
+      if (e.isComposing || composing || (e as KeyboardEvent & { keyCode?: number }).keyCode === 229) return;
       e.preventDefault();
       submit();
     }
@@ -167,13 +179,12 @@ export function Composer(props: {
           rows={2}
           onInput={(e) => setText(e.currentTarget.value)}
           onKeyDown={onKey}
+          onCompositionStart={onCompositionStart}
+          onCompositionEnd={onCompositionEnd}
         />
         <div class="lk-composer-row">
-          <button class="lk-composer-tool" title="Attach"><Icon name="paperclip" class="ic-sm" /></button>
-          <button class="lk-composer-tool" title="Reference"><Icon name="pin" class="ic-sm" /></button>
-          <button class="lk-composer-tool" title="Voice"><Icon name="mic" class="ic-sm" /></button>
-          <span class="lk-chip-mini">corpus · 14.2K docs</span>
-          <span class="lk-chip-mini">tools · 9</span>
+          <span class="lk-chip-mini">corpus · 287 docs</span>
+          <span class="lk-chip-mini">tools · 5</span>
           {props.pending ? (
             <button
               class="lk-composer-send"

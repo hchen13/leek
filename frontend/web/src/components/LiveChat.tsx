@@ -7,7 +7,7 @@ import { AgentMsg, Composer, UserMsg } from "./Chat";
 import { EventsPanel } from "./EventsPanel";
 import { BrainWidget } from "./BrainWidget";
 import { Rail, TopBar } from "./Workbench";
-import { Icon } from "./Icon";
+import { SafeMarkdown } from "./SafeMarkdown";
 import type { Scene } from "../scenes";
 
 const SESSION_ID = "live";
@@ -388,14 +388,49 @@ export function LiveChat() {
     return "idle";
   });
 
-  // Most recent agent message — its tool_calls drive the canvas panels
-  // (each tool invocation renders as one panel artifact).
-  const lastAgent = createMemo(() => {
-    const list = messages();
-    for (let i = list.length - 1; i >= 0; i--) {
-      if (list[i].role === "agent") return list[i];
+  // Aggregate every tool call / web_search across the whole session so the
+  // canvas keeps the trail of artifacts visible — turn boundaries don't
+  // erase prior research. Cleared by /clear (planned).
+  const sessionTools = createMemo<ToolCall[]>(() => {
+    const out: ToolCall[] = [];
+    const seen = new Set<string>();
+    for (const m of messages()) {
+      if (m.role !== "agent" || !m.tool_calls) continue;
+      for (const t of m.tool_calls) {
+        if (!seen.has(t.call_id)) {
+          seen.add(t.call_id);
+          out.push(t);
+        }
+      }
     }
-    return null;
+    return out;
+  });
+  const sessionSearches = createMemo<SearchCall[]>(() => {
+    const out: SearchCall[] = [];
+    for (const m of messages()) {
+      if (m.role !== "agent" || !m.searches) continue;
+      for (const s of m.searches) out.push(s);
+    }
+    return out;
+  });
+
+  // Wikilink ids the agent has touched via corpus_search this session.
+  // Drives the brain widget's activation halo. We scrape the truncated
+  // output_preview because the full output isn't kept client-side; ids
+  // that get cut mid-string are simply skipped — better than nothing
+  // until we wire structured tool outputs end-to-end.
+  const ID_RE = /"id":"((?:wikis|sources)\/[^"]+)"/g;
+  const activatedCorpusIds = createMemo<string[]>(() => {
+    const ids = new Set<string>();
+    for (const t of sessionTools()) {
+      if (t.name !== "corpus_search" || !t.output_preview) continue;
+      let m: RegExpExecArray | null;
+      ID_RE.lastIndex = 0;
+      while ((m = ID_RE.exec(t.output_preview)) !== null) {
+        ids.add(m[1]);
+      }
+    }
+    return Array.from(ids);
   });
 
   const headTitle = () => messages().length === 0
@@ -510,13 +545,16 @@ export function LiveChat() {
                       )}</For>
                     </div>
                   </Show>
-                  {/* Plain text + blinker for streaming. We deliberately don't use
-                      StreamText here: its lk-tok fade-in animation re-triggers on
-                      every delta (esp. CJK where /\s+/ split produces one token),
-                      causing visual glitches. StreamText is reserved for fixture
-                      scenes where text is pre-rendered. */}
-                  <span>{m.text}</span>
-                  <Show when={m.streaming}><span class="lk-stream" /></Show>
+                  {/* While streaming, show plain text + blinker — markdown
+                      renderer would re-parse on every delta, glitching mid-
+                      stream (especially for tables / code blocks before they
+                      close). Once the message is done, render real markdown
+                      so headers / tables / lists / code / links all show up.
+                  */}
+                  <Show when={m.streaming} fallback={<SafeMarkdown source={m.text} />}>
+                    <span>{m.text}</span>
+                    <span class="lk-stream" />
+                  </Show>
                 </AgentMsg>
               </Show>
             )}</For>
@@ -546,8 +584,9 @@ export function LiveChat() {
 
         <CanvasArea
           scene={derivedScene()}
-          tools={lastAgent()?.tool_calls ?? []}
-          searches={lastAgent()?.searches ?? []}
+          tools={sessionTools()}
+          searches={sessionSearches()}
+          activatedIds={activatedCorpusIds()}
         />
       </div>
 
@@ -569,6 +608,7 @@ function CanvasArea(props: {
   scene: Scene;
   tools: ToolCall[];
   searches: SearchCall[];
+  activatedIds: string[];
 }) {
   const subtitle = () => props.scene === "thinking-shallow"
     ? "reasoning · live"
@@ -587,11 +627,6 @@ function CanvasArea(props: {
             <span class="sep">/</span>
             {subtitle()}
           </span>
-          <div class="actions">
-            <button class="iconbtn" title="Layers"><Icon name="layer" class="ic-sm" /></button>
-            <button class="iconbtn" title="Search"><Icon name="search" class="ic-sm" /></button>
-            <button class="iconbtn" title="Expand"><Icon name="expand" class="ic-sm" /></button>
-          </div>
         </div>
       </Show>
 
@@ -633,7 +668,7 @@ function CanvasArea(props: {
         </div>
       </Show>
 
-      <BrainWidget scene={props.scene} fireIds={undefined} />
+      <BrainWidget scene={props.scene} fireIds={undefined} activatedIds={props.activatedIds} />
     </div>
   );
 }
