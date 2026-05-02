@@ -109,6 +109,9 @@ pub async fn decide_route(
         system: Some(ROUTING_PROMPT.to_string()),
         model: ROUTING_MODEL.to_string(),
         max_output_tokens: None,
+        // Routing is a deterministic intent classifier — no tool calls allowed.
+        tools: Vec::new(),
+        additional_inputs: Vec::new(),
     };
 
     let mut stream = provider.chat(req).await.context("routing chat call")?;

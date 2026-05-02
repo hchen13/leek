@@ -17,6 +17,13 @@ pub struct ChatRequest {
     pub system: Option<String>,
     pub model: String,
     pub max_output_tokens: Option<u32>,
+    pub tools: Vec<ToolSpec>,
+    /// Raw input items appended after `messages` — used by the agent loop to
+    /// inject prior-turn `function_call` and `function_call_output` items so
+    /// the model has a complete view of the multi-turn tool dialog. Each item
+    /// must already match the OpenAI Responses API input shape (see
+    /// codex-rs/protocol/src/models.rs ResponseItem).
+    pub additional_inputs: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,9 +40,62 @@ pub enum Role {
     System,
 }
 
+/// Server-side / client-side tools the model may call.
+#[derive(Debug, Clone)]
+pub enum ToolSpec {
+    /// Codex backend's built-in web_search (covers Search/OpenPage/FindInPage
+    /// sub-actions; runs entirely on the OpenAI side, no client dispatch).
+    WebSearch {
+        /// `external_web_access=true` opts into live web access. Codex's
+        /// "cached" mode would set this false (see codex-rs tool_spec.rs).
+        external_web_access: bool,
+    },
+    /// Generic client-side function tool. The model emits `function_call`
+    /// items; the agent loop dispatches via `tools::ToolRegistry`, then
+    /// re-invokes `chat()` with `function_call_output` injected into
+    /// `additional_inputs`.
+    Function {
+        name: String,
+        description: String,
+        /// JSONSchema describing the tool's argument object. Pass through
+        /// to OpenAI Responses API verbatim.
+        parameters: serde_json::Value,
+    },
+}
+
+/// One of OpenAI's web_search sub-actions, mirrored from codex-rs protocol.
+/// Surfaced to the UI so users see what the agent is searching / opening.
+#[derive(Debug, Clone)]
+pub enum WebSearchAction {
+    Search { query: String },
+    OpenPage { url: String },
+    FindInPage { url: String, pattern: String },
+    Other,
+}
+
 #[derive(Debug, Clone)]
 pub enum LlmEvent {
     TextDelta { text: String },
+    /// Lifecycle event for codex server-side `web_search`. Emitted twice per
+    /// call: once on `output_item.added` (status=in_progress) and once on
+    /// `output_item.done` (status=completed). The action carries the actual
+    /// query / URL / pattern the model issued.
+    WebSearchCall {
+        status: String,
+        action: Option<WebSearchAction>,
+    },
+    /// Client-side function tool invocation request from the model. The
+    /// agent loop is expected to: (1) execute via `tools::ToolRegistry`,
+    /// (2) inject the original `function_call` + corresponding
+    /// `function_call_output` into `ChatRequest.additional_inputs`,
+    /// (3) re-invoke `chat()` to let the model continue.
+    FunctionCall {
+        call_id: String,
+        name: String,
+        /// Already-complete arguments JSON (string form, as the codex
+        /// backend ships it). Caller must `serde_json::from_str` to use.
+        arguments: String,
+    },
     Usage(Usage),
     MessageEnd { stop_reason: StopReason },
 }

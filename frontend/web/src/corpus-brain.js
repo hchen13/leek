@@ -192,10 +192,62 @@
     };
   }
 
+  // ----- transform backend corpus.graph.json into brain schema -----
+  // Backend node:  { id, cluster, title, slug, type, tier, layer, tags, degree }
+  // Brain   node:  { id, t (tier code), l (label), g (group), degree }
+  // Backend cluster → brain tier code mapping
+  const CLUSTER_TO_TIER = {
+    'principles-wikis':   'pw',
+    'principles-sources': 'ps',
+    'knowledge-wikis':    'kw',
+    'knowledge-sources':  'ks',
+  };
+  // Cap node count for visual readability — 340×340 widget can show ~60
+  // before edges become dense fog. Keep highest-degree nodes (most central).
+  // Bump later if widget grows / view zooms.
+  const BRAIN_NODE_CAP = 60;
+
+  function transformBackendGraph(graph) {
+    if (!graph || !Array.isArray(graph.nodes)) return null;
+    const ranked = graph.nodes.slice().sort((a, b) => (b.degree || 0) - (a.degree || 0));
+    const top = ranked.slice(0, BRAIN_NODE_CAP);
+    const keep = new Set(top.map(n => n.id));
+
+    const nodes = top.map(n => {
+      const segs = n.id.split('/');
+      // wikilink path like `wikis/principles/concepts/foo` → group=concepts
+      const group = segs.length >= 3 ? segs[segs.length - 2] : undefined;
+      return {
+        id: n.id,
+        t: CLUSTER_TO_TIER[n.cluster] || 'pw',
+        l: n.title || segs[segs.length - 1] || n.id,
+        g: group,
+        degree: n.degree || 0,
+      };
+    });
+    const edges = (graph.edges || [])
+      .filter(e => keep.has(e.from) && keep.has(e.to))
+      .map(e => [e.from, e.to]);
+    return { nodes, edges };
+  }
+
   // ----- mount -----
   function mount(host, opts) {
     opts = opts || {};
     const W = host.clientWidth, H = host.clientHeight;
+
+    // Use real corpus graph when provided by caller (BrainWidget fetches
+    // /api/v1/corpus/graph and passes it through), otherwise fall back to
+    // the bundled fixture so the widget stays alive on a cold checkout.
+    let activeNodes = NODES;
+    let activeEdges = EDGES;
+    if (opts.graph) {
+      const transformed = transformBackendGraph(opts.graph);
+      if (transformed && transformed.nodes.length > 0) {
+        activeNodes = transformed.nodes;
+        activeEdges = transformed.edges;
+      }
+    }
 
     const cvs = document.createElement('canvas');
     cvs.width  = W * devicePixelRatio;
@@ -208,11 +260,11 @@
 
     // ID lookup
     const byId = {};
-    NODES.forEach(n => byId[n.id] = n);
+    activeNodes.forEach(n => byId[n.id] = n);
 
     // node neighbor counts → size
     const degree = {};
-    EDGES.forEach(([a, b]) => {
+    activeEdges.forEach(([a, b]) => {
       degree[a] = (degree[a] || 0) + 1;
       degree[b] = (degree[b] || 0) + 1;
     });
@@ -226,7 +278,7 @@
       ks: { x: cx + W * 0.22, y: cy + H * 0.18 }   // bottom-right
     };
 
-    const sim = NODES.map(n => {
+    const sim = activeNodes.map(n => {
       const c = quadCenter[n.t];
       return {
         ref: n,
@@ -241,7 +293,7 @@
     sim.forEach(s => simById[s.ref.id] = s);
 
     // edges as references to sim nodes
-    const edges = EDGES.map(([a, b]) => ({ a: simById[a], b: simById[b] })).filter(e => e.a && e.b);
+    const edges = activeEdges.map(([a, b]) => ({ a: simById[a], b: simById[b] })).filter(e => e.a && e.b);
 
     // pulses — randomly fire along an edge to suggest "neuron firing"
     const pulses = [];

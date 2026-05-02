@@ -8,7 +8,7 @@ use async_stream::try_stream;
 use futures::{stream::BoxStream, StreamExt};
 use serde::Deserialize;
 
-use super::{ChatRequest, LlmEvent, Role, StopReason, Usage};
+use super::{ChatRequest, LlmEvent, Role, StopReason, ToolSpec, Usage, WebSearchAction};
 
 pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
     let mut input = Vec::new();
@@ -32,7 +32,7 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
         .clone()
         .unwrap_or_else(|| "You are a helpful assistant.".to_string());
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": req.model,
         "stream": true,
         "instructions": instructions,
@@ -41,6 +41,42 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
         // history in vault.messages, so this is what we want anyway.
         "store": false,
     });
+
+    if !req.tools.is_empty() {
+        let tools_json: Vec<serde_json::Value> = req
+            .tools
+            .iter()
+            .map(|t| match t {
+                ToolSpec::WebSearch {
+                    external_web_access,
+                } => serde_json::json!({
+                    "type": "web_search",
+                    "external_web_access": external_web_access,
+                }),
+                ToolSpec::Function {
+                    name,
+                    description,
+                    parameters,
+                } => serde_json::json!({
+                    "type": "function",
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                    "strict": false,
+                }),
+            })
+            .collect();
+        body["tools"] = serde_json::Value::Array(tools_json);
+    }
+
+    // Append raw input items after messages (function_call / function_call_output
+    // re-injection during multi-turn tool dialog).
+    if !req.additional_inputs.is_empty() {
+        if let Some(arr) = body["input"].as_array_mut() {
+            arr.extend(req.additional_inputs.iter().cloned());
+        }
+    }
+
     // Note: `max_output_tokens` is intentionally NOT serialized — the codex
     // backend rejects it as "Unsupported parameter". We'll add it back when
     // the openai_api_key provider lands (platform.openai.com supports it).
@@ -117,6 +153,26 @@ struct DataEnvelope {
     delta: Option<String>,
     #[serde(default)]
     response: Option<ResponseObject>,
+    #[serde(default)]
+    item: Option<ItemObject>,
+}
+
+#[derive(Deserialize)]
+struct ItemObject {
+    #[serde(rename = "type", default)]
+    type_: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    action: Option<serde_json::Value>,
+    // function_call fields — present only when type="function_call"
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    /// Wire form is a string containing JSON (per codex-rs ResponseItem doc).
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -172,6 +228,48 @@ fn parse_one_event(raw: &str) -> Result<Vec<LlmEvent>> {
                 .ok_or_else(|| anyhow!("output_text.delta event missing 'delta'"))?;
             Ok(vec![LlmEvent::TextDelta { text }])
         }
+        // Server-side web_search lifecycle + client-side function_call dispatch.
+        // `output_item.added` fires on start, `output_item.done` fires when the
+        // item is complete. Both wrap many item kinds — dispatch on item.type.
+        Some("response.output_item.added") | Some("response.output_item.done") => {
+            let is_done = env.type_.as_deref() == Some("response.output_item.done");
+            let Some(item) = env.item else {
+                return Ok(Vec::new());
+            };
+            match item.type_.as_deref() {
+                Some("web_search_call") => {
+                    let action = item.action.as_ref().and_then(parse_web_search_action);
+                    let status = item.status.unwrap_or_default();
+                    Ok(vec![LlmEvent::WebSearchCall { status, action }])
+                }
+                // Function call: arguments are accumulated server-side and
+                // delivered complete on `output_item.done`. The `added` event
+                // typically has empty arguments — we skip it to avoid emitting
+                // a partial FunctionCall the agent can't dispatch.
+                Some("function_call") if is_done => {
+                    let call_id = item
+                        .call_id
+                        .ok_or_else(|| anyhow!("function_call done event missing 'call_id'"))?;
+                    let name = item
+                        .name
+                        .ok_or_else(|| anyhow!("function_call done event missing 'name'"))?;
+                    let arguments = item.arguments.unwrap_or_default();
+                    Ok(vec![LlmEvent::FunctionCall {
+                        call_id,
+                        name,
+                        arguments,
+                    }])
+                }
+                _ => Ok(Vec::new()),
+            }
+        }
+        // Argument deltas — useful only for "tool call streaming…" UX. We
+        // accumulate in the agent layer if/when we surface that progress;
+        // for now silently drop, since `output_item.done` carries the full
+        // arguments string anyway.
+        Some("response.function_call_arguments.delta")
+        | Some("response.function_call_arguments.done")
+        | Some("response.custom_tool_call_input.delta") => Ok(Vec::new()),
         Some("response.completed") => {
             let response = env
                 .response
@@ -205,6 +303,50 @@ fn parse_one_event(raw: &str) -> Result<Vec<LlmEvent>> {
         }
         // Lifecycle events we recognize but don't emit anything for (P1 scope)
         Some(_) | None => Ok(Vec::new()),
+    }
+}
+
+fn parse_web_search_action(v: &serde_json::Value) -> Option<WebSearchAction> {
+    let obj = v.as_object()?;
+    match obj.get("type").and_then(|t| t.as_str())? {
+        "search" => {
+            let query = obj
+                .get("query")
+                .and_then(|q| q.as_str())
+                .map(String::from)
+                .or_else(|| {
+                    // Some backends pass `queries: ["..."]` instead of singular.
+                    obj.get("queries")
+                        .and_then(|q| q.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|s| s.as_str())
+                        .map(String::from)
+                })
+                .unwrap_or_default();
+            Some(WebSearchAction::Search { query })
+        }
+        "open_page" => {
+            let url = obj
+                .get("url")
+                .and_then(|u| u.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Some(WebSearchAction::OpenPage { url })
+        }
+        "find_in_page" => {
+            let url = obj
+                .get("url")
+                .and_then(|u| u.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let pattern = obj
+                .get("pattern")
+                .and_then(|p| p.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Some(WebSearchAction::FindInPage { url, pattern })
+        }
+        _ => Some(WebSearchAction::Other),
     }
 }
 
@@ -273,5 +415,198 @@ mod tests {
     fn errors_on_failed_event() {
         let raw = "event: response.failed\ndata: {\"type\":\"response.failed\",\"error\":{}}";
         assert!(parse_one_event(raw).is_err());
+    }
+
+    #[test]
+    fn parses_web_search_call_in_progress_with_query() {
+        let raw = "data: {\"type\":\"response.output_item.added\",\"item\":{\
+                       \"id\":\"ws_1\",\"type\":\"web_search_call\",\"status\":\"in_progress\",\
+                       \"action\":{\"type\":\"search\",\"query\":\"NVDA Q1\"}}}";
+        let evts = parse_one_event(raw).unwrap();
+        assert_eq!(evts.len(), 1);
+        match &evts[0] {
+            LlmEvent::WebSearchCall { status, action } => {
+                assert_eq!(status, "in_progress");
+                match action {
+                    Some(super::WebSearchAction::Search { query }) => assert_eq!(query, "NVDA Q1"),
+                    other => panic!("expected Search action, got {other:?}"),
+                }
+            }
+            other => panic!("expected WebSearchCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_web_search_call_completed_with_open_page() {
+        let raw = "data: {\"type\":\"response.output_item.done\",\"item\":{\
+                       \"id\":\"ws_2\",\"type\":\"web_search_call\",\"status\":\"completed\",\
+                       \"action\":{\"type\":\"open_page\",\"url\":\"https://example.com/a\"}}}";
+        let evts = parse_one_event(raw).unwrap();
+        assert_eq!(evts.len(), 1);
+        match &evts[0] {
+            LlmEvent::WebSearchCall { status, action } => {
+                assert_eq!(status, "completed");
+                match action {
+                    Some(super::WebSearchAction::OpenPage { url }) => {
+                        assert_eq!(url, "https://example.com/a")
+                    }
+                    other => panic!("expected OpenPage, got {other:?}"),
+                }
+            }
+            other => panic!("expected WebSearchCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ignores_output_item_for_non_web_search() {
+        // output_item.added/done also wraps text/reasoning items — we should
+        // emit nothing for those (text comes from output_text.delta instead).
+        let raw = "data: {\"type\":\"response.output_item.added\",\"item\":{\
+                       \"type\":\"reasoning\",\"id\":\"r1\"}}";
+        assert!(parse_one_event(raw).unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_request_body_serializes_tools_when_present() {
+        use super::super::{ChatMessage, ChatRequest, Role, ToolSpec};
+        let req = ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "hi".into(),
+            }],
+            system: None,
+            model: "gpt-5.5".into(),
+            max_output_tokens: None,
+            tools: vec![ToolSpec::WebSearch {
+                external_web_access: true,
+            }],
+            additional_inputs: Vec::new(),
+        };
+        let body = build_request_body(&req);
+        let tools = body.get("tools").and_then(|t| t.as_array()).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "web_search");
+        assert_eq!(tools[0]["external_web_access"], true);
+    }
+
+    #[test]
+    fn build_request_body_omits_tools_when_empty() {
+        use super::super::{ChatMessage, ChatRequest, Role};
+        let req = ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "hi".into(),
+            }],
+            system: None,
+            model: "gpt-5.5".into(),
+            max_output_tokens: None,
+            tools: Vec::new(),
+            additional_inputs: Vec::new(),
+        };
+        let body = build_request_body(&req);
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn parses_function_call_done() {
+        let raw = "data: {\"type\":\"response.output_item.done\",\"item\":{\
+                       \"id\":\"fc_1\",\"type\":\"function_call\",\
+                       \"call_id\":\"call_42\",\"name\":\"web_fetch\",\
+                       \"arguments\":\"{\\\"url\\\":\\\"https://x.com\\\"}\"}}";
+        let evts = parse_one_event(raw).unwrap();
+        assert_eq!(evts.len(), 1);
+        match &evts[0] {
+            LlmEvent::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(call_id, "call_42");
+                assert_eq!(name, "web_fetch");
+                assert_eq!(arguments, "{\"url\":\"https://x.com\"}");
+            }
+            other => panic!("expected FunctionCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_call_added_is_silent() {
+        // The `added` event fires before arguments are streamed; we skip it
+        // to avoid double-dispatching tools.
+        let raw = "data: {\"type\":\"response.output_item.added\",\"item\":{\
+                       \"id\":\"fc_1\",\"type\":\"function_call\",\
+                       \"call_id\":\"c1\",\"name\":\"web_fetch\",\"arguments\":\"\"}}";
+        assert!(parse_one_event(raw).unwrap().is_empty());
+    }
+
+    #[test]
+    fn function_call_arguments_delta_silent() {
+        let raw = "data: {\"type\":\"response.function_call_arguments.delta\",\
+                       \"item_id\":\"fc_1\",\"delta\":\"{\\\"u\"}";
+        assert!(parse_one_event(raw).unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_request_body_serializes_function_tool() {
+        use super::super::{ChatMessage, ChatRequest, Role, ToolSpec};
+        let req = ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "hi".into(),
+            }],
+            system: None,
+            model: "gpt-5.5".into(),
+            max_output_tokens: None,
+            tools: vec![ToolSpec::Function {
+                name: "web_fetch".into(),
+                description: "Fetch a URL.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"],
+                }),
+            }],
+            additional_inputs: Vec::new(),
+        };
+        let body = build_request_body(&req);
+        let tools = body.get("tools").and_then(|t| t.as_array()).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "web_fetch");
+        assert_eq!(tools[0]["description"], "Fetch a URL.");
+        assert_eq!(tools[0]["parameters"]["required"][0], "url");
+    }
+
+    #[test]
+    fn build_request_body_appends_additional_inputs() {
+        use super::super::{ChatMessage, ChatRequest, Role};
+        let req = ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "fetch".into(),
+            }],
+            system: None,
+            model: "gpt-5.5".into(),
+            max_output_tokens: None,
+            tools: Vec::new(),
+            additional_inputs: vec![
+                serde_json::json!({
+                    "type": "function_call",
+                    "call_id": "c1",
+                    "name": "web_fetch",
+                    "arguments": "{\"url\":\"https://x\"}"
+                }),
+                serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": "c1",
+                    "output": "OK"
+                }),
+            ],
+        };
+        let body = build_request_body(&req);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[2]["type"], "function_call_output");
     }
 }

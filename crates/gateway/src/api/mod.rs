@@ -1,5 +1,6 @@
 //! HTTP / SSE API — axum router + shared `AppState`.
 
+pub mod corpus;
 pub mod health;
 pub mod messages;
 pub mod sessions;
@@ -17,6 +18,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::agent::tools::ToolRegistry;
 use crate::events::EventBus;
 use crate::llm::LlmProvider;
 
@@ -29,6 +31,8 @@ pub struct AppState {
     /// Per-session cancellation token for the active agent reply (if any).
     /// Inserted by `messages::post_handler`, cancelled by `sessions::abort`.
     pub active_replies: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    /// Client-side tool registry passed into the agent loop on each reply.
+    pub tools: ToolRegistry,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -39,6 +43,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/api/v1/health", get(health::handler))
+        .route("/api/v1/corpus/graph", get(corpus::graph_handler))
         .route(
             "/api/v1/sessions/{id}/messages",
             post(messages::post_handler).get(messages::list_handler),

@@ -48,7 +48,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5"
 
 # Static asset embedding (frontend/web/dist → binary)
-rust-embed = { version = "8", features = ["debug-embed"] }
+rust-embed = { version = "8", features = ["debug-embed", "include-exclude"] }
 mime_guess = "2"
 
 # Corpus parsing

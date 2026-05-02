@@ -94,6 +94,7 @@ pub async fn post_handler(
     let sess = session_id.clone();
     let provider = state.provider.clone();
     let bus = state.event_bus.clone();
+    let tools = state.tools.clone();
     let cancel_for_task = cancel.clone();
     tokio::spawn(async move {
         if let Err(e) = handle_user_message(
@@ -105,6 +106,7 @@ pub async fn post_handler(
             user_text,
             user_seq,
             cancel_for_task,
+            tools,
         )
         .await
         {
@@ -120,6 +122,7 @@ pub async fn post_handler(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_user_message(
     pool: sqlx::SqlitePool,
     user_id: String,
@@ -129,6 +132,7 @@ async fn handle_user_message(
     user_text: String,
     user_message_seq: i64,
     cancel: CancellationToken,
+    tools: crate::agent::tools::ToolRegistry,
 ) -> anyhow::Result<()> {
     // P1 simplification: routing layer fires only when there's no in-progress
     // task. With one, attach to it directly (in-thread chat_reply).
@@ -145,6 +149,7 @@ async fn handle_user_message(
             // Existing task: don't re-mark as delivered (it already is or in-flight)
             None,
             cancel,
+            tools,
         )
         .await;
     }
@@ -164,6 +169,7 @@ async fn handle_user_message(
                 event_bus,
                 None,
                 cancel,
+                tools,
             )
             .await;
         }
@@ -233,13 +239,16 @@ async fn handle_user_message(
                     expected_deliverable: draft.expected_deliverable,
                 }),
                 cancel,
+                tools,
             )
             .await
         }
 
         DecisionKind::ChatReply => {
-            agent::run_chat_reply(pool, user_id, session_id, provider, event_bus, None, cancel)
-                .await
+            agent::run_chat_reply(
+                pool, user_id, session_id, provider, event_bus, None, cancel, tools,
+            )
+            .await
         }
 
         DecisionKind::Ambiguous => {

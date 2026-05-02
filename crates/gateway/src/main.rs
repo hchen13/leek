@@ -146,6 +146,14 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
     )?);
     let event_bus = events::EventBus::new();
 
+    let tools = agent::tools::ToolRegistry::builder()
+        .register(Arc::new(agent::tools::web_fetch::WebFetchTool::new()?))
+        .register(Arc::new(agent::tools::corpus_search::CorpusSearchTool::new()))
+        .register(Arc::new(agent::tools::sec_filing_fetch::SecFilingFetchTool::new()?))
+        .register(Arc::new(agent::tools::tushare_quote::TushareQuoteTool::new()?))
+        .register(Arc::new(agent::tools::tradingview_quote::TradingViewQuoteTool::new()?))
+        .build();
+
     let state = api::AppState {
         pool: vault.pool.clone(),
         provider,
@@ -154,6 +162,7 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
         active_replies: std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
+        tools,
     };
 
     let app = api::router(state);
@@ -182,6 +191,13 @@ async fn run_chat(vault_path: &Path, prompt: String, model: String) -> Result<()
         system: None,
         model,
         max_output_tokens: Some(2048),
+        // Enable codex's built-in web_search so this CLI path doubles as a
+        // smoke-test for the tool-on-request wiring (search/open_page events
+        // print as `[web_search] ...` lines in stderr).
+        tools: vec![llm::ToolSpec::WebSearch {
+            external_web_access: true,
+        }],
+        additional_inputs: Vec::new(),
     };
 
     let mut stream = provider.chat(req).await?;
@@ -207,6 +223,15 @@ async fn run_chat(vault_path: &Path, prompt: String, model: String) -> Result<()
                 eprintln!(
                     "\x1b[90m[end] reason={:?} chars_streamed={}\x1b[0m",
                     stop_reason, total_chars
+                );
+            }
+            llm::LlmEvent::WebSearchCall { status, action } => {
+                eprintln!("\x1b[90m[web_search] {status} {action:?}\x1b[0m");
+            }
+            llm::LlmEvent::FunctionCall { call_id, name, arguments } => {
+                eprintln!(
+                    "\x1b[90m[function_call] id={call_id} name={name} args={}\x1b[0m",
+                    arguments.chars().take(80).collect::<String>()
                 );
             }
         }

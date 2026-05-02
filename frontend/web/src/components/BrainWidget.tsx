@@ -6,7 +6,11 @@ import { createEffect, onCleanup } from "solid-js";
 import type { Scene } from "../scenes";
 
 interface BrainAPI { fire(ids: string[]): void; stats(): unknown; }
-interface BrainGlobal { mount(host: HTMLElement): BrainAPI; NODES: unknown[]; EDGES: unknown[]; }
+interface BrainGlobal {
+  mount(host: HTMLElement, opts?: { graph?: unknown }): BrainAPI;
+  NODES: unknown[];
+  EDGES: unknown[];
+}
 
 declare global {
   interface Window { LeekBrain?: BrainGlobal; }
@@ -37,10 +41,35 @@ const stats = (s: Scene) =>
 export function BrainWidget(props: { scene: Scene; fireIds?: string[] }) {
   let host!: HTMLDivElement;
   let api: BrainAPI | null = null;
+  let mounting = false;
+
+  async function ensureMounted() {
+    if (api || mounting || !host || !window.LeekBrain) return;
+    mounting = true;
+    let graph: unknown = undefined;
+    try {
+      const r = await fetch("/api/v1/corpus/graph");
+      if (r.ok) graph = await r.json();
+    } catch {
+      // network failed — fall back to bundled fixture
+    }
+    if (!host || !window.LeekBrain) {
+      mounting = false;
+      return;
+    }
+    api = window.LeekBrain.mount(host, graph ? { graph } : undefined);
+    mounting = false;
+  }
 
   createEffect(() => {
     if (!host || !window.LeekBrain) return;
-    if (!api) api = window.LeekBrain.mount(host);
+    if (!api && !mounting) {
+      void ensureMounted().then(() => {
+        const ids = props.fireIds;
+        if (ids && api) api.fire(ids);
+      });
+      return;
+    }
 
     const ids = props.fireIds;
     if (!ids || !api) return;

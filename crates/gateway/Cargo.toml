@@ -39,3 +39,6 @@ mime_guess = { workspace = true }
 serde_yaml = { workspace = true }
 regex = { workspace = true }
 walkdir = { workspace = true }
+dom_smoothie = "0.9"
+url = "2.5"
+lru = "0.12"

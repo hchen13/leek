@@ -7,11 +7,65 @@ import { AgentMsg, Composer, UserMsg } from "./Chat";
 
 const SESSION_ID = "live";
 
+interface SearchCall {
+  status: "in_progress" | "completed" | string;
+  action: "search" | "open_page" | "find_in_page" | "other" | "unknown" | string;
+  detail: string;
+}
+
+interface ToolCall {
+  call_id: string;
+  status: "in_progress" | "completed" | "error" | string;
+  name: string;
+  arguments?: string;
+  output_preview?: string;
+  output_bytes?: number;
+}
+
 interface LiveMsg {
   role: "user" | "agent";
   text: string;
   ts: string;
   streaming?: boolean;
+  searches?: SearchCall[];
+  tool_calls?: ToolCall[];
+}
+
+function summarizeSearch(s: SearchCall): string {
+  const verb = s.status === "completed" ? "✓" : "▸";
+  switch (s.action) {
+    case "search":
+      return `${verb} ${s.status === "completed" ? "Searched" : "Searching"}: ${s.detail || "…"}`;
+    case "open_page": {
+      let host = s.detail;
+      try { host = new URL(s.detail).hostname; } catch { /* keep raw */ }
+      return `${verb} ${s.status === "completed" ? "Opened" : "Opening"}: ${host}`;
+    }
+    case "find_in_page":
+      return `${verb} ${s.status === "completed" ? "Searched in page" : "Searching in page"}: ${s.detail}`;
+    default:
+      return `${verb} ${s.action}`;
+  }
+}
+
+function summarizeTool(t: ToolCall): string {
+  const verb = t.status === "completed" ? "✓" : t.status === "error" ? "✗" : "▸";
+  // Try to extract a useful detail from arguments — for web_fetch that's the URL.
+  let detail = "";
+  if (t.arguments) {
+    try {
+      const args = JSON.parse(t.arguments);
+      if (typeof args.url === "string") {
+        try { detail = new URL(args.url).hostname; } catch { detail = args.url; }
+      }
+    } catch { /* show name only */ }
+  }
+  const head = t.status === "completed"
+    ? `${verb} ${t.name}`
+    : t.status === "error"
+    ? `${verb} ${t.name} failed`
+    : `${verb} ${t.name}`;
+  return detail ? `${head}: ${detail}` : head;
 }
 
 interface UsageInfo {
@@ -103,8 +157,79 @@ export function LiveChat() {
       setPending(true);
       setMessages((prev) => [
         ...prev,
-        { role: "agent", text: "", ts: fmtTime(), streaming: true },
+        { role: "agent", text: "", ts: fmtTime(), streaming: true, searches: [], tool_calls: [] },
       ]);
+    });
+
+    evtSrc.addEventListener("tool_call", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        const call: ToolCall = {
+          call_id: data.call_id,
+          status: data.status ?? "in_progress",
+          name: data.name ?? "",
+          arguments: data.arguments,
+          output_preview: data.output_preview,
+          output_bytes: data.output_bytes,
+        };
+        setMessages((prev) => {
+          const out = [...prev];
+          const last = out[out.length - 1];
+          if (!last || last.role !== "agent" || !last.streaming) return prev;
+          const tool_calls = [...(last.tool_calls ?? [])];
+          // Match completed/error to the in-progress chip with the same call_id.
+          if (call.status !== "in_progress") {
+            const idx = tool_calls.findIndex((t) => t.call_id === call.call_id);
+            if (idx >= 0) {
+              // Preserve original arguments since server omits them on completion.
+              tool_calls[idx] = { ...tool_calls[idx], ...call, arguments: tool_calls[idx].arguments ?? call.arguments };
+            } else {
+              tool_calls.push(call);
+            }
+          } else {
+            tool_calls.push(call);
+          }
+          out[out.length - 1] = { ...last, tool_calls };
+          return out;
+        });
+      } catch {
+        // skip malformed
+      }
+    });
+
+    evtSrc.addEventListener("web_search_call", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        const call: SearchCall = {
+          status: data.status ?? "in_progress",
+          action: data.action ?? "unknown",
+          detail: data.detail ?? "",
+        };
+        setMessages((prev) => {
+          const out = [...prev];
+          const last = out[out.length - 1];
+          if (!last || last.role !== "agent" || !last.streaming) return prev;
+          const searches = [...(last.searches ?? [])];
+          // Match completed -> in_progress by (action, detail) so the same
+          // chip flips state instead of duplicating. detail can be empty on
+          // in_progress (codex emits action only on done) — fall back to
+          // updating the last chip in that case.
+          if (call.status === "completed") {
+            const idx = searches.findIndex(
+              (s) => s.status === "in_progress" &&
+                     (s.action === call.action || s.action === "unknown" || call.detail === s.detail)
+            );
+            if (idx >= 0) searches[idx] = call;
+            else searches.push(call);
+          } else {
+            searches.push(call);
+          }
+          out[out.length - 1] = { ...last, searches };
+          return out;
+        });
+      } catch {
+        // skip malformed
+      }
     });
 
     evtSrc.addEventListener("agent_message_delta", (e: MessageEvent) => {
@@ -242,6 +367,33 @@ export function LiveChat() {
             fallback={<UserMsg time={m.ts}>{m.text}</UserMsg>}
           >
             <AgentMsg time={m.ts}>
+              <Show when={(m.searches?.length ?? 0) + (m.tool_calls?.length ?? 0) > 0}>
+                <div style={{
+                  display: "flex",
+                  "flex-direction": "column",
+                  gap: "2px",
+                  "margin-bottom": "8px",
+                  "font-family": "var(--font-mono)",
+                  "font-size": "11px",
+                  color: "var(--ink-3)",
+                }}>
+                  <For each={m.searches!}>{(s) => (
+                    <div style={{
+                      opacity: s.status === "completed" ? 1 : 0.7,
+                    }}>
+                      {summarizeSearch(s)}
+                    </div>
+                  )}</For>
+                  <For each={m.tool_calls!}>{(t) => (
+                    <div style={{
+                      opacity: t.status === "completed" ? 1 : t.status === "error" ? 1 : 0.7,
+                      color: t.status === "error" ? "#d97070" : "var(--ink-3)",
+                    }}>
+                      {summarizeTool(t)}
+                    </div>
+                  )}</For>
+                </div>
+              </Show>
               {/* Plain text + blinker for streaming. We deliberately don't use
                   StreamText here: its lk-tok fade-in animation re-triggers on
                   every delta (esp. CJK where /\s+/ split produces one token),
