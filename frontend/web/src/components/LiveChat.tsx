@@ -9,9 +9,23 @@ import { BrainWidget } from "./BrainWidget";
 import { Rail, TopBar } from "./Workbench";
 import { SafeMarkdown } from "./SafeMarkdown";
 import { ArtifactPanel } from "./ArtifactCards";
+import { SessionMenu, type SessionRow } from "./SessionMenu";
 import type { Scene } from "../scenes";
 
-const SESSION_ID = "live";
+const DEFAULT_SESSION_ID = "live";
+
+function readSessionFromHash(): string {
+  const h = window.location.hash.replace(/^#/, "");
+  if (h.startsWith("s/")) return h.slice(2);
+  return DEFAULT_SESSION_ID;
+}
+function writeSessionToHash(id: string) {
+  if (id === DEFAULT_SESSION_ID) {
+    if (window.location.hash) history.replaceState(null, "", window.location.pathname);
+  } else {
+    window.location.hash = `s/${id}`;
+  }
+}
 
 interface SearchCall {
   status: "in_progress" | "completed" | string;
@@ -93,6 +107,8 @@ interface LiveTick {
 }
 
 export function LiveChat() {
+  const [sessionId, setSessionId] = createSignal<string>(readSessionFromHash());
+  const [sessions, setSessions] = createSignal<SessionRow[]>([]);
   const [messages, setMessages] = createSignal<LiveMsg[]>([]);
   const [usage, setUsage] = createSignal<UsageInfo | null>(null);
   const [error, setError] = createSignal<string | null>(null);
@@ -109,6 +125,52 @@ export function LiveChat() {
   let chatScrollEl: HTMLDivElement | undefined;
   let agentStartTs = 0;
   let elapsedTimer: number | undefined;
+
+  async function refreshSessions() {
+    try {
+      const r = await fetch("/api/v1/sessions");
+      if (r.ok) {
+        const j = await r.json();
+        setSessions(j.items ?? []);
+      }
+    } catch {/* ignore */}
+  }
+
+  async function createSession() {
+    try {
+      const r = await fetch("/api/v1/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "untitled session" }),
+      });
+      if (!r.ok) return;
+      const j = await r.json();
+      await refreshSessions();
+      switchSession(j.id);
+    } catch {/* ignore */}
+  }
+
+  async function renameSession(id: string, title: string) {
+    try {
+      await fetch(`/api/v1/sessions/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      });
+      await refreshSessions();
+    } catch {/* ignore */}
+  }
+
+  async function deleteSession(id: string) {
+    try {
+      await fetch(`/api/v1/sessions/${id}`, { method: "DELETE" });
+      await refreshSessions();
+      if (id === sessionId()) {
+        // Falling back to the default session keeps the UI in a known state.
+        switchSession(DEFAULT_SESSION_ID);
+      }
+    } catch {/* ignore */}
+  }
 
   function emitTick(e: MessageEvent, kind: string, payload: unknown) {
     // The SSE `id` field carries the backend-assigned vault.events.seq —
@@ -144,10 +206,13 @@ export function LiveChat() {
     });
   }
 
-  onMount(async () => {
+  async function connect(id: string) {
     // 1. Load history (refresh-survival)
+    setMessages([]);
+    setUsage(null);
+    setPending(false);
     try {
-      const r = await fetch(`/api/v1/sessions/${SESSION_ID}/messages?limit=200`);
+      const r = await fetch(`/api/v1/sessions/${id}/messages?limit=200`);
       if (r.ok) {
         const json = await r.json();
         const hist: LiveMsg[] = (json.items ?? []).map((m: any) => {
@@ -170,7 +235,7 @@ export function LiveChat() {
     }
 
     // 2. Subscribe to live event stream
-    evtSrc = new EventSource(`/stream/sessions/${SESSION_ID}/events`);
+    evtSrc = new EventSource(`/stream/sessions/${id}/events`);
 
     evtSrc.addEventListener("open", () => setConnected(true));
     evtSrc.onerror = () => {
@@ -331,6 +396,27 @@ export function LiveChat() {
       }
       setPending(false);
     });
+  }
+
+  function switchSession(id: string) {
+    if (id === sessionId()) return;
+    evtSrc?.close();
+    evtSrc = undefined;
+    setSessionId(id);
+    writeSessionToHash(id);
+    void connect(id);
+  }
+
+  onMount(() => {
+    void connect(sessionId());
+    void refreshSessions();
+    // Pick up forward/back navigation that flips the session hash.
+    const onHash = () => {
+      const next = readSessionFromHash();
+      if (next !== sessionId()) switchSession(next);
+    };
+    window.addEventListener("hashchange", onHash);
+    onCleanup(() => window.removeEventListener("hashchange", onHash));
   });
 
   onCleanup(() => {
@@ -355,7 +441,7 @@ export function LiveChat() {
     // optimistic user message
     setMessages((prev) => [...prev, { role: "user", text, ts: fmtTime() }]);
     try {
-      const r = await fetch(`/api/v1/sessions/${SESSION_ID}/messages`, {
+      const r = await fetch(`/api/v1/sessions/${sessionId()}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content: { type: "text", text } }),
@@ -371,7 +457,7 @@ export function LiveChat() {
 
   async function stop() {
     try {
-      await fetch(`/api/v1/sessions/${SESSION_ID}/abort`, { method: "POST" });
+      await fetch(`/api/v1/sessions/${sessionId()}/abort`, { method: "POST" });
     } catch (e: any) {
       setError(e?.message ?? "abort failed");
     }
@@ -442,7 +528,7 @@ export function LiveChat() {
     if (turns === 0) return "0 turns";
     return `${turns} turn${turns > 1 ? "s" : ""} · ${pending() ? "live" : "ready"}`;
   };
-  const route = () => `~/sessions/${SESSION_ID}`;
+  const route = () => `~/sessions/${sessionId()}`;
 
   return (
     <div class="lk-app" data-screen-label="L.E.E.K · live">
@@ -452,8 +538,15 @@ export function LiveChat() {
 
         <section class="lk-chat">
           <div class="lk-chat-head">
-            <span class="lk-chat-head-title">{headTitle()}</span>
-            <div style={{ display: "flex", gap: "12px", "align-items": "center" }}>
+            <SessionMenu
+              sessions={sessions()}
+              currentId={sessionId()}
+              onSelect={switchSession}
+              onCreate={createSession}
+              onRename={renameSession}
+              onDelete={deleteSession}
+            />
+            <div style={{ display: "flex", gap: "12px", "align-items": "center", "margin-left": "auto" }}>
               <Show when={usage()}>
                 <span style={{ color: "var(--ink-3)", "font-size": "11px", "font-family": "var(--font-mono)" }}>
                   in={usage()!.inTokens} · out={usage()!.outTokens}
@@ -592,7 +685,7 @@ export function LiveChat() {
       </div>
 
       <EventsPanel
-        sessionId={SESSION_ID}
+        sessionId={sessionId()}
         open={eventsOpen()}
         onClose={() => setEventsOpen(false)}
         liveTick={liveTick()}

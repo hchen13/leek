@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -45,6 +45,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/health", get(health::handler))
         .route("/api/v1/corpus/graph", get(corpus::graph_handler))
         .route("/api/v1/corpus/doc", get(corpus::doc_handler))
+        .route(
+            "/api/v1/sessions",
+            get(sessions::list_handler).post(sessions::create_handler),
+        )
+        .route(
+            "/api/v1/sessions/{id}",
+            patch(sessions::patch_handler).delete(sessions::delete_handler),
+        )
         .route(
             "/api/v1/sessions/{id}/messages",
             post(messages::post_handler).get(messages::list_handler),
