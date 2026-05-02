@@ -10,6 +10,7 @@ import { Rail, TopBar } from "./Workbench";
 import { SafeMarkdown } from "./SafeMarkdown";
 import { ArtifactPanel } from "./ArtifactCards";
 import { SessionMenu, type SessionRow } from "./SessionMenu";
+import { CorpusDocModal, type CorpusDoc } from "./CorpusDocModal";
 import type { Scene } from "../scenes";
 
 const DEFAULT_SESSION_ID = "live";
@@ -101,8 +102,14 @@ interface UsageInfo {
   outTokens: number;
 }
 
-function fmtTime(d = new Date()) {
-  return d.toTimeString().slice(0, 5);
+function fmtTime(d: Date | string = new Date()): string {
+  // Render HH:MM in the user's local timezone. RFC3339 strings (UTC) get
+  // converted via Date(); Date instances pass through.
+  const date = typeof d === "string" ? new Date(d) : d;
+  if (Number.isNaN(date.getTime())) return "";
+  const h = String(date.getHours()).padStart(2, "0");
+  const m = String(date.getMinutes()).padStart(2, "0");
+  return `${h}:${m}`;
 }
 
 interface LiveTick {
@@ -125,6 +132,42 @@ export function LiveChat() {
   // Wall-clock seconds since the current agent reply started. Drives the
   // "thinking · 24s" status row above the streaming message.
   const [elapsedSec, setElapsedSec] = createSignal(0);
+  // Wiki preview modal — pop-able from brain node clicks AND corpus_search
+  // hit tile clicks AND in-modal wikilinks. Lives at this level so all three
+  // entry points share one modal stack.
+  const [openDoc, setOpenDoc] = createSignal<CorpusDoc | null>(null);
+  const [docLoading, setDocLoading] = createSignal(false);
+  const [docError, setDocError] = createSignal<string | null>(null);
+
+  async function openWiki(id: string, fallbackTitle = "") {
+    setDocLoading(true);
+    setDocError(null);
+    setOpenDoc({ id, title: fallbackTitle, tier: "", layer: "", tags: [], body: "" });
+    try {
+      const r = await fetch(`/api/v1/corpus/doc?id=${encodeURIComponent(id)}`);
+      if (!r.ok) {
+        setDocError(`HTTP ${r.status}`);
+        return;
+      }
+      const doc: CorpusDoc = await r.json();
+      setOpenDoc(doc);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "network error";
+      setDocError(msg);
+    } finally {
+      setDocLoading(false);
+    }
+  }
+  function closeWiki() { setOpenDoc(null); setDocError(null); }
+
+  createEffect(() => {
+    if (!openDoc()) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeWiki();
+    };
+    document.addEventListener("keydown", handler);
+    onCleanup(() => document.removeEventListener("keydown", handler));
+  });
 
   let evtSrc: EventSource | undefined;
   let agentBuffer = "";
@@ -213,34 +256,126 @@ export function LiveChat() {
   }
 
   async function connect(id: string) {
-    // 1. Load history (refresh-survival)
+    // 1. Load message + event history. Messages give us the chat backbone
+    //    (text, role, ts); events give us the tool_call / web_search /
+    //    narration trail we want to keep visible across reloads.
     setMessages([]);
     setUsage(null);
     setPending(false);
+
+    let hist: LiveMsg[] = [];
     try {
       const r = await fetch(`/api/v1/sessions/${id}/messages?limit=200`);
       if (r.ok) {
         const json = await r.json();
-        const hist: LiveMsg[] = (json.items ?? []).map((m: any) => {
+        hist = (json.items ?? []).map((m: any) => {
           let text = "";
-          try {
-            text = JSON.parse(m.content_json).text ?? "";
-          } catch {
-            // ignore
-          }
+          try { text = JSON.parse(m.content_json).text ?? ""; } catch {/* ignore */}
           return {
             role: m.role === "agent" ? "agent" : "user",
             text,
-            ts: typeof m.created_at === "string" ? m.created_at.slice(11, 16) : fmtTime(),
-          };
+            ts: fmtTime(m.created_at),
+            searches: [],
+            tool_calls: [],
+            narrations: [],
+          } as LiveMsg;
         });
-        setMessages(hist);
       }
-    } catch {
-      // history is optional
-    }
+    } catch {/* history is optional */}
 
-    // 2. Subscribe to live event stream
+    // 2. Replay events into agent messages so tool calls / searches /
+    //    narrations are visible after reload.
+    try {
+      const r = await fetch(`/api/v1/sessions/${id}/events?limit=5000`);
+      if (r.ok) {
+        const ev = await r.json();
+        const agentIdxs = hist.flatMap((m, i) => m.role === "agent" ? [i] : []);
+        let cursor = -1; // index into agentIdxs; advances on agent_message_start
+        let usageSnap: UsageInfo | null = null;
+        let lastSec: number | undefined;
+        for (const row of ev.items ?? []) {
+          const p = (() => { try { return JSON.parse(row.payload_json); } catch { return {}; } })();
+          switch (row.kind) {
+            case "agent_message_start":
+              cursor++;
+              break;
+            case "agent_message_end":
+              if (cursor >= 0 && cursor < agentIdxs.length) {
+                if (typeof p.message_seq === "number") {
+                  // Could correlate but we trust message order; nothing to do.
+                }
+              }
+              if (typeof lastSec === "number" && cursor < agentIdxs.length) {
+                hist[agentIdxs[cursor]].total_sec = lastSec;
+              }
+              break;
+            case "tool_call":
+              if (cursor >= 0 && cursor < agentIdxs.length) {
+                const msg = hist[agentIdxs[cursor]];
+                const calls = (msg.tool_calls ?? []) as ToolCall[];
+                const idx = calls.findIndex((t) => t.call_id === p.call_id);
+                const next: ToolCall = {
+                  call_id: p.call_id,
+                  status: p.status ?? "in_progress",
+                  name: p.name ?? "",
+                  arguments: p.arguments,
+                  output_preview: p.output_preview,
+                  output_bytes: p.output_bytes,
+                };
+                if (idx >= 0) {
+                  // Preserve arguments from in_progress event when completed
+                  // event doesn't carry them.
+                  calls[idx] = { ...calls[idx], ...next, arguments: calls[idx].arguments ?? next.arguments };
+                } else {
+                  calls.push(next);
+                }
+                msg.tool_calls = calls;
+              }
+              break;
+            case "web_search_call":
+              if (cursor >= 0 && cursor < agentIdxs.length) {
+                const msg = hist[agentIdxs[cursor]];
+                const searches = (msg.searches ?? []) as SearchCall[];
+                const sc: SearchCall = {
+                  status: p.status ?? "in_progress",
+                  action: p.action ?? "unknown",
+                  detail: p.detail ?? "",
+                };
+                if (sc.status === "completed") {
+                  const idx2 = searches.findIndex((s) =>
+                    s.status === "in_progress" &&
+                    (s.action === sc.action || s.action === "unknown" || s.detail === sc.detail));
+                  if (idx2 >= 0) searches[idx2] = sc;
+                  else searches.push(sc);
+                } else {
+                  searches.push(sc);
+                }
+                msg.searches = searches;
+              }
+              break;
+            case "agent_narration":
+              if (cursor >= 0 && cursor < agentIdxs.length) {
+                const msg = hist[agentIdxs[cursor]];
+                const ns = msg.narrations ?? [];
+                ns.push({ turn: typeof p.turn === "number" ? p.turn : 0, text: String(p.text ?? "") });
+                msg.narrations = ns;
+              }
+              break;
+            case "llm_usage":
+              usageSnap = {
+                inTokens: typeof p.input_tokens === "number" ? p.input_tokens : 0,
+                outTokens: typeof p.output_tokens === "number" ? p.output_tokens : 0,
+              };
+              break;
+          }
+        }
+        if (usageSnap) setUsage(usageSnap);
+      }
+    } catch {/* events optional */}
+
+    setMessages(hist);
+
+    // 3. Subscribe to live event stream
     evtSrc = new EventSource(`/stream/sessions/${id}/events`);
 
     evtSrc.addEventListener("open", () => setConnected(true));
@@ -259,17 +394,24 @@ export function LiveChat() {
     evtSrc.addEventListener("agent_message_start", (e: MessageEvent) => {
       agentBuffer = "";
       setPending(true);
-      setMessages((prev) => [
-        ...prev,
-        { role: "agent", text: "", ts: fmtTime(), streaming: true, searches: [], tool_calls: [] },
-      ]);
-      // Start the elapsed-time counter for the "thinking · Ns" status row.
-      agentStartTs = Date.now();
-      setElapsedSec(0);
-      if (elapsedTimer) clearInterval(elapsedTimer);
-      elapsedTimer = window.setInterval(() => {
-        setElapsedSec(Math.max(0, Math.floor((Date.now() - agentStartTs) / 1000)));
-      }, 1000);
+      // send() already inserted a streaming placeholder when the user hit
+      // Enter (so "thinking · Ns" appears instantly). If we got here on a
+      // server-initiated reply (e.g. resumed session), insert one now.
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (last && last.role === "agent" && last.streaming) return prev;
+        return [
+          ...prev,
+          { role: "agent", text: "", ts: fmtTime(), streaming: true, searches: [], tool_calls: [], narrations: [] },
+        ];
+      });
+      if (!elapsedTimer) {
+        agentStartTs = Date.now();
+        setElapsedSec(0);
+        elapsedTimer = window.setInterval(() => {
+          setElapsedSec(Math.max(0, Math.floor((Date.now() - agentStartTs) / 1000)));
+        }, 1000);
+      }
       try { emitTick(e, "agent_message_start", JSON.parse(e.data)); } catch { /* skip */ }
     });
 
@@ -465,8 +607,22 @@ export function LiveChat() {
 
   async function send(text: string) {
     setError(null);
-    // optimistic user message
-    setMessages((prev) => [...prev, { role: "user", text, ts: fmtTime() }]);
+    // Optimistic user message + immediate thinking placeholder so the
+    // user sees feedback within a frame instead of waiting for the
+    // backend's first SSE event (cold codex token refresh / network can
+    // burn 2-4s).
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", text, ts: fmtTime() },
+      { role: "agent", text: "", ts: fmtTime(), streaming: true, searches: [], tool_calls: [], narrations: [] },
+    ]);
+    setPending(true);
+    agentStartTs = Date.now();
+    setElapsedSec(0);
+    if (elapsedTimer) clearInterval(elapsedTimer);
+    elapsedTimer = window.setInterval(() => {
+      setElapsedSec(Math.max(0, Math.floor((Date.now() - agentStartTs) / 1000)));
+    }, 1000);
     try {
       const r = await fetch(`/api/v1/sessions/${sessionId()}/messages`, {
         method: "POST",
@@ -681,7 +837,10 @@ export function LiveChat() {
                       close). Once the message is done, render real markdown
                       so headers / tables / lists / code / links all show up.
                   */}
-                  <Show when={m.streaming} fallback={<SafeMarkdown source={m.text} />}>
+                  <Show
+                    when={m.streaming}
+                    fallback={<SafeMarkdown source={m.text} onWikiOpen={(id) => void openWiki(id)} />}
+                  >
                     <span>{m.text}</span>
                     <span class="lk-stream" />
                   </Show>
@@ -718,6 +877,7 @@ export function LiveChat() {
           searches={sessionSearches()}
           narrations={sessionNarrations()}
           activatedIds={activatedCorpusIds()}
+          onOpenDoc={openWiki}
         />
       </div>
 
@@ -727,6 +887,18 @@ export function LiveChat() {
         onClose={() => setEventsOpen(false)}
         liveTick={liveTick()}
       />
+
+      <Show when={openDoc()}>
+        {(doc) => (
+          <CorpusDocModal
+            doc={doc()}
+            loading={docLoading()}
+            error={docError()}
+            onClose={closeWiki}
+            onOpenDoc={(id) => void openWiki(id)}
+          />
+        )}
+      </Show>
     </div>
   );
 }
@@ -741,6 +913,7 @@ function CanvasArea(props: {
   searches: SearchCall[];
   narrations: NarrationStep[];
   activatedIds: string[];
+  onOpenDoc: (id: string, title?: string) => void;
 }) {
   const subtitle = () => props.scene === "thinking-shallow"
     ? "reasoning · live"
@@ -776,10 +949,16 @@ function CanvasArea(props: {
           searches={props.searches}
           tools={props.tools}
           narrations={props.narrations}
+          callbacks={{ onOpenDoc: (id, title) => props.onOpenDoc(id, title) }}
         />
       </Show>
 
-      <BrainWidget scene={props.scene} fireIds={undefined} activatedIds={props.activatedIds} />
+      <BrainWidget
+        scene={props.scene}
+        fireIds={undefined}
+        activatedIds={props.activatedIds}
+        onOpenDoc={(id, title) => props.onOpenDoc(id, title)}
+      />
     </div>
   );
 }

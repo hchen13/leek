@@ -42,13 +42,15 @@ export function ArtifactPanel(props: {
       position: "absolute",
       top: "70px",
       left: "36px",
-      right: "36px",
+      // Match the prototype's "stacked panel column" feel — a fixed-width
+      // ribbon down the left of the canvas, brain stays on the right.
+      width: "min(520px, 56%)",
       bottom: "20px",
       "padding-right": "8px",
       overflow: "auto",
       display: "flex",
       "flex-direction": "column",
-      gap: "12px",
+      gap: "10px",
     }}>
       <For each={props.narrations ?? []}>{(n) => <NarrationCard step={n} />}</For>
       <For each={props.searches}>{(s) => <SearchArtifact search={s} />}</For>
@@ -241,58 +243,37 @@ function CorpusSearchCard(props: { tool: ToolCallView; callbacks?: ArtifactCallb
 }
 
 function CorpusHitTile(props: { hit: CorpusHit; onOpen: () => void }) {
-  const tierLabel = () => {
-    const t = `${props.hit.tier} · ${props.hit.layer}`;
-    return t.length > 30 ? t.slice(0, 28) + "…" : t;
-  };
+  const tierLabel = () => `${props.hit.tier}·${props.hit.layer}`;
   return (
     <div
       onClick={props.onOpen}
+      title="Click to open the full wiki page"
       style={{
         cursor: "pointer",
-        padding: "10px 12px",
+        padding: "6px 10px",
         background: "rgba(255, 255, 255, 0.025)",
         border: "1px solid var(--line-1)",
-        "border-radius": "6px",
-        position: "relative",
-        overflow: "hidden",
+        "border-radius": "5px",
+        display: "flex",
+        "align-items": "center",
+        gap: "8px",
+        "min-height": "28px",
       }}
     >
-      <div style={{
-        display: "flex",
-        "justify-content": "space-between",
-        "align-items": "baseline",
-        "margin-bottom": "4px",
-      }}>
-        <span style={{ "font-weight": 600, "font-size": "13px", color: "var(--ink-0)" }}>
-          {props.hit.title}
-        </span>
-        <span style={{
-          "font-family": "var(--font-mono)",
-          "font-size": "10px",
-          color: "var(--ink-3)",
-        }}>{tierLabel()}</span>
-      </div>
-      <Show when={props.hit.snippet}>
-        <div style={{
-          color: "var(--ink-2)",
-          "font-size": "12px",
-          "line-height": 1.55,
-          "max-height": "76px",
-          overflow: "hidden",
-          position: "relative",
-        }}>
-          {props.hit.snippet}
-          {/* Fade-out gradient at the bottom hints there's more. */}
-          <div style={{
-            position: "absolute",
-            inset: "auto 0 0 0",
-            height: "30px",
-            background: "linear-gradient(to bottom, transparent, var(--bg-1) 92%)",
-            "pointer-events": "none",
-          }} />
-        </div>
-      </Show>
+      <span style={{
+        "font-size": "12.5px",
+        color: "var(--ink-0)",
+        flex: 1,
+        overflow: "hidden",
+        "text-overflow": "ellipsis",
+        "white-space": "nowrap",
+      }}>{props.hit.title}</span>
+      <span style={{
+        "font-family": "var(--font-mono)",
+        "font-size": "9.5px",
+        color: "var(--ink-3)",
+        "flex-shrink": 0,
+      }}>{tierLabel()}</span>
     </div>
   );
 }

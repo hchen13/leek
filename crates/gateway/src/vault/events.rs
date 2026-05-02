@@ -26,7 +26,11 @@ pub async fn list_for_session(
     since: Option<i64>,
     limit: Option<i64>,
 ) -> Result<Vec<EventRow>> {
-    let limit = limit.unwrap_or(500).clamp(1, 2000);
+    // Cap is generous: chat history reload wants the entire session's
+    // event log so tool calls / narrations rendered before reload don't
+    // disappear. SQLite handles 50k row scans easily over a session_id+seq
+    // index.
+    let limit = limit.unwrap_or(20_000).clamp(1, 100_000);
     let rows: Vec<EventRow> = sqlx::query_as(
         r#"
         SELECT seq, task_id, kind, payload_json, source, ts

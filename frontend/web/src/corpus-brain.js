@@ -295,24 +295,41 @@
     // edges as references to sim nodes
     const edges = activeEdges.map(([a, b]) => ({ a: simById[a], b: simById[b] })).filter(e => e.a && e.b);
 
-    // pulses — randomly fire along an edge to suggest "neuron firing"
+    // Pulses fire along edges between activated nodes — visualising the
+    // agent's reasoning as connections light up. No ambient/random firing:
+    // an empty activation set means a still graph.
     const pulses = [];
+    // Cache the list of edges that connect two activated nodes so we don't
+    // re-scan on every frame. Recomputed when activatedSet changes (cheap).
+    let activatedEdges = [];
+    let lastActivatedRev = -1;
+    let activatedRev = 0;
+    function refreshActivatedEdges() {
+      if (lastActivatedRev === activatedRev) return;
+      lastActivatedRev = activatedRev;
+      activatedEdges = edges.filter(e =>
+        state.activatedSet.has(e.a.ref.id) && state.activatedSet.has(e.b.ref.id)
+      );
+    }
     function maybeFire() {
-      // 1) deliberate firing if external set
+      // External directed firing (api.fire(ids)) — kept for explicit highlights.
       if (state.fireQueue.length) {
         const id = state.fireQueue.shift();
         const node = simById[id];
         if (node) {
           const adj = edges.filter(e => e.a === node || e.b === node);
-          adj.slice(0, 4).forEach(e => pulses.push({ e, t: 0, dur: 900 + Math.random() * 400, focal: true }));
+          adj.slice(0, 3).forEach(e => pulses.push({ e, t: 0, dur: 900 + Math.random() * 400, focal: true }));
           state.activeNode = node;
           state.activeUntil = performance.now() + 1800;
         }
       }
-      // 2) ambient
-      if (pulses.length < 6 && Math.random() < 0.04) {
-        const e = edges[Math.floor(Math.random() * edges.length)];
-        pulses.push({ e, t: 0, dur: 1200 + Math.random() * 800 });
+      // Subtle activated-path firing: only when ≥2 nodes activated AND there's
+      // an edge between them. Slow (5% per frame) and capped at 2 in flight.
+      refreshActivatedEdges();
+      if (activatedEdges.length === 0) return;
+      if (pulses.length < 2 && Math.random() < 0.012) {
+        const e = activatedEdges[Math.floor(Math.random() * activatedEdges.length)];
+        pulses.push({ e, t: 0, dur: 1400 + Math.random() * 600 });
       }
     }
 
@@ -433,9 +450,9 @@
         const isActiveEdge = state.activeNode && (e.a === state.activeNode || e.b === state.activeNode);
         const litEdge = Math.min(activationLevel(e.a), activationLevel(e.b));
         ctx.strokeStyle = isActiveEdge ? C.lineHi : C.line;
-        ctx.lineWidth = isActiveEdge ? 0.9 : 0.5;
-        // Background lines fade into a barely-visible web; activated edges pop.
-        ctx.globalAlpha = 0.06 + litEdge * 0.55;
+        ctx.lineWidth = isActiveEdge ? 0.9 : (0.5 + litEdge * 0.4);
+        // Always draw edges visible enough to read structure; activated edges pop.
+        ctx.globalAlpha = 0.22 + litEdge * 0.65;
         ctx.beginPath();
         ctx.moveTo(e.a.x, e.a.y);
         ctx.lineTo(e.b.x, e.b.y);
@@ -646,15 +663,16 @@
       cvs.style.cursor = 'default';
     });
 
-    // Pre-warm: run the physics off-screen for a few hundred ticks so the
-    // graph is already mostly settled by the time the user sees it. Without
-    // this, the brain visibly springs around for ~3-4 seconds on every
-    // page load — looks like a glitch, not an intent. We boost cooling
-    // during warmup to converge quickly, then drop it back to the slow
-    // ambient drift speed so the brain still feels alive.
-    state.cooling = 1.0;
-    for (let i = 0; i < 240; i++) step(16);
-    state.cooling = 0.22;
+    // Pre-warm: run the physics off-screen so the graph is already settled
+    // when the user first sees it. Two stages: fast convergence (high
+    // cooling, big steps) then a small calm-down so the residual jitter is
+    // imperceptible. After warmup we keep a *very* low cooling so the
+    // graph is essentially static unless explicitly perturbed.
+    state.cooling = 1.5;
+    for (let i = 0; i < 800; i++) step(16);
+    state.cooling = 0.4;
+    for (let i = 0; i < 200; i++) step(16);
+    state.cooling = 0.06;
 
     // raf loop
     let last = performance.now();
@@ -679,6 +697,7 @@
       // [] to reset (e.g. on /clear). Empty set = "everything dimly lit".
       setActivated(ids) {
         state.activatedSet = new Set(ids || []);
+        activatedRev += 1;
       },
       // public: reset viewport pan to default (no offset).
       recenter() {
