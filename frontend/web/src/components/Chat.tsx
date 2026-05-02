@@ -127,6 +127,12 @@ export function ClarifyCard(props: { question: string; opts: string[]; picked?: 
 
 /* ---------- composer ---------- */
 
+export interface SlashCommand {
+  name: string;
+  hint?: string;
+  run: () => void;
+}
+
 export function Composer(props: {
   value?: string;
   placeholder?: string;
@@ -134,14 +140,33 @@ export function Composer(props: {
   onSubmit?: (text: string) => void;
   onStop?: () => void;
   pending?: boolean;
+  commands?: SlashCommand[];
 }) {
   const [text, setText] = createSignal(props.value ?? "");
+  const [hl, setHl] = createSignal(0);
   const placeholder = () => props.placeholder ?? "Ask the kernel — query a name, draft a thesis, or run a screen…";
   const canSend = () => !props.pending && text().trim().length > 0;
+  const trimmed = () => text().trim();
+  const slashMode = () => trimmed().startsWith("/");
+  const matches = () => {
+    if (!slashMode()) return [] as SlashCommand[];
+    const q = trimmed().slice(1).toLowerCase();
+    return (props.commands ?? []).filter((c) => c.name.toLowerCase().startsWith(q));
+  };
+  const runMatch = (c: SlashCommand) => { c.run(); setText(""); setHl(0); };
   const submit = () => {
+    if (props.pending) return;
+    if (slashMode()) {
+      const m = matches();
+      const pick = m[hl()] ?? m[0];
+      if (pick) { runMatch(pick); return; }
+      // unknown slash command — fall through to send literal text so the
+      // user gets feedback rather than silent failure
+    }
     if (!canSend()) return;
     const t = text();
     setText("");
+    setHl(0);
     props.onSubmit?.(t);
   };
   // Track IME composition state so Enter doesn't fire while picking
@@ -153,15 +178,23 @@ export function Composer(props: {
   const onCompositionStart = () => { composing = true; };
   const onCompositionEnd = () => { composing = false; };
   const onKey = (e: KeyboardEvent) => {
+    if (matches().length > 0) {
+      if (e.key === "ArrowDown") { e.preventDefault(); setHl((h) => Math.min(h + 1, matches().length - 1)); return; }
+      if (e.key === "ArrowUp")   { e.preventDefault(); setHl((h) => Math.max(h - 1, 0)); return; }
+      if (e.key === "Tab")       { e.preventDefault(); const m = matches()[hl()]; if (m) setText("/" + m.name); return; }
+    }
     if (e.key === "Escape" && props.pending) {
       e.preventDefault();
       props.onStop?.();
       return;
     }
+    if (e.key === "Escape" && slashMode()) {
+      e.preventDefault();
+      setText("");
+      setHl(0);
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey && !props.pending) {
-      // `isComposing` is the spec field; `composing` is our local flag
-      // (some browsers fire keydown after compositionend in the same
-      // tick before isComposing flips back, so we belt-and-suspenders).
       if (e.isComposing || composing || (e as KeyboardEvent & { keyCode?: number }).keyCode === 229) return;
       e.preventDefault();
       submit();
@@ -169,6 +202,20 @@ export function Composer(props: {
   };
   return (
     <div class="lk-composer">
+      <Show when={matches().length > 0}>
+        <div class="lk-slash-menu">
+          <For each={matches()}>{(c, i) => (
+            <div
+              class={`lk-slash-item${i() === hl() ? " active" : ""}`}
+              onMouseEnter={() => setHl(i())}
+              onClick={() => runMatch(c)}
+            >
+              <span class="cmd">/{c.name}</span>
+              <Show when={c.hint}><span class="hint">{c.hint}</span></Show>
+            </div>
+          )}</For>
+        </div>
+      </Show>
       <div
         class="lk-composer-box"
         style={props.focus ? { "border-color": "rgba(217,119,87,0.45)", "box-shadow": "0 0 0 3px rgba(217,119,87,0.07)" } : {}}

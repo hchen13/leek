@@ -3,12 +3,12 @@
 // StreamText / Composer); only the data source is different.
 
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
-import { AgentMsg, Composer, UserMsg } from "./Chat";
+import { AgentMsg, Composer, UserMsg, type SlashCommand } from "./Chat";
 import { EventsPanel } from "./EventsPanel";
 import { BrainWidget } from "./BrainWidget";
 import { Rail, TopBar } from "./Workbench";
 import { SafeMarkdown } from "./SafeMarkdown";
-import { ArtifactPanel } from "./ArtifactCards";
+import { ArtifactPanel, extractLinkMeta } from "./ArtifactCards";
 import { SessionMenu, type SessionRow } from "./SessionMenu";
 import { CorpusDocModal, type CorpusDoc } from "./CorpusDocModal";
 import type { Scene } from "../scenes";
@@ -32,6 +32,25 @@ interface SearchCall {
   status: "in_progress" | "completed" | string;
   action: "search" | "open_page" | "find_in_page" | "other" | "unknown" | string;
   detail: string;
+}
+
+/** Stable id for a search call so chat-row clicks can locate the canvas tile.
+ *  Tool calls have a real `call_id`; searches don't, so we hash action+detail. */
+function searchKey(s: SearchCall): string {
+  return `search:${s.action}:${(s.detail || "").slice(0, 120)}`;
+}
+
+/** Scroll the canvas card with the matching `data-call-id` into view and
+ *  briefly highlight it. */
+function scrollToCanvasCard(callId: string | undefined) {
+  if (!callId) return;
+  const el = document.querySelector(`[data-call-id="${(window as any).CSS ? CSS.escape(callId) : callId}"]`) as HTMLElement | null;
+  if (!el) return;
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.classList.remove("lk-card-flash"); // restart animation if already added
+  void el.offsetWidth;
+  el.classList.add("lk-card-flash");
+  window.setTimeout(() => el.classList.remove("lk-card-flash"), 900);
 }
 
 interface ToolCall {
@@ -79,13 +98,23 @@ function summarizeSearch(s: SearchCall): string {
 
 function summarizeTool(t: ToolCall): string {
   const verb = t.status === "completed" ? "✓" : t.status === "error" ? "✗" : "▸";
-  // Try to extract a useful detail from arguments — for web_fetch that's the URL.
+  // Pull the most user-meaningful field out of the arguments — URL host for
+  // web_fetch, the query string for corpus_search, the symbol for quotes.
   let detail = "";
   if (t.arguments) {
     try {
       const args = JSON.parse(t.arguments);
       if (typeof args.url === "string") {
-        try { detail = new URL(args.url).hostname; } catch { detail = args.url; }
+        try { detail = new URL(args.url).hostname.replace(/^www\./, ""); }
+        catch { detail = args.url; }
+      } else if (typeof args.query === "string") {
+        detail = `"${args.query}"`;
+      } else if (typeof args.ts_code === "string") {
+        detail = args.ts_code;
+      } else if (Array.isArray(args.tickers)) {
+        detail = (args.tickers as string[]).slice(0, 3).join(", ");
+      } else if (typeof args.ticker === "string") {
+        detail = args.ticker;
       }
     } catch { /* show name only */ }
   }
@@ -585,8 +614,35 @@ export function LiveChat() {
       if (next !== sessionId()) switchSession(next);
     };
     window.addEventListener("hashchange", onHash);
+    // Restore the chat column width preference saved last drag session.
+    const saved = localStorage.getItem("lk-chat-col");
+    if (saved && /^\d+px$/.test(saved)) {
+      document.documentElement.style.setProperty("--lk-chat-col", saved);
+    }
     onCleanup(() => window.removeEventListener("hashchange", onHash));
   });
+
+  // Drag the chat ↔ canvas seam. Bound at run-time on mousedown so we don't
+  // pay listener overhead while idle.
+  function startResize(e: MouseEvent) {
+    e.preventDefault();
+    const target = e.currentTarget as HTMLElement;
+    target.classList.add("dragging");
+    const railWidth = 56; // .lk-app rail column width
+    const onMove = (ev: MouseEvent) => {
+      const x = Math.max(280, Math.min(window.innerWidth - 360, ev.clientX - railWidth));
+      document.documentElement.style.setProperty("--lk-chat-col", `${x}px`);
+    };
+    const onUp = () => {
+      target.classList.remove("dragging");
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      const v = document.documentElement.style.getPropertyValue("--lk-chat-col");
+      if (v) localStorage.setItem("lk-chat-col", v.trim());
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
 
   onCleanup(() => {
     evtSrc?.close();
@@ -646,6 +702,26 @@ export function LiveChat() {
     }
   }
 
+  // Slash menu actions. /clear clears the current session's chat view (not the
+  // backend history — full reload still brings it back). /new spins up a fresh
+  // session so the user can start clean without polluting the current one.
+  const slashCommands: SlashCommand[] = [
+    {
+      name: "clear",
+      hint: "清空当前对话视图",
+      run: () => {
+        setMessages([]);
+        setUsage(null);
+        setError(null);
+      },
+    },
+    {
+      name: "new",
+      hint: "新建 session",
+      run: () => { void createSession(); },
+    },
+  ];
+
   // Derive a Scene from real session state so the Workbench shell (canvas
   // header / brain meta / etc) shows the right form. `idle` until a turn
   // happens; `thinking-shallow` while pending; `delivered` once a reply
@@ -680,6 +756,24 @@ export function LiveChat() {
     for (const m of messages()) {
       if (m.role !== "agent" || !m.searches) continue;
       for (const s of m.searches) out.push(s);
+    }
+    return out;
+  });
+
+  // Harvest page titles from web_fetch tool calls so chat-side plain URL
+  // autolinks render as the real page title instead of just a hostname.
+  const urlTitles = createMemo<Record<string, string>>(() => {
+    const out: Record<string, string> = {};
+    for (const t of sessionTools()) {
+      if (t.name !== "web_fetch" || !t.output_preview) continue;
+      let url = "";
+      try {
+        const args = JSON.parse(t.arguments ?? "{}");
+        if (typeof args.url === "string") url = args.url;
+      } catch { continue; }
+      if (!url) continue;
+      const meta = extractLinkMeta(t.output_preview);
+      if (meta.title) out[url] = meta.title;
     }
     return out;
   });
@@ -815,17 +909,31 @@ export function LiveChat() {
                       color: "var(--ink-3)",
                     }}>
                       <For each={m.searches!}>{(s) => (
-                        <div style={{
-                          opacity: s.status === "completed" ? 1 : 0.7,
-                        }}>
+                        <div
+                          onClick={() => scrollToCanvasCard(searchKey(s))}
+                          title="跳到画布"
+                          style={{
+                            opacity: s.status === "completed" ? 1 : 0.7,
+                            cursor: "pointer",
+                            "border-radius": "3px",
+                            "padding-left": "2px",
+                          }}
+                        >
                           {summarizeSearch(s)}
                         </div>
                       )}</For>
                       <For each={m.tool_calls!}>{(t) => (
-                        <div style={{
-                          opacity: t.status === "completed" ? 1 : t.status === "error" ? 1 : 0.7,
-                          color: t.status === "error" ? "#d97070" : "var(--ink-3)",
-                        }}>
+                        <div
+                          onClick={() => scrollToCanvasCard(t.call_id)}
+                          title="跳到画布"
+                          style={{
+                            opacity: t.status === "completed" ? 1 : t.status === "error" ? 1 : 0.7,
+                            color: t.status === "error" ? "#d97070" : "var(--ink-3)",
+                            cursor: "pointer",
+                            "border-radius": "3px",
+                            "padding-left": "2px",
+                          }}
+                        >
                           {summarizeTool(t)}
                         </div>
                       )}</For>
@@ -839,7 +947,7 @@ export function LiveChat() {
                   */}
                   <Show
                     when={m.streaming}
-                    fallback={<SafeMarkdown source={m.text} onWikiOpen={(id) => void openWiki(id)} />}
+                    fallback={<SafeMarkdown source={m.text} onWikiOpen={(id) => void openWiki(id)} urlTitles={urlTitles()} />}
                   >
                     <span>{m.text}</span>
                     <span class="lk-stream" />
@@ -868,8 +976,15 @@ export function LiveChat() {
             onSubmit={send}
             onStop={stop}
             pending={pending()}
+            commands={slashCommands}
           />
         </section>
+
+        <div
+          class="lk-resizer"
+          onMouseDown={startResize}
+          title="拖动调整 chat 宽度"
+        />
 
         <CanvasArea
           scene={derivedScene()}

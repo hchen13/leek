@@ -72,11 +72,14 @@ md.renderer.rules.link_open = (tokens, idx, opts, env, self) => {
   const rIdx = tok.attrIndex("rel");
   if (rIdx < 0) tok.attrPush(["rel", "noopener noreferrer"]);
 
-  // If next token is a text whose content equals the href (i.e. plain
-  // URL autolink, not [title](url)), shorten it to a hostname.
+  // If next token is a text whose content equals the href (i.e. plain URL
+  // autolink, not [title](url)), prefer the page title we cached from a
+  // prior web_fetch on this URL; fall back to a friendly hostname.
   const next = tokens[idx + 1];
   if (next && next.type === "text" && next.content && next.content === href) {
-    next.content = friendlyHost(href);
+    const titles = (env as { urlTitles?: Record<string, string> })?.urlTitles;
+    const title = titles?.[href];
+    next.content = title || friendlyHost(href);
   }
   return defaultLinkOpen(tokens, idx, opts, env, self);
 };
@@ -108,10 +111,15 @@ export function SafeMarkdown(props: {
    *  callback (preventDefault on the original click) so the host app
    *  controls navigation. Without it, clicks fall through. */
   onWikiOpen?: (id: string) => void;
+  /** Map of url → page title harvested from prior web_fetch tool calls.
+   *  Plain URL autolinks render with the cached title instead of a bare
+   *  hostname (so chat shows "Warren Buffett - Wikipedia" not "en.wikipedia.org"). */
+  urlTitles?: Record<string, string>;
 }) {
   const html = createMemo(() => {
     const rewritten = rewriteCorpusPaths(props.source ?? "");
-    const raw = md.render(rewritten);
+    const env = { urlTitles: props.urlTitles };
+    const raw = md.render(rewritten, env);
     return DOMPurify.sanitize(raw, {
       ADD_ATTR: ["target", "rel"],
       // Same as the DOMPurify default plus the `leek-wiki:` scheme used
