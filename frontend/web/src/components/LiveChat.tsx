@@ -30,6 +30,8 @@ interface LiveMsg {
   streaming?: boolean;
   searches?: SearchCall[];
   tool_calls?: ToolCall[];
+  /** Final elapsed seconds for the agent reply, frozen at message_end. */
+  total_sec?: number;
 }
 
 function summarizeSearch(s: SearchCall): string {
@@ -93,10 +95,15 @@ export function LiveChat() {
   const [connected, setConnected] = createSignal(false);
   const [eventsOpen, setEventsOpen] = createSignal(false);
   const [liveTick, setLiveTick] = createSignal<LiveTick | null>(null);
+  // Wall-clock seconds since the current agent reply started. Drives the
+  // "thinking · 24s" status row above the streaming message.
+  const [elapsedSec, setElapsedSec] = createSignal(0);
 
   let evtSrc: EventSource | undefined;
   let agentBuffer = "";
   let chatScrollEl: HTMLDivElement | undefined;
+  let agentStartTs = 0;
+  let elapsedTimer: number | undefined;
 
   function emitTick(e: MessageEvent, kind: string, payload: unknown) {
     // The SSE `id` field carries the backend-assigned vault.events.seq —
@@ -180,6 +187,13 @@ export function LiveChat() {
         ...prev,
         { role: "agent", text: "", ts: fmtTime(), streaming: true, searches: [], tool_calls: [] },
       ]);
+      // Start the elapsed-time counter for the "thinking · Ns" status row.
+      agentStartTs = Date.now();
+      setElapsedSec(0);
+      if (elapsedTimer) clearInterval(elapsedTimer);
+      elapsedTimer = window.setInterval(() => {
+        setElapsedSec(Math.max(0, Math.floor((Date.now() - agentStartTs) / 1000)));
+      }, 1000);
       try { emitTick(e, "agent_message_start", JSON.parse(e.data)); } catch { /* skip */ }
     });
 
@@ -279,14 +293,22 @@ export function LiveChat() {
     evtSrc.addEventListener("agent_message_end", (e: MessageEvent) => {
       setPending(false);
       setError(null);
+      if (elapsedTimer) {
+        clearInterval(elapsedTimer);
+        elapsedTimer = undefined;
+      }
+      const finalSec = agentStartTs ? Math.max(0, Math.floor((Date.now() - agentStartTs) / 1000)) : 0;
       setMessages((prev) => {
         const out = [...prev];
         const last = out[out.length - 1];
         if (last && last.role === "agent") {
-          out[out.length - 1] = { ...last, streaming: false };
+          // Freeze final elapsed time on the message itself so it stays
+          // visible after streaming ends (the live signal resets to 0).
+          out[out.length - 1] = { ...last, streaming: false, total_sec: finalSec };
         }
         return out;
       });
+      setElapsedSec(0);
       try { emitTick(e, "agent_message_end", JSON.parse(e.data)); } catch { /* skip */ }
     });
 
@@ -306,7 +328,10 @@ export function LiveChat() {
     });
   });
 
-  onCleanup(() => evtSrc?.close());
+  onCleanup(() => {
+    evtSrc?.close();
+    if (elapsedTimer) clearInterval(elapsedTimer);
+  });
 
   // Cmd+E / Ctrl+E toggles the events timeline drawer.
   createEffect(() => {
@@ -422,6 +447,19 @@ export function LiveChat() {
             fallback={<UserMsg time={m.ts}>{m.text}</UserMsg>}
           >
             <AgentMsg time={m.ts}>
+              <Show when={m.streaming || m.total_sec != null}>
+                <div style={{
+                  "font-family": "var(--font-mono)",
+                  "font-size": "10.5px",
+                  color: "var(--ink-3)",
+                  "margin-bottom": "6px",
+                  opacity: m.streaming ? 1 : 0.55,
+                }}>
+                  {m.streaming
+                    ? `▸ thinking · ${elapsedSec()}s`
+                    : `✓ done · ${m.total_sec}s`}
+                </div>
+              </Show>
               <Show when={(m.searches?.length ?? 0) + (m.tool_calls?.length ?? 0) > 0}>
                 <div style={{
                   display: "flex",
