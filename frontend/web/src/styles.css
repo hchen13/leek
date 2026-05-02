@@ -1375,3 +1375,21 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
 .lk-slash-item.active { background: rgba(217, 119, 87, 0.10); color: var(--ink-0); }
 .lk-slash-item .cmd { color: var(--clay-soft); font-weight: 600; min-width: 64px; }
 .lk-slash-item .hint { color: var(--ink-3); font-size: 11px; }
+
+/* Always-visible slash chips in composer-row (alternative to typing `/`) */
+.lk-composer-cmd {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-3);
+  background: transparent;
+  border: 1px solid var(--line-1);
+  border-radius: 5px;
+  padding: 2px 8px;
+  cursor: pointer;
+  transition: background 120ms, color 120ms, border-color 120ms;
+}
+.lk-composer-cmd:hover {
+  background: rgba(217, 119, 87, 0.10);
+  color: var(--ink-1);
+  border-color: rgba(217, 119, 87, 0.35);
+}

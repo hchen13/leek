@@ -230,6 +230,16 @@ export function Composer(props: {
           onCompositionEnd={onCompositionEnd}
         />
         <div class="lk-composer-row">
+          <Show when={!props.pending && (props.commands?.length ?? 0) > 0}>
+            <For each={props.commands}>{(c) => (
+              <button
+                type="button"
+                class="lk-composer-cmd"
+                title={c.hint}
+                onClick={() => { c.run(); setText(""); setHl(0); }}
+              >/{c.name}</button>
+            )}</For>
+          </Show>
           {props.pending ? (
             <button
               class="lk-composer-send"
