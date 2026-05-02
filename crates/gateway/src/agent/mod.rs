@@ -188,6 +188,11 @@ pub async fn run_chat_reply(
     let mut stop_reason = "end_turn".to_string();
     let mut additional_inputs: Vec<serde_json::Value> = Vec::new();
     let mut turn = 0usize;
+    // Length of `full_text` at the start of the current turn — used to
+    // slice out the text the model produced *during* this turn so we can
+    // distinguish narration (preceded a tool call) from the final reply
+    // (the last turn that had no pending tool calls).
+    let mut turn_text_anchor = 0usize;
 
     'turns: loop {
         if turn >= MAX_TOOL_TURNS {
@@ -218,6 +223,7 @@ pub async fn run_chat_reply(
 
         let mut stream = provider.chat(req).await?;
         let mut pending_calls: Vec<PendingCall> = Vec::new();
+        turn_text_anchor = full_text.chars().count();
 
         'stream: loop {
             tokio::select! {
@@ -329,6 +335,30 @@ pub async fn run_chat_reply(
         // No tool calls this turn → model is done.
         if pending_calls.is_empty() {
             break 'turns;
+        }
+
+        // Carve out the text the model produced *during this turn* — that's
+        // narration (it preceded a tool dispatch) rather than the final
+        // answer. We surface it as a separate event so the canvas can show
+        // "agent's reasoning" alongside the artifacts. The text already
+        // streamed into agent_message_delta above; we just attach a
+        // structured boundary marker on top.
+        let narration: String = full_text.chars().skip(turn_text_anchor).collect();
+        let narration_trimmed = narration.trim();
+        if !narration_trimmed.is_empty() {
+            publish_and_persist(
+                &pool,
+                &user_id,
+                &session_id,
+                task.as_ref().map(|t| t.task_id.as_str()),
+                &event_bus,
+                "agent_narration",
+                serde_json::json!({
+                    "turn": turn,
+                    "text": narration_trimmed,
+                }),
+            )
+            .await?;
         }
 
         // Execute pending tools sequentially (parallelism can come later;

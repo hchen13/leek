@@ -42,6 +42,11 @@ interface ToolCall {
   output_bytes?: number;
 }
 
+interface NarrationStep {
+  turn: number;
+  text: string;
+}
+
 interface LiveMsg {
   role: "user" | "agent";
   text: string;
@@ -49,6 +54,7 @@ interface LiveMsg {
   streaming?: boolean;
   searches?: SearchCall[];
   tool_calls?: ToolCall[];
+  narrations?: NarrationStep[];
   /** Final elapsed seconds for the agent reply, frozen at message_end. */
   total_sec?: number;
 }
@@ -350,6 +356,27 @@ export function LiveChat() {
       }
     });
 
+    evtSrc.addEventListener("agent_narration", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        emitTick(e, "agent_narration", data);
+        const step: NarrationStep = {
+          turn: typeof data.turn === "number" ? data.turn : 0,
+          text: String(data.text ?? ""),
+        };
+        setMessages((prev) => {
+          const out = [...prev];
+          const last = out[out.length - 1];
+          if (!last || last.role !== "agent" || !last.streaming) return prev;
+          const narrations = [...(last.narrations ?? []), step];
+          out[out.length - 1] = { ...last, narrations };
+          return out;
+        });
+      } catch {
+        // skip malformed
+      }
+    });
+
     evtSrc.addEventListener("llm_usage", (e: MessageEvent) => {
       try {
         const u = JSON.parse(e.data);
@@ -497,6 +524,15 @@ export function LiveChat() {
     for (const m of messages()) {
       if (m.role !== "agent" || !m.searches) continue;
       for (const s of m.searches) out.push(s);
+    }
+    return out;
+  });
+
+  const sessionNarrations = createMemo<NarrationStep[]>(() => {
+    const out: NarrationStep[] = [];
+    for (const m of messages()) {
+      if (m.role !== "agent" || !m.narrations) continue;
+      for (const n of m.narrations) out.push(n);
     }
     return out;
   });
@@ -680,6 +716,7 @@ export function LiveChat() {
           scene={derivedScene()}
           tools={sessionTools()}
           searches={sessionSearches()}
+          narrations={sessionNarrations()}
           activatedIds={activatedCorpusIds()}
         />
       </div>
@@ -702,6 +739,7 @@ function CanvasArea(props: {
   scene: Scene;
   tools: ToolCall[];
   searches: SearchCall[];
+  narrations: NarrationStep[];
   activatedIds: string[];
 }) {
   const subtitle = () => props.scene === "thinking-shallow"
@@ -710,7 +748,8 @@ function CanvasArea(props: {
     ? "ready · cached"
     : "no thread";
 
-  const hasArtifacts = () => props.tools.length + props.searches.length > 0;
+  const hasArtifacts = () =>
+    props.tools.length + props.searches.length + props.narrations.length > 0;
 
   return (
     <div class="lk-canvas">
@@ -736,6 +775,7 @@ function CanvasArea(props: {
         <ArtifactPanel
           searches={props.searches}
           tools={props.tools}
+          narrations={props.narrations}
         />
       </Show>
 

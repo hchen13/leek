@@ -22,6 +22,11 @@ export interface SearchCallView {
   detail: string;
 }
 
+export interface NarrationStep {
+  turn: number;
+  text: string;
+}
+
 interface ArtifactCallbacks {
   onOpenDoc?: (id: string, title: string) => void;
 }
@@ -29,6 +34,7 @@ interface ArtifactCallbacks {
 export function ArtifactPanel(props: {
   searches: SearchCallView[];
   tools: ToolCallView[];
+  narrations?: NarrationStep[];
   callbacks?: ArtifactCallbacks;
 }) {
   return (
@@ -44,10 +50,37 @@ export function ArtifactPanel(props: {
       "flex-direction": "column",
       gap: "12px",
     }}>
+      <For each={props.narrations ?? []}>{(n) => <NarrationCard step={n} />}</For>
       <For each={props.searches}>{(s) => <SearchArtifact search={s} />}</For>
       <For each={props.tools}>{(t) => (
         <ToolArtifact tool={t} callbacks={props.callbacks} />
       )}</For>
+    </div>
+  );
+}
+
+function NarrationCard(props: { step: NarrationStep }) {
+  return (
+    <div style={{
+      "border-left": "3px solid var(--clay)",
+      padding: "8px 14px",
+      background: "rgba(217, 119, 87, 0.04)",
+      "border-radius": "0 6px 6px 0",
+      "font-size": "12.5px",
+      "line-height": 1.55,
+      color: "var(--ink-1)",
+    }}>
+      <div style={{
+        "font-family": "var(--font-mono)",
+        "font-size": "10px",
+        "text-transform": "uppercase",
+        "letter-spacing": "0.06em",
+        color: "var(--clay-soft)",
+        "margin-bottom": "4px",
+      }}>
+        thinking · turn {props.step.turn + 1}
+      </div>
+      <SafeMarkdown source={props.step.text} />
     </div>
   );
 }
