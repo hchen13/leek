@@ -704,8 +704,9 @@ export function LiveChat() {
 
   // Slash menu actions, exposed both as visible chips in the composer row and
   // through typing `/` to filter. /clear clears the current view (not backend
-  // history — reload restores it). /new spins up a fresh session. /compact is
-  // a placeholder for the future LLM-side conversation summarisation step.
+  // history — reload restores it). /compact is a placeholder for the future
+  // LLM-side conversation summarisation step. (New-session is already in the
+  // SessionMenu dropdown so it doesn't need a slash entry.)
   const slashCommands: SlashCommand[] = [
     {
       name: "clear",
@@ -722,11 +723,6 @@ export function LiveChat() {
       run: () => {
         setError("/compact 待实现：当前 turn 不影响");
       },
-    },
-    {
-      name: "new",
-      hint: "新建 session",
-      run: () => { void createSession(); },
     },
   ];
 
