@@ -8,6 +8,7 @@ import { EventsPanel } from "./EventsPanel";
 import { BrainWidget } from "./BrainWidget";
 import { Rail, TopBar } from "./Workbench";
 import { SafeMarkdown } from "./SafeMarkdown";
+import { ArtifactPanel } from "./ArtifactCards";
 import type { Scene } from "../scenes";
 
 const SESSION_ID = "live";
@@ -639,33 +640,10 @@ function CanvasArea(props: {
           </div>
         }
       >
-        <div style={{
-          position: "absolute",
-          top: "70px",
-          left: "36px",
-          width: "min(480px, 60%)",
-          display: "flex",
-          "flex-direction": "column",
-          gap: "10px",
-        }}>
-          <For each={props.searches}>{(s) => (
-            <ArtifactCard
-              kind="search"
-              title={s.action === "search" ? "web_search" : s.action}
-              detail={s.detail}
-              status={s.status}
-            />
-          )}</For>
-          <For each={props.tools}>{(t) => (
-            <ArtifactCard
-              kind="tool"
-              title={t.name}
-              detail={extractDetail(t)}
-              status={t.status}
-              preview={t.output_preview}
-            />
-          )}</For>
-        </div>
+        <ArtifactPanel
+          searches={props.searches}
+          tools={props.tools}
+        />
       </Show>
 
       <BrainWidget scene={props.scene} fireIds={undefined} activatedIds={props.activatedIds} />
@@ -673,71 +651,3 @@ function CanvasArea(props: {
   );
 }
 
-function extractDetail(t: ToolCall): string {
-  if (!t.arguments) return "";
-  try {
-    const a = JSON.parse(t.arguments);
-    if (typeof a.url === "string") return a.url;
-    if (typeof a.query === "string") return a.query;
-    if (typeof a.ts_code === "string") return a.ts_code;
-    if (typeof a.ticker === "string") return a.ticker;
-    if (Array.isArray(a.tickers)) return a.tickers.join(", ");
-    return JSON.stringify(a).slice(0, 80);
-  } catch {
-    return t.arguments.slice(0, 80);
-  }
-}
-
-function ArtifactCard(props: {
-  kind: "search" | "tool";
-  title: string;
-  detail: string;
-  status: string;
-  preview?: string;
-}) {
-  const dotColor = () =>
-    props.status === "completed" ? "#9eb78f" :
-    props.status === "error" ? "#d97070" :
-    "#d9a76c";
-  return (
-    <div style={{
-      background: "var(--bg-1)",
-      border: "1px solid var(--bg-2)",
-      "border-radius": "8px",
-      padding: "10px 12px",
-      "font-family": "var(--font-mono)",
-      "font-size": "11px",
-    }}>
-      <div style={{ display: "flex", "align-items": "center", gap: "8px", "margin-bottom": "4px" }}>
-        <span style={{
-          width: "6px",
-          height: "6px",
-          "border-radius": "50%",
-          background: dotColor(),
-          display: "inline-block",
-        }} />
-        <span style={{ color: "var(--ink-2)", "font-weight": 600 }}>{props.title}</span>
-        <span style={{ color: "var(--ink-3)", "font-size": "10px" }}>{props.status}</span>
-      </div>
-      <div style={{
-        color: "var(--ink-3)",
-        "font-size": "11px",
-        overflow: "hidden",
-        "text-overflow": "ellipsis",
-        "white-space": "nowrap",
-      }}>{props.detail}</div>
-      <Show when={props.preview}>
-        <div style={{
-          "margin-top": "6px",
-          padding: "6px 8px",
-          background: "rgba(0,0,0,0.18)",
-          "border-radius": "4px",
-          "font-size": "10.5px",
-          color: "var(--ink-2)",
-          "max-height": "80px",
-          overflow: "hidden",
-        }}>{props.preview}</div>
-      </Show>
-    </div>
-  );
-}

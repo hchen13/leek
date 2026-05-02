@@ -183,8 +183,6 @@ export function Composer(props: {
           onCompositionEnd={onCompositionEnd}
         />
         <div class="lk-composer-row">
-          <span class="lk-chip-mini">corpus · 287 docs</span>
-          <span class="lk-chip-mini">tools · 5</span>
           {props.pending ? (
             <button
               class="lk-composer-send"

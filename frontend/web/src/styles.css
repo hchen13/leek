@@ -277,6 +277,8 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
+  overflow: hidden;
   background: linear-gradient(180deg, rgba(217, 119, 87, 0.012), transparent 30%);
 }
 .lk-chat-head {
@@ -353,6 +355,18 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
   color: var(--clay-soft);
 }
 .lk-md pre code { background: none; border: 0; padding: 0; color: inherit; }
+.lk-md {
+  /* Long URLs / inline code shouldn't blow out the chat column width. */
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.lk-md pre, .lk-md table {
+  /* Wide content (filings tables, hex dumps, etc.) should scroll
+     inside its own block instead of stretching the whole chat column. */
+  max-width: 100%;
+  overflow-x: auto;
+  display: block;
+}
 .lk-md table {
   border-collapse: collapse;
   margin: 8px 0;

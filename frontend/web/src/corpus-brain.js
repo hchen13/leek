@@ -393,20 +393,20 @@
       if (state.cooling > 0.18) state.cooling *= 0.997;
     }
 
-    // helper: which set of nodes is "lit"? When activatedSet is empty
-    // (fresh session), every node is lit equally — so the brain still
-    // looks alive at idle. Once the agent touches anything, the lit set
-    // narrows to those (+ their direct neighbours) and everything else
-    // dims dramatically.
-    function isLit(s) {
-      if (state.activatedSet.size === 0) return true;
-      if (state.activatedSet.has(s.ref.id)) return true;
-      // Light up direct neighbours so context lines stay readable
+    // The brain starts entirely dim/grey — a quiet substrate. Activation
+    // is the *only* way a node lights up to its real cluster colour. This
+    // way the user always sees a clear distinction between "agent has
+    // touched this concept" vs "background corpus".
+    //
+    // Direct neighbours of an activated node get a partial fade-in so the
+    // surrounding context structure is still readable.
+    function activationLevel(s) {
+      if (state.activatedSet.has(s.ref.id)) return 1;     // fully lit
       for (const e of edges) {
         if ((e.a === s && state.activatedSet.has(e.b.ref.id)) ||
-            (e.b === s && state.activatedSet.has(e.a.ref.id))) return true;
+            (e.b === s && state.activatedSet.has(e.a.ref.id))) return 0.5; // adjacent
       }
-      return false;
+      return 0; // background
     }
     function isActivated(s) {
       return state.activatedSet.has(s.ref.id);
@@ -431,10 +431,11 @@
       // edges
       edges.forEach(e => {
         const isActiveEdge = state.activeNode && (e.a === state.activeNode || e.b === state.activeNode);
-        const litEdge = isLit(e.a) && isLit(e.b);
+        const litEdge = Math.min(activationLevel(e.a), activationLevel(e.b));
         ctx.strokeStyle = isActiveEdge ? C.lineHi : C.line;
         ctx.lineWidth = isActiveEdge ? 0.9 : 0.5;
-        ctx.globalAlpha = litEdge ? 1 : 0.18;
+        // Background lines fade into a barely-visible web; activated edges pop.
+        ctx.globalAlpha = 0.06 + litEdge * 0.55;
         ctx.beginPath();
         ctx.moveTo(e.a.x, e.a.y);
         ctx.lineTo(e.b.x, e.b.y);
@@ -460,33 +461,39 @@
         ctx.shadowBlur = 0;
       }
 
+      // Background grey — used to render dim, unlit nodes. Tier colour is
+      // mixed in proportionally as activationLevel rises (fade-in effect).
+      const GREY = 'rgba(140, 130, 116, 1)';
+
       // nodes
       sim.forEach(s => {
         const C2 = colors();
         const col = C2[s.ref.t];
         const isActiveLegacy = (state.activeNode === s) && (now < state.activeUntil);
         const isHover  = state.hover === s;
-        const lit      = isLit(s);
+        const level    = activationLevel(s); // 0 / 0.5 / 1
         const activated = isActivated(s);
         const breathe = 1 + Math.sin((now - state.tStart) * 0.001 + s.x * 0.01) * 0.06;
         const r = s.r * breathe * (activated ? 1.4 : (isActiveLegacy ? 1.7 : (isHover ? 1.4 : 1)));
 
-        ctx.globalAlpha = lit ? 1 : 0.22;
-        if (isActiveLegacy || isHover || activated) {
+        // background nodes: dim grey low-opacity; activated: bright colour;
+        // adjacent (level=0.5): in-between with partial colour saturation.
+        ctx.globalAlpha = 0.22 + level * 0.78;
+        if (activated || isHover) {
           ctx.shadowColor = col;
           ctx.shadowBlur = activated ? 18 : 14;
         }
-        ctx.fillStyle = col;
+        ctx.fillStyle = level >= 1 ? col : (level >= 0.5 ? mixColor(GREY, col, 0.5) : GREY);
         ctx.beginPath();
         ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
         ctx.fill();
         ctx.shadowBlur = 0;
 
-        // outer ring on activated nodes (persistent halo) + legacy active pulse
+        // outer ring halo only for fully activated (or live pulse).
         if (activated || isActiveLegacy) {
           ctx.strokeStyle = col;
           ctx.lineWidth = 0.7;
-          ctx.globalAlpha = (lit ? 1 : 0.22) * 0.55;
+          ctx.globalAlpha = 0.5;
           ctx.beginPath();
           ctx.arc(s.x, s.y, r + 4, 0, Math.PI * 2);
           ctx.stroke();
@@ -524,6 +531,32 @@
       }
 
       ctx.restore();
+    }
+
+    // Mix two CSS colour strings (hex or rgb()) at ratio t (0=a, 1=b).
+    // Used so adjacent nodes show a partial fade-in between background grey
+    // and their tier colour.
+    function mixColor(a, b, t) {
+      const pa = parseColor(a), pb = parseColor(b);
+      if (!pa || !pb) return b;
+      const r = Math.round(pa[0] + (pb[0] - pa[0]) * t);
+      const g = Math.round(pa[1] + (pb[1] - pa[1]) * t);
+      const bb = Math.round(pa[2] + (pb[2] - pa[2]) * t);
+      return `rgb(${r}, ${g}, ${bb})`;
+    }
+    function parseColor(s) {
+      if (!s) return null;
+      const m = /^#([0-9a-fA-F]{6})$/.exec(s.trim());
+      if (m) {
+        const v = parseInt(m[1], 16);
+        return [(v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff];
+      }
+      const r = /^rgba?\(([^)]+)\)$/.exec(s.trim());
+      if (r) {
+        const parts = r[1].split(',').map(x => parseFloat(x.trim()));
+        return [parts[0] || 0, parts[1] || 0, parts[2] || 0];
+      }
+      return null;
     }
 
     function roundRect(ctx, x, y, w, h, r) {
@@ -612,6 +645,16 @@
       state.drag = null;
       cvs.style.cursor = 'default';
     });
+
+    // Pre-warm: run the physics off-screen for a few hundred ticks so the
+    // graph is already mostly settled by the time the user sees it. Without
+    // this, the brain visibly springs around for ~3-4 seconds on every
+    // page load — looks like a glitch, not an intent. We boost cooling
+    // during warmup to converge quickly, then drop it back to the slow
+    // ambient drift speed so the brain still feels alive.
+    state.cooling = 1.0;
+    for (let i = 0; i < 240; i++) step(16);
+    state.cooling = 0.22;
 
     // raf loop
     let last = performance.now();

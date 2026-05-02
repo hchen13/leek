@@ -76,7 +76,15 @@ DECISION HEURISTICS\n\
 - Multi-ticker comparison snapshot → `tradingview_quote`.\n\
 - News / current event / unknown entity → `web_search` first.\n\
 - User gives a URL → `web_fetch` directly.\n\
-- Multiple sub-questions → call tools in PARALLEL when independent.";
+- Multiple sub-questions → call tools in PARALLEL when independent.\n\n\
+\
+CITATION STYLE\n\
+- When citing a corpus document, use its human TITLE (e.g. \"Margin of \
+  Safety\", \"Long-term debt cycle\"), NEVER its internal path id like \
+  `wikis/principles/concepts/...`. Path ids are an implementation detail \
+  the user should not see.\n\
+- When citing a web URL, use a [Title](URL) markdown link with a short \
+  human-readable title; never paste a raw URL as the visible text.";
 
 /// Hard cap on tool-call rounds within a single user turn. Prevents runaway
 /// loops where the model keeps re-invoking tools without reaching a final
@@ -352,7 +360,7 @@ pub async fn run_chat_reply(
                     "name": call.name,
                     // Truncate output preview for SSE / UI; full output still
                     // goes to the model via additional_inputs below.
-                    "output_preview": preview(&output_str, 240),
+                    "output_preview": preview(&output_str, 2000),
                     "output_bytes": output_str.len(),
                 }),
             )

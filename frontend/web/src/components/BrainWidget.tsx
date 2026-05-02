@@ -4,6 +4,7 @@
 
 import { Show, createEffect, createSignal, onCleanup } from "solid-js";
 import type { Scene } from "../scenes";
+import { SafeMarkdown } from "./SafeMarkdown";
 
 interface BrainAPI {
   fire(ids: string[]): void;
@@ -227,17 +228,16 @@ function CorpusDocModal(props: {
             <div style={{ "font-size": "18px", "font-weight": 600 }}>
               {props.doc.title || props.doc.id}
             </div>
-            <div style={{
-              "font-family": "var(--font-mono)",
-              "font-size": "11px",
-              color: "var(--ink-3)",
-              "margin-top": "4px",
-            }}>
-              {props.doc.id}
-              <Show when={props.doc.tier && props.doc.layer}>
-                {" · "}{props.doc.tier} / {props.doc.layer}
-              </Show>
-            </div>
+            <Show when={props.doc.tier && props.doc.layer}>
+              <div style={{
+                "font-family": "var(--font-mono)",
+                "font-size": "11px",
+                color: "var(--ink-3)",
+                "margin-top": "4px",
+              }}>
+                {props.doc.tier} · {props.doc.layer}
+              </div>
+            </Show>
           </div>
           <button
             onClick={props.onClose}
@@ -275,7 +275,6 @@ function CorpusDocModal(props: {
           flex: 1,
           overflow: "auto",
           "padding-right": "8px",
-          "white-space": "pre-wrap",
           "font-size": "13px",
           "line-height": 1.6,
         }}>
@@ -287,7 +286,7 @@ function CorpusDocModal(props: {
               </div>
             }
           >
-            {props.doc.body}
+            <SafeMarkdown source={props.doc.body} />
           </Show>
         </div>
       </div>
