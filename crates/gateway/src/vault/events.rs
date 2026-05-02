@@ -3,7 +3,50 @@
 //! `events.seq` is per-session monotonic and **independent** from `messages.seq`.
 
 use anyhow::{Context, Result};
-use sqlx::SqlitePool;
+use serde::Serialize;
+use sqlx::{FromRow, SqlitePool};
+
+/// Wire shape returned by the events list endpoint.
+#[derive(Debug, FromRow, Serialize)]
+pub struct EventRow {
+    pub seq: i64,
+    #[sqlx(default)]
+    pub task_id: Option<String>,
+    pub kind: String,
+    pub payload_json: String,
+    #[sqlx(default)]
+    pub source: Option<String>,
+    pub ts: String,
+}
+
+pub async fn list_for_session(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    since: Option<i64>,
+    limit: Option<i64>,
+) -> Result<Vec<EventRow>> {
+    let limit = limit.unwrap_or(500).clamp(1, 2000);
+    let rows: Vec<EventRow> = sqlx::query_as(
+        r#"
+        SELECT seq, task_id, kind, payload_json, source, ts
+        FROM events
+        WHERE user_id = ?
+          AND session_id = ?
+          AND seq > ?
+        ORDER BY seq ASC
+        LIMIT ?
+        "#,
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(since.unwrap_or(0))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("listing events")?;
+    Ok(rows)
+}
 
 pub async fn insert(
     pool: &SqlitePool,

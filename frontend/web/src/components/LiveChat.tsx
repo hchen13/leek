@@ -4,6 +4,7 @@
 
 import { For, Show, createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { AgentMsg, Composer, UserMsg } from "./Chat";
+import { EventsPanel } from "./EventsPanel";
 
 const SESSION_ID = "live";
 
@@ -77,16 +78,34 @@ function fmtTime(d = new Date()) {
   return d.toTimeString().slice(0, 5);
 }
 
+interface LiveTick {
+  seq: number;
+  kind: string;
+  payload: unknown;
+  ts: string;
+}
+
 export function LiveChat() {
   const [messages, setMessages] = createSignal<LiveMsg[]>([]);
   const [usage, setUsage] = createSignal<UsageInfo | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const [pending, setPending] = createSignal(false);
   const [connected, setConnected] = createSignal(false);
+  const [eventsOpen, setEventsOpen] = createSignal(false);
+  const [liveTick, setLiveTick] = createSignal<LiveTick | null>(null);
 
   let evtSrc: EventSource | undefined;
   let agentBuffer = "";
   let chatScrollEl: HTMLDivElement | undefined;
+
+  function emitTick(e: MessageEvent, kind: string, payload: unknown) {
+    // The SSE `id` field carries the backend-assigned vault.events.seq —
+    // EventsPanel dedupes against that so live ticks merge cleanly with
+    // history reloads.
+    const seq = parseInt(e.lastEventId, 10);
+    if (!Number.isFinite(seq)) return;
+    setLiveTick({ seq, kind, payload, ts: new Date().toISOString() });
+  }
 
   // Auto-scroll to bottom whenever messages change (length OR last text changes
   // during streaming). Without this, new replies render below the viewport.
@@ -149,21 +168,25 @@ export function LiveChat() {
     };
 
     // Server echoes user_message — we already added it optimistically on send,
-    // so dedupe by ignoring this event.
-    evtSrc.addEventListener("user_message", () => {});
+    // so we dedupe in the chat view but still forward to EventsPanel.
+    evtSrc.addEventListener("user_message", (e: MessageEvent) => {
+      try { emitTick(e, "user_message", JSON.parse(e.data)); } catch { /* skip */ }
+    });
 
-    evtSrc.addEventListener("agent_message_start", () => {
+    evtSrc.addEventListener("agent_message_start", (e: MessageEvent) => {
       agentBuffer = "";
       setPending(true);
       setMessages((prev) => [
         ...prev,
         { role: "agent", text: "", ts: fmtTime(), streaming: true, searches: [], tool_calls: [] },
       ]);
+      try { emitTick(e, "agent_message_start", JSON.parse(e.data)); } catch { /* skip */ }
     });
 
     evtSrc.addEventListener("tool_call", (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data);
+        emitTick(e, "tool_call", data);
         const call: ToolCall = {
           call_id: data.call_id,
           status: data.status ?? "in_progress",
@@ -200,6 +223,7 @@ export function LiveChat() {
     evtSrc.addEventListener("web_search_call", (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data);
+        emitTick(e, "web_search_call", data);
         const call: SearchCall = {
           status: data.status ?? "in_progress",
           action: data.action ?? "unknown",
@@ -236,6 +260,7 @@ export function LiveChat() {
       try {
         const data = JSON.parse(e.data);
         if (typeof data.text === "string") appendDelta(data.text);
+        emitTick(e, "agent_message_delta", data);
       } catch {
         // skip malformed
       }
@@ -245,12 +270,13 @@ export function LiveChat() {
       try {
         const u = JSON.parse(e.data);
         setUsage({ inTokens: u.input_tokens ?? 0, outTokens: u.output_tokens ?? 0 });
+        emitTick(e, "llm_usage", u);
       } catch {
         // skip malformed
       }
     });
 
-    evtSrc.addEventListener("agent_message_end", () => {
+    evtSrc.addEventListener("agent_message_end", (e: MessageEvent) => {
       setPending(false);
       setError(null);
       setMessages((prev) => {
@@ -261,6 +287,7 @@ export function LiveChat() {
         }
         return out;
       });
+      try { emitTick(e, "agent_message_end", JSON.parse(e.data)); } catch { /* skip */ }
     });
 
     // task_created / task_delivered / clarification_requested are emitted by
@@ -280,6 +307,18 @@ export function LiveChat() {
   });
 
   onCleanup(() => evtSrc?.close());
+
+  // Cmd+E / Ctrl+E toggles the events timeline drawer.
+  createEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "e") {
+        e.preventDefault();
+        setEventsOpen((v) => !v);
+      }
+    };
+    document.addEventListener("keydown", handler);
+    onCleanup(() => document.removeEventListener("keydown", handler));
+  });
 
   async function send(text: string) {
     setError(null);
@@ -339,11 +378,27 @@ export function LiveChat() {
           }} />
           LIVE · session={SESSION_ID}
         </span>
-        <Show when={usage()}>
-          <span style={{ color: "var(--ink-3)" }}>
-            in={usage()!.inTokens} · out={usage()!.outTokens}
-          </span>
-        </Show>
+        <div style={{ display: "flex", gap: "12px", "align-items": "center" }}>
+          <Show when={usage()}>
+            <span style={{ color: "var(--ink-3)" }}>
+              in={usage()!.inTokens} · out={usage()!.outTokens}
+            </span>
+          </Show>
+          <button
+            onClick={() => setEventsOpen((v) => !v)}
+            title="Cmd/Ctrl+E"
+            style={{
+              background: eventsOpen() ? "var(--bg-2)" : "transparent",
+              border: "1px solid var(--bg-2)",
+              color: "var(--ink-2)",
+              "border-radius": "6px",
+              padding: "2px 10px",
+              cursor: "pointer",
+              "font-family": "var(--font-mono)",
+              "font-size": "11px",
+            }}
+          >events</button>
+        </div>
       </div>
 
       <div
@@ -424,6 +479,13 @@ export function LiveChat() {
         onSubmit={send}
         onStop={stop}
         pending={pending()}
+      />
+
+      <EventsPanel
+        sessionId={SESSION_ID}
+        open={eventsOpen()}
+        onClose={() => setEventsOpen(false)}
+        liveTick={liveTick()}
       />
     </div>
   );

@@ -53,6 +53,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/sessions/{id}/abort",
             post(sessions::abort_handler),
         )
+        .route(
+            "/api/v1/sessions/{id}/events",
+            get(sessions::events_handler),
+        )
         .route("/stream/sessions/{id}/events", get(stream::handler))
         .with_state(state)
         // Anything not matched above falls through to the embedded SPA
