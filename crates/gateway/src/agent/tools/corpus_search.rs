@@ -52,6 +52,32 @@ fn corpus_docs() -> &'static [CorpusDoc] {
     DOCS.get_or_init(load_corpus)
 }
 
+/// Read-only view of a corpus doc, exposed so the HTTP API can serve full
+/// document text (e.g. for the Brain widget's "click a node → see content"
+/// preview). Body string is owned to decouple from the lazy static lifetime
+/// at the trait boundary; the embedded data is not very large (~7MB total).
+#[derive(serde::Serialize)]
+pub struct CorpusDocView {
+    pub id: String,
+    pub title: String,
+    pub tier: String,
+    pub layer: String,
+    pub tags: Vec<String>,
+    pub body: String,
+}
+
+pub fn lookup_doc(id: &str) -> Option<CorpusDocView> {
+    let d = corpus_docs().iter().find(|d| d.id == id)?;
+    Some(CorpusDocView {
+        id: d.id.clone(),
+        title: d.title.clone(),
+        tier: d.tier.clone(),
+        layer: d.layer.clone(),
+        tags: d.tags.clone(),
+        body: d.body.clone(),
+    })
+}
+
 fn load_corpus() -> Vec<CorpusDoc> {
     let mut docs = Vec::new();
     for path in CorpusEmbed::iter() {

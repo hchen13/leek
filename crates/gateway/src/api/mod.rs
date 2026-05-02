@@ -44,6 +44,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(health::handler))
         .route("/api/v1/corpus/graph", get(corpus::graph_handler))
+        .route("/api/v1/corpus/doc", get(corpus::doc_handler))
         .route(
             "/api/v1/sessions/{id}/messages",
             post(messages::post_handler).get(messages::list_handler),

@@ -504,6 +504,19 @@
     });
     cvs.addEventListener('mouseleave', () => { state.hover = null; });
 
+    // click → caller's preview (e.g. open modal with wiki content)
+    cvs.addEventListener('click', (ev) => {
+      if (typeof opts.onNodeClick !== 'function') return;
+      const r = cvs.getBoundingClientRect();
+      const mx = ev.clientX - r.left, my = ev.clientY - r.top;
+      let best = null, bd = 100;
+      sim.forEach(s => {
+        const d = Math.hypot(s.x - mx, s.y - my);
+        if (d < 10 && d < bd) { bd = d; best = s; }
+      });
+      if (best) opts.onNodeClick(best.ref.id, { title: best.ref.l, tier: best.ref.t });
+    });
+
     // raf loop
     let last = performance.now();
     function loop(now) {

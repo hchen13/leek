@@ -5,8 +5,13 @@
 //! (corpus authoring) trigger a manual rebuild; we don't watch the corpus
 //! directory at runtime.
 
+use axum::extract::Query;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::Deserialize;
+
+use crate::agent::tools::corpus_search;
 
 const GRAPH_JSON: &str = include_str!("../../assets/corpus.graph.json");
 
@@ -23,4 +28,31 @@ pub async fn graph_handler() -> Response {
         GRAPH_JSON,
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct DocQuery {
+    /// Wikilink-style id (e.g. `wikis/principles/concepts/margin-of-safety`).
+    pub id: String,
+}
+
+/// Return a single corpus document's frontmatter + body. Used by the brain
+/// widget's node-click preview and any other "show me this wiki" UI surface.
+pub async fn doc_handler(Query(params): Query<DocQuery>) -> Response {
+    match corpus_search::lookup_doc(&params.id) {
+        Some(view) => (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, "public, max-age=300")],
+            Json(view),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "corpus doc not found",
+                "id": params.id,
+            })),
+        )
+            .into_response(),
+    }
 }
