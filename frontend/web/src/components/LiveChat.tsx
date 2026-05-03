@@ -94,67 +94,98 @@ interface LiveMsg {
   decision_draft?: DecisionDraftPayload;
 }
 
-/** Render a forked-session's compaction summary as a collapsible system
- *  card. Default collapsed (title + first line); click to expand the full
- *  structured markdown. */
+/** Context-compacted divider — shown at the head of every forked session.
+ *  Prominent horizontal rule signals the break; summary expands on click. */
 function CompactionSummaryCard(props: { time: string; markdown: string }) {
   const [open, setOpen] = createSignal(false);
-  // First non-empty line gives the user a one-line preview (typically the
-  // first heading or the leading sentence of "## 当前研究主题").
-  const preview = () => {
-    const lines = (props.markdown || "")
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l && !l.startsWith("##"));
-    return lines[0] ?? "(空摘要)";
-  };
   return (
-    <div
-      class="lk-msg lk-msg-compaction"
-      data-who="system"
-      style={{
-        border: "1px dashed rgba(217,119,87,0.35)",
-        "border-radius": "6px",
-        padding: "10px 12px",
-        margin: "8px 0",
-        background: "rgba(217,119,87,0.04)",
-      }}
-    >
+    <div class="lk-msg lk-msg-compaction" data-who="system" style={{ margin: "16px 0 8px" }}>
       <div
         onClick={() => setOpen((v) => !v)}
         style={{
-          cursor: "pointer",
-          "font-family": "var(--font-mono)",
-          "font-size": "11.5px",
-          color: "var(--ink-2)",
           display: "flex",
-          gap: "8px",
           "align-items": "center",
+          gap: "10px",
+          cursor: "pointer",
+          "user-select": "none",
         }}
       >
-        <span>📦</span>
-        <span style={{ "font-weight": 600 }}>压缩摘要</span>
-        <span style={{ color: "var(--ink-3)" }}>· {props.time}</span>
-        <Show when={!open()}>
-          <span style={{
-            color: "var(--ink-3)",
-            "margin-left": "8px",
-            "white-space": "nowrap",
-            overflow: "hidden",
-            "text-overflow": "ellipsis",
-          }}>
-            {preview()}
-          </span>
-        </Show>
-        <span style={{ "margin-left": "auto", color: "var(--ink-3)" }}>
-          {open() ? "收起 ▴" : "展开 ▾"}
+        <div style={{
+          flex: 1,
+          height: "1px",
+          background: "linear-gradient(90deg, transparent, rgba(217,119,87,0.5))",
+        }} />
+        <span style={{
+          "font-family": "var(--font-mono)",
+          "font-size": "10.5px",
+          color: "rgba(217,119,87,0.8)",
+          "letter-spacing": "0.12em",
+          "text-transform": "uppercase",
+          "white-space": "nowrap",
+          padding: "2px 8px",
+          border: "1px solid rgba(217,119,87,0.3)",
+          "border-radius": "20px",
+          background: "rgba(217,119,87,0.06)",
+        }}>
+          context compacted · {open() ? "收起 ▴" : "展开 ▾"}
         </span>
+        <div style={{
+          flex: 1,
+          height: "1px",
+          background: "linear-gradient(90deg, rgba(217,119,87,0.5), transparent)",
+        }} />
       </div>
       <Show when={open()}>
-        <div style={{ "margin-top": "10px", "font-size": "13px" }}>
+        <div style={{
+          margin: "10px 0 4px",
+          padding: "12px 14px",
+          background: "rgba(217,119,87,0.04)",
+          border: "1px dashed rgba(217,119,87,0.25)",
+          "border-radius": "6px",
+          "font-size": "13px",
+          "line-height": "1.6",
+        }}>
+          <div style={{
+            "font-family": "var(--font-mono)",
+            "font-size": "10px",
+            color: "var(--ink-3)",
+            "margin-bottom": "8px",
+          }}>{props.time}</div>
           <SafeMarkdown source={props.markdown} />
         </div>
       </Show>
+    </div>
+  );
+}
+
+/** Inline divider shown at the bottom of messages while compaction is running. */
+function CompactingDivider() {
+  return (
+    <div style={{ margin: "16px 0 8px", display: "flex", "align-items": "center", gap: "10px" }}>
+      <div style={{
+        flex: 1,
+        height: "1px",
+        background: "linear-gradient(90deg, transparent, rgba(217,119,87,0.4))",
+      }} />
+      <span style={{
+        "font-family": "var(--font-mono)",
+        "font-size": "10.5px",
+        color: "rgba(217,119,87,0.7)",
+        "letter-spacing": "0.1em",
+        "text-transform": "uppercase",
+        "white-space": "nowrap",
+        padding: "2px 8px",
+        border: "1px dashed rgba(217,119,87,0.3)",
+        "border-radius": "20px",
+        animation: "lk-blink 1.6s ease-in-out infinite",
+      }}>
+        compacting…
+      </span>
+      <div style={{
+        flex: 1,
+        height: "1px",
+        background: "linear-gradient(90deg, rgba(217,119,87,0.4), transparent)",
+      }} />
     </div>
   );
 }
@@ -601,6 +632,20 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
           }
         }
         if (usageSnap) setUsage(usageSnap);
+
+        // Restore compaction state: if the most recent compaction.started has
+        // no matching completed/aborted after it, compaction is still running.
+        let lastStartTs = "";
+        let lastEndTs = "";
+        for (const row of ev.items ?? []) {
+          if (row.kind === "compaction.started") lastStartTs = row.created_at ?? "";
+          if (row.kind === "compaction.completed" || row.kind === "compaction.aborted") {
+            lastEndTs = row.created_at ?? "";
+          }
+        }
+        if (lastStartTs && lastStartTs > lastEndTs) {
+          setCompacting(true);
+        }
       }
     } catch {/* events optional */}
 
@@ -1299,6 +1344,10 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
                 </AgentMsg>
               </Show>
             )}</For>
+
+            <Show when={compacting()}>
+              <CompactingDivider />
+            </Show>
 
             <Show when={error()}>
               <div style={{

@@ -79,6 +79,12 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
         }
     }
 
+    // Verbosity hint: only gpt-5.x (Responses API, codex backend) supports
+    // this field. "low" suppresses padding without changing reasoning budget.
+    if req.model.starts_with("gpt-5") {
+        body["text"] = serde_json::json!({ "verbosity": "low" });
+    }
+
     // Reasoning effort for gpt-5/gpt-5.5-style models. Omit when caller
     // didn't ask — backend uses the model's default level.
     if let Some(effort) = req.reasoning_effort {
