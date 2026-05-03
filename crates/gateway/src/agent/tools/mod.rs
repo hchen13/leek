@@ -9,6 +9,7 @@
 //! advertised through `ToolSpec::WebSearch` and execute on OpenAI's side.
 
 pub mod corpus_search;
+pub mod get_candlesticks;
 pub mod record_investment_action;
 pub mod sec_filing_fetch;
 pub mod tradingview_quote;

@@ -176,6 +176,7 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
 
     let tools = agent::tools::ToolRegistry::builder()
         .register(Arc::new(agent::tools::web_fetch::WebFetchTool::new()?))
+        .register(Arc::new(agent::tools::get_candlesticks::GetCandlesticksTool::new()?))
         .register(Arc::new(agent::tools::corpus_search::CorpusSearchTool::new()))
         .register(Arc::new(agent::tools::sec_filing_fetch::SecFilingFetchTool::new()?))
         .register(Arc::new(agent::tools::tushare_quote::TushareQuoteTool::new()?))
