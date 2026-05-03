@@ -674,16 +674,24 @@ export function LiveChat() {
         const data = JSON.parse(e.data) as { new_session_id?: string };
         const newId = data.new_session_id;
         if (newId) {
-          // Switch over — connect() will reload the new session's messages
+          // Switch over — connect() reloads the new session's messages
           // (including the compaction_summary head row) and SSE stream.
-          switchSession(newId);
+          // Await it so the post-flush optimistic push isn't clobbered by
+          // connect()'s in-flight setMessages(hist).
+          await switchSession(newId);
           await refreshSessions();
+          // Clear compacting flag BEFORE flushing the queue, otherwise
+          // send() sees `compacting() == true` and re-queues each message
+          // instead of POSTing it.
+          setCompacting(false);
+          setPendingCompactionTargetId(null);
           // Flush queued messages into the new session, in order.
           const queued = compactQueue();
           setCompactQueue([]);
           for (const text of queued) {
             await send(text);
           }
+          return;
         }
       } catch {
         // ignore — UI lock will clear regardless
@@ -713,13 +721,13 @@ export function LiveChat() {
     });
   }
 
-  function switchSession(id: string) {
+  async function switchSession(id: string) {
     if (id === sessionId()) return;
     evtSrc?.close();
     evtSrc = undefined;
     setSessionId(id);
     writeSessionToHash(id);
-    void connect(id);
+    await connect(id);
   }
 
   onMount(() => {
@@ -810,6 +818,27 @@ export function LiveChat() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content: { type: "text", text } }),
       });
+      if (r.status === 202) {
+        // Auto-compaction kicked off pre-turn: backend hasn't persisted our
+        // user message and won't start a reply. Roll back the optimistic UI
+        // and queue the text for re-send against the new session once
+        // `compaction.completed` SSE arrives.
+        const body = (await r.json().catch(() => ({}))) as {
+          auto_compacting?: boolean;
+        };
+        if (body.auto_compacting) {
+          setMessages((prev) => prev.slice(0, -2));
+          setPending(false);
+          if (elapsedTimer) {
+            clearInterval(elapsedTimer);
+            elapsedTimer = null;
+          }
+          setCompactQueue((q) => [...q, text]);
+          // SSE `compaction.started` will flip `compacting` on its own; the
+          // flush happens in the `compaction.completed` handler.
+          return;
+        }
+      }
       if (!r.ok) {
         const body = await r.text();
         setError(`POST ${r.status}: ${body.slice(0, 200)}`);

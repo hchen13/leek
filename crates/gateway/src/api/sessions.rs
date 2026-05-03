@@ -167,65 +167,83 @@ pub async fn compact_handler(
     Path(session_id): Path<String>,
     Json(body): Json<CompactBody>,
 ) -> Result<(StatusCode, Json<CompactAcceptedResponse>), AppError> {
-    // Reject if there's a *live* in-flight reply / compaction on this
-    // session — compacting mid-stream would race with vault writes and
-    // confuse the UI. A cancelled-but-not-yet-cleaned-up token is fine
-    // (someone hit /abort and the task is on its way out).
-    {
-        let map = state.active_replies.lock().await;
-        if let Some(t) = map.get(&session_id) {
-            if !t.is_cancelled() {
-                return Err(AppError(anyhow::anyhow!(
-                    "compaction rejected: agent reply in progress; abort or wait first"
-                )));
-            }
-        }
-    }
-
-    // Pre-allocate the new session id so we can return it immediately and
-    // the frontend can subscribe to it before the background task finishes.
-    let new_session_id = format!("s-{}", uuid::Uuid::new_v4().simple());
     let trigger = body
         .trigger
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| "manual".to_string());
+    let new_session_id = start_compaction(&state, &session_id, &trigger, body.focus.as_deref())
+        .await
+        .map_err(AppError)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CompactAcceptedResponse { new_session_id }),
+    ))
+}
 
-    // Compaction shares the active_replies map with normal replies — same
-    // token, same /abort endpoint cancels both. Keeps the UX rule "one
-    // in-flight thing per session, Esc cancels it" consistent.
+/// Kick off a compaction on `session_id`. Common path used by both manual
+/// `POST /compact` and the auto-pre-turn trigger inside `messages::post_handler`.
+/// Returns the pre-allocated new session id; the actual summary work runs
+/// in a background task and emits SSE `compaction.{started,completed,aborted}`
+/// events on the source session.
+///
+/// The cancel token goes into `active_replies` regardless of trigger; the
+/// frontend decides whether `/abort` is offered (manual: yes; auto: no), but
+/// the backend doesn't enforce that distinction — auto compactions are simply
+/// not surfaced in UI as cancellable.
+pub async fn start_compaction(
+    state: &AppState,
+    session_id: &str,
+    trigger: &str,
+    focus: Option<&str>,
+) -> anyhow::Result<String> {
+    // Reject if there's a *live* in-flight reply / compaction on this
+    // session — racing with vault writes would confuse the UI. A cancelled-
+    // but-not-yet-cleaned-up token is fine (someone hit /abort already).
+    {
+        let map = state.active_replies.lock().await;
+        if let Some(t) = map.get(session_id) {
+            if !t.is_cancelled() {
+                anyhow::bail!(
+                    "compaction rejected: agent reply in progress; abort or wait first"
+                );
+            }
+        }
+    }
+
+    let new_session_id = format!("s-{}", uuid::Uuid::new_v4().simple());
+
     let cancel = CancellationToken::new();
     {
         let mut map = state.active_replies.lock().await;
-        map.insert(session_id.clone(), cancel.clone());
+        map.insert(session_id.to_string(), cancel.clone());
     }
 
-    // Fire the start event synchronously so the UI flips into "compacting"
-    // immediately, before the slow summarizer call.
+    // Fire the start event synchronously so any subscriber flips into
+    // "compacting" before the slow summarizer call.
     agent::publish_and_persist(
         &state.pool,
         &state.user_id,
-        &session_id,
+        session_id,
         None,
         &state.event_bus,
         "compaction.started",
         serde_json::json!({
             "trigger": trigger,
-            "focus": body.focus,
+            "focus": focus,
             "new_session_id": new_session_id,
         }),
     )
     .await?;
 
-    // Spawn background work; POST returns 202 right after this.
     let pool = state.pool.clone();
     let user_id = state.user_id.clone();
     let bus = state.event_bus.clone();
     let provider = state.provider.clone();
     let active_replies = state.active_replies.clone();
-    let source_session = session_id.clone();
+    let source_session = session_id.to_string();
     let new_id = new_session_id.clone();
-    let focus = body.focus.clone();
-    let trigger_for_task = trigger.clone();
+    let focus_owned = focus.map(|s| s.to_string());
+    let trigger_for_task = trigger.to_string();
     let cancel_for_task = cancel.clone();
     let cancel_for_cleanup = cancel.clone();
 
@@ -236,15 +254,12 @@ pub async fn compact_handler(
             source_session.clone(),
             new_id.clone(),
             provider,
-            focus.as_deref(),
+            focus_owned.as_deref(),
             &trigger_for_task,
             cancel_for_task,
         )
         .await;
 
-        // Drop the cancel token unless we were replaced by a later /compact
-        // or POST (which would have cancelled us); the new owner keeps the
-        // slot in that case.
         if !cancel_for_cleanup.is_cancelled() {
             active_replies.lock().await.remove(&source_session);
         }
@@ -261,15 +276,13 @@ pub async fn compact_handler(
                 }),
             ),
             Err(err) => {
-                // Surface the full anyhow chain so failed compactions are
-                // diagnosable from server logs (the outermost context alone
-                // is rarely informative — e.g. "compact: chat call").
                 tracing::warn!(error = ?err, "compaction failed");
                 (
                     "compaction.aborted".to_string(),
                     serde_json::json!({
                         "new_session_id": new_id,
                         "reason": format!("{err:#}"),
+                        "trigger": trigger_for_task,
                     }),
                 )
             }
@@ -290,10 +303,7 @@ pub async fn compact_handler(
         }
     });
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(CompactAcceptedResponse { new_session_id }),
-    ))
+    Ok(new_session_id)
 }
 
 /// Outcome record for a successful compaction — drives the

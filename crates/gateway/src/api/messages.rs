@@ -4,6 +4,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use super::sessions as api_sessions;
 use super::{AppError, AppState};
 use crate::agent::routing::{self, DecisionKind};
 use crate::agent::{self, TaskBinding};
@@ -13,6 +14,24 @@ use crate::vault::{
     events as vault_events, messages as vault_messages, sessions as vault_sessions,
     tasks as vault_tasks,
 };
+
+/// Auto-compaction threshold. When the session's last `llm_usage` event
+/// reports `input_tokens` ≥ this value, the next user message triggers a
+/// fork-compaction *before* the LLM is called again — otherwise the next
+/// turn would push the request over the model's context window.
+///
+/// Codex-style buffer: leave headroom for the next turn's user message,
+/// system prompt growth, and tool outputs. GPT-5.5 context window is 400K;
+/// we trigger at 300K (75%) to leave ~100K for the working turn. Override
+/// via `LEEK_AUTO_COMPACT_THRESHOLD` for tests / low-budget tiers.
+const AUTO_COMPACT_THRESHOLD_DEFAULT: i64 = 300_000;
+
+fn auto_compact_threshold() -> i64 {
+    std::env::var("LEEK_AUTO_COMPACT_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(AUTO_COMPACT_THRESHOLD_DEFAULT)
+}
 
 #[derive(Deserialize)]
 pub struct PostMessageBody {
@@ -32,8 +51,18 @@ pub enum ContentPart {
 }
 
 #[derive(Serialize)]
-pub struct PostMessageResponse {
-    pub message_seq: i64,
+#[serde(untagged)]
+pub enum PostMessageResponse {
+    /// User message accepted, agent reply is starting.
+    Created { message_seq: i64 },
+    /// Token budget exceeded — auto-compaction kicked off; the user message
+    /// was *not* persisted and should be re-sent by the caller against
+    /// `new_session_id` once `compaction.completed` arrives on the source
+    /// session's SSE stream.
+    AutoCompacting {
+        auto_compacting: bool,
+        new_session_id: String,
+    },
 }
 
 pub async fn post_handler(
@@ -46,6 +75,35 @@ pub async fn post_handler(
     let user_text = match &body.content {
         ContentPart::Text { text } => text.clone(),
     };
+
+    // Pre-turn auto-compaction: if the most recent LLM call on this session
+    // already saw input_tokens ≥ threshold, reject this user message and
+    // start compaction. Frontend queues the message and re-POSTs it against
+    // `new_session_id` after `compaction.completed`.
+    let threshold = auto_compact_threshold();
+    if let Some(latest) =
+        vault_events::latest_input_tokens(&state.pool, &state.user_id, &session_id).await?
+    {
+        if latest >= threshold {
+            tracing::info!(
+                session_id,
+                latest_input_tokens = latest,
+                threshold,
+                "auto-compact triggered"
+            );
+            let new_session_id =
+                api_sessions::start_compaction(&state, &session_id, "auto_pre_turn", None)
+                    .await
+                    .map_err(AppError)?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(PostMessageResponse::AutoCompacting {
+                    auto_compacting: true,
+                    new_session_id,
+                }),
+            ));
+        }
+    }
 
     let user_seq = vault_messages::insert(
         &state.pool,
@@ -125,7 +183,7 @@ pub async fn post_handler(
 
     Ok((
         StatusCode::CREATED,
-        Json(PostMessageResponse {
+        Json(PostMessageResponse::Created {
             message_seq: user_seq,
         }),
     ))

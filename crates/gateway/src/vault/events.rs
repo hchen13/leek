@@ -52,6 +52,41 @@ pub async fn list_for_session(
     Ok(rows)
 }
 
+/// Most recent `input_tokens` reported by the LLM provider for this session.
+/// Used by the auto-compaction trigger: when the session's last LLM call
+/// already saw > N tokens of input, the next turn would exceed the budget,
+/// so compact before sending it. Returns `None` for fresh sessions with no
+/// `llm_usage` events yet.
+pub async fn latest_input_tokens(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+) -> Result<Option<i64>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT payload_json
+        FROM events
+        WHERE user_id = ?
+          AND session_id = ?
+          AND kind = 'llm_usage'
+        ORDER BY seq DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+    .context("reading latest llm_usage event")?;
+
+    let Some((payload_json,)) = row else {
+        return Ok(None);
+    };
+    let payload: serde_json::Value =
+        serde_json::from_str(&payload_json).context("parsing llm_usage payload")?;
+    Ok(payload.get("input_tokens").and_then(|v| v.as_i64()))
+}
+
 pub async fn insert(
     pool: &SqlitePool,
     user_id: &str,
