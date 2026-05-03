@@ -4,6 +4,7 @@ pub mod corpus;
 pub mod deliverables;
 pub mod health;
 pub mod messages;
+pub mod portfolio;
 pub mod sessions;
 pub mod static_files;
 pub mod stream;
@@ -101,6 +102,11 @@ pub fn router(state: AppState) -> Router {
             post(deliverables::reject_handler),
         )
         .route("/api/v1/decisions", get(deliverables::decisions_handler))
+        .route(
+            "/api/v1/portfolio",
+            get(portfolio::get_handler).post(portfolio::post_handler),
+        )
+        .route("/api/v1/portfolio/history", get(portfolio::history_handler))
         .with_state(state)
         // Anything not matched above falls through to the embedded SPA
         .fallback(static_files::handler)

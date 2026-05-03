@@ -7,7 +7,10 @@
 import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import { LiveChat } from "./components/LiveChat";
 import { Workbench } from "./components/Workbench";
+import { PortfolioPage } from "./components/PortfolioPage";
 import { ALL_SCENES, type Scene } from "./scenes";
+
+type Page = "chat" | "portfolio";
 
 type View =
   | { mode: "live" }
@@ -26,6 +29,7 @@ function readViewFromHash(): View {
 
 export function App() {
   const [view, setView] = createSignal<View>(readViewFromHash());
+  const [page, setPage] = createSignal<Page>("chat");
 
   onMount(() => {
     const handler = () => setView(readViewFromHash());
@@ -35,22 +39,93 @@ export function App() {
 
   return (
     <div style={{
-      width: "100vw", height: "100vh",
-      display: "flex", "flex-direction": "column",
+      width: "100vw",
+      height: "100vh",
+      display: "flex",
+      "flex-direction": "column",
       background: "var(--bg-0)",
     }}>
       <Show when={view().mode === "demo"}>
         <DemoBanner scene={(view() as { mode: "demo"; scene: Scene }).scene} />
       </Show>
-      <div style={{ flex: 1, overflow: "auto" }}>
+      <div style={{ flex: 1, overflow: "hidden" }}>
         <Show
           when={view().mode === "live"}
           fallback={<Workbench scene={(view() as { mode: "demo"; scene: Scene }).scene} />}
         >
-          <LiveChat />
+          <Show
+            when={page() === "portfolio"}
+            fallback={<LiveChat onNavigate={setPage} />}
+          >
+            <PortfolioWithRail onNavigate={setPage} />
+          </Show>
         </Show>
       </div>
     </div>
+  );
+}
+
+function PortfolioWithRail(props: { onNavigate: (p: Page) => void }) {
+  return (
+    <div class="lk-app" style={{ width: "100%", height: "100%" }}>
+      <NavRail page="portfolio" onNavigate={props.onNavigate} />
+      <div class="lk-main" style={{ "grid-template-rows": "1fr", "grid-template-columns": "1fr" }}>
+        <PortfolioPage />
+      </div>
+    </div>
+  );
+}
+
+export function NavRail(props: { page: Page; onNavigate: (p: Page) => void }) {
+  return (
+    <aside class="lk-rail">
+      <div class="lk-rail-logo">L</div>
+      <RailNavBtn label="C" sub="chat" target="chat" active={props.page === "chat"} onNavigate={props.onNavigate} />
+      <RailNavBtn label="P" sub="port" target="portfolio" active={props.page === "portfolio"} onNavigate={props.onNavigate} />
+      <div class="lk-rail-spacer" />
+      <div class="lk-rail-avatar">JC</div>
+    </aside>
+  );
+}
+
+function RailNavBtn(props: {
+  label: string;
+  sub: string;
+  target: Page;
+  active: boolean;
+  onNavigate: (p: Page) => void;
+}) {
+  return (
+    <button
+      class="lk-rail-btn"
+      data-active={props.active}
+      onClick={() => props.onNavigate(props.target)}
+      title={props.target}
+      style={{
+        display: "flex",
+        "flex-direction": "column",
+        "align-items": "center",
+        "justify-content": "center",
+        gap: "2px",
+        height: "44px",
+        width: "36px",
+      }}
+    >
+      <span style={{
+        "font-family": "var(--font-stencil)",
+        "font-size": "13px",
+        "font-weight": "700",
+        "line-height": "1",
+        color: props.active ? "var(--clay-soft)" : "var(--ink-2)",
+      }}>{props.label}</span>
+      <span style={{
+        "font-family": "var(--font-mono)",
+        "font-size": "8px",
+        color: props.active ? "var(--clay-soft)" : "var(--ink-3)",
+        "letter-spacing": "0.04em",
+        "text-transform": "uppercase",
+      }}>{props.sub}</span>
+    </button>
   );
 }
 
