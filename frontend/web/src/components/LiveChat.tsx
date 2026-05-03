@@ -68,10 +68,21 @@ interface NarrationStep {
   text: string;
 }
 
+interface DecisionDraftPayload {
+  deliverable_id: string;
+  ticker: string;
+  direction: string;
+  size_pct?: number;
+  stop_loss?: number;
+  target?: number;
+  horizon_days?: number;
+  rationale: string;
+}
+
 interface LiveMsg {
   /** `compaction_summary` rows are written by /compact and rendered as a
    *  collapsible system card at the head of forked sessions. */
-  role: "user" | "agent" | "compaction_summary";
+  role: "user" | "agent" | "compaction_summary" | "decision_draft";
   text: string;
   ts: string;
   streaming?: boolean;
@@ -80,6 +91,7 @@ interface LiveMsg {
   narrations?: NarrationStep[];
   /** Final elapsed seconds for the agent reply, frozen at message_end. */
   total_sec?: number;
+  decision_draft?: DecisionDraftPayload;
 }
 
 /** Render a forked-session's compaction summary as a collapsible system
@@ -141,6 +153,107 @@ function CompactionSummaryCard(props: { time: string; markdown: string }) {
       <Show when={open()}>
         <div style={{ "margin-top": "10px", "font-size": "13px" }}>
           <SafeMarkdown source={props.markdown} />
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+function DecisionDraftCard(props: { time: string; draft: DecisionDraftPayload }) {
+  const [status, setStatus] = createSignal<"pending" | "confirmed" | "rejected">("pending");
+  const [busy, setBusy] = createSignal(false);
+
+  async function act(action: "confirm" | "reject") {
+    setBusy(true);
+    try {
+      const r = await fetch(`/api/v1/deliverables/${props.draft.deliverable_id}/${action}`, { method: "POST" });
+      if (r.ok) setStatus(action === "confirm" ? "confirmed" : "rejected");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const dirColor = () => props.draft.direction === "buy" ? "rgba(100,200,120,0.15)" : "rgba(217,112,112,0.12)";
+  const dirBorder = () => props.draft.direction === "buy" ? "rgba(100,200,120,0.4)" : "rgba(217,112,112,0.4)";
+
+  return (
+    <div style={{
+      border: `1px solid ${dirBorder()}`,
+      "border-radius": "8px",
+      padding: "12px 14px",
+      margin: "6px 0",
+      background: dirColor(),
+      "font-family": "var(--font-mono)",
+    }}>
+      <div style={{ display: "flex", "align-items": "center", gap: "10px", "margin-bottom": "8px" }}>
+        <span style={{ "font-size": "12px", "font-weight": 700, color: "var(--ink-0)", "text-transform": "uppercase", "letter-spacing": "0.06em" }}>
+          {props.draft.direction === "buy" ? "▲ 买入" : "▼ 卖出"} · {props.draft.ticker}
+        </span>
+        <Show when={props.draft.size_pct != null}>
+          <span style={{ "font-size": "11px", color: "var(--ink-2)" }}>{props.draft.size_pct}%</span>
+        </Show>
+        <div style={{ flex: 1 }} />
+        <span style={{ "font-size": "10px", color: "var(--ink-3)" }}>{props.time}</span>
+      </div>
+      <div style={{ "font-size": "12px", color: "var(--ink-1)", "line-height": "1.5", "margin-bottom": "10px" }}>
+        {props.draft.rationale}
+      </div>
+      <div style={{ display: "flex", gap: "6px", "font-size": "11px", color: "var(--ink-3)", "margin-bottom": "10px" }}>
+        <Show when={props.draft.stop_loss != null}>
+          <span>止损 {props.draft.stop_loss}</span>
+        </Show>
+        <Show when={props.draft.target != null}>
+          <span>· 目标 {props.draft.target}</span>
+        </Show>
+        <Show when={props.draft.horizon_days != null}>
+          <span>· 周期 {props.draft.horizon_days}d</span>
+        </Show>
+      </div>
+      <Show
+        when={status() === "pending"}
+        fallback={
+          <div style={{
+            "font-size": "11px",
+            color: status() === "confirmed" ? "rgba(100,200,120,0.9)" : "rgba(217,112,112,0.9)",
+            "font-weight": 600,
+            "text-transform": "uppercase",
+            "letter-spacing": "0.06em",
+          }}>
+            {status() === "confirmed" ? "✓ 已确认" : "✗ 已拒绝"}
+          </div>
+        }
+      >
+        <div style={{ display: "flex", gap: "8px" }}>
+          <button
+            onClick={() => void act("confirm")}
+            disabled={busy()}
+            style={{
+              background: "rgba(100,200,120,0.25)",
+              border: "1px solid rgba(100,200,120,0.5)",
+              color: "rgba(100,220,120,1)",
+              "font-family": "var(--font-mono)",
+              "font-size": "11px",
+              "font-weight": 600,
+              padding: "4px 14px",
+              "border-radius": "5px",
+              cursor: busy() ? "wait" : "pointer",
+              "letter-spacing": "0.04em",
+            }}
+          >确认执行</button>
+          <button
+            onClick={() => void act("reject")}
+            disabled={busy()}
+            style={{
+              background: "transparent",
+              border: "1px solid var(--line-2)",
+              color: "var(--ink-2)",
+              "font-family": "var(--font-mono)",
+              "font-size": "11px",
+              padding: "4px 14px",
+              "border-radius": "5px",
+              cursor: busy() ? "wait" : "pointer",
+            }}
+          >拒绝</button>
         </div>
       </Show>
     </div>
@@ -477,6 +590,14 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
                 outTokens: typeof p.output_tokens === "number" ? p.output_tokens : 0,
               };
               break;
+            case "decision_draft_ready":
+              hist.push({
+                role: "decision_draft",
+                text: "",
+                ts: fmtTime(row.created_at),
+                decision_draft: p as DecisionDraftPayload,
+              });
+              break;
           }
         }
         if (usageSnap) setUsage(usageSnap);
@@ -659,6 +780,17 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
       });
       setElapsedSec(0);
       try { emitTick(e, "agent_message_end", JSON.parse(e.data)); } catch { /* skip */ }
+    });
+
+    evtSrc.addEventListener("decision_draft_ready", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data) as DecisionDraftPayload;
+        setMessages((prev) => [
+          ...prev,
+          { role: "decision_draft", text: "", ts: fmtTime(), decision_draft: data },
+        ]);
+        try { emitTick(e, "decision_draft_ready", data); } catch { /* skip */ }
+      } catch { /* skip */ }
     });
 
     // task_created / task_delivered / clarification_requested are emitted by
@@ -844,7 +976,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
           setPending(false);
           if (elapsedTimer) {
             clearInterval(elapsedTimer);
-            elapsedTimer = null;
+            elapsedTimer = undefined;
           }
           setCompactQueue((q) => [...q, text]);
           // SSE `compaction.started` will flip `compacting` on its own; the
@@ -1082,10 +1214,17 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
                 when={m.role === "agent"}
                 fallback={
                   <Show
-                    when={m.role === "compaction_summary"}
-                    fallback={<UserMsg time={m.ts}>{m.text}</UserMsg>}
+                    when={m.role === "decision_draft" && m.decision_draft != null}
+                    fallback={
+                      <Show
+                        when={m.role === "compaction_summary"}
+                        fallback={<UserMsg time={m.ts}>{m.text}</UserMsg>}
+                      >
+                        <CompactionSummaryCard time={m.ts} markdown={m.text} />
+                      </Show>
+                    }
                   >
-                    <CompactionSummaryCard time={m.ts} markdown={m.text} />
+                    <DecisionDraftCard time={m.ts} draft={m.decision_draft!} />
                   </Show>
                 }
               >
