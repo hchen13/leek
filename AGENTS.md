@@ -49,6 +49,7 @@ When opening a new CC session in this project, do this in order:
 - Cross-device handoff documents are named `handoff-YYYY-MM-DD.md`.
 - Decision records (when we start logging them individually) go under `design/decisions/`.
 - Scratch / temporary files go under `tmp/` (gitignored).
+- **Browser/Playwright 截图必须保存到 `tmp/`，严禁落到项目根目录。** 测试结束后 `tmp/` 内容可直接清空，不需逐一确认。
 
 ## Authoritative documents
 
