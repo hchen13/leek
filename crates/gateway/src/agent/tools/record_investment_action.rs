@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::events::EventEnvelope;
 use crate::llm::ToolSpec;
+use crate::vault::events as vault_events;
 
 use super::{ToolContext, ToolHandler};
 
@@ -139,14 +140,29 @@ impl ToolHandler for RecordInvestmentActionTool {
             "ticker": ticker,
             "direction": direction,
             "size_pct": size_pct,
-            "session_id": ctx.session_id,
+            "stop_loss": stop_loss,
+            "target": target,
+            "horizon_days": horizon_days,
+            "rationale": rationale,
         });
         let ts = Utc::now();
+        let evt_seq = vault_events::insert(
+            &ctx.pool,
+            &ctx.user_id,
+            &ctx.session_id,
+            ctx.task_id.as_deref(),
+            "decision_draft_ready",
+            &event_payload,
+            Some("agent"),
+            ts,
+        )
+        .await
+        .unwrap_or(0);
         ctx.event_bus
             .publish(
                 &ctx.session_id,
                 EventEnvelope {
-                    seq: 0,
+                    seq: evt_seq,
                     kind: "decision_draft_ready".to_string(),
                     payload: event_payload,
                     ts,
