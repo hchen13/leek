@@ -229,6 +229,9 @@ export function LiveChat() {
   const [compacting, setCompacting] = createSignal(false);
   const [compactQueue, setCompactQueue] = createSignal<string[]>([]);
   const [pendingCompactionTargetId, setPendingCompactionTargetId] = createSignal<string | null>(null);
+  // Trigger of the in-flight compaction (`manual` | `auto_pre_turn`). Used
+  // to gate the Composer's STOP button: auto compactions cannot be cancelled.
+  const [compactionTrigger, setCompactionTrigger] = createSignal<string | null>(null);
   const [eventsOpen, setEventsOpen] = createSignal(false);
   const [liveTick, setLiveTick] = createSignal<LiveTick | null>(null);
   // Wall-clock seconds since the current agent reply started. Drives the
@@ -666,8 +669,14 @@ export function LiveChat() {
     // POST handler runs, then `completed` (success) or `aborted` (Esc /
     // failure) from the spawned task. Frontend mirrors these into UI lock
     // state and (on completion) navigates to the new session.
-    evtSrc.addEventListener("compaction.started", (_e: MessageEvent) => {
+    evtSrc.addEventListener("compaction.started", (e: MessageEvent) => {
       setCompacting(true);
+      try {
+        const data = JSON.parse(e.data) as { trigger?: string };
+        setCompactionTrigger(data.trigger ?? null);
+      } catch {
+        setCompactionTrigger(null);
+      }
     });
     evtSrc.addEventListener("compaction.completed", async (e: MessageEvent) => {
       try {
@@ -684,6 +693,7 @@ export function LiveChat() {
           // send() sees `compacting() == true` and re-queues each message
           // instead of POSTing it.
           setCompacting(false);
+          setCompactionTrigger(null);
           setPendingCompactionTargetId(null);
           // Flush queued messages into the new session, in order.
           const queued = compactQueue();
@@ -697,6 +707,7 @@ export function LiveChat() {
         // ignore — UI lock will clear regardless
       }
       setCompacting(false);
+      setCompactionTrigger(null);
       setPendingCompactionTargetId(null);
     });
     evtSrc.addEventListener("compaction.aborted", (e: MessageEvent) => {
@@ -707,6 +718,7 @@ export function LiveChat() {
         setError("compaction aborted");
       }
       setCompacting(false);
+      setCompactionTrigger(null);
       setPendingCompactionTargetId(null);
     });
 
@@ -1167,6 +1179,7 @@ export function LiveChat() {
             onStop={stop}
             pending={pending()}
             compacting={compacting()}
+            cancellable={compactionTrigger() !== "auto_pre_turn"}
             commands={slashCommands}
           />
         </section>
