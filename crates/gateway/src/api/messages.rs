@@ -20,11 +20,10 @@ use crate::vault::{
 /// fork-compaction *before* the LLM is called again — otherwise the next
 /// turn would push the request over the model's context window.
 ///
-/// Codex-style buffer: leave headroom for the next turn's user message,
-/// system prompt growth, and tool outputs. GPT-5.5 context window is 400K;
-/// we trigger at 300K (75%) to leave ~100K for the working turn. Override
-/// via `LEEK_AUTO_COMPACT_THRESHOLD` for tests / low-budget tiers.
-const AUTO_COMPACT_THRESHOLD_DEFAULT: i64 = 300_000;
+/// Trigger at 95% of the 400K context window (= 380K), leaving ~20K for the
+/// working turn's user message, system prompt delta, and tool outputs.
+/// Override via `LEEK_AUTO_COMPACT_THRESHOLD` for tests / low-budget tiers.
+const AUTO_COMPACT_THRESHOLD_DEFAULT: i64 = 380_000;
 
 fn auto_compact_threshold() -> i64 {
     std::env::var("LEEK_AUTO_COMPACT_THRESHOLD")
