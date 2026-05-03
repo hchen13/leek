@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::events::{EventBus, EventEnvelope};
 use crate::llm::{ChatMessage, ChatRequest, LlmEvent, LlmProvider, Role, ToolSpec, WebSearchAction};
-use crate::vault::{events as vault_events, messages as vault_messages, tasks as vault_tasks};
+use crate::vault::{self, events as vault_events, messages as vault_messages, tasks as vault_tasks};
 
 use tools::{ToolContext, ToolRegistry};
 
@@ -115,8 +115,14 @@ pub async fn run_chat_reply(
     let mandate_text = mandate_path
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok());
-    let system_prompt =
-        harness::build_system_prompt(&handoff_summaries, mandate_text.as_deref());
+    let charter_text = vault::charters::get_active_text(&pool, &user_id)
+        .await
+        .unwrap_or(None);
+    let system_prompt = harness::build_system_prompt(
+        &handoff_summaries,
+        mandate_text.as_deref(),
+        charter_text.as_deref(),
+    );
 
     let ctx = ToolContext {
         pool: pool.clone(),

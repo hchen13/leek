@@ -45,7 +45,11 @@ human-readable title; never paste a raw URL as the visible text.";
 /// joined into the inherited-context section. `mandate` is the contents of
 /// `vault/<user_id>/mandate.md` if it exists and is non-empty — caller is
 /// responsible for reading the file (we keep this fn pure for testability).
-pub fn build_system_prompt(handoff_summaries: &[String], mandate: Option<&str>) -> String {
+pub fn build_system_prompt(
+    handoff_summaries: &[String],
+    mandate: Option<&str>,
+    charter: Option<&str>,
+) -> String {
     let mut prompt = String::with_capacity(8192);
 
     prompt.push_str(IDENTITY);
@@ -75,6 +79,14 @@ pub fn build_system_prompt(handoff_summaries: &[String], mandate: Option<&str>) 
         }
     }
 
+    if let Some(text) = charter {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            prompt.push_str("\n\n# Investment philosophy (team charter)\n\n");
+            prompt.push_str(trimmed);
+        }
+    }
+
     if !handoff_summaries.is_empty() {
         prompt.push_str("\n\n# Prior session handoff (compacted)\n\n");
         prompt.push_str(&handoff_summaries.join("\n\n---\n\n"));
@@ -94,7 +106,7 @@ mod tests {
 
     #[test]
     fn build_includes_all_baseline_sections() {
-        let p = build_system_prompt(&[], None);
+        let p = build_system_prompt(&[], None, None);
         assert!(p.contains("# Identity"));
         assert!(p.contains("truth-seeking investment partner"));
         assert!(p.contains("# Discipline"));
@@ -106,21 +118,21 @@ mod tests {
     #[test]
     fn build_appends_handoff_summaries() {
         let summaries = vec!["旧 session 摘要".to_string()];
-        let p = build_system_prompt(&summaries, None);
+        let p = build_system_prompt(&summaries, None, None);
         assert!(p.contains("Prior session handoff"));
         assert!(p.contains("旧 session 摘要"));
     }
 
     #[test]
     fn build_omits_handoff_when_empty() {
-        let p = build_system_prompt(&[], None);
+        let p = build_system_prompt(&[], None, None);
         assert!(!p.contains("Prior session handoff"));
     }
 
     #[test]
     fn build_includes_mandate_when_provided() {
         let m = "- 单标位置上限 5%\n- 不碰复杂衍生品";
-        let p = build_system_prompt(&[], Some(m));
+        let p = build_system_prompt(&[], Some(m), None);
         assert!(p.contains("# User mandate"));
         assert!(p.contains("单标位置上限 5%"));
         assert!(p.contains("不碰复杂衍生品"));
@@ -128,12 +140,26 @@ mod tests {
 
     #[test]
     fn build_omits_mandate_when_empty_or_whitespace() {
-        let p1 = build_system_prompt(&[], Some(""));
-        let p2 = build_system_prompt(&[], Some("   \n\n   "));
-        let p3 = build_system_prompt(&[], None);
+        let p1 = build_system_prompt(&[], Some(""), None);
+        let p2 = build_system_prompt(&[], Some("   \n\n   "), None);
+        let p3 = build_system_prompt(&[], None, None);
         assert!(!p1.contains("# User mandate"));
         assert!(!p2.contains("# User mandate"));
         assert!(!p3.contains("# User mandate"));
+    }
+
+    #[test]
+    fn build_includes_charter_when_provided() {
+        let charter = "We believe in long-term value investing.\n\n关注有护城河的企业。";
+        let p = build_system_prompt(&[], None, Some(charter));
+        assert!(p.contains("Investment philosophy"));
+        assert!(p.contains("护城河"));
+    }
+
+    #[test]
+    fn build_omits_charter_when_none() {
+        let p = build_system_prompt(&[], None, None);
+        assert!(!p.contains("Investment philosophy"));
     }
 
     /// Disabled by default; run with
@@ -142,7 +168,7 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_prompt() {
-        let p = build_system_prompt(&[], None);
+        let p = build_system_prompt(&[], None, None);
         eprintln!("--- PROMPT (len={} bytes) ---\n{}\n--- END ---", p.len(), p);
     }
 }

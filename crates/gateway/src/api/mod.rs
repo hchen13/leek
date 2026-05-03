@@ -1,5 +1,6 @@
 //! HTTP / SSE API — axum router + shared `AppState`.
 
+pub mod charter;
 pub mod corpus;
 pub mod deliverables;
 pub mod health;
@@ -65,6 +66,10 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/api/v1/health", get(health::handler))
+        .route(
+            "/api/v1/charter",
+            get(charter::get_handler).put(charter::put_handler),
+        )
         .route("/api/v1/corpus/graph", get(corpus::graph_handler))
         .route("/api/v1/corpus/doc", get(corpus::doc_handler))
         .route(

@@ -10,7 +10,11 @@
 
 pub mod corpus_search;
 pub mod get_candlesticks;
+pub mod get_capital_flow;
+pub mod get_company_info;
+pub mod get_crypto_market;
 pub mod get_financials;
+pub mod get_funding_rate;
 pub mod record_investment_action;
 pub mod sec_filing_fetch;
 pub mod tradingview_quote;
