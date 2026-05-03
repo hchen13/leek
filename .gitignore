@@ -55,3 +55,4 @@ mandates/
 # Playwright debug artifacts (root-level only — don't catch design assets)
 /.playwright-mcp/
 /*.png
+.claude/worktrees/
