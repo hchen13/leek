@@ -9,6 +9,7 @@
 //! advertised through `ToolSpec::WebSearch` and execute on OpenAI's side.
 
 pub mod corpus_search;
+pub mod record_investment_action;
 pub mod sec_filing_fetch;
 pub mod tradingview_quote;
 pub mod tushare_quote;
@@ -23,6 +24,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::llm::ToolSpec;
 
+/// Per-request context injected by the agent loop into every tool call.
+/// Stateless tools (web_fetch, corpus_search, etc.) may ignore it.
+/// Stateful tools (record_investment_action, etc.) need it to write to vault.
+#[derive(Clone)]
+pub struct ToolContext {
+    pub pool: sqlx::SqlitePool,
+    pub event_bus: crate::events::EventBus,
+    pub user_id: String,
+    pub session_id: String,
+    pub task_id: Option<String>,
+}
+
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
     fn name(&self) -> &str;
@@ -35,6 +48,7 @@ pub trait ToolHandler: Send + Sync {
         &self,
         args: serde_json::Value,
         cancel: CancellationToken,
+        ctx: &ToolContext,
     ) -> Result<String>;
 }
 
@@ -69,6 +83,7 @@ impl ToolRegistry {
         name: &str,
         raw_args: &str,
         cancel: CancellationToken,
+        ctx: &ToolContext,
     ) -> Result<String> {
         let handler = self
             .handlers
@@ -80,7 +95,7 @@ impl ToolRegistry {
             serde_json::from_str(raw_args)
                 .map_err(|e| anyhow!("invalid arguments JSON for {name}: {e}"))?
         };
-        handler.call(args, cancel).await
+        handler.call(args, cancel, ctx).await
     }
 }
 
@@ -128,6 +143,7 @@ mod tests {
             &self,
             args: serde_json::Value,
             _cancel: CancellationToken,
+            _ctx: &ToolContext,
         ) -> Result<String> {
             Ok(args
                 .get("text")
@@ -137,13 +153,28 @@ mod tests {
         }
     }
 
+    async fn make_ctx() -> ToolContext {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        ToolContext {
+            pool,
+            event_bus: crate::events::EventBus::new(),
+            user_id: "test".into(),
+            session_id: "sess".into(),
+            task_id: None,
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_invokes_handler() {
+        let ctx = make_ctx().await;
         let reg = ToolRegistry::builder()
             .register(Arc::new(EchoTool))
             .build();
         let out = reg
-            .dispatch("echo", r#"{"text":"hi"}"#, CancellationToken::new())
+            .dispatch("echo", r#"{"text":"hi"}"#, CancellationToken::new(), &ctx)
             .await
             .unwrap();
         assert_eq!(out, "hi");
@@ -151,9 +182,10 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_unknown_tool_errors() {
+        let ctx = make_ctx().await;
         let reg = ToolRegistry::empty();
         let err = reg
-            .dispatch("nope", "{}", CancellationToken::new())
+            .dispatch("nope", "{}", CancellationToken::new(), &ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unknown tool"));
@@ -161,11 +193,12 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_invalid_json_args_errors() {
+        let ctx = make_ctx().await;
         let reg = ToolRegistry::builder()
             .register(Arc::new(EchoTool))
             .build();
         let err = reg
-            .dispatch("echo", "not json", CancellationToken::new())
+            .dispatch("echo", "not json", CancellationToken::new(), &ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("invalid arguments JSON"));
@@ -173,10 +206,11 @@ mod tests {
 
     #[tokio::test]
     async fn empty_args_treated_as_empty_object() {
+        let ctx = make_ctx().await;
         let reg = ToolRegistry::builder()
             .register(Arc::new(EchoTool))
             .build();
-        let out = reg.dispatch("echo", "", CancellationToken::new()).await.unwrap();
+        let out = reg.dispatch("echo", "", CancellationToken::new(), &ctx).await.unwrap();
         // EchoTool returns "" when text key absent — that's the contract.
         assert_eq!(out, "");
     }

@@ -212,6 +212,7 @@ impl ToolHandler for SecFilingFetchTool {
         &self,
         args: serde_json::Value,
         cancel: CancellationToken,
+        _ctx: &super::ToolContext,
     ) -> Result<String> {
         let ticker = args
             .get("ticker")

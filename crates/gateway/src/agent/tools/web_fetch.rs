@@ -197,6 +197,7 @@ impl ToolHandler for WebFetchTool {
         &self,
         args: serde_json::Value,
         cancel: CancellationToken,
+        _ctx: &super::ToolContext,
     ) -> Result<String> {
         let url_str = args
             .get("url")

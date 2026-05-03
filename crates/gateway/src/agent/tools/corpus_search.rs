@@ -212,6 +212,7 @@ impl ToolHandler for CorpusSearchTool {
         &self,
         args: serde_json::Value,
         _cancel: CancellationToken,
+        _ctx: &super::ToolContext,
     ) -> Result<String> {
         let query = args
             .get("query")
@@ -356,13 +357,29 @@ mod tests {
         );
     }
 
+    async fn make_ctx() -> super::ToolContext {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        super::ToolContext {
+            pool,
+            event_bus: crate::events::EventBus::new(),
+            user_id: "test".into(),
+            session_id: "sess".into(),
+            task_id: None,
+        }
+    }
+
     #[tokio::test]
     async fn search_returns_relevant_hit() {
+        let ctx = make_ctx().await;
         let tool = CorpusSearchTool::new();
         let out = tool
             .call(
                 serde_json::json!({"query": "margin of safety", "limit": 3}),
                 CancellationToken::new(),
+                &ctx,
             )
             .await
             .unwrap();
@@ -376,6 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_respects_tier_filter() {
+        let ctx = make_ctx().await;
         let tool = CorpusSearchTool::new();
         let out = tool
             .call(
@@ -385,6 +403,7 @@ mod tests {
                     "limit": 5
                 }),
                 CancellationToken::new(),
+                &ctx,
             )
             .await
             .unwrap();
@@ -396,11 +415,13 @@ mod tests {
 
     #[tokio::test]
     async fn search_empty_query_returns_empty_hits() {
+        let ctx = make_ctx().await;
         let tool = CorpusSearchTool::new();
         let out = tool
             .call(
                 serde_json::json!({"query": "  "}),
                 CancellationToken::new(),
+                &ctx,
             )
             .await
             .unwrap();

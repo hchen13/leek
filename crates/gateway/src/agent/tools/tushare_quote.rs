@@ -80,6 +80,7 @@ impl ToolHandler for TushareQuoteTool {
         &self,
         args: serde_json::Value,
         cancel: CancellationToken,
+        _ctx: &super::ToolContext,
     ) -> Result<String> {
         let token = std::env::var("TUSHARE_TOKEN").map_err(|_| {
             anyhow!(

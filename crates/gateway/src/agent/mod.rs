@@ -21,7 +21,7 @@ use crate::events::{EventBus, EventEnvelope};
 use crate::llm::{ChatMessage, ChatRequest, LlmEvent, LlmProvider, Role, ToolSpec, WebSearchAction};
 use crate::vault::{events as vault_events, messages as vault_messages, tasks as vault_tasks};
 
-use tools::ToolRegistry;
+use tools::{ToolContext, ToolRegistry};
 
 const DEFAULT_MODEL: &str = "gpt-5.5";
 
@@ -117,6 +117,14 @@ pub async fn run_chat_reply(
         .and_then(|p| std::fs::read_to_string(p).ok());
     let system_prompt =
         harness::build_system_prompt(&handoff_summaries, mandate_text.as_deref());
+
+    let ctx = ToolContext {
+        pool: pool.clone(),
+        event_bus: event_bus.clone(),
+        user_id: user_id.clone(),
+        session_id: session_id.clone(),
+        task_id: task.as_ref().map(|t| t.task_id.clone()),
+    };
 
     // Build the tools array once: server-side web_search + every client-side
     // function tool registered in the registry. The model picks between them
@@ -327,7 +335,7 @@ pub async fn run_chat_reply(
         // serializing keeps the audit trail simple).
         for call in pending_calls {
             let exec_result = tools
-                .dispatch(&call.name, &call.arguments, cancel.clone())
+                .dispatch(&call.name, &call.arguments, cancel.clone(), &ctx)
                 .await;
 
             // Treat tool errors as a delivered output: the model sees the

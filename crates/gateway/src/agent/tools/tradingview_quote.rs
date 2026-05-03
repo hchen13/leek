@@ -96,6 +96,7 @@ impl ToolHandler for TradingViewQuoteTool {
         &self,
         args: serde_json::Value,
         cancel: CancellationToken,
+        _ctx: &super::ToolContext,
     ) -> Result<String> {
         let tickers: Vec<String> = args
             .get("tickers")

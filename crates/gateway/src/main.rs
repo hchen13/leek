@@ -180,6 +180,7 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
         .register(Arc::new(agent::tools::sec_filing_fetch::SecFilingFetchTool::new()?))
         .register(Arc::new(agent::tools::tushare_quote::TushareQuoteTool::new()?))
         .register(Arc::new(agent::tools::tradingview_quote::TradingViewQuoteTool::new()?))
+        .register(Arc::new(agent::tools::record_investment_action::RecordInvestmentActionTool::new()))
         .build();
 
     // mandates/<user_id>.md sits next to the vault sqlite. Users edit this

@@ -1,6 +1,7 @@
 //! HTTP / SSE API — axum router + shared `AppState`.
 
 pub mod corpus;
+pub mod deliverables;
 pub mod health;
 pub mod messages;
 pub mod sessions;
@@ -90,6 +91,16 @@ pub fn router(state: AppState) -> Router {
             get(sessions::events_handler),
         )
         .route("/stream/sessions/{id}/events", get(stream::handler))
+        .route("/api/v1/deliverables", get(deliverables::list_handler))
+        .route(
+            "/api/v1/deliverables/{id}/confirm",
+            post(deliverables::confirm_handler),
+        )
+        .route(
+            "/api/v1/deliverables/{id}/reject",
+            post(deliverables::reject_handler),
+        )
+        .route("/api/v1/decisions", get(deliverables::decisions_handler))
         .with_state(state)
         // Anything not matched above falls through to the embedded SPA
         .fallback(static_files::handler)
