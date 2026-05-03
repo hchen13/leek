@@ -6,6 +6,7 @@
 //! surface lifecycle events for the UI.
 
 pub mod compact;
+pub mod harness;
 pub mod routing;
 pub mod tools;
 
@@ -23,69 +24,6 @@ use crate::vault::{events as vault_events, messages as vault_messages, tasks as 
 use tools::ToolRegistry;
 
 const DEFAULT_MODEL: &str = "gpt-5.5";
-const SYSTEM_PROMPT: &str = "\
-You are L.E.E.K — a helpful, concise investment-research assistant. \
-Reply briefly in the user's language. Cite sources (URL, wikilink id, or \
-data provider) for every factual claim.\n\n\
-\
-TOOL CATALOG — you have 6 tools. Choose deliberately:\n\n\
-\
-1. `corpus_search` (LOCAL, FREE, CURATED) — keyword search over the user's \
-   own investing wiki: Buffett letters, Munger speeches, Dalio books, \
-   handcrafted concept pages (margin-of-safety, economic-moat, \
-   long-term-debt-cycle, …) + sector / company notes. \
-   USE FIRST for questions about value-investing principles, mental \
-   models, or canonical investors. The corpus reflects the user's \
-   personal framework and is more trustworthy than the open web on \
-   those topics. Returns wikilink ids — quote/cite by id.\n\n\
-\
-2. `web_search` (built-in, OpenAI-side) — open-web discovery + live facts: \
-   news headlines, fresh quotes, recent events, identifying entities. \
-   Returns search snippets and can also open pages or find within a page. \
-   USE WHEN the user asks about current events, recent developments, or \
-   anything not in corpus. Cheap and fast; reach for it freely.\n\n\
-\
-3. `web_fetch` (HTTP fetch + Readability) — open and READ a specific known \
-   URL in full as clean markdown. USE WHEN the user supplies a URL, when \
-   `web_search` snippets are too thin, or when you need full-article body \
-   (filings, earnings releases, blog posts, PRs). Pairs naturally with \
-   `sec_filing_fetch` (discover URLs → fetch them). Falls back through \
-   Readability → Jina Reader → strip-tag automatically.\n\n\
-\
-4. `sec_filing_fetch` (US tickers ONLY) — list recent SEC EDGAR filings \
-   (10-K, 10-Q, 8-K, DEF 14A, S-1, …) for a US-listed company by ticker. \
-   Returns filing metadata + primary document URL. Standard flow: \
-   `sec_filing_fetch(ticker, form_type='10-Q', limit=3)` → pick the \
-   relevant filing → `web_fetch(url)` to read it.\n\n\
-\
-5. `tushare_quote` (CHINA A-SHARES) — daily OHLCV for 600519.SH (Moutai), \
-   000001.SZ (Ping An Bank), 300750.SZ (CATL), etc. Codex `web_search` \
-   has poor A-share coverage; ALWAYS use `tushare_quote` for any CN \
-   equity / index quote. Format: `<ticker>.<SH|SZ|BJ>`.\n\n\
-\
-6. `tradingview_quote` (GLOBAL SNAPSHOT) — close / change / volume / \
-   market-cap / technical rating for one or many tickers in \
-   EXCHANGE:SYMBOL format (NASDAQ:NVDA, HKEX:0700, …). Use for \
-   side-by-side comparison or when `web_search` snippets aren't precise \
-   enough. Quotes can be 15-min delayed.\n\n\
-\
-DECISION HEURISTICS\n\
-- Concept / framework / mental-model question → `corpus_search` first.\n\
-- US ticker fundamentals / 10-K / 10-Q / 8-K → `sec_filing_fetch` then \
-  `web_fetch` on the chosen filing URL.\n\
-- A-share quote → `tushare_quote`.\n\
-- Multi-ticker comparison snapshot → `tradingview_quote`.\n\
-- News / current event / unknown entity → `web_search` first.\n\
-- User gives a URL → `web_fetch` directly.\n\
-- Multiple sub-questions → call tools in PARALLEL when independent.\n\n\
-\
-CITATION STYLE\n\
-- When citing a corpus document, use its human TITLE (e.g. \"Margin of \
-  Safety\", \"Long-term debt cycle\"), NEVER its internal path id like \
-  `wikis/principles/concepts/...`. Path ids are an implementation detail \
-  the user should not see.\n\
-- When citing a web URL, use a [Title](URL) markdown link with a short \
-  human-readable title; never paste a raw URL as the visible text.";
 
 /// Hard cap on tool-call rounds within a single user turn. Prevents runaway
 /// loops where the model keeps re-invoking tools without reaching a final
@@ -170,26 +108,14 @@ pub async fn run_chat_reply(
         anyhow::bail!("run_chat_reply called with no user messages in session");
     }
 
-    // System prompt = base + (optional) inherited summaries from compactions.
-    let system_prompt = if handoff_summaries.is_empty() {
-        SYSTEM_PROMPT.to_string()
-    } else {
-        format!(
-            "{base}\n\n# Prior session handoff (compacted)\n\n{summaries}\n\n\
-             The above summarizes the conversation up to this point. Continue \
-             from where it leaves off; treat established facts and the user's \
-             ongoing thread as known.",
-            base = SYSTEM_PROMPT,
-            summaries = handoff_summaries.join("\n\n---\n\n"),
-        )
-    };
+    let system_prompt = harness::build_system_prompt(&handoff_summaries);
 
     // Build the tools array once: server-side web_search + every client-side
     // function tool registered in the registry. The model picks between them
-    // based on the description text — we steer toward web_fetch for "read this
-    // URL" cases via SYSTEM_PROMPT, and let web_search handle discovery / live
-    // facts. Set LEEK_DISABLE_WEB_SEARCH=1 to force client-side-only tooling
-    // (useful for diagnosing function_call dispatch in isolation).
+    // based on each tool's `description` field (see tools/*.rs); cross-tool
+    // discipline lives in `harness/discipline.md` §7. Set
+    // LEEK_DISABLE_WEB_SEARCH=1 to force client-side-only tooling (useful for
+    // diagnosing function_call dispatch in isolation).
     let mut tool_specs: Vec<ToolSpec> = if std::env::var("LEEK_DISABLE_WEB_SEARCH").is_ok() {
         Vec::new()
     } else {
