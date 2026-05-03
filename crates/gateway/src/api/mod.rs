@@ -62,6 +62,10 @@ pub fn router(state: AppState) -> Router {
             post(sessions::abort_handler),
         )
         .route(
+            "/api/v1/sessions/{id}/compact",
+            post(sessions::compact_handler),
+        )
+        .route(
             "/api/v1/sessions/{id}/events",
             get(sessions::events_handler),
         )

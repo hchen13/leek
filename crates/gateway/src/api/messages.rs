@@ -96,11 +96,13 @@ pub async fn post_handler(
     let bus = state.event_bus.clone();
     let tools = state.tools.clone();
     let cancel_for_task = cancel.clone();
+    let cancel_for_cleanup = cancel.clone();
+    let active_replies = state.active_replies.clone();
     tokio::spawn(async move {
         if let Err(e) = handle_user_message(
             pool,
             user_id,
-            sess,
+            sess.clone(),
             provider,
             bus,
             user_text,
@@ -111,6 +113,13 @@ pub async fn post_handler(
         .await
         {
             tracing::error!(error = %e, "agent dispatch failed");
+        }
+        // Clear the cancel token after the reply finishes so /compact knows
+        // the session is idle. Skip if we were replaced by a later POST —
+        // replacement cancels the previous token; if ours is cancelled, the
+        // map slot belongs to someone else now.
+        if !cancel_for_cleanup.is_cancelled() {
+            active_replies.lock().await.remove(&sess);
         }
     });
 

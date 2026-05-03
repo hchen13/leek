@@ -198,6 +198,7 @@ async fn run_chat(vault_path: &Path, prompt: String, model: String) -> Result<()
             external_web_access: true,
         }],
         additional_inputs: Vec::new(),
+        reasoning_effort: None,
     };
 
     let mut stream = provider.chat(req).await?;

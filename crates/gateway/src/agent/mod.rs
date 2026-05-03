@@ -5,6 +5,7 @@
 //! the same `tools` array but the model executes them remotely; we only
 //! surface lifecycle events for the UI.
 
+pub mod compact;
 pub mod routing;
 pub mod tools;
 
@@ -136,10 +137,17 @@ pub async fn run_chat_reply(
     cancel: CancellationToken,
     tools: ToolRegistry,
 ) -> Result<()> {
-    // Load full history. P1: cap at last 100 messages — context-trimming logic
-    // (data-schema.md / agent-loop.md §4.3) lands when token budgets matter.
-    let history = vault_messages::list(&pool, &user_id, &session_id, None, 100).await?;
+    // Load full history. The hard cap is high enough that a session
+    // shouldn't bump it before compaction kicks in; once compacted, the new
+    // session starts at seq=1 again so the cap is fresh. Token-budget-based
+    // trimming is replaced by /compact (#137) — when context bites, fork
+    // rather than truncate.
+    let history = vault_messages::list(&pool, &user_id, &session_id, None, 1000).await?;
 
+    // Compaction summary rows (role=compaction_summary) get prepended to the
+    // system prompt instead of going into the message list — they're "what
+    // this session inherits from its parent", not turns the model said.
+    let mut handoff_summaries: Vec<String> = Vec::new();
     let messages: Vec<ChatMessage> = history
         .iter()
         .filter_map(|row| {
@@ -148,15 +156,33 @@ pub async fn run_chat_reply(
             let role = match row.role.as_str() {
                 "user" => Role::User,
                 "agent" => Role::Assistant,
-                _ => return None, // skip system / tool rows in this slice
+                "compaction_summary" => {
+                    handoff_summaries.push(text);
+                    return None;
+                }
+                _ => return None, // skip other system / tool rows in this slice
             };
             Some(ChatMessage { role, content: text })
         })
         .collect();
 
-    if messages.is_empty() {
+    if messages.is_empty() && handoff_summaries.is_empty() {
         anyhow::bail!("run_chat_reply called with no user messages in session");
     }
+
+    // System prompt = base + (optional) inherited summaries from compactions.
+    let system_prompt = if handoff_summaries.is_empty() {
+        SYSTEM_PROMPT.to_string()
+    } else {
+        format!(
+            "{base}\n\n# Prior session handoff (compacted)\n\n{summaries}\n\n\
+             The above summarizes the conversation up to this point. Continue \
+             from where it leaves off; treat established facts and the user's \
+             ongoing thread as known.",
+            base = SYSTEM_PROMPT,
+            summaries = handoff_summaries.join("\n\n---\n\n"),
+        )
+    };
 
     // Build the tools array once: server-side web_search + every client-side
     // function tool registered in the registry. The model picks between them
@@ -214,11 +240,12 @@ pub async fn run_chat_reply(
 
         let req = ChatRequest {
             messages: messages.clone(),
-            system: Some(SYSTEM_PROMPT.to_string()),
+            system: Some(system_prompt.clone()),
             model: DEFAULT_MODEL.to_string(),
             max_output_tokens: None,
             tools: tool_specs.clone(),
             additional_inputs: additional_inputs.clone(),
+            reasoning_effort: None,
         };
 
         let mut stream = provider.chat(req).await?;
