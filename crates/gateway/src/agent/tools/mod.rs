@@ -10,6 +10,7 @@
 
 pub mod corpus_search;
 pub mod get_candlesticks;
+pub mod get_financials;
 pub mod record_investment_action;
 pub mod sec_filing_fetch;
 pub mod tradingview_quote;
