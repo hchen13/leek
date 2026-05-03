@@ -42,8 +42,10 @@ human-readable title; never paste a raw URL as the visible text.";
 
 /// Build the full system prompt. `handoff_summaries` are pre-extracted
 /// compaction-summary message texts (role=compaction_summary rows), to be
-/// joined into the inherited-context section.
-pub fn build_system_prompt(handoff_summaries: &[String]) -> String {
+/// joined into the inherited-context section. `mandate` is the contents of
+/// `vault/<user_id>/mandate.md` if it exists and is non-empty — caller is
+/// responsible for reading the file (we keep this fn pure for testability).
+pub fn build_system_prompt(handoff_summaries: &[String], mandate: Option<&str>) -> String {
     let mut prompt = String::with_capacity(8192);
 
     prompt.push_str(IDENTITY);
@@ -62,8 +64,16 @@ pub fn build_system_prompt(handoff_summaries: &[String]) -> String {
         prompt.push_str(CORPUS_DISTILLED);
     }
 
-    // TODO: when per-user vault wiring lands, read
-    // `vault/{user_id}/mandate.md` and append as `# User mandate`.
+    // User mandate — discipline §5 promotes this to the source of truth
+    // for risk tolerance / position caps / mandate hints. Empty / missing
+    // mandate omits the section so the LLM doesn't hallucinate constraints.
+    if let Some(text) = mandate {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            prompt.push_str("\n\n# User mandate (vault/<user_id>/mandate.md)\n\n");
+            prompt.push_str(trimmed);
+        }
+    }
 
     if !handoff_summaries.is_empty() {
         prompt.push_str("\n\n# Prior session handoff (compacted)\n\n");
@@ -84,7 +94,7 @@ mod tests {
 
     #[test]
     fn build_includes_all_baseline_sections() {
-        let p = build_system_prompt(&[]);
+        let p = build_system_prompt(&[], None);
         assert!(p.contains("# Identity"));
         assert!(p.contains("truth-seeking investment partner"));
         assert!(p.contains("# Discipline"));
@@ -96,15 +106,34 @@ mod tests {
     #[test]
     fn build_appends_handoff_summaries() {
         let summaries = vec!["旧 session 摘要".to_string()];
-        let p = build_system_prompt(&summaries);
+        let p = build_system_prompt(&summaries, None);
         assert!(p.contains("Prior session handoff"));
         assert!(p.contains("旧 session 摘要"));
     }
 
     #[test]
     fn build_omits_handoff_when_empty() {
-        let p = build_system_prompt(&[]);
+        let p = build_system_prompt(&[], None);
         assert!(!p.contains("Prior session handoff"));
+    }
+
+    #[test]
+    fn build_includes_mandate_when_provided() {
+        let m = "- 单标位置上限 5%\n- 不碰复杂衍生品";
+        let p = build_system_prompt(&[], Some(m));
+        assert!(p.contains("# User mandate"));
+        assert!(p.contains("单标位置上限 5%"));
+        assert!(p.contains("不碰复杂衍生品"));
+    }
+
+    #[test]
+    fn build_omits_mandate_when_empty_or_whitespace() {
+        let p1 = build_system_prompt(&[], Some(""));
+        let p2 = build_system_prompt(&[], Some("   \n\n   "));
+        let p3 = build_system_prompt(&[], None);
+        assert!(!p1.contains("# User mandate"));
+        assert!(!p2.contains("# User mandate"));
+        assert!(!p3.contains("# User mandate"));
     }
 
     /// Disabled by default; run with
@@ -113,7 +142,7 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_prompt() {
-        let p = build_system_prompt(&[]);
+        let p = build_system_prompt(&[], None);
         eprintln!("--- PROMPT (len={} bytes) ---\n{}\n--- END ---", p.len(), p);
     }
 }

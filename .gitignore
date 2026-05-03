@@ -49,6 +49,9 @@ vault.db-wal
 *.sqlite-shm
 *.sqlite-wal
 
+# Per-user mandate (investment preferences, position caps, etc — discipline §5)
+mandates/
+
 # Playwright debug artifacts (root-level only — don't catch design assets)
 /.playwright-mcp/
 /*.png

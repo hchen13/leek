@@ -74,6 +74,7 @@ pub async fn run_chat_reply(
     task: Option<TaskBinding>,
     cancel: CancellationToken,
     tools: ToolRegistry,
+    mandate_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
     // Load full history. The hard cap is high enough that a session
     // shouldn't bump it before compaction kicks in; once compacted, the new
@@ -108,7 +109,14 @@ pub async fn run_chat_reply(
         anyhow::bail!("run_chat_reply called with no user messages in session");
     }
 
-    let system_prompt = harness::build_system_prompt(&handoff_summaries);
+    // Re-read mandate.md every turn so user edits take effect without
+    // restart. Filesystem cache makes this near-free; a missing or empty
+    // file omits the mandate section.
+    let mandate_text = mandate_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    let system_prompt =
+        harness::build_system_prompt(&handoff_summaries, mandate_text.as_deref());
 
     // Build the tools array once: server-side web_search + every client-side
     // function tool registered in the registry. The model picks between them

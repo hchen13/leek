@@ -159,6 +159,7 @@ pub async fn post_handler(
     let provider = state.provider.clone();
     let bus = state.event_bus.clone();
     let tools = state.tools.clone();
+    let mandate_path = state.mandate_path.clone();
     let cancel_for_task = cancel.clone();
     let cancel_for_cleanup = cancel.clone();
     let active_replies = state.active_replies.clone();
@@ -173,6 +174,7 @@ pub async fn post_handler(
             user_seq,
             cancel_for_task,
             tools,
+            mandate_path,
         )
         .await
         {
@@ -206,6 +208,7 @@ async fn handle_user_message(
     user_message_seq: i64,
     cancel: CancellationToken,
     tools: crate::agent::tools::ToolRegistry,
+    mandate_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     // P1 simplification: routing layer fires only when there's no in-progress
     // task. With one, attach to it directly (in-thread chat_reply).
@@ -223,6 +226,7 @@ async fn handle_user_message(
             None,
             cancel,
             tools,
+            mandate_path,
         )
         .await;
     }
@@ -243,6 +247,7 @@ async fn handle_user_message(
                 None,
                 cancel,
                 tools,
+                mandate_path,
             )
             .await;
         }
@@ -313,13 +318,22 @@ async fn handle_user_message(
                 }),
                 cancel,
                 tools,
+                mandate_path,
             )
             .await
         }
 
         DecisionKind::ChatReply => {
             agent::run_chat_reply(
-                pool, user_id, session_id, provider, event_bus, None, cancel, tools,
+                pool,
+                user_id,
+                session_id,
+                provider,
+                event_bus,
+                None,
+                cancel,
+                tools,
+                mandate_path,
             )
             .await
         }

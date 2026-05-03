@@ -47,6 +47,12 @@ pub struct AppState {
     pub active_replies: Arc<Mutex<HashMap<String, ActiveTask>>>,
     /// Client-side tool registry passed into the agent loop on each reply.
     pub tools: ToolRegistry,
+    /// Filesystem path to the active user's mandate.md file (their investment
+    /// preferences / risk tolerance / position caps / etc — discipline §5).
+    /// Resolved at boot from the vault directory: `<vault-dir>/mandates/<user_id>.md`.
+    /// Read on every chat turn so edits take effect immediately. `None` only
+    /// in degenerate test setups where the path can't be resolved.
+    pub mandate_path: Option<std::path::PathBuf>,
 }
 
 pub fn router(state: AppState) -> Router {

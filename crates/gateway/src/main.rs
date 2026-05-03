@@ -182,6 +182,14 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
         .register(Arc::new(agent::tools::tradingview_quote::TradingViewQuoteTool::new()?))
         .build();
 
+    // mandates/<user_id>.md sits next to the vault sqlite. Users edit this
+    // file directly (markdown over Obsidian / vim / etc); we re-read it on
+    // every chat turn so edits take effect without restart.
+    let mandate_path = vault_path.parent().map(|dir| {
+        dir.join("mandates")
+            .join(format!("{}.md", vault::LOCAL_USER_ID))
+    });
+
     let state = api::AppState {
         pool: vault.pool.clone(),
         provider,
@@ -191,6 +199,7 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
             std::collections::HashMap::new(),
         )),
         tools,
+        mandate_path,
     };
 
     let app = api::router(state);
