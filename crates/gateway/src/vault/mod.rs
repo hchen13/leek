@@ -4,6 +4,7 @@
 
 pub mod compactions;
 pub mod events;
+pub mod holdings;
 pub mod messages;
 pub mod provider_configs;
 pub mod sessions;

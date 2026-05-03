@@ -7,6 +7,7 @@ import { AgentMsg, Composer, UserMsg, type SlashCommand } from "./Chat";
 import { EventsPanel } from "./EventsPanel";
 import { BrainWidget } from "./BrainWidget";
 import { Rail, TopBar } from "./Workbench";
+import { NavRail } from "../App";
 import { SafeMarkdown } from "./SafeMarkdown";
 import { ArtifactPanel, extractLinkMeta } from "./ArtifactCards";
 import { SessionMenu, type SessionRow } from "./SessionMenu";
@@ -215,7 +216,7 @@ interface LiveTick {
   ts: string;
 }
 
-export function LiveChat() {
+export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => void } = {}) {
   const [sessionId, setSessionId] = createSignal<string>(readSessionFromHash());
   const [sessions, setSessions] = createSignal<SessionRow[]>([]);
   const [messages, setMessages] = createSignal<LiveMsg[]>([]);
@@ -1013,7 +1014,9 @@ export function LiveChat() {
 
   return (
     <div class="lk-app" data-screen-label="L.E.E.K · live">
-      <Rail active="chat" />
+      <Show when={props.onNavigate} fallback={<Rail active="chat" />}>
+        {(nav) => <NavRail page="chat" onNavigate={nav()} />}
+      </Show>
       <div class="lk-main">
         <TopBar route={route()} />
 
