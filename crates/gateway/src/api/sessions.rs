@@ -10,7 +10,7 @@ use axum::Json;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use super::{AppError, AppState};
+use super::{ActiveTask, AppError, AppState};
 use crate::agent;
 use crate::events::EventEnvelope;
 use crate::vault::{
@@ -23,10 +23,21 @@ pub async fn abort_handler(
     Path(session_id): Path<String>,
 ) -> StatusCode {
     let map = state.active_replies.lock().await;
-    if let Some(token) = map.get(&session_id) {
-        token.cancel();
-        tracing::info!(session_id, "abort signalled");
+    let Some(task) = map.get(&session_id) else {
+        // Nothing in flight; treat as a no-op success.
+        return StatusCode::ACCEPTED;
+    };
+    if !task.user_cancellable {
+        // Auto pre-turn compaction — refuse the abort. The user has to wait
+        // because skipping it would push the next turn over context.
+        tracing::info!(
+            session_id,
+            "abort rejected: in-flight task is not user-cancellable (auto compaction)"
+        );
+        return StatusCode::CONFLICT;
     }
+    task.token.cancel();
+    tracing::info!(session_id, "abort signalled");
     StatusCode::ACCEPTED
 }
 
@@ -123,11 +134,13 @@ pub async fn delete_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    // Cancel any in-flight reply for this session before yanking the data.
+    // Cancel any in-flight task for this session before yanking the data.
+    // (Delete is the user's explicit intent — we cancel even auto-compactions
+    // here, since the data they're operating on is about to disappear.)
     {
         let mut map = state.active_replies.lock().await;
-        if let Some(token) = map.remove(&session_id) {
-            token.cancel();
+        if let Some(task) = map.remove(&session_id) {
+            task.token.cancel();
         }
     }
     vault_sessions::hard_delete(&state.pool, &state.user_id, &session_id).await?;
@@ -201,8 +214,8 @@ pub async fn start_compaction(
     // but-not-yet-cleaned-up token is fine (someone hit /abort already).
     {
         let map = state.active_replies.lock().await;
-        if let Some(t) = map.get(session_id) {
-            if !t.is_cancelled() {
+        if let Some(task) = map.get(session_id) {
+            if !task.token.is_cancelled() {
                 anyhow::bail!(
                     "compaction rejected: agent reply in progress; abort or wait first"
                 );
@@ -213,9 +226,18 @@ pub async fn start_compaction(
     let new_session_id = format!("s-{}", uuid::Uuid::new_v4().simple());
 
     let cancel = CancellationToken::new();
+    // Auto pre-turn compactions are mandatory (see ActiveTask docs); manual
+    // ones can be aborted with Esc.
+    let user_cancellable = trigger != "auto_pre_turn";
     {
         let mut map = state.active_replies.lock().await;
-        map.insert(session_id.to_string(), cancel.clone());
+        map.insert(
+            session_id.to_string(),
+            ActiveTask {
+                token: cancel.clone(),
+                user_cancellable,
+            },
+        );
     }
 
     // Fire the start event synchronously so any subscriber flips into

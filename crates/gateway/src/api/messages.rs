@@ -141,8 +141,14 @@ pub async fn post_handler(
     let cancel = CancellationToken::new();
     {
         let mut map = state.active_replies.lock().await;
-        if let Some(prev) = map.insert(session_id.clone(), cancel.clone()) {
-            prev.cancel();
+        if let Some(prev) = map.insert(
+            session_id.clone(),
+            super::ActiveTask {
+                token: cancel.clone(),
+                user_cancellable: true,
+            },
+        ) {
+            prev.token.cancel();
         }
     }
 
