@@ -24,6 +24,34 @@ pub struct ChatRequest {
     /// must already match the OpenAI Responses API input shape (see
     /// codex-rs/protocol/src/models.rs ResponseItem).
     pub additional_inputs: Vec<serde_json::Value>,
+    /// Reasoning effort for models that support it (gpt-5/gpt-5.5/...).
+    /// `None` means use the model's backend default. Compaction passes
+    /// `Some(Minimal)` so summaries don't burn thinking tokens.
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// Mirrors codex-rs `ReasoningEffort`. We omit XHigh / None — leek only
+/// needs the four levels users would actually pick.
+#[derive(Debug, Clone, Copy)]
+pub enum ReasoningEffort {
+    Minimal,
+    #[allow(dead_code)]
+    Low,
+    #[allow(dead_code)]
+    Medium,
+    #[allow(dead_code)]
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

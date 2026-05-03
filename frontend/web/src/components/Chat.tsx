@@ -140,12 +140,24 @@ export function Composer(props: {
   onSubmit?: (text: string) => void;
   onStop?: () => void;
   pending?: boolean;
+  /** When true, the composer shows the STOP button (same as `pending`) but
+   *  Enter still calls onSubmit — the parent is expected to queue rather
+   *  than fire the message. Used during /compact. */
+  compacting?: boolean;
+  /** When false (auto-compaction), the STOP button is hidden and Esc is
+   *  ignored — the operation cannot be cancelled. Defaults to true. */
+  cancellable?: boolean;
   commands?: SlashCommand[];
 }) {
   const [text, setText] = createSignal(props.value ?? "");
   const [hl, setHl] = createSignal(0);
-  const placeholder = () => props.placeholder ?? "Ask the kernel — query a name, draft a thesis, or run a screen…";
-  const canSend = () => !props.pending && text().trim().length > 0;
+  const placeholder = () => {
+    if (props.compacting) return "压缩中… 输入将进入队列";
+    return props.placeholder ?? "Ask the kernel — query a name, draft a thesis, or run a screen…";
+  };
+  // Display logic: pending OR compacting both show STOP and lock SEND.
+  const isLocked = () => !!props.pending || !!props.compacting;
+  const canSend = () => !isLocked() && text().trim().length > 0;
   const trimmed = () => text().trim();
   const slashMode = () => trimmed().startsWith("/");
   const matches = () => {
@@ -155,7 +167,9 @@ export function Composer(props: {
   };
   const runMatch = (c: SlashCommand) => { c.run(); setText(""); setHl(0); };
   const submit = () => {
-    if (props.pending) return;
+    // While compacting, Enter still fires onSubmit so the parent can queue
+    // the message. Only normal `pending` (= reply in flight) blocks.
+    if (props.pending && !props.compacting) return;
     if (slashMode()) {
       const m = matches();
       const pick = m[hl()] ?? m[0];
@@ -163,7 +177,7 @@ export function Composer(props: {
       // unknown slash command — fall through to send literal text so the
       // user gets feedback rather than silent failure
     }
-    if (!canSend()) return;
+    if (text().trim().length === 0) return;
     const t = text();
     setText("");
     setHl(0);
@@ -183,7 +197,9 @@ export function Composer(props: {
       if (e.key === "ArrowUp")   { e.preventDefault(); setHl((h) => Math.max(h - 1, 0)); return; }
       if (e.key === "Tab")       { e.preventDefault(); const m = matches()[hl()]; if (m) setText("/" + m.name); return; }
     }
-    if (e.key === "Escape" && props.pending) {
+    if (e.key === "Escape" && (props.pending || props.compacting)) {
+      // Auto-compaction (cancellable === false) cannot be aborted.
+      if (props.compacting && props.cancellable === false) return;
       e.preventDefault();
       props.onStop?.();
       return;
@@ -194,7 +210,10 @@ export function Composer(props: {
       setHl(0);
       return;
     }
-    if (e.key === "Enter" && !e.shiftKey && !props.pending) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      // Block Enter when reply is in flight (real pending) but allow
+      // queueing during compaction.
+      if (props.pending && !props.compacting) return;
       if (e.isComposing || composing || (e as KeyboardEvent & { keyCode?: number }).keyCode === 229) return;
       e.preventDefault();
       submit();
@@ -240,15 +259,25 @@ export function Composer(props: {
               >/{c.name}</button>
             )}</For>
           </Show>
-          {props.pending ? (
+          {isLocked() && !(props.compacting && props.cancellable === false) ? (
             <button
               class="lk-composer-send"
               style={{ background: "rgba(217,112,112,0.85)" }}
               onClick={() => props.onStop?.()}
-              title="Stop generating (Esc)"
+              title={props.compacting ? "中止压缩（Esc）" : "Stop generating (Esc)"}
             >
               <Icon name="close" class="ic-xs" /> STOP
             </button>
+          ) : isLocked() ? (
+            // Auto-compaction in flight: show a non-interactive busy chip
+            // instead of STOP, since the operation can't be aborted.
+            <span
+              class="lk-composer-send"
+              style={{ background: "rgba(180,140,90,0.55)", cursor: "not-allowed" }}
+              title="自动压缩进行中，不可取消"
+            >
+              auto-compact…
+            </span>
           ) : (
             <button class="lk-composer-send" onClick={submit} disabled={!canSend()}>
               <Icon name="send" class="ic-xs" /> SEND

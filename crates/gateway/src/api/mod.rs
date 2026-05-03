@@ -22,17 +22,37 @@ use crate::agent::tools::ToolRegistry;
 use crate::events::EventBus;
 use crate::llm::LlmProvider;
 
+/// One in-flight per-session piece of work — either a chat reply, a manual
+/// `/compact`, or an auto pre-turn compaction. The `user_cancellable` flag
+/// gates `POST /abort`: chat replies and manual compactions are cancellable
+/// (Esc / `/compact` chip stop button); auto compactions are *not* —
+/// the user is forced to wait because the alternative is the next turn
+/// blowing past the model's context window.
+#[derive(Clone)]
+pub struct ActiveTask {
+    pub token: CancellationToken,
+    pub user_cancellable: bool,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: sqlx::SqlitePool,
     pub provider: Arc<dyn LlmProvider>,
     pub event_bus: EventBus,
     pub user_id: String,
-    /// Per-session cancellation token for the active agent reply (if any).
-    /// Inserted by `messages::post_handler`, cancelled by `sessions::abort`.
-    pub active_replies: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    /// Per-session active task (chat reply / manual compact / auto compact).
+    /// Inserted by `messages::post_handler` and `sessions::start_compaction`,
+    /// cancelled by `sessions::abort_handler` (subject to `user_cancellable`)
+    /// or removed by background-task cleanup once finished.
+    pub active_replies: Arc<Mutex<HashMap<String, ActiveTask>>>,
     /// Client-side tool registry passed into the agent loop on each reply.
     pub tools: ToolRegistry,
+    /// Filesystem path to the active user's mandate.md file (their investment
+    /// preferences / risk tolerance / position caps / etc — discipline §5).
+    /// Resolved at boot from the vault directory: `<vault-dir>/mandates/<user_id>.md`.
+    /// Read on every chat turn so edits take effect immediately. `None` only
+    /// in degenerate test setups where the path can't be resolved.
+    pub mandate_path: Option<std::path::PathBuf>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -60,6 +80,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/sessions/{id}/abort",
             post(sessions::abort_handler),
+        )
+        .route(
+            "/api/v1/sessions/{id}/compact",
+            post(sessions::compact_handler),
         )
         .route(
             "/api/v1/sessions/{id}/events",

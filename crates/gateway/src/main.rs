@@ -71,6 +71,16 @@ enum CorpusAction {
         #[arg(long, default_value = "./crates/gateway/assets/corpus.graph.json")]
         output: PathBuf,
     },
+
+    /// 把 corpus/wikis/principles 蒸馏成 system-prompt 可嵌入的单一 markdown blob
+    Distill {
+        /// corpus 仓库根目录
+        #[arg(long, default_value = "./corpus")]
+        root: PathBuf,
+        /// 输出 markdown 文件路径
+        #[arg(long, default_value = "./crates/gateway/assets/corpus_distilled.md")]
+        output: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -103,8 +113,26 @@ async fn main() -> Result<()> {
         Command::Chat { prompt, model } => run_chat(&cli.vault, prompt, model).await,
         Command::Corpus { action } => match action {
             CorpusAction::RebuildGraph { root, output } => run_corpus_rebuild(&root, &output),
+            CorpusAction::Distill { root, output } => run_corpus_distill(&root, &output),
         },
     }
+}
+
+fn run_corpus_distill(root: &Path, output: &Path) -> Result<()> {
+    let (blob, report) = corpus::distill::distill(root)?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(output, &blob).with_context(|| format!("writing {}", output.display()))?;
+    println!(
+        "\x1b[92m✓\x1b[0m distilled {} pages → {} ({} bytes)",
+        report.pages_in,
+        output.display(),
+        report.bytes_out
+    );
+    println!("    input_hash {}", &report.input_hash[..16]);
+    Ok(())
 }
 
 fn run_corpus_rebuild(root: &Path, output: &Path) -> Result<()> {
@@ -154,6 +182,14 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
         .register(Arc::new(agent::tools::tradingview_quote::TradingViewQuoteTool::new()?))
         .build();
 
+    // mandates/<user_id>.md sits next to the vault sqlite. Users edit this
+    // file directly (markdown over Obsidian / vim / etc); we re-read it on
+    // every chat turn so edits take effect without restart.
+    let mandate_path = vault_path.parent().map(|dir| {
+        dir.join("mandates")
+            .join(format!("{}.md", vault::LOCAL_USER_ID))
+    });
+
     let state = api::AppState {
         pool: vault.pool.clone(),
         provider,
@@ -163,6 +199,7 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
             std::collections::HashMap::new(),
         )),
         tools,
+        mandate_path,
     };
 
     let app = api::router(state);
@@ -198,6 +235,7 @@ async fn run_chat(vault_path: &Path, prompt: String, model: String) -> Result<()
             external_web_access: true,
         }],
         additional_inputs: Vec::new(),
+        reasoning_effort: None,
     };
 
     let mut stream = provider.chat(req).await?;

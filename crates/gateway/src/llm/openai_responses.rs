@@ -9,6 +9,8 @@ use futures::{stream::BoxStream, StreamExt};
 use serde::Deserialize;
 
 use super::{ChatRequest, LlmEvent, Role, StopReason, ToolSpec, Usage, WebSearchAction};
+// `ReasoningEffort` is stringified at the call site (`effort.as_str()`),
+// so no direct import here.
 
 pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
     let mut input = Vec::new();
@@ -77,6 +79,15 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
         }
     }
 
+    // Reasoning effort for gpt-5/gpt-5.5-style models. Omit when caller
+    // didn't ask — backend uses the model's default level.
+    if let Some(effort) = req.reasoning_effort {
+        body["reasoning"] = serde_json::json!({
+            "effort": effort.as_str(),
+            "summary": serde_json::Value::Null,
+        });
+    }
+
     // Note: `max_output_tokens` is intentionally NOT serialized — the codex
     // backend rejects it as "Unsupported parameter". We'll add it back when
     // the openai_api_key provider lands (platform.openai.com supports it).
@@ -96,27 +107,36 @@ pub fn parse_sse_stream(resp: reqwest::Response) -> BoxStream<'static, Result<Ll
     let mut bytes_stream = resp.bytes_stream();
 
     Box::pin(try_stream! {
-        let mut buf = String::new();
+        // Buffer at byte level. The codex backend can split a multi-byte
+        // UTF-8 character (e.g. CJK) across two HTTP chunks; decoding
+        // chunks individually with `from_utf8` blows up at the boundary
+        // (observed during /compact on long Chinese sessions). The blank-
+        // line event delimiter is pure ASCII, so scanning bytes is safe;
+        // we decode UTF-8 only after we've extracted a whole event.
+        let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = bytes_stream.next().await {
             let chunk = chunk.context("reading SSE chunk")?;
-            let s = std::str::from_utf8(&chunk).context("non-UTF-8 in SSE chunk")?;
-            buf.push_str(s);
+            buf.extend_from_slice(&chunk);
 
-            // Split on blank-line event delimiter; SSE allows \n\n or \r\n\r\n
             loop {
                 let Some(idx) = find_event_boundary(&buf) else { break };
-                let raw_event = buf[..idx.end_of_event].to_string();
-                buf.drain(..idx.next_event_start);
-                for evt in parse_one_event(&raw_event)? {
+                let raw_bytes: Vec<u8> = buf.drain(..idx.next_event_start).collect();
+                let raw_event = std::str::from_utf8(&raw_bytes[..idx.end_of_event])
+                    .context("non-UTF-8 in SSE event")?;
+                for evt in parse_one_event(raw_event)? {
                     yield evt;
                 }
             }
         }
 
-        // Flush remaining buffer if it has a complete event without trailing blank line
-        if !buf.trim().is_empty() {
-            for evt in parse_one_event(&buf)? {
-                yield evt;
+        // Flush any complete event left without a trailing blank line.
+        if !buf.is_empty() {
+            let trailing = std::str::from_utf8(&buf)
+                .context("non-UTF-8 in trailing SSE event")?;
+            if !trailing.trim().is_empty() {
+                for evt in parse_one_event(trailing)? {
+                    yield evt;
+                }
             }
         }
     })
@@ -127,14 +147,14 @@ struct EventBoundary {
     next_event_start: usize,
 }
 
-fn find_event_boundary(buf: &str) -> Option<EventBoundary> {
-    if let Some(i) = buf.find("\n\n") {
+fn find_event_boundary(buf: &[u8]) -> Option<EventBoundary> {
+    if let Some(i) = buf.windows(2).position(|w| w == b"\n\n") {
         return Some(EventBoundary {
             end_of_event: i,
             next_event_start: i + 2,
         });
     }
-    if let Some(i) = buf.find("\r\n\r\n") {
+    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
         return Some(EventBoundary {
             end_of_event: i,
             next_event_start: i + 4,
@@ -481,6 +501,7 @@ mod tests {
                 external_web_access: true,
             }],
             additional_inputs: Vec::new(),
+            reasoning_effort: None,
         };
         let body = build_request_body(&req);
         let tools = body.get("tools").and_then(|t| t.as_array()).unwrap();
@@ -502,6 +523,7 @@ mod tests {
             max_output_tokens: None,
             tools: Vec::new(),
             additional_inputs: Vec::new(),
+            reasoning_effort: None,
         };
         let body = build_request_body(&req);
         assert!(body.get("tools").is_none());
@@ -567,6 +589,7 @@ mod tests {
                 }),
             }],
             additional_inputs: Vec::new(),
+            reasoning_effort: None,
         };
         let body = build_request_body(&req);
         let tools = body.get("tools").and_then(|t| t.as_array()).unwrap();
@@ -575,6 +598,67 @@ mod tests {
         assert_eq!(tools[0]["name"], "web_fetch");
         assert_eq!(tools[0]["description"], "Fetch a URL.");
         assert_eq!(tools[0]["parameters"]["required"][0], "url");
+    }
+
+    #[test]
+    fn event_boundary_finds_lf_in_byte_buffer() {
+        // "data: 中文\n\nremaining" — boundary should land cleanly even
+        // though the body contains 3-byte CJK characters. UTF-8 \n (0x0A)
+        // never appears inside continuation bytes (0x80-0xBF), so byte
+        // search is safe.
+        let buf = b"data: \xe4\xb8\xad\xe6\x96\x87\n\nremaining";
+        let idx = super::find_event_boundary(buf).unwrap();
+        let event = std::str::from_utf8(&buf[..idx.end_of_event]).unwrap();
+        assert_eq!(event, "data: 中文");
+        assert_eq!(&buf[idx.next_event_start..], b"remaining");
+    }
+
+    #[test]
+    fn event_boundary_returns_none_for_partial_multibyte_at_end() {
+        // chunk ends mid-character — no event boundary yet, caller
+        // must accumulate more bytes before decoding. This is exactly
+        // the case that broke the old String-based pipeline.
+        let buf = b"data: hello\xe4\xb8"; // truncated 中
+        assert!(super::find_event_boundary(buf).is_none());
+    }
+
+    #[test]
+    fn build_request_body_serializes_reasoning_effort() {
+        use super::super::{ChatMessage, ChatRequest, ReasoningEffort, Role};
+        let req = ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "summarize this".into(),
+            }],
+            system: None,
+            model: "gpt-5.5".into(),
+            max_output_tokens: None,
+            tools: Vec::new(),
+            additional_inputs: Vec::new(),
+            reasoning_effort: Some(ReasoningEffort::Minimal),
+        };
+        let body = build_request_body(&req);
+        assert_eq!(body["reasoning"]["effort"], "minimal");
+        assert!(body["reasoning"]["summary"].is_null());
+    }
+
+    #[test]
+    fn build_request_body_omits_reasoning_when_none() {
+        use super::super::{ChatMessage, ChatRequest, Role};
+        let req = ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "hi".into(),
+            }],
+            system: None,
+            model: "gpt-5.5".into(),
+            max_output_tokens: None,
+            tools: Vec::new(),
+            additional_inputs: Vec::new(),
+            reasoning_effort: None,
+        };
+        let body = build_request_body(&req);
+        assert!(body.get("reasoning").is_none());
     }
 
     #[test]
@@ -602,6 +686,7 @@ mod tests {
                     "output": "OK"
                 }),
             ],
+            reasoning_effort: None,
         };
         let body = build_request_body(&req);
         let input = body["input"].as_array().unwrap();

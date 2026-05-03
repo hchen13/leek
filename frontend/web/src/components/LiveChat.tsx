@@ -68,7 +68,9 @@ interface NarrationStep {
 }
 
 interface LiveMsg {
-  role: "user" | "agent";
+  /** `compaction_summary` rows are written by /compact and rendered as a
+   *  collapsible system card at the head of forked sessions. */
+  role: "user" | "agent" | "compaction_summary";
   text: string;
   ts: string;
   streaming?: boolean;
@@ -77,6 +79,71 @@ interface LiveMsg {
   narrations?: NarrationStep[];
   /** Final elapsed seconds for the agent reply, frozen at message_end. */
   total_sec?: number;
+}
+
+/** Render a forked-session's compaction summary as a collapsible system
+ *  card. Default collapsed (title + first line); click to expand the full
+ *  structured markdown. */
+function CompactionSummaryCard(props: { time: string; markdown: string }) {
+  const [open, setOpen] = createSignal(false);
+  // First non-empty line gives the user a one-line preview (typically the
+  // first heading or the leading sentence of "## 当前研究主题").
+  const preview = () => {
+    const lines = (props.markdown || "")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("##"));
+    return lines[0] ?? "(空摘要)";
+  };
+  return (
+    <div
+      class="lk-msg lk-msg-compaction"
+      data-who="system"
+      style={{
+        border: "1px dashed rgba(217,119,87,0.35)",
+        "border-radius": "6px",
+        padding: "10px 12px",
+        margin: "8px 0",
+        background: "rgba(217,119,87,0.04)",
+      }}
+    >
+      <div
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          cursor: "pointer",
+          "font-family": "var(--font-mono)",
+          "font-size": "11.5px",
+          color: "var(--ink-2)",
+          display: "flex",
+          gap: "8px",
+          "align-items": "center",
+        }}
+      >
+        <span>📦</span>
+        <span style={{ "font-weight": 600 }}>压缩摘要</span>
+        <span style={{ color: "var(--ink-3)" }}>· {props.time}</span>
+        <Show when={!open()}>
+          <span style={{
+            color: "var(--ink-3)",
+            "margin-left": "8px",
+            "white-space": "nowrap",
+            overflow: "hidden",
+            "text-overflow": "ellipsis",
+          }}>
+            {preview()}
+          </span>
+        </Show>
+        <span style={{ "margin-left": "auto", color: "var(--ink-3)" }}>
+          {open() ? "收起 ▴" : "展开 ▾"}
+        </span>
+      </div>
+      <Show when={open()}>
+        <div style={{ "margin-top": "10px", "font-size": "13px" }}>
+          <SafeMarkdown source={props.markdown} />
+        </div>
+      </Show>
+    </div>
+  );
 }
 
 function summarizeSearch(s: SearchCall): string {
@@ -156,6 +223,15 @@ export function LiveChat() {
   const [error, setError] = createSignal<string | null>(null);
   const [pending, setPending] = createSignal(false);
   const [connected, setConnected] = createSignal(false);
+  // Compaction state — set when /compact is in flight. While true, the
+  // composer locks SEND, new submits queue (don't fire), and Esc routes to
+  // the same /abort endpoint normal replies use.
+  const [compacting, setCompacting] = createSignal(false);
+  const [compactQueue, setCompactQueue] = createSignal<string[]>([]);
+  const [pendingCompactionTargetId, setPendingCompactionTargetId] = createSignal<string | null>(null);
+  // Trigger of the in-flight compaction (`manual` | `auto_pre_turn`). Used
+  // to gate the Composer's STOP button: auto compactions cannot be cancelled.
+  const [compactionTrigger, setCompactionTrigger] = createSignal<string | null>(null);
   const [eventsOpen, setEventsOpen] = createSignal(false);
   const [liveTick, setLiveTick] = createSignal<LiveTick | null>(null);
   // Wall-clock seconds since the current agent reply started. Drives the
@@ -300,8 +376,12 @@ export function LiveChat() {
         hist = (json.items ?? []).map((m: any) => {
           let text = "";
           try { text = JSON.parse(m.content_json).text ?? ""; } catch {/* ignore */}
+          const role: LiveMsg["role"] =
+            m.role === "agent" ? "agent"
+            : m.role === "compaction_summary" ? "compaction_summary"
+            : "user";
           return {
-            role: m.role === "agent" ? "agent" : "user",
+            role,
             text,
             ts: fmtTime(m.created_at),
             searches: [],
@@ -585,6 +665,63 @@ export function LiveChat() {
     // memory:feedback_codex_claude_code_baseline — the chat flow is the
     // user-facing source of truth.
 
+    // Compaction lifecycle. Backend emits `started` synchronously when the
+    // POST handler runs, then `completed` (success) or `aborted` (Esc /
+    // failure) from the spawned task. Frontend mirrors these into UI lock
+    // state and (on completion) navigates to the new session.
+    evtSrc.addEventListener("compaction.started", (e: MessageEvent) => {
+      setCompacting(true);
+      try {
+        const data = JSON.parse(e.data) as { trigger?: string };
+        setCompactionTrigger(data.trigger ?? null);
+      } catch {
+        setCompactionTrigger(null);
+      }
+    });
+    evtSrc.addEventListener("compaction.completed", async (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data) as { new_session_id?: string };
+        const newId = data.new_session_id;
+        if (newId) {
+          // Switch over — connect() reloads the new session's messages
+          // (including the compaction_summary head row) and SSE stream.
+          // Await it so the post-flush optimistic push isn't clobbered by
+          // connect()'s in-flight setMessages(hist).
+          await switchSession(newId);
+          await refreshSessions();
+          // Clear compacting flag BEFORE flushing the queue, otherwise
+          // send() sees `compacting() == true` and re-queues each message
+          // instead of POSTing it.
+          setCompacting(false);
+          setCompactionTrigger(null);
+          setPendingCompactionTargetId(null);
+          // Flush queued messages into the new session, in order.
+          const queued = compactQueue();
+          setCompactQueue([]);
+          for (const text of queued) {
+            await send(text);
+          }
+          return;
+        }
+      } catch {
+        // ignore — UI lock will clear regardless
+      }
+      setCompacting(false);
+      setCompactionTrigger(null);
+      setPendingCompactionTargetId(null);
+    });
+    evtSrc.addEventListener("compaction.aborted", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data) as { reason?: string };
+        setError(`compaction aborted: ${data.reason ?? "unknown"}`);
+      } catch {
+        setError("compaction aborted");
+      }
+      setCompacting(false);
+      setCompactionTrigger(null);
+      setPendingCompactionTargetId(null);
+    });
+
     evtSrc.addEventListener("error", (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data);
@@ -596,13 +733,13 @@ export function LiveChat() {
     });
   }
 
-  function switchSession(id: string) {
+  async function switchSession(id: string) {
     if (id === sessionId()) return;
     evtSrc?.close();
     evtSrc = undefined;
     setSessionId(id);
     writeSessionToHash(id);
-    void connect(id);
+    await connect(id);
   }
 
   onMount(() => {
@@ -663,6 +800,14 @@ export function LiveChat() {
 
   async function send(text: string) {
     setError(null);
+    // While a compaction is in flight, hold the message in a local queue
+    // rather than firing it. The compaction.completed handler flushes the
+    // queue into the new session in order. Modeled on Claude Code's
+    // "messages enter the queue while compaction runs" behavior.
+    if (compacting()) {
+      setCompactQueue((q) => [...q, text]);
+      return;
+    }
     // Optimistic user message + immediate thinking placeholder so the
     // user sees feedback within a frame instead of waiting for the
     // backend's first SSE event (cold codex token refresh / network can
@@ -685,6 +830,27 @@ export function LiveChat() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content: { type: "text", text } }),
       });
+      if (r.status === 202) {
+        // Auto-compaction kicked off pre-turn: backend hasn't persisted our
+        // user message and won't start a reply. Roll back the optimistic UI
+        // and queue the text for re-send against the new session once
+        // `compaction.completed` SSE arrives.
+        const body = (await r.json().catch(() => ({}))) as {
+          auto_compacting?: boolean;
+        };
+        if (body.auto_compacting) {
+          setMessages((prev) => prev.slice(0, -2));
+          setPending(false);
+          if (elapsedTimer) {
+            clearInterval(elapsedTimer);
+            elapsedTimer = null;
+          }
+          setCompactQueue((q) => [...q, text]);
+          // SSE `compaction.started` will flip `compacting` on its own; the
+          // flush happens in the `compaction.completed` handler.
+          return;
+        }
+      }
       if (!r.ok) {
         const body = await r.text();
         setError(`POST ${r.status}: ${body.slice(0, 200)}`);
@@ -719,9 +885,34 @@ export function LiveChat() {
     },
     {
       name: "compact",
-      hint: "压缩对话上下文（todo）",
+      hint: "压缩对话上下文（fork 出新 session）",
       run: () => {
-        setError("/compact 待实现：当前 turn 不影响");
+        if (compacting() || pending()) return;
+        setError(null);
+        setCompacting(true);
+        void (async () => {
+          try {
+            const r = await fetch(`/api/v1/sessions/${sessionId()}/compact`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ trigger: "manual" }),
+            });
+            if (!r.ok) {
+              setCompacting(false);
+              const body = await r.text();
+              setError(`compact ${r.status}: ${body.slice(0, 200)}`);
+              return;
+            }
+            const data = (await r.json()) as { new_session_id: string };
+            setPendingCompactionTargetId(data.new_session_id);
+            // Don't navigate yet — wait for compaction.completed SSE so the
+            // user sees the lock release at the same moment the new session
+            // becomes ready.
+          } catch (e: any) {
+            setCompacting(false);
+            setError(e?.message ?? "compact failed");
+          }
+        })();
       },
     },
   ];
@@ -886,7 +1077,14 @@ export function LiveChat() {
             <For each={messages()}>{(m) => (
               <Show
                 when={m.role === "agent"}
-                fallback={<UserMsg time={m.ts}>{m.text}</UserMsg>}
+                fallback={
+                  <Show
+                    when={m.role === "compaction_summary"}
+                    fallback={<UserMsg time={m.ts}>{m.text}</UserMsg>}
+                  >
+                    <CompactionSummaryCard time={m.ts} markdown={m.text} />
+                  </Show>
+                }
               >
                 <AgentMsg time={m.ts}>
                   <Show when={m.streaming || m.total_sec != null}>
@@ -980,6 +1178,8 @@ export function LiveChat() {
             onSubmit={send}
             onStop={stop}
             pending={pending()}
+            compacting={compacting()}
+            cancellable={compactionTrigger() !== "auto_pre_turn"}
             commands={slashCommands}
           />
         </section>

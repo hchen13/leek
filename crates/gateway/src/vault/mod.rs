@@ -2,6 +2,7 @@
 //!
 //! See `design/p1-spec/data-schema.md` for the full schema reference.
 
+pub mod compactions;
 pub mod events;
 pub mod messages;
 pub mod provider_configs;

@@ -39,6 +39,41 @@ pub async fn ensure_exists(
     Ok(())
 }
 
+/// Insert a new session as a child of `parent_session_id`. The child carries
+/// `parent_session_id` + `compact_reason` so the UI can navigate back to the
+/// pre-compaction history.
+pub async fn fork(
+    pool: &SqlitePool,
+    user_id: &str,
+    parent_session_id: &str,
+    new_session_id: &str,
+    title: Option<&str>,
+    compact_reason: &str,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO sessions (
+            user_id, id, title, status, pinned,
+            created_at, last_active_at,
+            parent_session_id, compact_reason
+        )
+        VALUES (?, ?, ?, 'active', 0, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(user_id)
+    .bind(new_session_id)
+    .bind(title)
+    .bind(&now)
+    .bind(&now)
+    .bind(parent_session_id)
+    .bind(compact_reason)
+    .execute(pool)
+    .await
+    .context("forking session row")?;
+    Ok(())
+}
+
 pub async fn list(pool: &SqlitePool, user_id: &str) -> Result<Vec<SessionRow>> {
     let rows: Vec<SessionRow> = sqlx::query_as(
         r#"

@@ -37,8 +37,9 @@ tmp/
 target/
 **/*.rs.bk
 
-# Build artifacts
+# Build artifacts (regenerated via `leek corpus rebuild-graph` / `leek corpus distill`)
 crates/gateway/assets/corpus.graph.json
+crates/gateway/assets/corpus_distilled.md
 
 # Local SQLite vault
 vault.db
@@ -47,6 +48,9 @@ vault.db-wal
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# Per-user mandate (investment preferences, position caps, etc — discipline §5)
+mandates/
 
 # Playwright debug artifacts (root-level only — don't catch design assets)
 /.playwright-mcp/
