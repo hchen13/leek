@@ -20,6 +20,11 @@
 const IDENTITY: &str = include_str!("../../../../harness/identity.md");
 const DISCIPLINE: &str = include_str!("../../../../harness/discipline.md");
 const CORPUS_ORIENTATION: &str = include_str!("../../../../harness/corpus_orientation.md");
+/// Build artifact — populated by `leek corpus distill` and gitignored. On a
+/// fresh checkout, build.rs writes a placeholder so this macro doesn't fail;
+/// in production deployment the real distilled blob is generated as part of
+/// the build pipeline.
+const CORPUS_DISTILLED: &str = include_str!("../../assets/corpus_distilled.md");
 
 /// Citation *surface* conventions — runtime rules for how to render citations
 /// (don't leak internal path ids, prefer titled markdown links). Different
@@ -49,8 +54,14 @@ pub fn build_system_prompt(handoff_summaries: &[String]) -> String {
     prompt.push_str("\n\n");
     prompt.push_str(CITATION_CONVENTIONS);
 
-    // TODO: when the corpus distiller lands, include the distilled
-    // principles blob here as `# Investing principles (your default mind)`.
+    // Distilled corpus principles (~100K tokens when populated). Skip the
+    // placeholder on fresh checkouts so we don't pollute the prompt with
+    // build-script breadcrumbs.
+    if !CORPUS_DISTILLED.starts_with("<!-- placeholder") {
+        prompt.push_str("\n\n");
+        prompt.push_str(CORPUS_DISTILLED);
+    }
+
     // TODO: when per-user vault wiring lands, read
     // `vault/{user_id}/mandate.md` and append as `# User mandate`.
 

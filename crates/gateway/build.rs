@@ -1,15 +1,18 @@
-//! Build-time helper that ensures two assets exist before the main crate
-//! compiles, so `include_str!` / `RustEmbed` macros don't fail:
+//! Build-time helper that ensures generated assets exist before the main
+//! crate compiles, so `include_str!` / `RustEmbed` macros don't fail:
 //!
 //! 1. `frontend/web/dist/index.html` — placeholder when the SolidJS app
 //!    hasn't been built (production: `cd frontend/web && npm run build`).
 //! 2. `crates/gateway/assets/corpus.graph.json` — placeholder when the
 //!    corpus hasn't been crawled yet (production: `leek corpus rebuild-graph`).
+//! 3. `crates/gateway/assets/corpus_distilled.md` — placeholder when the
+//!    corpus principles haven't been distilled (production:
+//!    `leek corpus distill`).
 //!
-//! We do NOT re-crawl the corpus from build.rs — that would require a build-
-//! deps crate split. Users run `leek corpus rebuild-graph` whenever they want
-//! a fresh graph; this script just guarantees the macro doesn't blow up on a
-//! fresh checkout.
+//! We do NOT re-crawl / re-distill the corpus from build.rs — that would
+//! require a build-deps crate split. Users run the relevant `leek corpus …`
+//! command whenever they want a fresh asset; this script just guarantees the
+//! macro doesn't blow up on a fresh checkout.
 
 use std::fs;
 use std::path::Path;
@@ -29,6 +32,9 @@ const EMPTY_CORPUS_GRAPH: &str = r#"{
   "edges": []
 }
 "#;
+
+const EMPTY_CORPUS_DISTILLED: &str =
+    "<!-- placeholder: run `leek corpus distill` to populate -->\n";
 
 fn main() {
     let dist = Path::new("../../frontend/web/dist");
@@ -53,6 +59,19 @@ fn main() {
         }
     }
 
+    let corpus_distilled = Path::new("assets/corpus_distilled.md");
+    if !corpus_distilled.exists() {
+        if let Some(parent) = corpus_distilled.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                eprintln!("warning: could not create assets/: {e}");
+            }
+        }
+        if let Err(e) = fs::write(corpus_distilled, EMPTY_CORPUS_DISTILLED) {
+            eprintln!("warning: could not write corpus_distilled.md placeholder: {e}");
+        }
+    }
+
     println!("cargo:rerun-if-changed=../../frontend/web/dist/index.html");
     println!("cargo:rerun-if-changed=assets/corpus.graph.json");
+    println!("cargo:rerun-if-changed=assets/corpus_distilled.md");
 }

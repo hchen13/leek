@@ -37,8 +37,9 @@ tmp/
 target/
 **/*.rs.bk
 
-# Build artifacts
+# Build artifacts (regenerated via `leek corpus rebuild-graph` / `leek corpus distill`)
 crates/gateway/assets/corpus.graph.json
+crates/gateway/assets/corpus_distilled.md
 
 # Local SQLite vault
 vault.db
