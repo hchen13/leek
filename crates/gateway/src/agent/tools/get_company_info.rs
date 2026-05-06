@@ -45,7 +45,10 @@ impl GetCompanyInfoTool {
         };
         let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
         if code != 0 {
-            let msg = body.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown tushare error");
+            let msg = body
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown tushare error");
             bail!("tushare error (code={code}): {msg}");
         }
         Ok(body)
@@ -134,11 +137,17 @@ impl ToolHandler for GetCompanyInfoTool {
         });
         let fina_body = self.tushare_post(fina_payload, &cancel).await?;
 
-        let company_data = company_body.get("data").ok_or_else(|| anyhow!("missing data in stock_company response"))?;
+        let company_data = company_body
+            .get("data")
+            .ok_or_else(|| anyhow!("missing data in stock_company response"))?;
         let company_fields: Vec<String> = company_data
             .get("fields")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let company_items: Vec<serde_json::Value> = company_data
             .get("items")
@@ -172,7 +181,12 @@ impl ToolHandler for GetCompanyInfoTool {
         }
         if !setup_date.is_empty() {
             let date_fmt = if setup_date.len() == 8 {
-                format!("{}-{}-{}", &setup_date[..4], &setup_date[4..6], &setup_date[6..])
+                format!(
+                    "{}-{}-{}",
+                    &setup_date[..4],
+                    &setup_date[4..6],
+                    &setup_date[6..]
+                )
             } else {
                 setup_date.clone()
             };
@@ -200,11 +214,17 @@ impl ToolHandler for GetCompanyInfoTool {
             out.push_str(&format!("\n**公司简介**\n{introduction}\n"));
         }
 
-        let fina_data = fina_body.get("data").ok_or_else(|| anyhow!("missing data in fina_indicator_vip response"))?;
+        let fina_data = fina_body
+            .get("data")
+            .ok_or_else(|| anyhow!("missing data in fina_indicator_vip response"))?;
         let fina_fields: Vec<String> = fina_data
             .get("fields")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let fina_items: Vec<serde_json::Value> = fina_data
             .get("items")

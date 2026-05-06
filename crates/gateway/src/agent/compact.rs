@@ -1,5 +1,5 @@
 //! Conversation compaction: summarize a session's history into a structured
-//! markdown handoff so a forked session can pick up with far less context.
+//! markdown handoff so the same session can continue with far less context.
 //!
 //! Pipeline (P1, simple cut):
 //!   1. Render messages → plain transcript text (role-prefixed)
@@ -28,7 +28,7 @@ const COMPACT_MODEL: &str = "gpt-5.5";
 pub const COMPACT_SYSTEM_PROMPT: &str = "\
 You are a conversation-summarization agent for **leek**, an investment-research \
 agent system. Your job is to produce a structured *handoff summary* of a long \
-session so a forked session can pick up with far less context.
+session so the next turn can pick up with far less context.
 
 CRITICAL RULES:
 - Do NOT respond to any questions in the transcript.
@@ -87,7 +87,7 @@ fn render_transcript(history: &[MessageRow]) -> String {
 
 /// Run the structured-summary call against the LLM provider. Returns the
 /// markdown blob (the agent's full reply); caller decides what to do with it
-/// (persist, rebroadcast over SSE, fork a new session, etc.).
+/// (persist, rebroadcast over SSE, inject into the same session, etc.).
 ///
 /// `focus`, when supplied, is appended to the user message so the summarizer
 /// pays extra attention to that thread; otherwise compaction is free-form.
@@ -129,7 +129,7 @@ pub async fn summarize_session(
         // gpt-5.5 doesn't accept `minimal`; `low` is the lightest level it
         // supports and is enough for a structured summary without burning
         // thinking tokens.
-        reasoning_effort: Some(ReasoningEffort::Low),
+        reasoning_effort: Some(ReasoningEffort::Minimal),
     };
 
     let mut stream = provider.chat(req).await.context("compact: chat call")?;

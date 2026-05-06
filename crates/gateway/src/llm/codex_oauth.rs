@@ -93,10 +93,7 @@ impl LlmProvider for CodexOauthProvider {
         "codex_oauth"
     }
 
-    async fn chat(
-        &self,
-        req: ChatRequest,
-    ) -> Result<BoxStream<'static, Result<LlmEvent>>> {
+    async fn chat(&self, req: ChatRequest) -> Result<BoxStream<'static, Result<LlmEvent>>> {
         let access_token = self.ensure_fresh_token().await?;
         let body = openai_responses::build_request_body(&req);
         let url = format!("{BASE_URL}/responses");

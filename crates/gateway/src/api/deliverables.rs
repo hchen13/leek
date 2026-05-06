@@ -28,13 +28,8 @@ pub async fn confirm_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    let decision_id = vault_decisions::confirm_deliverable(
-        &state.pool,
-        &state.user_id,
-        &id,
-        "standalone",
-    )
-    .await?;
+    let decision_id =
+        vault_decisions::confirm_deliverable(&state.pool, &state.user_id, &id).await?;
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({ "decision_id": decision_id })),
@@ -51,13 +46,8 @@ pub async fn reject_handler(
     Path(id): Path<String>,
     Json(body): Json<RejectBody>,
 ) -> Result<StatusCode, AppError> {
-    vault_decisions::reject_deliverable(
-        &state.pool,
-        &state.user_id,
-        &id,
-        body.reason.as_deref(),
-    )
-    .await?;
+    vault_decisions::reject_deliverable(&state.pool, &state.user_id, &id, body.reason.as_deref())
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

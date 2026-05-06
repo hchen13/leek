@@ -39,7 +39,9 @@ impl GetCryptoMarketTool {
             _ = cancel.cancelled() => bail!("aborted"),
             r = resp.json() => r?,
         };
-        let data = body.get("data").ok_or_else(|| anyhow!("missing 'data' in CoinGecko global response"))?;
+        let data = body
+            .get("data")
+            .ok_or_else(|| anyhow!("missing 'data' in CoinGecko global response"))?;
 
         let total_market_cap = data
             .get("total_market_cap")
@@ -82,8 +84,13 @@ impl GetCryptoMarketTool {
         Ok(out)
     }
 
-    async fn fetch_top_coins(&self, vs_currency: &str, limit: u64, cancel: &CancellationToken) -> Result<String> {
-        let per_page = limit.min(50).max(1);
+    async fn fetch_top_coins(
+        &self,
+        vs_currency: &str,
+        limit: u64,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
+        let per_page = limit.clamp(1, 50);
         let url = format!(
             "https://api.coingecko.com/api/v3/coins/markets?vs_currency={vs_currency}&order=market_cap_desc&per_page={per_page}&page=1&sparkline=false"
         );
@@ -93,7 +100,10 @@ impl GetCryptoMarketTool {
             r = self.http.get(&url).send() => r?,
         };
         if !resp.status().is_success() {
-            bail!("CoinGecko /coins/markets returned HTTP {}", resp.status().as_u16());
+            bail!(
+                "CoinGecko /coins/markets returned HTTP {}",
+                resp.status().as_u16()
+            );
         }
         let coins: serde_json::Value = tokio::select! {
             biased;
@@ -101,19 +111,40 @@ impl GetCryptoMarketTool {
             r = resp.json() => r?,
         };
 
-        let arr = coins.as_array().ok_or_else(|| anyhow!("unexpected CoinGecko response shape"))?;
+        let arr = coins
+            .as_array()
+            .ok_or_else(|| anyhow!("unexpected CoinGecko response shape"))?;
 
-        let mut out = format!("## Top {} Coins by Market Cap ({vs_currency})\n\n", arr.len());
+        let mut out = format!(
+            "## Top {} Coins by Market Cap ({vs_currency})\n\n",
+            arr.len()
+        );
         out.push_str("| # | Name | Symbol | Price | 24h% | Market Cap | Volume |\n");
         out.push_str("|---|------|--------|-------|------|------------|--------|\n");
 
         for (i, coin) in arr.iter().enumerate() {
             let name = coin.get("name").and_then(|v| v.as_str()).unwrap_or("-");
-            let symbol = coin.get("symbol").and_then(|v| v.as_str()).unwrap_or("-").to_uppercase();
-            let price = coin.get("current_price").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let change = coin.get("price_change_percentage_24h").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let mcap = coin.get("market_cap").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let vol = coin.get("total_volume").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let symbol = coin
+                .get("symbol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_uppercase();
+            let price = coin
+                .get("current_price")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let change = coin
+                .get("price_change_percentage_24h")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let mcap = coin
+                .get("market_cap")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let vol = coin
+                .get("total_volume")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
 
             out.push_str(&format!(
                 "| {} | {} | {} | {} | {:+.2}% | {} | {} |\n",
@@ -130,7 +161,12 @@ impl GetCryptoMarketTool {
         Ok(out)
     }
 
-    async fn fetch_coin_detail(&self, coin_id: &str, vs_currency: &str, cancel: &CancellationToken) -> Result<String> {
+    async fn fetch_coin_detail(
+        &self,
+        coin_id: &str,
+        vs_currency: &str,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
         let url = format!(
             "https://api.coingecko.com/api/v3/coins/{coin_id}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false"
         );
@@ -140,7 +176,10 @@ impl GetCryptoMarketTool {
             r = self.http.get(&url).send() => r?,
         };
         if !resp.status().is_success() {
-            bail!("CoinGecko /coins/{coin_id} returned HTTP {}", resp.status().as_u16());
+            bail!(
+                "CoinGecko /coins/{coin_id} returned HTTP {}",
+                resp.status().as_u16()
+            );
         }
         let body: serde_json::Value = tokio::select! {
             biased;
@@ -149,25 +188,68 @@ impl GetCryptoMarketTool {
         };
 
         let name = body.get("name").and_then(|v| v.as_str()).unwrap_or(coin_id);
-        let symbol = body.get("symbol").and_then(|v| v.as_str()).unwrap_or("-").to_uppercase();
-        let md = body.get("market_data").ok_or_else(|| anyhow!("missing market_data"))?;
+        let symbol = body
+            .get("symbol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_uppercase();
+        let md = body
+            .get("market_data")
+            .ok_or_else(|| anyhow!("missing market_data"))?;
 
-        let price = md.get("current_price").and_then(|v| v.get(vs_currency)).and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let mcap = md.get("market_cap").and_then(|v| v.get(vs_currency)).and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let vol = md.get("total_volume").and_then(|v| v.get(vs_currency)).and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let chg_24h = md.get("price_change_percentage_24h").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let chg_7d = md.get("price_change_percentage_7d").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let ath = md.get("ath").and_then(|v| v.get(vs_currency)).and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let ath_chg = md.get("ath_change_percentage").and_then(|v| v.get(vs_currency)).and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let supply = md.get("circulating_supply").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let price = md
+            .get("current_price")
+            .and_then(|v| v.get(vs_currency))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let mcap = md
+            .get("market_cap")
+            .and_then(|v| v.get(vs_currency))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let vol = md
+            .get("total_volume")
+            .and_then(|v| v.get(vs_currency))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let chg_24h = md
+            .get("price_change_percentage_24h")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let chg_7d = md
+            .get("price_change_percentage_7d")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let ath = md
+            .get("ath")
+            .and_then(|v| v.get(vs_currency))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let ath_chg = md
+            .get("ath_change_percentage")
+            .and_then(|v| v.get(vs_currency))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let supply = md
+            .get("circulating_supply")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
 
         let mut out = format!("## {name} ({symbol})\n\n");
-        out.push_str(&format!("- Price: {} {}\n", fmt_price(price), vs_currency.to_uppercase()));
+        out.push_str(&format!(
+            "- Price: {} {}\n",
+            fmt_price(price),
+            vs_currency.to_uppercase()
+        ));
         out.push_str(&format!("- 24h Change: {:+.2}%\n", chg_24h));
         out.push_str(&format!("- 7d Change: {:+.2}%\n", chg_7d));
         out.push_str(&format!("- Market Cap: {}\n", fmt_large(mcap)));
         out.push_str(&format!("- 24h Volume: {}\n", fmt_large(vol)));
-        out.push_str(&format!("- ATH: {} ({:+.1}% from ATH)\n", fmt_price(ath), ath_chg));
+        out.push_str(&format!(
+            "- ATH: {} ({:+.1}% from ATH)\n",
+            fmt_price(ath),
+            ath_chg
+        ));
         out.push_str(&format!("- Circulating Supply: {:.0} {symbol}\n", supply));
         out.push_str("\n_Source: CoinGecko_\n");
         Ok(out)
@@ -248,10 +330,7 @@ impl ToolHandler for GetCryptoMarketTool {
             .get("vs_currency")
             .and_then(|v| v.as_str())
             .unwrap_or("usd");
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(20);
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20);
 
         match mode {
             "global" => self.fetch_global(vs_currency, &cancel).await,

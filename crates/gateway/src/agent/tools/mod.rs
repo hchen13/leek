@@ -9,6 +9,7 @@
 //! advertised through `ToolSpec::WebSearch` and execute on OpenAI's side.
 
 pub mod corpus_search;
+pub mod delegate_research;
 pub mod get_candlesticks;
 pub mod get_capital_flow;
 pub mod get_company_info;
@@ -16,9 +17,10 @@ pub mod get_crypto_market;
 pub mod get_financials;
 pub mod get_funding_rate;
 pub mod record_investment_action;
+pub mod record_research_note;
 pub mod sec_filing_fetch;
 pub mod tradingview_quote;
-pub mod tushare_quote;
+pub mod use_skill;
 pub mod web_fetch;
 
 use std::collections::HashMap;
@@ -68,6 +70,7 @@ impl ToolRegistry {
         ToolRegistryBuilder::default()
     }
 
+    #[cfg(test)]
     pub fn empty() -> Self {
         Self::default()
     }
@@ -75,10 +78,6 @@ impl ToolRegistry {
     /// All advertised tool specs (passed verbatim to `ChatRequest.tools`).
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.handlers.values().map(|h| h.spec()).collect()
-    }
-
-    pub fn names(&self) -> Vec<String> {
-        self.handlers.keys().cloned().collect()
     }
 
     /// Look up + invoke a tool by name. Errors propagate as `Err`; handler-
@@ -176,9 +175,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_invokes_handler() {
         let ctx = make_ctx().await;
-        let reg = ToolRegistry::builder()
-            .register(Arc::new(EchoTool))
-            .build();
+        let reg = ToolRegistry::builder().register(Arc::new(EchoTool)).build();
         let out = reg
             .dispatch("echo", r#"{"text":"hi"}"#, CancellationToken::new(), &ctx)
             .await
@@ -200,9 +197,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_invalid_json_args_errors() {
         let ctx = make_ctx().await;
-        let reg = ToolRegistry::builder()
-            .register(Arc::new(EchoTool))
-            .build();
+        let reg = ToolRegistry::builder().register(Arc::new(EchoTool)).build();
         let err = reg
             .dispatch("echo", "not json", CancellationToken::new(), &ctx)
             .await
@@ -213,19 +208,18 @@ mod tests {
     #[tokio::test]
     async fn empty_args_treated_as_empty_object() {
         let ctx = make_ctx().await;
-        let reg = ToolRegistry::builder()
-            .register(Arc::new(EchoTool))
-            .build();
-        let out = reg.dispatch("echo", "", CancellationToken::new(), &ctx).await.unwrap();
+        let reg = ToolRegistry::builder().register(Arc::new(EchoTool)).build();
+        let out = reg
+            .dispatch("echo", "", CancellationToken::new(), &ctx)
+            .await
+            .unwrap();
         // EchoTool returns "" when text key absent — that's the contract.
         assert_eq!(out, "");
     }
 
     #[test]
     fn specs_round_trips_function_tool() {
-        let reg = ToolRegistry::builder()
-            .register(Arc::new(EchoTool))
-            .build();
+        let reg = ToolRegistry::builder().register(Arc::new(EchoTool)).build();
         let specs = reg.specs();
         assert_eq!(specs.len(), 1);
         match &specs[0] {

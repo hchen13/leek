@@ -11,7 +11,7 @@ use super::ToolHandler;
 
 const TOOL_NAME: &str = "get_financials";
 const TUSHARE_ENDPOINT: &str = "https://api.tushare.pro";
-const FMP_BASE: &str = "https://financialmodelingprep.com/api/v3";
+const FMP_BASE: &str = "https://financialmodelingprep.com/stable";
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_PERIODS: u64 = 4;
 const MAX_PERIODS: u64 = 8;
@@ -96,16 +96,12 @@ impl ToolHandler for GetFinancialsTool {
         let periods = args
             .get("periods")
             .and_then(|v| v.as_u64())
-            .map(|n| n.min(MAX_PERIODS).max(1))
+            .map(|n| n.clamp(1, MAX_PERIODS))
             .unwrap_or(DEFAULT_PERIODS) as usize;
 
         match market {
-            "a_share" => {
-                fetch_a_share(&self.http, &ticker, report_type, periods, cancel).await
-            }
-            "us_stock" => {
-                fetch_us_stock(&self.http, &ticker, report_type, periods, cancel).await
-            }
+            "a_share" => fetch_a_share(&self.http, &ticker, report_type, periods, cancel).await,
+            "us_stock" => fetch_us_stock(&self.http, &ticker, report_type, periods, cancel).await,
             _ => bail!("unknown market: {market}"),
         }
     }
@@ -200,7 +196,11 @@ fn tushare_extract(body: &serde_json::Value) -> (Vec<String>, Vec<Vec<serde_json
     let fields: Vec<String> = data
         .get("fields")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let items: Vec<Vec<serde_json::Value>> = data
         .get("items")
@@ -295,9 +295,7 @@ async fn fetch_ashare_income(
     let (field_names, items) = tushare_extract(&body);
 
     if items.is_empty() {
-        return Ok(format!(
-            "[get_financials: no income data for {ts_code}]"
-        ));
+        return Ok(format!("[get_financials: no income data for {ts_code}]"));
     }
 
     let mut out = format!("## {ts_code} · 利润表（近{periods}期）\n\n");
@@ -325,7 +323,16 @@ async fn fetch_ashare_balance(
     cancel: &CancellationToken,
 ) -> Result<String> {
     let fields = "ts_code,end_date,total_assets,total_liab,total_hldr_eqy_exc_min_int,money_cap,accounts_receiv,inventories";
-    let body = tushare_call(http, token, "balancesheet", ts_code, periods, fields, cancel).await?;
+    let body = tushare_call(
+        http,
+        token,
+        "balancesheet",
+        ts_code,
+        periods,
+        fields,
+        cancel,
+    )
+    .await?;
     let (field_names, items) = tushare_extract(&body);
 
     if items.is_empty() {
@@ -359,17 +366,26 @@ async fn fetch_ashare_cashflow(
     cancel: &CancellationToken,
 ) -> Result<String> {
     let fields = "ts_code,end_date,net_operate_cashflow,n_cashflow_inv_act,n_cash_flows_fnc_act,free_cashflow";
-    let body = tushare_call(http, token, "cashflow_vip", ts_code, periods, fields, cancel).await?;
+    let body = tushare_call(
+        http,
+        token,
+        "cashflow_vip",
+        ts_code,
+        periods,
+        fields,
+        cancel,
+    )
+    .await?;
     let (field_names, items) = tushare_extract(&body);
 
     if items.is_empty() {
-        return Ok(format!(
-            "[get_financials: no cashflow data for {ts_code}]"
-        ));
+        return Ok(format!("[get_financials: no cashflow data for {ts_code}]"));
     }
 
     let mut out = format!("## {ts_code} · 现金流量表（近{periods}期）\n\n");
-    out.push_str("| 报告期 | 经营活动CF（亿） | 投资活动CF（亿） | 筹资活动CF（亿） | 自由CF（亿） |\n");
+    out.push_str(
+        "| 报告期 | 经营活动CF（亿） | 投资活动CF（亿） | 筹资活动CF（亿） | 自由CF（亿） |\n",
+    );
     out.push_str("|--------|---------------|---------------|---------------|------------|\n");
     for row in &items {
         let period = ashare_period(col(row, &field_names, "end_date"));
@@ -377,9 +393,7 @@ async fn fetch_ashare_cashflow(
         let inv = fmt_yi(col(row, &field_names, "n_cashflow_inv_act"));
         let fin = fmt_yi(col(row, &field_names, "n_cash_flows_fnc_act"));
         let free = fmt_yi(col(row, &field_names, "free_cashflow"));
-        out.push_str(&format!(
-            "| {period} | {oper} | {inv} | {fin} | {free} |\n"
-        ));
+        out.push_str(&format!("| {period} | {oper} | {inv} | {fin} | {free} |\n"));
     }
     out.push_str("\n_来源: Tushare Pro (cashflow_vip)_");
     Ok(out)
@@ -393,14 +407,20 @@ async fn fetch_ashare_ratios(
     cancel: &CancellationToken,
 ) -> Result<String> {
     let fields = "ts_code,end_date,ann_date,eps,bps,roe,roa,grossprofit_margin,debt_to_assets,current_ratio,quick_ratio,revenue_yoy,profit_yoy";
-    let body =
-        tushare_call(http, token, "fina_indicator_vip", ts_code, periods, fields, cancel).await?;
+    let body = tushare_call(
+        http,
+        token,
+        "fina_indicator_vip",
+        ts_code,
+        periods,
+        fields,
+        cancel,
+    )
+    .await?;
     let (field_names, items) = tushare_extract(&body);
 
     if items.is_empty() {
-        return Ok(format!(
-            "[get_financials: no ratio data for {ts_code}]"
-        ));
+        return Ok(format!("[get_financials: no ratio data for {ts_code}]"));
     }
 
     let mut out = format!("## {ts_code} · 财务指标（近{periods}期）\n\n");
@@ -435,11 +455,9 @@ async fn fetch_us_stock(
     let key = match std::env::var("FMP_API_KEY") {
         Ok(k) => k,
         Err(_) => {
-            return Ok(
-                "[get_financials: FMP_API_KEY not set — get a free key at \
+            return Ok("[get_financials: FMP_API_KEY not set — get a free key at \
                  https://financialmodelingprep.com/developer/docs to access US stock financials]"
-                    .to_string(),
-            );
+                .to_string());
         }
     };
 
@@ -537,7 +555,7 @@ async fn fetch_fmp_income(
     key: &str,
     cancel: &CancellationToken,
 ) -> Result<String> {
-    let url = format!("{FMP_BASE}/income-statement/{ticker}?limit={periods}&apikey={key}");
+    let url = format!("{FMP_BASE}/income-statement?symbol={ticker}&limit={periods}&apikey={key}");
     let rows = fmp_get(http, &url, cancel).await?;
 
     if rows.is_empty() {
@@ -569,11 +587,14 @@ async fn fetch_fmp_balance(
     key: &str,
     cancel: &CancellationToken,
 ) -> Result<String> {
-    let url = format!("{FMP_BASE}/balance-sheet-statement/{ticker}?limit={periods}&apikey={key}");
+    let url =
+        format!("{FMP_BASE}/balance-sheet-statement?symbol={ticker}&limit={periods}&apikey={key}");
     let rows = fmp_get(http, &url, cancel).await?;
 
     if rows.is_empty() {
-        return Ok(format!("[get_financials: no balance sheet data for {ticker}]"));
+        return Ok(format!(
+            "[get_financials: no balance sheet data for {ticker}]"
+        ));
     }
 
     let mut out = format!("## {ticker} · Balance Sheet (last {periods} periods)\n\n");
@@ -600,7 +621,8 @@ async fn fetch_fmp_cashflow(
     key: &str,
     cancel: &CancellationToken,
 ) -> Result<String> {
-    let url = format!("{FMP_BASE}/cash-flow-statement/{ticker}?limit={periods}&apikey={key}");
+    let url =
+        format!("{FMP_BASE}/cash-flow-statement?symbol={ticker}&limit={periods}&apikey={key}");
     let rows = fmp_get(http, &url, cancel).await?;
 
     if rows.is_empty() {
@@ -616,9 +638,7 @@ async fn fetch_fmp_cashflow(
         let inv = fmt_b(row, "investingActivitiesCashFlow");
         let fin = fmt_b(row, "financingActivitiesCashFlow");
         let free = fmt_b(row, "freeCashFlow");
-        out.push_str(&format!(
-            "| {date} | {oper} | {inv} | {fin} | {free} |\n"
-        ));
+        out.push_str(&format!("| {date} | {oper} | {inv} | {fin} | {free} |\n"));
     }
     out.push_str("\n_Source: Financial Modeling Prep (cash-flow-statement)_");
     Ok(out)
@@ -631,24 +651,35 @@ async fn fetch_fmp_ratios(
     key: &str,
     cancel: &CancellationToken,
 ) -> Result<String> {
-    let url = format!("{FMP_BASE}/ratios/{ticker}?limit={periods}&apikey={key}");
+    let url = format!("{FMP_BASE}/ratios?symbol={ticker}&limit={periods}&apikey={key}");
     let rows = fmp_get(http, &url, cancel).await?;
+    let metrics_url =
+        format!("{FMP_BASE}/key-metrics?symbol={ticker}&limit={periods}&apikey={key}");
+    let metrics = fmp_get(http, &metrics_url, cancel)
+        .await
+        .unwrap_or_default();
 
     if rows.is_empty() {
         return Ok(format!("[get_financials: no ratio data for {ticker}]"));
     }
 
     let mut out = format!("## {ticker} · Key Ratios (last {periods} periods)\n\n");
-    out.push_str("| Date | ROE% | ROA% | Gross Margin% | Debt/Equity | Current Ratio | P/E | P/B |\n");
+    out.push_str(
+        "| Date | ROE% | ROA% | Gross Margin% | Debt/Equity | Current Ratio | P/E | P/B |\n",
+    );
     out.push_str("|------|------|------|--------------|------------|--------------|-----|-----|\n");
     for row in &rows {
         let date = fmp_str(row, "date");
-        let roe = fmt_ratio_pct(row, "returnOnEquity");
-        let roa = fmt_ratio_pct(row, "returnOnAssets");
+        let metric = metrics
+            .iter()
+            .find(|m| fmp_str(m, "date") == date)
+            .unwrap_or(row);
+        let roe = fmt_ratio_pct(metric, "returnOnEquity");
+        let roa = fmt_ratio_pct(metric, "returnOnAssets");
         let gpm = fmt_ratio_pct(row, "grossProfitMargin");
-        let d2e = fmt_ratio(row, "debtEquityRatio");
+        let d2e = fmt_ratio(row, "debtToEquityRatio");
         let cr = fmt_ratio(row, "currentRatio");
-        let pe = fmt_ratio(row, "priceEarningsRatio");
+        let pe = fmt_ratio(row, "priceToEarningsRatio");
         let pb = fmt_ratio(row, "priceToBookRatio");
         out.push_str(&format!(
             "| {date} | {roe} | {roa} | {gpm} | {d2e} | {cr} | {pe} | {pb} |\n"

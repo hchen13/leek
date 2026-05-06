@@ -1,16 +1,18 @@
 //! Session-compaction row helpers.
 //!
-//! Each row records one compaction event: the original session, the forked
-//! child session that received the summary, and per-call metadata. See
-//! `migrations/0002_compaction.sql` for the schema.
+//! Each row records one in-place compaction event. The original and compacted
+//! session ids are usually the same session; the separate row id lets one
+//! session compact multiple times.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 use sqlx::{FromRow, SqlitePool};
+use uuid::Uuid;
 
 #[derive(Debug, FromRow, Serialize, Clone)]
 #[allow(dead_code)] // fields exposed via API once compaction history UI lands
 pub struct CompactionRow {
+    pub id: String,
     pub original_session_id: String,
     pub compacted_session_id: String,
     pub summary_md: String,
@@ -37,17 +39,19 @@ pub async fn insert(
     trigger: &str,
     focus: Option<&str>,
 ) -> Result<()> {
+    let id = Uuid::now_v7().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         r#"
         INSERT INTO session_compactions (
-            user_id, original_session_id, compacted_session_id,
+            user_id, id, original_session_id, compacted_session_id,
             summary_md, messages_retained, messages_removed,
             tokens_before, tokens_after, trigger, focus, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(user_id)
+    .bind(&id)
     .bind(original_session_id)
     .bind(compacted_session_id)
     .bind(summary_md)

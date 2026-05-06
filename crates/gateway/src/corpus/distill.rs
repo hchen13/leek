@@ -116,8 +116,7 @@ fn input_hash(principles_dir: &Path) -> Result<String> {
         let rel = path.strip_prefix(principles_dir).unwrap_or(&path);
         hasher.update(rel.to_string_lossy().as_bytes());
         hasher.update(b"\0");
-        let bytes =
-            fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         hasher.update(&bytes);
     }
     Ok(format!("{:x}", hasher.finalize()))
@@ -136,10 +135,7 @@ pub struct DistillReport {
 pub fn distill(corpus_root: &Path) -> Result<(String, DistillReport)> {
     let principles_dir = corpus_root.join("wikis").join("principles");
     if !principles_dir.exists() {
-        anyhow::bail!(
-            "expected wikis/principles/ at {}",
-            principles_dir.display()
-        );
+        anyhow::bail!("expected wikis/principles/ at {}", principles_dir.display());
     }
 
     let hash = input_hash(&principles_dir)?;
@@ -211,8 +207,7 @@ mod tests {
 
     #[test]
     fn strip_section_removes_section_until_next_h2() {
-        let input =
-            "## 概念解析\nbody\n\n## 来源\n- [[foo]]\n- [[bar]]\n\n## 思想演变\nmore body";
+        let input = "## 概念解析\nbody\n\n## 来源\n- [[foo]]\n- [[bar]]\n\n## 思想演变\nmore body";
         let out = strip_section(input, "## 来源");
         assert!(!out.contains("来源"));
         assert!(!out.contains("[[foo]]"));

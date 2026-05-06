@@ -12,9 +12,7 @@ pub struct GetResponse {
     pub snapshot_at: Option<String>,
 }
 
-pub async fn get_handler(
-    State(state): State<AppState>,
-) -> Result<Json<GetResponse>, AppError> {
+pub async fn get_handler(State(state): State<AppState>) -> Result<Json<GetResponse>, AppError> {
     let items = vault_holdings::get_latest(&state.pool, &state.user_id).await?;
     let snapshot_at = items.first().map(|r| r.snapshot_at.clone());
     Ok(Json(GetResponse { items, snapshot_at }))

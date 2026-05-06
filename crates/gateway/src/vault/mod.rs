@@ -10,7 +10,9 @@ pub mod holdings;
 pub mod messages;
 pub mod provider_configs;
 pub mod sessions;
+pub mod subagents;
 pub mod tasks;
+pub mod tool_runs;
 
 use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};

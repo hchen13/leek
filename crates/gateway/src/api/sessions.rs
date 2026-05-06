@@ -12,7 +12,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::{ActiveTask, AppError, AppState};
 use crate::agent;
-use crate::events::EventEnvelope;
 use crate::vault::{
     compactions as vault_compactions, events as vault_events, messages as vault_messages,
     sessions as vault_sessions,
@@ -63,14 +62,9 @@ pub async fn events_handler(
     Path(session_id): Path<String>,
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<EventsResponse>, AppError> {
-    let rows = vault_events::list_for_session(
-        &state.pool,
-        &state.user_id,
-        &session_id,
-        q.since,
-        q.limit,
-    )
-    .await?;
+    let rows =
+        vault_events::list_for_session(&state.pool, &state.user_id, &session_id, q.since, q.limit)
+            .await?;
     Ok(Json(EventsResponse { items: rows }))
 }
 
@@ -106,13 +100,7 @@ pub async fn create_handler(
     let id = body
         .id
         .unwrap_or_else(|| format!("s-{}", uuid::Uuid::new_v4().simple()));
-    vault_sessions::ensure_exists(
-        &state.pool,
-        &state.user_id,
-        &id,
-        body.title.as_deref(),
-    )
-    .await?;
+    vault_sessions::ensure_exists(&state.pool, &state.user_id, &id, body.title.as_deref()).await?;
     Ok((StatusCode::CREATED, Json(CreateSessionResponse { id })))
 }
 
@@ -163,71 +151,46 @@ pub struct CompactBody {
     pub focus: Option<String>,
 }
 
-#[derive(serde::Serialize)]
-pub struct CompactAcceptedResponse {
-    /// New session forked from `id`. Frontend should navigate to this once
-    /// it receives the `compaction.completed` SSE event.
-    pub new_session_id: String,
-}
-
-/// `POST /api/v1/sessions/{id}/compact` — fork the session into a new one
-/// whose head is a structured handoff summary, freeing context budget. The
-/// endpoint returns 202 immediately and runs the summary call in the
-/// background; subscribers on the original session's SSE stream see
+/// `POST /api/v1/sessions/{id}/compact` — summarize the session's history
+/// in-place: inserts a `compaction_summary` message into the same session,
+/// freeing context budget for the next turn. The endpoint returns 202
+/// immediately; subscribers on the session's SSE stream see
 /// `compaction.started` / `compaction.completed` / `compaction.aborted`.
 pub async fn compact_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     Json(body): Json<CompactBody>,
-) -> Result<(StatusCode, Json<CompactAcceptedResponse>), AppError> {
+) -> Result<StatusCode, AppError> {
     let trigger = body
         .trigger
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| "manual".to_string());
-    let new_session_id = start_compaction(&state, &session_id, &trigger, body.focus.as_deref())
+    start_compaction(&state, &session_id, &trigger, body.focus.as_deref())
         .await
         .map_err(AppError)?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(CompactAcceptedResponse { new_session_id }),
-    ))
+    Ok(StatusCode::ACCEPTED)
 }
 
-/// Kick off a compaction on `session_id`. Common path used by both manual
-/// `POST /compact` and the auto-pre-turn trigger inside `messages::post_handler`.
-/// Returns the pre-allocated new session id; the actual summary work runs
-/// in a background task and emits SSE `compaction.{started,completed,aborted}`
-/// events on the source session.
-///
-/// The cancel token goes into `active_replies` regardless of trigger; the
-/// frontend decides whether `/abort` is offered (manual: yes; auto: no), but
-/// the backend doesn't enforce that distinction — auto compactions are simply
-/// not surfaced in UI as cancellable.
+/// Kick off an in-place compaction on `session_id`. Writes a
+/// `compaction_summary` message into the same session and leaves all prior
+/// messages intact (visible in UI, excluded from LLM context). Common path
+/// used by both manual `POST /compact` and auto-pre-turn trigger.
 pub async fn start_compaction(
     state: &AppState,
     session_id: &str,
     trigger: &str,
     focus: Option<&str>,
-) -> anyhow::Result<String> {
-    // Reject if there's a *live* in-flight reply / compaction on this
-    // session — racing with vault writes would confuse the UI. A cancelled-
-    // but-not-yet-cleaned-up token is fine (someone hit /abort already).
+) -> anyhow::Result<()> {
     {
         let map = state.active_replies.lock().await;
         if let Some(task) = map.get(session_id) {
             if !task.token.is_cancelled() {
-                anyhow::bail!(
-                    "compaction rejected: agent reply in progress; abort or wait first"
-                );
+                anyhow::bail!("compaction rejected: agent reply in progress; abort or wait first");
             }
         }
     }
 
-    let new_session_id = format!("s-{}", uuid::Uuid::new_v4().simple());
-
     let cancel = CancellationToken::new();
-    // Auto pre-turn compactions are mandatory (see ActiveTask docs); manual
-    // ones can be aborted with Esc.
     let user_cancellable = trigger != "auto_pre_turn";
     {
         let mut map = state.active_replies.lock().await;
@@ -240,8 +203,6 @@ pub async fn start_compaction(
         );
     }
 
-    // Fire the start event synchronously so any subscriber flips into
-    // "compacting" before the slow summarizer call.
     agent::publish_and_persist(
         &state.pool,
         &state.user_id,
@@ -249,11 +210,7 @@ pub async fn start_compaction(
         None,
         &state.event_bus,
         "compaction.started",
-        serde_json::json!({
-            "trigger": trigger,
-            "focus": focus,
-            "new_session_id": new_session_id,
-        }),
+        serde_json::json!({ "trigger": trigger, "focus": focus }),
     )
     .await?;
 
@@ -263,7 +220,6 @@ pub async fn start_compaction(
     let provider = state.provider.clone();
     let active_replies = state.active_replies.clone();
     let source_session = session_id.to_string();
-    let new_id = new_session_id.clone();
     let focus_owned = focus.map(|s| s.to_string());
     let trigger_for_task = trigger.to_string();
     let cancel_for_task = cancel.clone();
@@ -274,7 +230,6 @@ pub async fn start_compaction(
             pool.clone(),
             user_id.clone(),
             source_session.clone(),
-            new_id.clone(),
             provider,
             focus_owned.as_deref(),
             &trigger_for_task,
@@ -290,7 +245,6 @@ pub async fn start_compaction(
             Ok(report) => (
                 "compaction.completed".to_string(),
                 serde_json::json!({
-                    "new_session_id": new_id,
                     "summary_md": report.summary_md,
                     "messages_removed": report.messages_removed,
                     "messages_retained": report.messages_retained,
@@ -302,7 +256,6 @@ pub async fn start_compaction(
                 (
                     "compaction.aborted".to_string(),
                     serde_json::json!({
-                        "new_session_id": new_id,
                         "reason": format!("{err:#}"),
                         "trigger": trigger_for_task,
                     }),
@@ -310,22 +263,15 @@ pub async fn start_compaction(
             }
         };
 
-        if let Err(e) = agent::publish_and_persist(
-            &pool,
-            &user_id,
-            &source_session,
-            None,
-            &bus,
-            &kind,
-            payload,
-        )
-        .await
+        if let Err(e) =
+            agent::publish_and_persist(&pool, &user_id, &source_session, None, &bus, &kind, payload)
+                .await
         {
             tracing::error!(error = %e, "failed to publish compaction terminal event");
         }
     });
 
-    Ok(new_session_id)
+    Ok(())
 }
 
 /// Outcome record for a successful compaction — drives the
@@ -336,66 +282,57 @@ struct CompactionReport {
     messages_retained: i64,
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_compaction(
     pool: sqlx::SqlitePool,
     user_id: String,
     source_session: String,
-    new_session: String,
     provider: std::sync::Arc<dyn crate::llm::LlmProvider>,
     focus: Option<&str>,
     trigger: &str,
     cancel: CancellationToken,
 ) -> anyhow::Result<CompactionReport> {
-    // Load full history of source session. The hard-coded LIMIT here matches
-    // run_chat_reply — bumped to 1000 in #133 once that lands; for now we
-    // accept the same ceiling everyone else uses.
-    let history =
-        vault_messages::list(&pool, &user_id, &source_session, None, 1000).await?;
-    if history.is_empty() {
+    // Load only the messages that will go into the transcript: everything
+    // after the last compaction_summary (or the full history on first compact).
+    let all_history = vault_messages::list(&pool, &user_id, &source_session, None, 1000).await?;
+    if all_history.is_empty() {
         anyhow::bail!("source session has no messages to compact");
+    }
+
+    // Find the last compaction_summary boundary; compact only the tail.
+    let start_idx = all_history
+        .iter()
+        .rposition(|r| r.role == "compaction_summary")
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let history = &all_history[start_idx..];
+    if history.is_empty() {
+        anyhow::bail!("no new messages since last compaction");
     }
     let messages_removed = history.len() as i64;
 
-    // Run structured summary (gpt-5.5, reasoning_effort=Minimal).
-    let summary =
-        agent::compact::summarize_session(provider, &history, focus, cancel).await?;
+    let summary = agent::compact::summarize_session(provider, history, focus, cancel).await?;
 
-    // Fork the new session.
-    vault_sessions::fork(
-        &pool,
-        &user_id,
-        &source_session,
-        &new_session,
-        Some("Compacted"),
-        trigger,
-    )
-    .await?;
-
-    // Write the summary as the first message of the new session, role
-    // `compaction_summary` so the agent loop can inject it into the system
-    // prompt instead of the message list (lands in #136).
+    // Write the summary into the same session as a compaction_summary message.
     vault_messages::insert(
         &pool,
         &user_id,
-        &new_session,
+        &source_session,
         "compaction_summary",
         &serde_json::json!({ "type": "text", "text": summary }),
         None,
     )
     .await?;
 
-    // Audit row.
     vault_compactions::insert(
         &pool,
         &user_id,
         &source_session,
-        &new_session,
+        &source_session,
         &summary,
-        /* messages_retained */ 1, // just the summary in the new session
+        1,
         messages_removed,
-        /* tokens_before */ None, // wired in #136 with llm_usage_log lookup
-        /* tokens_after */ None,
+        None,
+        None,
         trigger,
         focus,
     )

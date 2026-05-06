@@ -20,23 +20,23 @@ use crate::llm::ToolSpec;
 
 use super::ToolHandler;
 
-const TOOL_NAME: &str = "tradingview_quote";
+const TOOL_NAME: &str = "market_quote";
 const ENDPOINT_TPL: &str = "https://scanner.tradingview.com/{market}/scan";
 const REQUEST_TIMEOUT_SECS: u64 = 15;
 const MAX_TICKERS: usize = 25;
 
 const COLUMNS: &[&str] = &[
-    "name",            // symbol short
-    "description",     // company name
-    "close",           // last/close
-    "change",          // % change
-    "change_abs",      // absolute change
+    "name",        // symbol short
+    "description", // company name
+    "close",       // last/close
+    "change",      // % change
+    "change_abs",  // absolute change
     "volume",
     "market_cap_basic",
     "high",
     "low",
     "open",
-    "Recommend.All",   // -1..1 technical rating
+    "Recommend.All", // -1..1 technical rating
 ];
 
 pub struct TradingViewQuoteTool {
@@ -63,17 +63,17 @@ impl ToolHandler for TradingViewQuoteTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
-            description:
-                "Snapshot quotes (close / change / volume / market cap / high-low / \
-                 technical rating) for one or more tickers via TradingView's scanner. \
+            description: "Snapshot quotes (close / change / volume / market cap / high-low / \
+                 technical rating) for one or more tickers. \
                  Use this when web_search's snippet isn't precise enough or when you \
                  need to compare multiple symbols side-by-side. Tickers must be in \
-                 `EXCHANGE:SYMBOL` format (TradingView convention): \
+                 `EXCHANGE:SYMBOL` format: \
                  `NASDAQ:NVDA`, `NYSE:BRK.B`, `AMEX:SPY`, `BATS:VTI`, `HKEX:0700`, \
-                 `LSE:HSBA`, `BINANCE:BTCUSDT`. For US stocks set `market='america'` \
-                 (default). For non-US: `hongkong`, `india`, `japan`, `crypto`, `forex`, \
-                 `germany`. Returns a markdown table. Quotes may be 15-min delayed."
-                    .into(),
+                 `LSE:HSBA`, `SSE:600519`, `SZSE:000001`, `BINANCE:BTCUSDT`. For US \
+                 stocks set `market='america'` (default). For non-US: `china`, \
+                 `hongkong`, `india`, `japan`, `crypto`, `forex`, `germany`. Returns a \
+                 markdown table. Quotes may be 15-min delayed."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -84,7 +84,7 @@ impl ToolHandler for TradingViewQuoteTool {
                     },
                     "market": {
                         "type": "string",
-                        "description": "Scanner market segment (default 'america'). Common values: america, hongkong, india, japan, germany, uk, canada, australia, crypto, forex.",
+                        "description": "Market segment (default 'america'). Common values: america, china, hongkong, india, japan, germany, uk, canada, australia, crypto, forex.",
                     }
                 },
                 "required": ["tickers"]
@@ -165,7 +165,7 @@ impl ToolHandler for TradingViewQuoteTool {
             .ok_or_else(|| anyhow!("tradingview response missing 'data' array"))?;
         if rows.is_empty() {
             return Ok(format!(
-                "[tradingview_quote: no rows returned for {} tickers in market '{market}'. \
+                "[market_quote: no rows returned for {} tickers in market '{market}'. \
                  Verify the EXCHANGE:SYMBOL format.]",
                 tickers.len()
             ));
@@ -175,14 +175,18 @@ impl ToolHandler for TradingViewQuoteTool {
         let mut by_symbol: std::collections::HashMap<String, Vec<serde_json::Value>> =
             std::collections::HashMap::new();
         for row in rows {
-            let Some(s) = row.get("s").and_then(|v| v.as_str()) else { continue };
-            let Some(d) = row.get("d").and_then(|v| v.as_array()) else { continue };
+            let Some(s) = row.get("s").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(d) = row.get("d").and_then(|v| v.as_array()) else {
+                continue;
+            };
             by_symbol.insert(s.to_string(), d.clone());
         }
 
         let mut out = String::new();
         out.push_str(&format!(
-            "# TradingView · {market} · {} symbols\n\n",
+            "# Market quote · {market} · {} symbols\n\n",
             tickers.len()
         ));
         out.push_str(
@@ -225,6 +229,7 @@ fn is_valid_market(m: &str) -> bool {
     matches!(
         m,
         "america"
+            | "china"
             | "hongkong"
             | "india"
             | "japan"
@@ -282,7 +287,10 @@ fn truncate(s: &str, max_chars: usize) -> String {
     if chars.len() <= max_chars {
         s.to_string()
     } else {
-        let mut t: String = chars.into_iter().take(max_chars.saturating_sub(1)).collect();
+        let mut t: String = chars
+            .into_iter()
+            .take(max_chars.saturating_sub(1))
+            .collect();
         t.push('…');
         t
     }

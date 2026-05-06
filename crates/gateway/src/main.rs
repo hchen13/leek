@@ -20,7 +20,11 @@ use llm::LlmProvider;
 use vault::Vault;
 
 #[derive(Parser)]
-#[command(name = "leek", version, about = "L.E.E.K — Logic-Enhanced Equity Kernel")]
+#[command(
+    name = "leek",
+    version,
+    about = "L.E.E.K — Logic-Enhanced Equity Kernel"
+)]
 struct Cli {
     /// Vault SQLite path (per-user data store)
     #[arg(long, global = true, default_value = "./vault.db")]
@@ -95,6 +99,35 @@ enum AuthProvider {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load .env from the directory containing the binary, then the CWD,
+    // then the workspace root — whichever exists first wins per-variable.
+    for candidate in [
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(".env"))),
+        std::env::current_dir().ok().map(|d| d.join(".env")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(content) = std::fs::read_to_string(&candidate) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once('=') {
+                    let k = k.trim();
+                    let v = v.trim().trim_matches('"').trim_matches('\'');
+                    if std::env::var(k).is_err() {
+                        std::env::set_var(k, v);
+                    }
+                }
+            }
+            break;
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -176,17 +209,43 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
 
     let tools = agent::tools::ToolRegistry::builder()
         .register(Arc::new(agent::tools::web_fetch::WebFetchTool::new()?))
-        .register(Arc::new(agent::tools::get_candlesticks::GetCandlesticksTool::new()?))
-        .register(Arc::new(agent::tools::corpus_search::CorpusSearchTool::new()))
-        .register(Arc::new(agent::tools::sec_filing_fetch::SecFilingFetchTool::new()?))
-        .register(Arc::new(agent::tools::tushare_quote::TushareQuoteTool::new()?))
-        .register(Arc::new(agent::tools::tradingview_quote::TradingViewQuoteTool::new()?))
-        .register(Arc::new(agent::tools::record_investment_action::RecordInvestmentActionTool::new()))
-        .register(Arc::new(agent::tools::get_financials::GetFinancialsTool::new()?))
-        .register(Arc::new(agent::tools::get_funding_rate::GetFundingRateTool::new()?))
-        .register(Arc::new(agent::tools::get_crypto_market::GetCryptoMarketTool::new()?))
-        .register(Arc::new(agent::tools::get_company_info::GetCompanyInfoTool::new()?))
-        .register(Arc::new(agent::tools::get_capital_flow::GetCapitalFlowTool::new()?))
+        .register(Arc::new(
+            agent::tools::get_candlesticks::GetCandlesticksTool::new()?,
+        ))
+        .register(Arc::new(
+            agent::tools::corpus_search::CorpusSearchTool::new(),
+        ))
+        .register(Arc::new(
+            agent::tools::sec_filing_fetch::SecFilingFetchTool::new()?,
+        ))
+        .register(Arc::new(
+            agent::tools::tradingview_quote::TradingViewQuoteTool::new()?,
+        ))
+        .register(Arc::new(
+            agent::tools::record_investment_action::RecordInvestmentActionTool::new(),
+        ))
+        .register(Arc::new(
+            agent::tools::get_financials::GetFinancialsTool::new()?,
+        ))
+        .register(Arc::new(
+            agent::tools::get_funding_rate::GetFundingRateTool::new()?,
+        ))
+        .register(Arc::new(
+            agent::tools::get_crypto_market::GetCryptoMarketTool::new()?,
+        ))
+        .register(Arc::new(
+            agent::tools::get_company_info::GetCompanyInfoTool::new()?,
+        ))
+        .register(Arc::new(
+            agent::tools::get_capital_flow::GetCapitalFlowTool::new()?,
+        ))
+        .register(Arc::new(agent::tools::use_skill::UseSkillTool))
+        .register(Arc::new(
+            agent::tools::record_research_note::RecordResearchNoteTool::new(),
+        ))
+        .register(Arc::new(
+            agent::tools::delegate_research::DelegateResearchTool::new(provider.clone()),
+        ))
         .build();
 
     // mandates/<user_id>.md sits next to the vault sqlite. Users edit this
@@ -216,9 +275,7 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
         .with_context(|| format!("binding {addr}"))?;
 
     tracing::info!(%addr, vault = %vault_path.display(), "leek serve listening");
-    axum::serve(listener, app)
-        .await
-        .context("axum serve")?;
+    axum::serve(listener, app).await.context("axum serve")?;
     Ok(())
 }
 
@@ -273,7 +330,11 @@ async fn run_chat(vault_path: &Path, prompt: String, model: String) -> Result<()
             llm::LlmEvent::WebSearchCall { status, action } => {
                 eprintln!("\x1b[90m[web_search] {status} {action:?}\x1b[0m");
             }
-            llm::LlmEvent::FunctionCall { call_id, name, arguments } => {
+            llm::LlmEvent::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
                 eprintln!(
                     "\x1b[90m[function_call] id={call_id} name={name} args={}\x1b[0m",
                     arguments.chars().take(80).collect::<String>()
@@ -288,11 +349,13 @@ async fn run_auth_codex(vault_path: &Path, import_from_codex_cli: bool) -> Resul
     let vault = Vault::open(vault_path).await?;
 
     let tokens = if import_from_codex_cli {
-        let imported = read_codex_cli_auth()?
-            .ok_or_else(|| anyhow!("~/.codex/auth.json not found"))?;
+        let imported =
+            read_codex_cli_auth()?.ok_or_else(|| anyhow!("~/.codex/auth.json not found"))?;
         println!("Imported tokens from ~/.codex/auth.json");
         println!();
-        println!("\x1b[93m⚠  WARNING\x1b[0m: codex CLI / VS Code 扩展接下来若 refresh 会让 leek 失效。");
+        println!(
+            "\x1b[93m⚠  WARNING\x1b[0m: codex CLI / VS Code 扩展接下来若 refresh 会让 leek 失效。"
+        );
         println!("    使用 leek 期间避免在终端跑 `codex` 或在 VS Code 用 codex 扩展。");
         println!();
         imported
@@ -334,10 +397,10 @@ fn read_codex_cli_auth() -> Result<Option<CodexTokens>> {
         return Ok(None);
     }
 
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let payload: serde_json::Value = serde_json::from_str(&content)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let payload: serde_json::Value =
+        serde_json::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
     let tokens_obj = payload
         .get("tokens")
         .and_then(|v| v.as_object())
@@ -353,8 +416,8 @@ fn read_codex_cli_auth() -> Result<Option<CodexTokens>> {
         .ok_or_else(|| anyhow!("{}: missing refresh_token", path.display()))?
         .to_string();
 
-    let expires_at = auth::jwt::decode_exp(&access_token)
-        .context("decoding exp from imported access_token")?;
+    let expires_at =
+        auth::jwt::decode_exp(&access_token).context("decoding exp from imported access_token")?;
 
     if expires_at < chrono::Utc::now() {
         bail!(

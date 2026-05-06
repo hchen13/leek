@@ -17,7 +17,7 @@ use crate::vault::{
 
 /// Auto-compaction threshold. When the session's last `llm_usage` event
 /// reports `input_tokens` ≥ this value, the next user message triggers a
-/// fork-compaction *before* the LLM is called again — otherwise the next
+/// in-place compaction *before* the LLM is called again — otherwise the next
 /// turn would push the request over the model's context window.
 ///
 /// Trigger at 95% of the 400K context window (= 380K), leaving ~20K for the
@@ -54,14 +54,10 @@ pub enum ContentPart {
 pub enum PostMessageResponse {
     /// User message accepted, agent reply is starting.
     Created { message_seq: i64 },
-    /// Token budget exceeded — auto-compaction kicked off; the user message
-    /// was *not* persisted and should be re-sent by the caller against
-    /// `new_session_id` once `compaction.completed` arrives on the source
-    /// session's SSE stream.
-    AutoCompacting {
-        auto_compacting: bool,
-        new_session_id: String,
-    },
+    /// Token budget exceeded — in-place compaction kicked off; the user
+    /// message was *not* persisted and should be re-sent to the same session
+    /// once `compaction.completed` arrives on the SSE stream.
+    AutoCompacting { auto_compacting: bool },
 }
 
 pub async fn post_handler(
@@ -77,8 +73,8 @@ pub async fn post_handler(
 
     // Pre-turn auto-compaction: if the most recent LLM call on this session
     // already saw input_tokens ≥ threshold, reject this user message and
-    // start compaction. Frontend queues the message and re-POSTs it against
-    // `new_session_id` after `compaction.completed`.
+    // start compaction. Frontend queues the message and re-POSTs it to this
+    // same session after `compaction.completed`.
     let threshold = auto_compact_threshold();
     if let Some(latest) =
         vault_events::latest_input_tokens(&state.pool, &state.user_id, &session_id).await?
@@ -90,15 +86,13 @@ pub async fn post_handler(
                 threshold,
                 "auto-compact triggered"
             );
-            let new_session_id =
-                api_sessions::start_compaction(&state, &session_id, "auto_pre_turn", None)
-                    .await
-                    .map_err(AppError)?;
+            api_sessions::start_compaction(&state, &session_id, "auto_pre_turn", None)
+                .await
+                .map_err(AppError)?;
             return Ok((
                 StatusCode::ACCEPTED,
                 Json(PostMessageResponse::AutoCompacting {
                     auto_compacting: true,
-                    new_session_id,
                 }),
             ));
         }
@@ -254,9 +248,9 @@ async fn handle_user_message(
 
     match decision.kind {
         DecisionKind::NewTask => {
-            let draft = decision.task_draft.ok_or_else(|| {
-                anyhow::anyhow!("routing returned new_task without task_draft")
-            })?;
+            let draft = decision
+                .task_draft
+                .ok_or_else(|| anyhow::anyhow!("routing returned new_task without task_draft"))?;
             let task_id = vault_tasks::insert_in_progress(
                 &pool,
                 &user_id,
@@ -373,7 +367,10 @@ async fn load_history_for_routing(
                 "agent" => Role::Assistant,
                 _ => return None,
             };
-            Some(ChatMessage { role, content: text })
+            Some(ChatMessage {
+                role,
+                content: text,
+            })
         })
         .collect();
     Ok(messages)

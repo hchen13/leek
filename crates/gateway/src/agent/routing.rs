@@ -118,11 +118,8 @@ pub async fn decide_route(
     let mut stream = provider.chat(req).await.context("routing chat call")?;
     let mut text = String::new();
     while let Some(event) = stream.next().await {
-        match event? {
-            LlmEvent::TextDelta { text: t } => text.push_str(&t),
-            // Ignore usage / message_end for the routing pass — caller can
-            // track aggregate usage separately if/when we surface it.
-            _ => {}
+        if let LlmEvent::TextDelta { text: t } = event? {
+            text.push_str(&t);
         }
     }
 

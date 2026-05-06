@@ -10,7 +10,6 @@
 //! - Returns top-N hits with a 240-char snippet around the first match so
 //!   the model sees enough context to decide whether to web_fetch / drill in.
 
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, Result};
@@ -139,7 +138,10 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     if !content.starts_with("---") {
         return None;
     }
-    let after = content.get(3..)?.strip_prefix('\n').unwrap_or(content.get(3..)?);
+    let after = content
+        .get(3..)?
+        .strip_prefix('\n')
+        .unwrap_or(content.get(3..)?);
     let end = after.find("\n---")?;
     let fm = &after[..end];
     let rest = after.get(end + 4..)?;
@@ -165,8 +167,7 @@ impl ToolHandler for CorpusSearchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
-            description:
-                "Search the local LEEK corpus (curated investing wikis + source texts: \
+            description: "Search the local LEEK corpus (curated investing wikis + source texts: \
                  Buffett letters, Dalio books, Munger speeches, NVIDIA/AI/macro notes, etc.). \
                  Use this BEFORE web_search when the question is about value-investing \
                  principles, mental models, or the people / books you'd find in a serious \
@@ -175,7 +176,7 @@ impl ToolHandler for CorpusSearchTool {
                  title, tier, layer, tags, and a snippet around the first match. Combine \
                  with web_fetch (using the returned id as a wikilink reference) to read \
                  the full document if needed."
-                    .into(),
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -237,7 +238,7 @@ impl ToolHandler for CorpusSearchTool {
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
-            .map(|n| (n as usize).min(MAX_LIMIT).max(1))
+            .map(|n| (n as usize).clamp(1, MAX_LIMIT))
             .unwrap_or(DEFAULT_LIMIT);
 
         let terms: Vec<String> = query
@@ -252,8 +253,8 @@ impl ToolHandler for CorpusSearchTool {
         let docs = corpus_docs();
         let mut scored: Vec<(usize, &CorpusDoc, usize)> = docs
             .iter()
-            .filter(|d| tier_filter.as_deref().map_or(true, |t| d.tier == t))
-            .filter(|d| layer_filter.as_deref().map_or(true, |l| d.layer == l))
+            .filter(|d| tier_filter.as_deref().is_none_or(|t| d.tier == t))
+            .filter(|d| layer_filter.as_deref().is_none_or(|l| d.layer == l))
             .filter(|d| {
                 if tag_filter.is_empty() {
                     return true;
@@ -324,7 +325,10 @@ fn build_snippet(body: &str, pos: usize) -> String {
     let start = pos.saturating_sub(SNIPPET_HALF_WIDTH);
     let end = (pos + SNIPPET_HALF_WIDTH).min(body.len());
     // Snap to char boundaries.
-    let start = (0..=start).rev().find(|i| body.is_char_boundary(*i)).unwrap_or(0);
+    let start = (0..=start)
+        .rev()
+        .find(|i| body.is_char_boundary(*i))
+        .unwrap_or(0);
     let end = (end..=body.len())
         .find(|i| body.is_char_boundary(*i))
         .unwrap_or(body.len());
@@ -340,6 +344,7 @@ fn build_snippet(body: &str, pos: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::tools::ToolContext;
 
     #[test]
     fn corpus_loads_at_least_some_docs() {
@@ -352,17 +357,18 @@ mod tests {
         // Spot-check structure on a known anchor.
         assert!(
             docs.iter()
-                .any(|d| d.id.contains("margin-of-safety") || d.title.to_lowercase().contains("margin")),
+                .any(|d| d.id.contains("margin-of-safety")
+                    || d.title.to_lowercase().contains("margin")),
             "expected margin-of-safety in corpus"
         );
     }
 
-    async fn make_ctx() -> super::ToolContext {
+    async fn make_ctx() -> ToolContext {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        super::ToolContext {
+        ToolContext {
             pool,
             event_bus: crate::events::EventBus::new(),
             user_id: "test".into(),
@@ -385,10 +391,13 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         let hits = v["hits"].as_array().unwrap();
-        assert!(!hits.is_empty(), "expected at least one hit for 'margin of safety'");
+        assert!(
+            !hits.is_empty(),
+            "expected at least one hit for 'margin of safety'"
+        );
         let first = &hits[0];
         assert!(first["title"].as_str().is_some());
-        assert!(first["snippet"].as_str().unwrap().len() > 0);
+        assert!(!first["snippet"].as_str().unwrap().is_empty());
     }
 
     #[tokio::test]

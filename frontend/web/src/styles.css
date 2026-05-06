@@ -443,6 +443,7 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
   border-radius: 10px 10px 2px 10px;
   padding: 8px 12px;
   max-width: 86%;
+  white-space: pre-wrap;
 }
 .lk-msg-body code, .lk-msg-body kbd {
   font-family: var(--font-mono);

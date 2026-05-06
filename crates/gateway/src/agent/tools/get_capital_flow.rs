@@ -48,7 +48,10 @@ impl GetCapitalFlowTool {
         };
         let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
         if code != 0 {
-            let msg = body.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown tushare error");
+            let msg = body
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown tushare error");
             bail!("tushare error (code={code}): {msg}");
         }
         Ok(body)
@@ -68,12 +71,18 @@ impl GetCapitalFlowTool {
             "fields": "trade_date,buy_elg_amount,sell_elg_amount,net_mf_amount,buy_lg_amount,sell_lg_amount,buy_md_amount,sell_md_amount,buy_sm_amount,sell_sm_amount"
         });
         let body = self.tushare_post(payload, cancel).await?;
-        let data = body.get("data").ok_or_else(|| anyhow!("missing data in moneyflow response"))?;
+        let data = body
+            .get("data")
+            .ok_or_else(|| anyhow!("missing data in moneyflow response"))?;
 
         let fields: Vec<String> = data
             .get("fields")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let items: Vec<&Vec<serde_json::Value>> = data
             .get("items")
@@ -82,7 +91,9 @@ impl GetCapitalFlowTool {
             .unwrap_or_default();
 
         if items.is_empty() {
-            return Ok(format!("[get_capital_flow: no moneyflow data for {ts_code}]"));
+            return Ok(format!(
+                "[get_capital_flow: no moneyflow data for {ts_code}]"
+            ));
         }
 
         let idx = |name: &str| -> Option<usize> { fields.iter().position(|f| f == name) };
@@ -133,8 +144,12 @@ impl GetCapitalFlowTool {
 
         let mut out = format!("## {ts_code} · 资金流向（近{}日）\n\n", rows.len());
         out.push_str("| 日期       | 超大单净流入 | 大单净流入  | 中单净流入  | 小单净流入  | 总净流入    |\n");
-        out.push_str("|-----------|------------|-----------|-----------|-----------|------------|\n");
-        out.push_str("| (单位: 万元) |            |           |           |           |            |\n");
+        out.push_str(
+            "|-----------|------------|-----------|-----------|-----------|------------|\n",
+        );
+        out.push_str(
+            "| (单位: 万元) |            |           |           |           |            |\n",
+        );
         for (date, elg, lg, md, sm, net) in &rows {
             let date_fmt = if date.len() == 8 {
                 format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..])
@@ -159,9 +174,8 @@ impl GetCapitalFlowTool {
         let end = Utc::now().date_naive();
         let start = end - chrono::Duration::days(days * 2);
 
-        let fmt_date = |d: chrono::NaiveDate| {
-            format!("{:04}{:02}{:02}", d.year(), d.month(), d.day())
-        };
+        let fmt_date =
+            |d: chrono::NaiveDate| format!("{:04}{:02}{:02}", d.year(), d.month(), d.day());
 
         let payload = serde_json::json!({
             "api_name": "moneyflow_hsgt",
@@ -173,12 +187,18 @@ impl GetCapitalFlowTool {
             "fields": "trade_date,north_money,hgt,sgt,south_money"
         });
         let body = self.tushare_post(payload, cancel).await?;
-        let data = body.get("data").ok_or_else(|| anyhow!("missing data in moneyflow_hsgt response"))?;
+        let data = body
+            .get("data")
+            .ok_or_else(|| anyhow!("missing data in moneyflow_hsgt response"))?;
 
         let fields: Vec<String> = data
             .get("fields")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let items: Vec<&Vec<serde_json::Value>> = data
             .get("items")
@@ -234,7 +254,9 @@ impl GetCapitalFlowTool {
         }
 
         let mut out = format!("## 北向资金（近{}日）\n\n", rows.len());
-        out.push_str("| 日期       | 北向净流入(亿) | 沪股通(亿) | 深股通(亿) | 南向净流入(亿) |\n");
+        out.push_str(
+            "| 日期       | 北向净流入(亿) | 沪股通(亿) | 深股通(亿) | 南向净流入(亿) |\n",
+        );
         out.push_str("|-----------|-------------|----------|----------|-------------|\n");
         for (date, north, hgt, sgt, south) in &rows {
             let date_fmt = if date.len() == 8 {
@@ -302,17 +324,24 @@ impl ToolHandler for GetCapitalFlowTool {
             anyhow!("TUSHARE_TOKEN env var not set — A-share data unavailable. Get a token at https://tushare.pro/register")
         })?;
 
-        let data_type = args.get("data_type").and_then(|v| v.as_str()).unwrap_or("both");
-        let ts_code = args.get("ts_code").and_then(|v| v.as_str()).map(|s| s.trim().to_uppercase());
+        let data_type = args
+            .get("data_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("both");
+        let ts_code = args
+            .get("ts_code")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_uppercase());
         let days = args
             .get("days")
             .and_then(|v| v.as_i64())
-            .map(|n| n.min(MAX_DAYS).max(1))
+            .map(|n| n.clamp(1, MAX_DAYS))
             .unwrap_or(DEFAULT_DAYS);
 
         match data_type {
             "stock_flow" => {
-                let code = ts_code.ok_or_else(|| anyhow!("'ts_code' is required for stock_flow data_type"))?;
+                let code = ts_code
+                    .ok_or_else(|| anyhow!("'ts_code' is required for stock_flow data_type"))?;
                 self.fetch_stock_flow(&token, &code, days, &cancel).await
             }
             "northbound" => self.fetch_northbound(&token, days, &cancel).await,

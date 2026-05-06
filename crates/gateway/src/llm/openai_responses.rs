@@ -124,8 +124,7 @@ pub fn parse_sse_stream(resp: reqwest::Response) -> BoxStream<'static, Result<Ll
             let chunk = chunk.context("reading SSE chunk")?;
             buf.extend_from_slice(&chunk);
 
-            loop {
-                let Some(idx) = find_event_boundary(&buf) else { break };
+            while let Some(idx) = find_event_boundary(&buf) {
                 let raw_bytes: Vec<u8> = buf.drain(..idx.next_event_start).collect();
                 let raw_event = std::str::from_utf8(&raw_bytes[..idx.end_of_event])
                     .context("non-UTF-8 in SSE event")?;
@@ -243,9 +242,8 @@ fn parse_one_event(raw: &str) -> Result<Vec<LlmEvent>> {
         return Ok(Vec::new());
     }
 
-    let env: DataEnvelope = serde_json::from_str(&data).with_context(|| {
-        format!("parsing SSE data line as JSON: {}", truncate(&data, 200))
-    })?;
+    let env: DataEnvelope = serde_json::from_str(&data)
+        .with_context(|| format!("parsing SSE data line as JSON: {}", truncate(&data, 200)))?;
 
     match env.type_.as_deref() {
         Some("response.output_text.delta") => {
@@ -324,9 +322,10 @@ fn parse_one_event(raw: &str) -> Result<Vec<LlmEvent>> {
                 LlmEvent::MessageEnd { stop_reason: stop },
             ])
         }
-        Some("response.failed") | Some("response.error") | Some("error") => {
-            Err(anyhow!("provider returned error event: {}", truncate(&data, 500)))
-        }
+        Some("response.failed") | Some("response.error") | Some("error") => Err(anyhow!(
+            "provider returned error event: {}",
+            truncate(&data, 500)
+        )),
         // Lifecycle events we recognize but don't emit anything for (P1 scope)
         Some(_) | None => Ok(Vec::new()),
     }

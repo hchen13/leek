@@ -41,8 +41,7 @@ const DEFAULT_MAX_CHARS: usize = 50_000;
 const HARD_CAP_MAX_CHARS: usize = 100_000;
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const CACHE_CAPACITY: usize = 64;
-const USER_AGENT: &str =
-    "leek/0.1 (+https://github.com/hchen13/leek; investment-research agent)";
+const USER_AGENT: &str = "leek/0.1 (+https://github.com/hchen13/leek; investment-research agent)";
 
 /// Below this many chars Tier 1 readability output is considered "too thin"
 /// (likely SPA / JS-heavy / paywall) — trigger Tier 2 Jina Reader fallback.
@@ -121,11 +120,7 @@ impl WebFetchTool {
     /// returns clean markdown. Free tier is rate-limited but doesn't need
     /// an API key for low-volume use; we add `Authorization: Bearer` if
     /// `JINA_API_KEY` is set in the environment.
-    async fn fetch_via_jina(
-        &self,
-        target_url: &str,
-        cancel: &CancellationToken,
-    ) -> Result<String> {
+    async fn fetch_via_jina(&self, target_url: &str, cancel: &CancellationToken) -> Result<String> {
         let endpoint = format!("{}/{}", JINA_BASE_URL, target_url);
         let mut req = self
             .http
@@ -165,14 +160,13 @@ impl ToolHandler for WebFetchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
-            description:
-                "Fetch a URL over HTTP and return the readable main content as markdown. \
+            description: "Fetch a URL over HTTP and return the readable main content as markdown. \
                  Use for articles, news, filings, blog posts, PRs. The page is parsed with \
                  a Readability algorithm — navigation, ads, footers are stripped. Tables, \
                  lists, links, and code blocks are preserved. JavaScript is NOT executed; \
                  for SPA-heavy or login-gated pages a fallback to Jina Reader fires \
                  automatically (when configured). Always cite the URL in your final answer."
-                    .into(),
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -250,9 +244,7 @@ impl ToolHandler for WebFetchTool {
                 "REDIRECT DETECTED: {} → {}\n\n\
                  The URL redirects to a different host. To complete the fetch, \
                  call web_fetch again with: {{\"url\": \"{}\"}}",
-                final_url,
-                resolved,
-                resolved
+                final_url, resolved, resolved
             ));
         }
 
@@ -288,7 +280,9 @@ impl ToolHandler for WebFetchTool {
 
         let body = String::from_utf8_lossy(&bytes).into_owned();
 
-        let (extracted, tier_used) = if content_type.contains("text/html") || content_type.is_empty() {
+        let (extracted, tier_used) = if content_type.contains("text/html")
+            || content_type.is_empty()
+        {
             // Tier 1: Readability + dom_smoothie
             let tier1 = extract_readable_markdown(&body, &final_url);
             let tier1_len = tier1.as_ref().map(|s| s.chars().count()).unwrap_or(0);
@@ -426,14 +420,8 @@ fn upgrade_to_https(mut url: Url) -> Url {
 
 fn same_origin_modulo_www(a: &Url, b: &Url) -> bool {
     let strip_www = |s: &str| s.strip_prefix("www.").unwrap_or(s).to_ascii_lowercase();
-    let host_a = a
-        .host_str()
-        .map(strip_www)
-        .unwrap_or_default();
-    let host_b = b
-        .host_str()
-        .map(strip_www)
-        .unwrap_or_default();
+    let host_a = a.host_str().map(strip_www).unwrap_or_default();
+    let host_b = b.host_str().map(strip_www).unwrap_or_default();
     host_a == host_b && a.scheme() == b.scheme() && a.port() == b.port()
 }
 
@@ -452,7 +440,7 @@ fn extract_readable_markdown(html: &str, url: &str) -> Option<String> {
     if text.trim().is_empty() {
         return None;
     }
-    let title: String = article.title.into();
+    let title = article.title;
     if title.trim().is_empty() {
         Some(text)
     } else {

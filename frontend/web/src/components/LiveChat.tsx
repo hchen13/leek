@@ -16,16 +16,23 @@ import type { Scene } from "../scenes";
 
 const DEFAULT_SESSION_ID = "live";
 
-function readSessionFromHash(): string {
+function readSessionFromLocation(): string {
+  const match = window.location.pathname.match(/^\/sessions\/([^/?#]+)/);
+  if (match?.[1]) return decodeURIComponent(match[1]);
   const h = window.location.hash.replace(/^#/, "");
   if (h.startsWith("s/")) return h.slice(2);
   return DEFAULT_SESSION_ID;
 }
-function writeSessionToHash(id: string) {
+function writeSessionToLocation(id: string) {
   if (id === DEFAULT_SESSION_ID) {
-    if (window.location.hash) history.replaceState(null, "", window.location.pathname);
+    if (window.location.pathname !== "/" || window.location.hash) {
+      history.pushState(null, "", "/");
+    }
   } else {
-    window.location.hash = `s/${id}`;
+    const path = `/sessions/${encodeURIComponent(id)}`;
+    if (window.location.pathname !== path || window.location.hash) {
+      history.pushState(null, "", path);
+    }
   }
 }
 
@@ -81,7 +88,7 @@ interface DecisionDraftPayload {
 
 interface LiveMsg {
   /** `compaction_summary` rows are written by /compact and rendered as a
-   *  collapsible system card at the head of forked sessions. */
+   *  collapsible system card inside the same session. */
   role: "user" | "agent" | "compaction_summary" | "decision_draft";
   text: string;
   ts: string;
@@ -92,9 +99,12 @@ interface LiveMsg {
   /** Final elapsed seconds for the agent reply, frozen at message_end. */
   total_sec?: number;
   decision_draft?: DecisionDraftPayload;
+  msg_seq?: number;
+  raw_ts?: string;
+  hidden?: boolean;
 }
 
-/** Context-compacted divider — shown at the head of every forked session.
+/** Context-compacted divider — shown after compaction in the same session.
  *  Prominent horizontal rule signals the break; summary expands on click. */
 function CompactionSummaryCard(props: { time: string; markdown: string }) {
   const [open, setOpen] = createSignal(false);
@@ -204,8 +214,8 @@ function DecisionDraftCard(props: { time: string; draft: DecisionDraftPayload })
     }
   }
 
-  const dirColor = () => props.draft.direction === "buy" ? "rgba(100,200,120,0.15)" : "rgba(217,112,112,0.12)";
-  const dirBorder = () => props.draft.direction === "buy" ? "rgba(100,200,120,0.4)" : "rgba(217,112,112,0.4)";
+  const dirColor = () => props.draft.direction === "long" ? "rgba(100,200,120,0.15)" : "rgba(217,112,112,0.12)";
+  const dirBorder = () => props.draft.direction === "long" ? "rgba(100,200,120,0.4)" : "rgba(217,112,112,0.4)";
 
   return (
     <div style={{
@@ -218,7 +228,7 @@ function DecisionDraftCard(props: { time: string; draft: DecisionDraftPayload })
     }}>
       <div style={{ display: "flex", "align-items": "center", gap: "10px", "margin-bottom": "8px" }}>
         <span style={{ "font-size": "12px", "font-weight": 700, color: "var(--ink-0)", "text-transform": "uppercase", "letter-spacing": "0.06em" }}>
-          {props.draft.direction === "buy" ? "▲ 买入" : "▼ 卖出"} · {props.draft.ticker}
+          {props.draft.direction === "long" ? "▲ 买入" : props.draft.direction === "short" ? "▼ 卖出" : "◆ 平仓"} · {props.draft.ticker}
         </span>
         <Show when={props.draft.size_pct != null}>
           <span style={{ "font-size": "11px", color: "var(--ink-2)" }}>{props.draft.size_pct}%</span>
@@ -338,6 +348,24 @@ function summarizeTool(t: ToolCall): string {
   return detail ? `${head}: ${detail}` : head;
 }
 
+function summarizeProcess(m: LiveMsg): string {
+  const narrations = m.narrations?.length ?? 0;
+  const tools = m.tool_calls?.length ?? 0;
+  const searches = m.searches?.length ?? 0;
+  const parts: string[] = [];
+  if (narrations > 0) parts.push(`${narrations} 个推理步骤`);
+  if (tools > 0) parts.push(`${tools} 个工具`);
+  if (searches > 0) parts.push(`${searches} 次网页动作`);
+  return parts.length > 0 ? `过程已展开到画布：${parts.join(" · ")}` : "";
+}
+
+function firstCanvasTarget(m: LiveMsg): string | undefined {
+  if ((m.narrations?.length ?? 0) > 0) return "narration-trace";
+  const firstSearch = m.searches?.[0];
+  if (firstSearch) return searchKey(firstSearch);
+  return m.tool_calls?.[0]?.call_id;
+}
+
 interface UsageInfo {
   inTokens: number;
   outTokens: number;
@@ -361,7 +389,7 @@ interface LiveTick {
 }
 
 export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => void } = {}) {
-  const [sessionId, setSessionId] = createSignal<string>(readSessionFromHash());
+  const [sessionId, setSessionId] = createSignal<string>(readSessionFromLocation());
   const [sessions, setSessions] = createSignal<SessionRow[]>([]);
   const [messages, setMessages] = createSignal<LiveMsg[]>([]);
   const [usage, setUsage] = createSignal<UsageInfo | null>(null);
@@ -529,6 +557,8 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
             role,
             text,
             ts: fmtTime(m.created_at),
+            msg_seq: typeof m.seq === "number" ? m.seq : undefined,
+            raw_ts: m.created_at,
             searches: [],
             tool_calls: [],
             narrations: [],
@@ -543,24 +573,48 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
       const r = await fetch(`/api/v1/sessions/${id}/events?limit=5000`);
       if (r.ok) {
         const ev = await r.json();
-        const agentIdxs = hist.flatMap((m, i) => m.role === "agent" ? [i] : []);
-        let cursor = -1; // index into agentIdxs; advances on agent_message_start
+        const agentIdxs: number[] = [];
+        let cursor = -1; // index into event-created agent slots
         let usageSnap: UsageInfo | null = null;
         let lastSec: number | undefined;
+        const mergeAgentActivity = (fromIdx: number, toIdx: number) => {
+          const from = hist[fromIdx];
+          const to = hist[toIdx];
+          to.searches = [...(to.searches ?? []), ...(from.searches ?? [])];
+          const byCall = new Map<string, ToolCall>();
+          for (const t of [...(to.tool_calls ?? []), ...(from.tool_calls ?? [])]) {
+            const prev = byCall.get(t.call_id);
+            byCall.set(t.call_id, { ...(prev ?? t), ...t, arguments: prev?.arguments ?? t.arguments });
+          }
+          to.tool_calls = Array.from(byCall.values());
+          to.narrations = [...(to.narrations ?? []), ...(from.narrations ?? [])];
+          to.total_sec = from.total_sec ?? to.total_sec;
+          from.hidden = true;
+        };
         for (const row of ev.items ?? []) {
           const p = (() => { try { return JSON.parse(row.payload_json); } catch { return {}; } })();
           switch (row.kind) {
             case "agent_message_start":
               cursor++;
+              hist.push({
+                role: "agent",
+                text: "",
+                ts: fmtTime(row.ts ?? row.created_at),
+                raw_ts: row.ts ?? row.created_at,
+                searches: [],
+                tool_calls: [],
+                narrations: [],
+              });
+              agentIdxs.push(hist.length - 1);
               break;
             case "agent_message_end":
               if (cursor >= 0 && cursor < agentIdxs.length) {
+                const currentIdx = agentIdxs[cursor];
+                if (typeof lastSec === "number") hist[currentIdx].total_sec = lastSec;
                 if (typeof p.message_seq === "number") {
-                  // Could correlate but we trust message order; nothing to do.
+                  const targetIdx = hist.findIndex((m) => m.role === "agent" && m.msg_seq === p.message_seq);
+                  if (targetIdx >= 0 && targetIdx !== currentIdx) mergeAgentActivity(currentIdx, targetIdx);
                 }
-              }
-              if (typeof lastSec === "number" && cursor < agentIdxs.length) {
-                hist[agentIdxs[cursor]].total_sec = lastSec;
               }
               break;
             case "tool_call":
@@ -625,7 +679,8 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
               hist.push({
                 role: "decision_draft",
                 text: "",
-                ts: fmtTime(row.created_at),
+                ts: fmtTime(row.ts ?? row.created_at),
+                raw_ts: row.ts ?? row.created_at,
                 decision_draft: p as DecisionDraftPayload,
               });
               break;
@@ -638,9 +693,10 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
         let lastStartTs = "";
         let lastEndTs = "";
         for (const row of ev.items ?? []) {
-          if (row.kind === "compaction.started") lastStartTs = row.created_at ?? "";
+          const rowTs = row.ts ?? row.created_at ?? "";
+          if (row.kind === "compaction.started") lastStartTs = rowTs;
           if (row.kind === "compaction.completed" || row.kind === "compaction.aborted") {
-            lastEndTs = row.created_at ?? "";
+            lastEndTs = rowTs;
           }
         }
         if (lastStartTs && lastStartTs > lastEndTs) {
@@ -649,6 +705,9 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
       }
     } catch {/* events optional */}
 
+    hist = hist
+      .filter((m) => !m.hidden)
+      .sort((a, b) => (a.raw_ts ?? "").localeCompare(b.raw_ts ?? ""));
     setMessages(hist);
 
     // 3. Subscribe to live event stream
@@ -805,6 +864,19 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
       }
     });
 
+    evtSrc.addEventListener("provider_retry", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        const retry = Number(data.retry ?? 0);
+        const max = Number(data.max_retries ?? 10);
+        const delaySec = Math.max(0, Math.round(Number(data.delay_ms ?? 0) / 1000));
+        setError(`provider error，${delaySec}s 后重试 ${retry}/${max}`);
+        emitTick(e, "provider_retry", data);
+      } catch {
+        setError("provider error，准备重试");
+      }
+    });
+
     evtSrc.addEventListener("agent_message_end", (e: MessageEvent) => {
       setPending(false);
       setError(null);
@@ -856,37 +928,22 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
         setCompactionTrigger(null);
       }
     });
-    evtSrc.addEventListener("compaction.completed", async (e: MessageEvent) => {
-      try {
-        const data = JSON.parse(e.data) as { new_session_id?: string };
-        const newId = data.new_session_id;
-        if (newId) {
-          // Switch over — connect() reloads the new session's messages
-          // (including the compaction_summary head row) and SSE stream.
-          // Await it so the post-flush optimistic push isn't clobbered by
-          // connect()'s in-flight setMessages(hist).
-          await switchSession(newId);
-          await refreshSessions();
-          // Clear compacting flag BEFORE flushing the queue, otherwise
-          // send() sees `compacting() == true` and re-queues each message
-          // instead of POSTing it.
-          setCompacting(false);
-          setCompactionTrigger(null);
-          setPendingCompactionTargetId(null);
-          // Flush queued messages into the new session, in order.
-          const queued = compactQueue();
-          setCompactQueue([]);
-          for (const text of queued) {
-            await send(text);
-          }
-          return;
-        }
-      } catch {
-        // ignore — UI lock will clear regardless
-      }
+    evtSrc.addEventListener("compaction.completed", async () => {
+      // Reload the same session — compaction_summary is now appended in-place.
+      // Reconnect so the SSE stream reattaches after connect() closes the old one.
+      evtSrc?.close();
+      evtSrc = undefined;
+      await connect(sessionId());
+      // Clear compacting flag BEFORE flushing the queue so send() POSTs instead
+      // of re-queuing.
       setCompacting(false);
       setCompactionTrigger(null);
       setPendingCompactionTargetId(null);
+      const queued = compactQueue();
+      setCompactQueue([]);
+      for (const text of queued) {
+        await send(text);
+      }
     });
     evtSrc.addEventListener("compaction.aborted", (e: MessageEvent) => {
       try {
@@ -908,6 +965,25 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
         setError("agent error");
       }
       setPending(false);
+      if (elapsedTimer) {
+        clearInterval(elapsedTimer);
+        elapsedTimer = undefined;
+      }
+      setElapsedSec(0);
+      // Finalize any hanging streaming bubble so it doesn't spin forever.
+      const finalSec = agentStartTs ? Math.max(0, Math.floor((Date.now() - agentStartTs) / 1000)) : 0;
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (!last || last.role !== "agent" || !last.streaming) return prev;
+        const hasActivity =
+          (last.searches?.length ?? 0) > 0 ||
+          (last.tool_calls?.length ?? 0) > 0 ||
+          (last.narrations?.length ?? 0) > 0;
+        if (!last.text && !hasActivity) return prev.slice(0, -1); // empty bubble → remove
+        const out = [...prev];
+        out[out.length - 1] = { ...last, streaming: false, total_sec: finalSec };
+        return out;
+      });
     });
   }
 
@@ -916,25 +992,28 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     evtSrc?.close();
     evtSrc = undefined;
     setSessionId(id);
-    writeSessionToHash(id);
+    writeSessionToLocation(id);
     await connect(id);
   }
 
   onMount(() => {
     void connect(sessionId());
     void refreshSessions();
-    // Pick up forward/back navigation that flips the session hash.
-    const onHash = () => {
-      const next = readSessionFromHash();
+    const onLocation = () => {
+      const next = readSessionFromLocation();
       if (next !== sessionId()) switchSession(next);
     };
-    window.addEventListener("hashchange", onHash);
+    window.addEventListener("hashchange", onLocation);
+    window.addEventListener("popstate", onLocation);
     // Restore the chat column width preference saved last drag session.
     const saved = localStorage.getItem("lk-chat-col");
     if (saved && /^\d+px$/.test(saved)) {
       document.documentElement.style.setProperty("--lk-chat-col", saved);
     }
-    onCleanup(() => window.removeEventListener("hashchange", onHash));
+    onCleanup(() => {
+      window.removeEventListener("hashchange", onLocation);
+      window.removeEventListener("popstate", onLocation);
+    });
   });
 
   // Drag the chat ↔ canvas seam. Bound at run-time on mousedown so we don't
@@ -1063,7 +1142,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     },
     {
       name: "compact",
-      hint: "压缩对话上下文（fork 出新 session）",
+      hint: "压缩当前对话上下文",
       run: () => {
         if (compacting() || pending()) return;
         setError(null);
@@ -1081,11 +1160,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
               setError(`compact ${r.status}: ${body.slice(0, 200)}`);
               return;
             }
-            const data = (await r.json()) as { new_session_id: string };
-            setPendingCompactionTargetId(data.new_session_id);
-            // Don't navigate yet — wait for compaction.completed SSE so the
-            // user sees the lock release at the same moment the new session
-            // becomes ready.
+            // compaction.completed SSE will reload messages and flush queue.
           } catch (e: any) {
             setCompacting(false);
             setError(e?.message ?? "compact failed");
@@ -1287,45 +1362,27 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
                         : `✓ done · ${m.total_sec}s`}
                     </div>
                   </Show>
-                  <Show when={(m.searches?.length ?? 0) + (m.tool_calls?.length ?? 0) > 0}>
+                  <Show when={(m.searches?.length ?? 0) + (m.tool_calls?.length ?? 0) + (m.narrations?.length ?? 0) > 0}>
                     <div style={{
-                      display: "flex",
-                      "flex-direction": "column",
-                      gap: "2px",
                       "margin-bottom": "8px",
                       "font-family": "var(--font-mono)",
                       "font-size": "11px",
                       color: "var(--ink-3)",
+                      cursor: "pointer",
                     }}>
-                      <For each={m.searches!}>{(s) => (
-                        <div
-                          onClick={() => scrollToCanvasCard(searchKey(s))}
-                          title="跳到画布"
-                          style={{
-                            opacity: s.status === "completed" ? 1 : 0.7,
-                            cursor: "pointer",
-                            "border-radius": "3px",
-                            "padding-left": "2px",
-                          }}
-                        >
-                          {summarizeSearch(s)}
-                        </div>
-                      )}</For>
-                      <For each={m.tool_calls!}>{(t) => (
-                        <div
-                          onClick={() => scrollToCanvasCard(t.call_id)}
-                          title="跳到画布"
-                          style={{
-                            opacity: t.status === "completed" ? 1 : t.status === "error" ? 1 : 0.7,
-                            color: t.status === "error" ? "#d97070" : "var(--ink-3)",
-                            cursor: "pointer",
-                            "border-radius": "3px",
-                            "padding-left": "2px",
-                          }}
-                        >
-                          {summarizeTool(t)}
-                        </div>
-                      )}</For>
+                      <div
+                        onClick={() => scrollToCanvasCard(firstCanvasTarget(m))}
+                        title="跳到画布"
+                        style={{
+                          display: "inline-block",
+                          padding: "4px 7px",
+                          background: "rgba(255,255,255,0.035)",
+                          border: "1px solid var(--line-1)",
+                          "border-radius": "5px",
+                        }}
+                      >
+                        {summarizeProcess(m)}
+                      </div>
                     </div>
                   </Show>
                   {/* While streaming, show plain text + blinker — markdown
@@ -1472,4 +1529,3 @@ function CanvasArea(props: {
     </div>
   );
 }
-

@@ -88,7 +88,6 @@ pub async fn confirm_deliverable(
     pool: &SqlitePool,
     user_id: &str,
     deliverable_id: &str,
-    session_id: &str,
 ) -> Result<String> {
     let row = sqlx::query_as::<_, (Option<String>, String, String)>(
         r#"
@@ -102,15 +101,22 @@ pub async fn confirm_deliverable(
     .fetch_optional(pool)
     .await
     .context("fetching deliverable for confirm")?
-    .map(|(task_id, payload_json, status)| DeliverableLookup { task_id, payload_json, status })
+    .map(|(task_id, payload_json, status)| DeliverableLookup {
+        task_id,
+        payload_json,
+        status,
+    })
     .ok_or_else(|| anyhow::anyhow!("deliverable not found: {deliverable_id}"))?;
 
     if row.status != "pending_confirm" {
-        bail!("deliverable {deliverable_id} is not pending_confirm (status={})", row.status);
+        bail!(
+            "deliverable {deliverable_id} is not pending_confirm (status={})",
+            row.status
+        );
     }
 
-    let payload: serde_json::Value = serde_json::from_str(&row.payload_json)
-        .context("parsing deliverable payload_json")?;
+    let payload: serde_json::Value =
+        serde_json::from_str(&row.payload_json).context("parsing deliverable payload_json")?;
 
     let ticker = payload["ticker"]
         .as_str()
@@ -125,6 +131,25 @@ pub async fn confirm_deliverable(
     let stop_loss = payload["stop_loss"].as_f64();
     let target = payload["target"].as_f64();
     let horizon_days = payload["horizon_days"].as_i64();
+    let session_id = if let Some(session_id) = payload.get("session_id").and_then(|v| v.as_str()) {
+        session_id.to_string()
+    } else if let Some(task_id) = row.task_id.as_deref() {
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT session_id
+            FROM tasks
+            WHERE user_id = ? AND id = ?
+            "#,
+        )
+        .bind(user_id)
+        .bind(task_id)
+        .fetch_optional(pool)
+        .await
+        .context("looking up task session for deliverable")?
+        .ok_or_else(|| anyhow::anyhow!("task not found for deliverable: {task_id}"))?
+    } else {
+        bail!("deliverable {deliverable_id} has no source session");
+    };
 
     let now = Utc::now().to_rfc3339();
     let decision_id = Uuid::now_v7().to_string();
@@ -157,7 +182,7 @@ pub async fn confirm_deliverable(
     .bind(&decision_id)
     .bind(deliverable_id)
     .bind(&row.task_id)
-    .bind(session_id)
+    .bind(&session_id)
     .bind(&ticker)
     .bind(&direction)
     .bind(size_pct)

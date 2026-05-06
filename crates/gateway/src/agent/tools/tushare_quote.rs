@@ -50,15 +50,14 @@ impl ToolHandler for TushareQuoteTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
-            description:
-                "Fetch daily OHLCV (open/high/low/close/volume) for a Chinese A-share \
+            description: "Fetch daily OHLCV (open/high/low/close/volume) for a Chinese A-share \
                  from Tushare Pro. Use this for any A-share or Chinese index \
                  question — codex's web_search has poor coverage on CN equities. \
                  Symbol format is `<ticker>.<exchange>`: `.SH` for Shanghai \
                  (e.g. 600519.SH = Moutai), `.SZ` for Shenzhen (e.g. 000001.SZ = \
                  Ping An Bank, 300750.SZ = CATL), `.BJ` for Beijing. Returns a \
                  markdown table of the most recent N trading days."
-                    .into(),
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -95,14 +94,12 @@ impl ToolHandler for TushareQuoteTool {
             .trim()
             .to_uppercase();
         if !is_valid_ts_code(&ts_code) {
-            bail!(
-                "invalid ts_code `{ts_code}` — expected format like '000001.SZ' / '600519.SH'"
-            );
+            bail!("invalid ts_code `{ts_code}` — expected format like '000001.SZ' / '600519.SH'");
         }
         let days = args
             .get("days")
             .and_then(|v| v.as_u64())
-            .map(|n| (n as u32).min(MAX_DAYS).max(1))
+            .map(|n| (n as u32).clamp(1, MAX_DAYS))
             .unwrap_or(DEFAULT_DAYS);
 
         // Tushare daily returns up to a configurable window; we send a wide
@@ -153,7 +150,11 @@ impl ToolHandler for TushareQuoteTool {
         let fields: Vec<String> = data
             .get("fields")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let items: Vec<&Vec<serde_json::Value>> = data
             .get("items")

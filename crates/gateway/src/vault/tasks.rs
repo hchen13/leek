@@ -15,7 +15,7 @@ pub struct NewTask<'a> {
     pub title: &'a str,
     pub goal: &'a str,
     pub expected_deliverable: &'a str,
-    pub source: &'a str,           // "user" / "cron" / "agent_proposed"
+    pub source: &'a str, // "user" / "cron" / "agent_proposed"
     pub constraints_json: Option<&'a str>,
     pub context_refs_json: Option<&'a str>,
 }
@@ -112,11 +112,7 @@ pub async fn get_active_for_session(
     Ok(row)
 }
 
-pub async fn mark_delivered(
-    pool: &SqlitePool,
-    user_id: &str,
-    task_id: &str,
-) -> Result<()> {
+pub async fn mark_delivered(pool: &SqlitePool, user_id: &str, task_id: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         r#"

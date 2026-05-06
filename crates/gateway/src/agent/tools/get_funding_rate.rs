@@ -25,13 +25,15 @@ impl GetFundingRateTool {
         Ok(Self { http })
     }
 
-    async fn fetch_binance(&self, symbol: &str, limit: u64, cancel: &CancellationToken) -> Result<String> {
-        let funding_url = format!(
-            "https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&limit={limit}"
-        );
-        let oi_url = format!(
-            "https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}"
-        );
+    async fn fetch_binance(
+        &self,
+        symbol: &str,
+        limit: u64,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
+        let funding_url =
+            format!("https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&limit={limit}");
+        let oi_url = format!("https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}");
         let ls_url = format!(
             "https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={symbol}&period=1h&limit=8"
         );
@@ -42,7 +44,10 @@ impl GetFundingRateTool {
             r = self.http.get(&funding_url).send() => r?,
         };
         if !funding_resp.status().is_success() {
-            bail!("Binance fundingRate returned HTTP {}", funding_resp.status().as_u16());
+            bail!(
+                "Binance fundingRate returned HTTP {}",
+                funding_resp.status().as_u16()
+            );
         }
         let funding_data: serde_json::Value = tokio::select! {
             biased;
@@ -56,7 +61,10 @@ impl GetFundingRateTool {
             r = self.http.get(&oi_url).send() => r?,
         };
         if !oi_resp.status().is_success() {
-            bail!("Binance openInterest returned HTTP {}", oi_resp.status().as_u16());
+            bail!(
+                "Binance openInterest returned HTTP {}",
+                oi_resp.status().as_u16()
+            );
         }
         let oi_data: serde_json::Value = tokio::select! {
             biased;
@@ -70,7 +78,10 @@ impl GetFundingRateTool {
             r = self.http.get(&ls_url).send() => r?,
         };
         if !ls_resp.status().is_success() {
-            bail!("Binance longShortRatio returned HTTP {}", ls_resp.status().as_u16());
+            bail!(
+                "Binance longShortRatio returned HTTP {}",
+                ls_resp.status().as_u16()
+            );
         }
         let ls_data: serde_json::Value = tokio::select! {
             biased;
@@ -85,24 +96,46 @@ impl GetFundingRateTool {
         out.push_str("|-------------------|-------------|-------------|\n");
         if let Some(arr) = funding_data.as_array() {
             for item in arr {
-                let time_ms = item.get("fundingTime").and_then(|v| v.as_i64()).unwrap_or(0);
-                let rate = item.get("fundingRate").and_then(|v| v.as_str()).unwrap_or("0");
-                let mark = item.get("markPrice").and_then(|v| v.as_str()).unwrap_or("-");
-                let dt = Utc.timestamp_millis_opt(time_ms).single()
+                let time_ms = item
+                    .get("fundingTime")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let rate = item
+                    .get("fundingRate")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0");
+                let mark = item
+                    .get("markPrice")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                let dt = Utc
+                    .timestamp_millis_opt(time_ms)
+                    .single()
                     .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_else(|| "-".to_string());
                 let rate_f: f64 = rate.parse().unwrap_or(0.0);
                 let rate_pct = format!("{:+.4}%", rate_f * 100.0);
                 let mark_f: f64 = mark.parse().unwrap_or(0.0);
-                let mark_fmt = if mark_f > 0.0 { format!("{:.2}", mark_f) } else { mark.to_string() };
-                out.push_str(&format!("| {:<18} | {:>12} | {:>12} |\n", dt, rate_pct, mark_fmt));
+                let mark_fmt = if mark_f > 0.0 {
+                    format!("{:.2}", mark_f)
+                } else {
+                    mark.to_string()
+                };
+                out.push_str(&format!(
+                    "| {:<18} | {:>12} | {:>12} |\n",
+                    dt, rate_pct, mark_fmt
+                ));
             }
         }
         out.push('\n');
 
-        let oi_str = oi_data.get("openInterest").and_then(|v| v.as_str()).unwrap_or("0");
+        let oi_str = oi_data
+            .get("openInterest")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0");
         let oi_f: f64 = oi_str.parse().unwrap_or(0.0);
-        let mark_latest = funding_data.as_array()
+        let mark_latest = funding_data
+            .as_array()
             .and_then(|a| a.last())
             .and_then(|item| item.get("markPrice"))
             .and_then(|v| v.as_str())
@@ -114,7 +147,9 @@ impl GetFundingRateTool {
             out.push_str(&format!(
                 "Current OI: {:.1} {} (${:.2}B)\n\n",
                 oi_f,
-                symbol.trim_end_matches(|c: char| c.is_alphabetic() && c.is_uppercase() && !"BTCETHBNBSOL".contains(c)),
+                symbol.trim_end_matches(|c: char| c.is_alphabetic()
+                    && c.is_uppercase()
+                    && !"BTCETHBNBSOL".contains(c)),
                 oi_usd / 1_000_000_000.0
             ));
         } else {
@@ -127,10 +162,21 @@ impl GetFundingRateTool {
         if let Some(arr) = ls_data.as_array() {
             for item in arr {
                 let ts = item.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
-                let long_acc = item.get("longAccount").and_then(|v| v.as_str()).unwrap_or("0");
-                let short_acc = item.get("shortAccount").and_then(|v| v.as_str()).unwrap_or("0");
-                let ratio = item.get("longShortRatio").and_then(|v| v.as_str()).unwrap_or("0");
-                let dt = Utc.timestamp_millis_opt(ts).single()
+                let long_acc = item
+                    .get("longAccount")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0");
+                let short_acc = item
+                    .get("shortAccount")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0");
+                let ratio = item
+                    .get("longShortRatio")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0");
+                let dt = Utc
+                    .timestamp_millis_opt(ts)
+                    .single()
                     .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_else(|| "-".to_string());
                 let long_f: f64 = long_acc.parse().unwrap_or(0.0);
@@ -151,12 +197,8 @@ impl GetFundingRateTool {
     }
 
     async fn fetch_okx(&self, symbol: &str, cancel: &CancellationToken) -> Result<String> {
-        let funding_url = format!(
-            "https://www.okx.com/api/v5/public/funding-rate?instId={symbol}"
-        );
-        let oi_url = format!(
-            "https://www.okx.com/api/v5/public/open-interest?instId={symbol}"
-        );
+        let funding_url = format!("https://www.okx.com/api/v5/public/funding-rate?instId={symbol}");
+        let oi_url = format!("https://www.okx.com/api/v5/public/open-interest?instId={symbol}");
 
         let funding_resp = tokio::select! {
             biased;
@@ -164,7 +206,10 @@ impl GetFundingRateTool {
             r = self.http.get(&funding_url).send() => r?,
         };
         if !funding_resp.status().is_success() {
-            bail!("OKX funding-rate returned HTTP {}", funding_resp.status().as_u16());
+            bail!(
+                "OKX funding-rate returned HTTP {}",
+                funding_resp.status().as_u16()
+            );
         }
         let funding_body: serde_json::Value = tokio::select! {
             biased;
@@ -178,7 +223,10 @@ impl GetFundingRateTool {
             r = self.http.get(&oi_url).send() => r?,
         };
         if !oi_resp.status().is_success() {
-            bail!("OKX open-interest returned HTTP {}", oi_resp.status().as_u16());
+            bail!(
+                "OKX open-interest returned HTTP {}",
+                oi_resp.status().as_u16()
+            );
         }
         let oi_body: serde_json::Value = tokio::select! {
             biased;
@@ -189,22 +237,47 @@ impl GetFundingRateTool {
         let mut out = format!("## {symbol} · OKX Perpetual Futures\n\n");
 
         let empty_arr = serde_json::Value::Array(vec![]);
-        let funding_arr = funding_body.get("data").and_then(|v| v.as_array()).unwrap_or(funding_body.as_array().unwrap_or(empty_arr.as_array().unwrap()));
+        let funding_arr = funding_body
+            .get("data")
+            .and_then(|v| v.as_array())
+            .unwrap_or(
+                funding_body
+                    .as_array()
+                    .unwrap_or(empty_arr.as_array().unwrap()),
+            );
 
         out.push_str("### Current Funding Rate\n");
         if let Some(item) = funding_arr.first() {
-            let rate = item.get("fundingRate").and_then(|v| v.as_str()).unwrap_or("0");
-            let next_rate = item.get("nextFundingRate").and_then(|v| v.as_str()).unwrap_or("0");
-            let next_time_ms = item.get("nextFundingTime").and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-            let mark = item.get("markPrice").and_then(|v| v.as_str()).unwrap_or("-");
+            let rate = item
+                .get("fundingRate")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0");
+            let next_rate = item
+                .get("nextFundingRate")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0");
+            let next_time_ms = item
+                .get("nextFundingTime")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let mark = item
+                .get("markPrice")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
             let rate_f: f64 = rate.parse().unwrap_or(0.0);
             let next_rate_f: f64 = next_rate.parse().unwrap_or(0.0);
-            let next_dt = Utc.timestamp_millis_opt(next_time_ms).single()
+            let next_dt = Utc
+                .timestamp_millis_opt(next_time_ms)
+                .single()
                 .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
                 .unwrap_or_else(|| "-".to_string());
             out.push_str(&format!("- Current rate: {:+.4}%\n", rate_f * 100.0));
-            out.push_str(&format!("- Next rate: {:+.4}% ({})\n", next_rate_f * 100.0, next_dt));
+            out.push_str(&format!(
+                "- Next rate: {:+.4}% ({})\n",
+                next_rate_f * 100.0,
+                next_dt
+            ));
             out.push_str(&format!("- Mark price: {mark}\n"));
         }
         out.push('\n');
@@ -233,11 +306,12 @@ impl ToolHandler for GetFundingRateTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
-            description: "Fetch perpetual futures funding rates and open interest for crypto assets. \
+            description:
+                "Fetch perpetual futures funding rates and open interest for crypto assets. \
                 Use for sentiment analysis, funding arbitrage, and leverage assessment. \
                 Supports Binance (default) and OKX. No API key required. \
                 symbol format: \"BTCUSDT\" for Binance, \"BTC-USD-SWAP\" for OKX."
-                .into(),
+                    .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -279,7 +353,7 @@ impl ToolHandler for GetFundingRateTool {
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
-            .map(|n| n.min(100).max(1))
+            .map(|n| n.clamp(1, 100))
             .unwrap_or(10);
 
         match exchange {

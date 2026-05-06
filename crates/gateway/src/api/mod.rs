@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -84,10 +84,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/sessions/{id}/messages",
             post(messages::post_handler).get(messages::list_handler),
         )
-        .route(
-            "/api/v1/sessions/{id}/abort",
-            post(sessions::abort_handler),
-        )
+        .route("/api/v1/sessions/{id}/abort", post(sessions::abort_handler))
         .route(
             "/api/v1/sessions/{id}/compact",
             post(sessions::compact_handler),

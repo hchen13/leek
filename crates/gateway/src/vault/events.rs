@@ -87,6 +87,7 @@ pub async fn latest_input_tokens(
     Ok(payload.get("input_tokens").and_then(|v| v.as_i64()))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert(
     pool: &SqlitePool,
     user_id: &str,

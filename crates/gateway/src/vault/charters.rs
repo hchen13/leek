@@ -5,7 +5,6 @@ use uuid::Uuid;
 
 pub struct CharterRow {
     pub id: String,
-    pub name: String,
     pub text: String,
     pub version: i64,
     pub updated_at: String,
@@ -26,8 +25,13 @@ pub async fn get_active_text(pool: &SqlitePool, user_id: &str) -> Result<Option<
         return Ok(None);
     };
 
-    let v: serde_json::Value = serde_json::from_str(&charter_json).context("parsing charter_json")?;
-    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let v: serde_json::Value =
+        serde_json::from_str(&charter_json).context("parsing charter_json")?;
+    let text = v
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
     if text.trim().is_empty() {
         Ok(None)
     } else {
@@ -36,8 +40,8 @@ pub async fn get_active_text(pool: &SqlitePool, user_id: &str) -> Result<Option<
 }
 
 pub async fn get_active(pool: &SqlitePool, user_id: &str) -> Result<Option<CharterRow>> {
-    let row: Option<(String, String, String, i64, String)> = sqlx::query_as(
-        "SELECT id, name, charter_json, version, updated_at FROM team_charters \
+    let row: Option<(String, String, i64, String)> = sqlx::query_as(
+        "SELECT id, charter_json, version, updated_at FROM team_charters \
          WHERE user_id = ? AND active = 1 \
          ORDER BY version DESC LIMIT 1",
     )
@@ -46,27 +50,36 @@ pub async fn get_active(pool: &SqlitePool, user_id: &str) -> Result<Option<Chart
     .await
     .context("fetching active charter row")?;
 
-    let Some((id, name, charter_json, version, updated_at)) = row else {
+    let Some((id, charter_json, version, updated_at)) = row else {
         return Ok(None);
     };
 
-    let v: serde_json::Value = serde_json::from_str(&charter_json).context("parsing charter_json")?;
-    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let v: serde_json::Value =
+        serde_json::from_str(&charter_json).context("parsing charter_json")?;
+    let text = v
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
 
-    Ok(Some(CharterRow { id, name, text, version, updated_at }))
+    Ok(Some(CharterRow {
+        id,
+        text,
+        version,
+        updated_at,
+    }))
 }
 
 pub async fn upsert(pool: &SqlitePool, user_id: &str, text: &str) -> Result<CharterRow> {
     let charter_json = serde_json::json!({ "text": text }).to_string();
     let now = Utc::now().to_rfc3339();
 
-    let existing_id: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM team_charters WHERE user_id = ? AND active = 1 LIMIT 1",
-    )
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await
-    .context("checking existing charter")?;
+    let existing_id: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM team_charters WHERE user_id = ? AND active = 1 LIMIT 1")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .context("checking existing charter")?;
 
     if let Some((id,)) = existing_id {
         sqlx::query(
@@ -104,7 +117,6 @@ pub async fn upsert(pool: &SqlitePool, user_id: &str, text: &str) -> Result<Char
 
         Ok(CharterRow {
             id,
-            name: "default".to_string(),
             text: text.to_string(),
             version: 1,
             updated_at: now,

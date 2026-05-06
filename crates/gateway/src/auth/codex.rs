@@ -76,8 +76,8 @@ pub async fn device_flow_login() -> Result<CodexTokens> {
     let refresh = token
         .refresh_token
         .ok_or_else(|| anyhow!("token exchange did not return refresh_token"))?;
-    let expires_at = jwt::decode_exp(&token.access_token)
-        .context("decoding exp from access_token JWT")?;
+    let expires_at =
+        jwt::decode_exp(&token.access_token).context("decoding exp from access_token JWT")?;
 
     Ok(CodexTokens {
         access_token: token.access_token,
@@ -89,10 +89,7 @@ pub async fn device_flow_login() -> Result<CodexTokens> {
 /// Refresh access_token. `refresh_token` may rotate — caller should persist
 /// whichever the response returned (or the existing one if response omitted it).
 #[allow(dead_code)] // wired up in Task #44 (codex_oauth provider)
-pub async fn refresh(
-    client: &reqwest::Client,
-    refresh_token: &str,
-) -> Result<CodexTokens> {
+pub async fn refresh(client: &reqwest::Client, refresh_token: &str) -> Result<CodexTokens> {
     let resp = client
         .post(TOKEN_URL)
         .form(&[
@@ -125,8 +122,8 @@ pub async fn refresh(
     let new_refresh = token
         .refresh_token
         .unwrap_or_else(|| refresh_token.to_string());
-    let expires_at = jwt::decode_exp(&token.access_token)
-        .context("decoding exp from refreshed access_token")?;
+    let expires_at =
+        jwt::decode_exp(&token.access_token).context("decoding exp from refreshed access_token")?;
 
     Ok(CodexTokens {
         access_token: token.access_token,

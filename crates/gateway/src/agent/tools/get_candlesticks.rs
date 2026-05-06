@@ -16,6 +16,8 @@ const TUSHARE_ENDPOINT: &str = "https://api.tushare.pro";
 const TUSHARE_FIELDS: &str = "ts_code,trade_date,open,high,low,close,vol,amount,pct_chg";
 const YAHOO_BASE: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
 const BINANCE_BASE: &str = "https://api.binance.com/api/v3/klines";
+const COINGECKO_SEARCH: &str = "https://api.coingecko.com/api/v3/search";
+const COINGECKO_OHLC: &str = "https://api.coingecko.com/api/v3/coins/{id}/ohlc";
 const REQUEST_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_LIMIT: usize = 30;
 const MAX_LIMIT: usize = 200;
@@ -28,9 +30,7 @@ impl GetCandlesticksTool {
     pub fn new() -> Result<Self> {
         let http = Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .user_agent(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            )
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
             .build()?;
         Ok(Self { http })
     }
@@ -57,11 +57,11 @@ enum Interval {
 }
 
 impl Interval {
-    fn tushare_freq(&self) -> &str {
+    fn tushare_api(&self) -> &str {
         match self {
-            Interval::Day => "D",
-            Interval::Week => "W",
-            Interval::Month => "M",
+            Interval::Day => "daily",
+            Interval::Week => "weekly",
+            Interval::Month => "monthly",
         }
     }
 
@@ -125,7 +125,7 @@ impl ToolHandler for GetCandlesticksTool {
                 - US/HK stocks: ticker like \"AAPL\", \"TSLA\", \"0700.HK\", \"BABA\"\n\
                 - Crypto: Binance symbol like \"BTCUSDT\", \"ETHUSDT\", \"SOLUSDT\"\n\
                 Returns a markdown table of OHLCV data sorted oldest→newest.\n\
-                Prefer this over tushare_quote for historical analysis spanning multiple days."
+                Prefer this whenever price trend or mean-reversion context matters."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -163,14 +163,14 @@ impl ToolHandler for GetCandlesticksTool {
         cancel: CancellationToken,
         _ctx: &super::ToolContext,
     ) -> Result<String> {
-        let args: Args = serde_json::from_value(args)
-            .map_err(|e| anyhow!("invalid arguments: {e}"))?;
-        let limit = args.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT).max(1);
+        let args: Args =
+            serde_json::from_value(args).map_err(|e| anyhow!("invalid arguments: {e}"))?;
+        let limit = args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let adjusted = args.adjusted.unwrap_or(true);
 
         match args.market {
             Market::AShare => {
-                self.fetch_a_share(&args.ticker, args.interval, limit, adjusted, cancel)
+                self.fetch_a_share(&args.ticker, args.interval, limit, cancel)
                     .await
             }
             Market::UsStock | Market::HkStock => {
@@ -191,33 +191,25 @@ impl GetCandlesticksTool {
         ticker: &str,
         interval: Interval,
         limit: usize,
-        adjusted: bool,
         cancel: CancellationToken,
     ) -> Result<String> {
         let token = match std::env::var("TUSHARE_TOKEN") {
             Ok(t) => t,
             Err(_) => {
-                return Ok(format!(
-                    "[get_candlesticks: TUSHARE_TOKEN not configured — \
+                return Ok("[get_candlesticks: TUSHARE_TOKEN not configured — \
                      A-share candlesticks unavailable. \
                      Get a free token at https://tushare.pro/register]"
-                ))
+                    .to_string());
             }
         };
 
-        let mut params = serde_json::json!({
-            "ts_code": ticker,
-            "freq": interval.tushare_freq(),
-            "limit": limit,
-        });
-        if adjusted {
-            params["adj"] = serde_json::Value::String("qfq".into());
-        }
-
         let payload = serde_json::json!({
-            "api_name": "pro_bar",
+            "api_name": interval.tushare_api(),
             "token": token,
-            "params": params,
+            "params": {
+                "ts_code": ticker,
+                "limit": limit,
+            },
             "fields": TUSHARE_FIELDS,
         });
 
@@ -308,13 +300,13 @@ impl GetCandlesticksTool {
 
         rows.sort_by(|a, b| a[0].cmp(&b[0]));
 
-        let adj_label = if adjusted { "前复权" } else { "不复权" };
         let mut out = format!(
-            "## {ticker} · {} · {} ({limit})\n\n",
-            interval.label_cn(),
-            adj_label
+            "## {ticker} · {} · 不复权 ({limit})\n\n",
+            interval.label_cn()
         );
-        out.push_str("| 日期       | 开盘    | 最高    | 最低    | 收盘    | 涨跌幅 | 成交量   |\n");
+        out.push_str(
+            "| 日期       | 开盘    | 最高    | 最低    | 收盘    | 涨跌幅 | 成交量   |\n",
+        );
         out.push_str("|-----------|---------|---------|---------|---------|--------|----------|\n");
         for r in &rows {
             out.push_str(&format!(
@@ -418,7 +410,11 @@ impl GetCandlesticksTool {
                 let high = highs.get(i)?.as_ref()?;
                 let low = lows.get(i)?.as_ref()?;
                 let close = closes.get(i)?.as_ref()?;
-                let volume = volumes.get(i).and_then(|v| v.as_ref()).copied().unwrap_or(0.0);
+                let volume = volumes
+                    .get(i)
+                    .and_then(|v| v.as_ref())
+                    .copied()
+                    .unwrap_or(0.0);
                 let date = DateTime::from_timestamp(ts, 0)
                     .unwrap()
                     .format("%Y-%m-%d")
@@ -468,7 +464,18 @@ impl GetCandlesticksTool {
         limit: usize,
         cancel: CancellationToken,
     ) -> Result<String> {
-        let symbol = ticker.to_uppercase();
+        // Normalise: uppercase, append USDT if no quote currency present.
+        let raw = ticker.to_uppercase();
+        let symbol = if raw.ends_with("USDT")
+            || raw.ends_with("BTC")
+            || raw.ends_with("ETH")
+            || raw.ends_with("BNB")
+        {
+            raw.clone()
+        } else {
+            format!("{raw}USDT")
+        };
+
         let url = format!(
             "{BINANCE_BASE}?symbol={symbol}&interval={}&limit={limit}",
             interval.binance_interval()
@@ -479,24 +486,38 @@ impl GetCandlesticksTool {
             _ = cancel.cancelled() => bail!("aborted before binance request"),
             r = self.http.get(&url).send() => r?,
         };
-        if !resp.status().is_success() {
-            bail!("Binance returned HTTP {}", resp.status().as_u16());
-        }
+        let status = resp.status();
         let body: serde_json::Value = tokio::select! {
             biased;
             _ = cancel.cancelled() => bail!("aborted during binance parse"),
             r = resp.json() => r?,
         };
 
+        // 400 typically means the symbol doesn't exist on Binance.
+        // Fall back to CoinGecko for less-liquid tokens.
+        if !status.is_success() {
+            let binance_msg = body
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            tracing::info!(symbol, %binance_msg, "Binance klines failed, trying CoinGecko");
+            return self
+                .fetch_coingecko(&raw, interval, limit, cancel)
+                .await
+                .map_err(|cg_err| {
+                    anyhow!(
+                        "Binance: {} (symbol={symbol}); CoinGecko fallback also failed: {cg_err}",
+                        binance_msg
+                    )
+                });
+        }
+
         let klines = body
             .as_array()
             .ok_or_else(|| anyhow!("Binance: unexpected response shape"))?;
 
         if klines.is_empty() {
-            return Ok(format!(
-                "[get_candlesticks: no data returned for {symbol} from Binance. \
-                 Verify the symbol format (e.g. BTCUSDT).]"
-            ));
+            return self.fetch_coingecko(&raw, interval, limit, cancel).await;
         }
 
         struct Row {
@@ -508,9 +529,7 @@ impl GetCandlesticksTool {
             volume: f64,
         }
 
-        let parse_str_f64 = |v: &serde_json::Value| -> Option<f64> {
-            v.as_str()?.parse().ok()
-        };
+        let parse_str_f64 = |v: &serde_json::Value| -> Option<f64> { v.as_str()?.parse().ok() };
 
         let mut rows: Vec<Row> = klines
             .iter()
@@ -526,19 +545,31 @@ impl GetCandlesticksTool {
                     .unwrap()
                     .format("%Y-%m-%d")
                     .to_string();
-                Some(Row { date, open, high, low, close, volume })
+                Some(Row {
+                    date,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                })
             })
             .collect();
 
         rows.sort_by(|a, b| a.date.cmp(&b.date));
 
-        let base = symbol.trim_end_matches("USDT").trim_end_matches("BTC");
+        let base = symbol
+            .trim_end_matches("USDT")
+            .trim_end_matches("BTC")
+            .trim_end_matches("ETH");
         let mut out = format!(
             "## {base}/USDT · {} · Binance ({limit})\n\n",
             interval.label()
         );
         out.push_str("| Date       | Open        | High        | Low         | Close       | Volume       |\n");
-        out.push_str("|-----------|-------------|-------------|-------------|-------------|-------------|\n");
+        out.push_str(
+            "|-----------|-------------|-------------|-------------|-------------|-------------|\n",
+        );
         for r in &rows {
             out.push_str(&format!(
                 "| {:<10} | {:>11} | {:>11} | {:>11} | {:>11} | {:>12} |\n",
@@ -551,6 +582,141 @@ impl GetCandlesticksTool {
             ));
         }
         out.push_str("\n_Source: Binance_\n");
+        Ok(out)
+    }
+
+    /// CoinGecko fallback for tokens not listed on Binance.
+    /// Uses /search to resolve symbol → coin_id, then /coins/{id}/ohlc.
+    async fn fetch_coingecko(
+        &self,
+        symbol: &str,
+        interval: Interval,
+        limit: usize,
+        cancel: CancellationToken,
+    ) -> Result<String> {
+        let base = symbol
+            .to_uppercase()
+            .trim_end_matches("USDT")
+            .trim_end_matches("BTC")
+            .trim_end_matches("ETH")
+            .to_string();
+
+        // Step 1: resolve symbol → CoinGecko coin_id.
+        let search_url = format!("{COINGECKO_SEARCH}?query={base}");
+        let search_resp = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("aborted before coingecko search"),
+            r = self.http.get(&search_url).send() => r?,
+        };
+        let search_body: serde_json::Value = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("aborted during coingecko search parse"),
+            r = search_resp.json() => r?,
+        };
+
+        let coin_id = search_body
+            .pointer("/coins/0/id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("CoinGecko: no coin found for symbol '{base}'"))?
+            .to_string();
+
+        // Step 2: OHLC. CoinGecko granularity: ≤2d=30min, ≤30d=4h, else=daily.
+        // To get `limit` daily candles we request enough days.
+        let days = match interval {
+            Interval::Day => limit.max(90).to_string(),
+            Interval::Week => (limit * 7).max(90).to_string(),
+            Interval::Month => "max".to_string(),
+        };
+        let ohlc_url =
+            COINGECKO_OHLC.replace("{id}", &coin_id) + &format!("?vs_currency=usd&days={days}");
+
+        let ohlc_resp = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("aborted before coingecko ohlc"),
+            r = self.http.get(&ohlc_url).send() => r?,
+        };
+        if !ohlc_resp.status().is_success() {
+            bail!(
+                "CoinGecko OHLC returned HTTP {}",
+                ohlc_resp.status().as_u16()
+            );
+        }
+        let ohlc_body: serde_json::Value = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("aborted during coingecko ohlc parse"),
+            r = ohlc_resp.json() => r?,
+        };
+
+        let candles = ohlc_body
+            .as_array()
+            .ok_or_else(|| anyhow!("CoinGecko: unexpected OHLC shape"))?;
+
+        if candles.is_empty() {
+            bail!("CoinGecko: no OHLC data for '{coin_id}'");
+        }
+
+        struct Row {
+            date: String,
+            open: f64,
+            high: f64,
+            low: f64,
+            close: f64,
+        }
+
+        let mut rows: Vec<Row> = candles
+            .iter()
+            .filter_map(|c| {
+                let arr = c.as_array()?;
+                let ts_ms = arr.first()?.as_i64()?;
+                let open = arr.get(1)?.as_f64()?;
+                let high = arr.get(2)?.as_f64()?;
+                let low = arr.get(3)?.as_f64()?;
+                let close = arr.get(4)?.as_f64()?;
+                let date = DateTime::from_timestamp(ts_ms / 1000, 0)
+                    .unwrap()
+                    .format("%Y-%m-%d")
+                    .to_string();
+                Some(Row {
+                    date,
+                    open,
+                    high,
+                    low,
+                    close,
+                })
+            })
+            .collect();
+
+        rows.sort_by(|a, b| a.date.cmp(&b.date));
+        // Deduplicate by date (CoinGecko 4h candles → multiple per day).
+        rows.dedup_by(|a, b| {
+            if a.date == b.date {
+                b.close = a.close;
+                true
+            } else {
+                false
+            }
+        });
+        if rows.len() > limit {
+            rows.drain(..rows.len() - limit);
+        }
+
+        let mut out = format!(
+            "## {base}/USD · {} · CoinGecko ({limit})\n\n",
+            interval.label()
+        );
+        out.push_str("| Date       | Open        | High        | Low         | Close       |\n");
+        out.push_str("|-----------|-------------|-------------|-------------|-------------|\n");
+        for r in &rows {
+            out.push_str(&format!(
+                "| {:<10} | {:>11} | {:>11} | {:>11} | {:>11} |\n",
+                r.date,
+                fmt_crypto_price(r.open),
+                fmt_crypto_price(r.high),
+                fmt_crypto_price(r.low),
+                fmt_crypto_price(r.close),
+            ));
+        }
+        out.push_str("\n_Source: CoinGecko_\n");
         Ok(out)
     }
 }

@@ -20,6 +20,8 @@
 const IDENTITY: &str = include_str!("../../../../harness/identity.md");
 const DISCIPLINE: &str = include_str!("../../../../harness/discipline.md");
 const CORPUS_ORIENTATION: &str = include_str!("../../../../harness/corpus_orientation.md");
+
+use crate::agent::tools::use_skill::SKILL_METADATA;
 /// Build artifact — populated by `leek corpus distill` and gitignored. On a
 /// fresh checkout, build.rs writes a placeholder so this macro doesn't fail;
 /// in production deployment the real distilled blob is generated as part of
@@ -40,6 +42,33 @@ user should not see.\n\
 - When citing a web URL, use a [Title](URL) markdown link with a short \
 human-readable title; never paste a raw URL as the visible text.";
 
+const METHOD_AND_DELEGATION: &str = "\
+# General research method\n\n\
+- Do not treat financial research as a bag of scenarios. For any unfamiliar \
+task, first identify the decision type, then choose the right corpus lens, \
+then gather situation data, then stress-test the thesis, then translate it \
+into a decision frame only if the user is asking for one.\n\
+- The default chain is: user mandate → corpus principles → current facts → \
+opposing case → risk/exit conditions → answer.\n\
+- Use `record_research_note` for reversible memory, preferences, mandate \
+candidates, or reusable lessons. Use `record_investment_action` only for a \
+clear capital commitment to a named instrument and direction.\n\
+	- Use `delegate_research` when a task needs a specialized second lens. The \
+	main agent remains accountable for the final answer; subagents provide \
+	focused reports, not final authority.\n\
+	- Good delegation examples: data gaps to `data_scout`, valuation quality to \
+	`fundamental_analyst`, short-term opportunity structure to `trading_analyst`, \
+	bear case and sizing risk to `risk_manager`, and corpus drift checks to \
+	`corpus_guardian`.\n\n\
+	# Visible progress narration\n\n\
+	- For non-trivial research work, before each research tool call or coherent \
+	tool batch after the initial `use_skill`, write one short Chinese progress \
+	note explaining what you are checking and why it matters.\n\
+	- The progress note is a user-visible reasoning trace, not private chain of \
+	thought. State the next check, the decision relevance, and any key uncertainty; \
+	do not expose hidden deliberation.\n\
+	- Keep each note concise. Do not repeat the final answer in progress notes.";
+
 /// Build the full system prompt. `handoff_summaries` are pre-extracted
 /// compaction-summary message texts (role=compaction_summary rows), to be
 /// joined into the inherited-context section. `mandate` is the contents of
@@ -59,6 +88,15 @@ pub fn build_system_prompt(
     prompt.push_str(CORPUS_ORIENTATION);
     prompt.push_str("\n\n");
     prompt.push_str(CITATION_CONVENTIONS);
+    prompt.push_str("\n\n");
+    prompt.push_str(METHOD_AND_DELEGATION);
+    prompt.push_str("\n\n");
+    prompt.push_str("# Research Skills\n\n");
+    prompt.push_str(
+        "Available skills (call `use_skill` with the skill name as your FIRST action \
+         when the task matches — before any other tool call or analysis):\n\n",
+    );
+    prompt.push_str(SKILL_METADATA);
 
     // Distilled corpus principles (~100K tokens when populated). Skip the
     // placeholder on fresh checkouts so we don't pollute the prompt with
@@ -100,6 +138,19 @@ pub fn build_system_prompt(
     prompt
 }
 
+pub fn build_subagent_prompt(role: &str, role_instruction: &str) -> String {
+    format!(
+        "{IDENTITY}\n\n{DISCIPLINE}\n\n{CORPUS_ORIENTATION}\n\n\
+         # Subagent role\n\n\
+         You are `{role}`, a focused research subagent inside L.E.E.K. \
+         {role_instruction}\n\n\
+         Output in Chinese. Keep the report compact but decision-useful. \
+         Separate facts, inference, speculation, missing data, and the strongest \
+         opposing view. Do not claim you fetched data unless the main agent gave \
+         it to you in context."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +164,11 @@ mod tests {
         assert!(p.contains("## 7. 工具使用纪律"));
         assert!(p.contains("# corpus orientation"));
         assert!(p.contains("Citation surface conventions"));
+        assert!(p.contains("General research method"));
+        assert!(p.contains("delegate_research"));
+        assert!(p.contains("# Research Skills"));
+        assert!(p.contains("equity-valuation"));
+        assert!(p.contains("crypto-research"));
     }
 
     #[test]

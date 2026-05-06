@@ -258,7 +258,10 @@ mod tests {
     #[test]
     fn cluster_combos() {
         assert_eq!(cluster_for("principles", "wiki"), Some("principles-wikis"));
-        assert_eq!(cluster_for("knowledge", "source"), Some("knowledge-sources"));
+        assert_eq!(
+            cluster_for("knowledge", "source"),
+            Some("knowledge-sources")
+        );
         assert_eq!(cluster_for("foo", "bar"), None);
     }
 
@@ -271,11 +274,7 @@ mod tests {
             .collect();
         assert_eq!(
             caps,
-            vec![
-                "wikis/principles/concepts/foo",
-                "sources/x|alias",
-                "bar",
-            ]
+            vec!["wikis/principles/concepts/foo", "sources/x|alias", "bar",]
         );
     }
 

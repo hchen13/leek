@@ -30,12 +30,14 @@ impl ToolHandler for RecordInvestmentActionTool {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
             description:
-                "Record an investment action (decision draft) for the user to confirm or reject. \
-                 Use this when the user explicitly asks to record, save, or lock in an investment \
-                 decision. Do NOT use this for speculative discussion or analysis — only when the \
-                 user is ready to commit. Writes a draft to the vault; the user must confirm via \
-                 the UI before it becomes final. Returns the draft summary and a pending \
-                 confirmation message."
+                "Record a trade decision draft (long / short / close a position) for the user \
+                 to confirm or reject in the UI. The semantic contract: the user is committing \
+                 capital, not sharing an observation. Three signals must all be present — \
+                 (1) a named ticker, (2) a clear direction, (3) language of commitment \
+                 ('buy', 'build a position', 'close', 'enter', 'exit') rather than language of \
+                 reflection ('interesting', 'note', 'agree', 'remember this', 'principle'). \
+                 When the intent is to preserve an insight or guideline rather than execute a \
+                 trade, use record_research_note instead."
                     .into(),
             parameters: serde_json::json!({
                 "type": "object",

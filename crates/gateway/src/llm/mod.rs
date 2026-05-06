@@ -103,7 +103,9 @@ pub enum WebSearchAction {
 
 #[derive(Debug, Clone)]
 pub enum LlmEvent {
-    TextDelta { text: String },
+    TextDelta {
+        text: String,
+    },
     /// Lifecycle event for codex server-side `web_search`. Emitted twice per
     /// call: once on `output_item.added` (status=in_progress) and once on
     /// `output_item.done` (status=completed). The action carries the actual
@@ -125,7 +127,9 @@ pub enum LlmEvent {
         arguments: String,
     },
     Usage(Usage),
-    MessageEnd { stop_reason: StopReason },
+    MessageEnd {
+        stop_reason: StopReason,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -150,8 +154,5 @@ pub trait LlmProvider: Send + Sync {
     #[allow(dead_code)] // used by registry / fallback chain in later slices
     fn name(&self) -> &str;
 
-    async fn chat(
-        &self,
-        req: ChatRequest,
-    ) -> Result<BoxStream<'static, Result<LlmEvent>>>;
+    async fn chat(&self, req: ChatRequest) -> Result<BoxStream<'static, Result<LlmEvent>>>;
 }

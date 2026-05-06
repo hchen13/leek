@@ -14,11 +14,7 @@ pub struct CodexConfig {
     pub expires_at: DateTime<Utc>,
 }
 
-pub async fn upsert_codex(
-    pool: &SqlitePool,
-    user_id: &str,
-    tokens: &CodexTokens,
-) -> Result<()> {
+pub async fn upsert_codex(pool: &SqlitePool, user_id: &str, tokens: &CodexTokens) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         r#"

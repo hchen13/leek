@@ -68,7 +68,9 @@ export function ArtifactPanel(props: {
         height: "252px",
         visibility: "hidden",
       }} />
-      <For each={props.narrations ?? []}>{(n) => <NarrationCard step={n} />}</For>
+      <Show when={(props.narrations ?? []).length > 0}>
+        <ProgressNarrationPanel steps={props.narrations ?? []} />
+      </Show>
       <For each={props.searches}>{(s) => <SearchArtifact search={s} />}</For>
       <For each={props.tools}>{(t) => (
         <ToolArtifact tool={t} callbacks={props.callbacks} />
@@ -77,29 +79,76 @@ export function ArtifactPanel(props: {
   );
 }
 
-function NarrationCard(props: { step: NarrationStep }) {
+function ProgressNarrationPanel(props: { steps: NarrationStep[] }) {
   return (
-    <div style={{
-      "grid-column": "span 1",
-      "border-left": "3px solid var(--clay)",
-      padding: "8px 14px",
-      background: "rgba(217, 119, 87, 0.04)",
-      "border-radius": "0 6px 6px 0",
-      "font-size": "12.5px",
-      "line-height": 1.55,
-      color: "var(--ink-1)",
-    }}>
+    <div
+      data-call-id="narration-trace"
+      style={{
+        "grid-column": "span 2",
+        background: "linear-gradient(180deg, rgba(217,119,87,0.08), rgba(255,255,255,0.02))",
+        border: "1px solid rgba(217,119,87,0.24)",
+        "border-radius": "8px",
+        padding: "14px 16px",
+      }}
+    >
       <div style={{
-        "font-family": "var(--font-mono)",
-        "font-size": "10px",
-        "text-transform": "uppercase",
-        "letter-spacing": "0.06em",
-        color: "var(--clay-soft)",
-        "margin-bottom": "4px",
+        display: "flex",
+        "align-items": "center",
+        gap: "10px",
+        "margin-bottom": "12px",
       }}>
-        thinking · turn {props.step.turn + 1}
+        <span style={{
+          "font-family": "var(--font-mono)",
+          "font-size": "10.5px",
+          color: "var(--clay-soft)",
+          "font-weight": 700,
+          "text-transform": "uppercase",
+          "letter-spacing": "0.08em",
+        }}>
+          reasoning trace
+        </span>
+        <span style={{
+          "font-family": "var(--font-mono)",
+          "font-size": "10px",
+          color: "var(--ink-3)",
+        }}>
+          {props.steps.length} step{props.steps.length === 1 ? "" : "s"}
+        </span>
       </div>
-      <SafeMarkdown source={props.step.text} />
+      <div style={{ display: "flex", "flex-direction": "column", gap: "10px" }}>
+        <For each={props.steps}>{(step, i) => (
+          <div style={{
+            display: "grid",
+            "grid-template-columns": "28px minmax(0, 1fr)",
+            gap: "10px",
+            "align-items": "start",
+          }}>
+            <div style={{
+              width: "24px",
+              height: "24px",
+              "border-radius": "999px",
+              display: "grid",
+              "place-items": "center",
+              background: "rgba(217,119,87,0.14)",
+              color: "var(--clay-soft)",
+              "font-family": "var(--font-mono)",
+              "font-size": "10px",
+              "font-weight": 700,
+            }}>
+              {String(i() + 1).padStart(2, "0")}
+            </div>
+            <div style={{
+              color: "var(--ink-1)",
+              "font-size": "12.5px",
+              "line-height": 1.55,
+              "border-bottom": i() === props.steps.length - 1 ? "none" : "1px solid rgba(255,255,255,0.06)",
+              "padding-bottom": i() === props.steps.length - 1 ? "0" : "10px",
+            }}>
+              <SafeMarkdown source={step.text} />
+            </div>
+          </div>
+        )}</For>
+      </div>
     </div>
   );
 }
@@ -178,6 +227,10 @@ function CardShell(props: {
 }
 
 function SearchArtifact(props: { search: SearchCallView }) {
+  const badge = () =>
+    props.search.action === "open_page" ? "web · page" :
+    props.search.action === "find_in_page" ? "web · find" :
+    "web · search";
   const verb = () => props.search.status === "completed"
     ? props.search.action === "open_page" ? "Opened"
     : props.search.action === "find_in_page" ? "Found in page"
@@ -223,7 +276,7 @@ function SearchArtifact(props: { search: SearchCallView }) {
         "letter-spacing": "0.04em",
       }}>
         <StatusDot status={props.search.status} />
-        <span style={{ color: "var(--ink-2)", "font-weight": 600 }}>web · search</span>
+        <span style={{ color: "var(--ink-2)", "font-weight": 600 }}>{badge()}</span>
         <span style={{ "margin-left": "10px", "text-transform": "none", "letter-spacing": "0" }}>
           {verb()}
         </span>
@@ -254,7 +307,9 @@ function ToolArtifact(props: { tool: ToolCallView; callbacks?: ArtifactCallbacks
   switch (props.tool.name) {
     case "corpus_search": return <CorpusSearchCard {...props} />;
     case "web_fetch":     return <WebFetchCard {...props} />;
-    case "tradingview_quote": return <TradingViewCard {...props} />;
+    case "market_quote":
+    case "tradingview_quote": return <MarketQuoteCard {...props} />;
+    case "get_candlesticks": return <CandlestickToolCard {...props} />;
     case "tushare_quote": return <TushareCard {...props} />;
     case "sec_filing_fetch": return <SecFilingCard {...props} />;
     default:              return <GenericToolCard {...props} />;
@@ -557,7 +612,7 @@ function WebFetchCard(props: { tool: ToolCallView }) {
   );
 }
 
-/* ---------- tradingview_quote · multi-ticker quote chips ---------- */
+/* ---------- market_quote · multi-ticker quote chips ---------- */
 
 interface TVQuoteRow {
   symbol: string;
@@ -586,7 +641,7 @@ function parseTradingViewTable(md: string): TVQuoteRow[] {
   return out;
 }
 
-function TradingViewCard(props: { tool: ToolCallView }) {
+function MarketQuoteCard(props: { tool: ToolCallView }) {
   const args = parseArgs(props.tool);
   const tickers = Array.isArray(args.tickers) ? (args.tickers as string[]) : [];
   const rows = createMemo(() => parseTradingViewTable(props.tool.output_preview ?? ""));
@@ -596,7 +651,7 @@ function TradingViewCard(props: { tool: ToolCallView }) {
   return (
     <CardShell
       status={props.tool.status}
-      badge="market · tradingview"
+      badge="market · quote"
       detail={tickers.join(", ")}
       callId={props.tool.call_id}
       span={span()}
@@ -648,7 +703,7 @@ function QuoteChip(props: { row: TVQuoteRow }) {
   );
 }
 
-/* ---------- tushare_quote · candlestick ---------- */
+/* ---------- candlesticks ---------- */
 
 interface OhlcvRow {
   date: string;
@@ -675,6 +730,45 @@ function parseTushareTable(md: string): OhlcvRow[] {
       close: parseFloat(c),
       pctChg: parseFloat(p),
       vol: parseFloat(v),
+    });
+  }
+  return rows;
+}
+
+function parseMarketNumber(raw: string): number {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === "—") return NaN;
+  const suffix = trimmed.match(/[KMB]$/i)?.[0]?.toUpperCase();
+  const base = parseFloat(trimmed.replace(/[,，%]/g, "").replace(/[KMB]$/i, ""));
+  if (!Number.isFinite(base)) return NaN;
+  if (suffix === "K") return base * 1_000;
+  if (suffix === "M") return base * 1_000_000;
+  if (suffix === "B") return base * 1_000_000_000;
+  return base;
+}
+
+function parseCandlestickTable(md: string): OhlcvRow[] {
+  const rows: OhlcvRow[] = [];
+  for (const line of md.split("\n")) {
+    if (!line.startsWith("|") || line.includes("---") || /Date|日期/i.test(line)) continue;
+    const cells = line.split("|").map((c) => c.trim()).filter((_, i, arr) => i > 0 && i < arr.length - 1);
+    if (cells.length < 6 || !/^\d{4}-\d{2}-\d{2}$/.test(cells[0])) continue;
+    const open = parseMarketNumber(cells[1]);
+    const high = parseMarketNumber(cells[2]);
+    const low = parseMarketNumber(cells[3]);
+    const close = parseMarketNumber(cells[4]);
+    const hasPct = cells.length >= 7;
+    const pctChg = hasPct ? parseMarketNumber(cells[5]) : (open ? ((close - open) / open) * 100 : 0);
+    const vol = parseMarketNumber(hasPct ? cells[6] : cells[5]);
+    if (![open, high, low, close].every(Number.isFinite)) continue;
+    rows.push({
+      date: cells[0],
+      open,
+      high,
+      low,
+      close,
+      pctChg: Number.isFinite(pctChg) ? pctChg : 0,
+      vol: Number.isFinite(vol) ? vol : 0,
     });
   }
   return rows;
@@ -791,6 +885,43 @@ function TushareCard(props: { tool: ToolCallView }) {
           <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
             <Show when={props.tool.status === "in_progress"} fallback="No data.">
               Fetching A-share OHLCV…
+            </Show>
+          </div>
+        }
+      >
+        <Candlestick data={rows()} height={180} />
+      </Show>
+    </CardShell>
+  );
+}
+
+function CandlestickToolCard(props: { tool: ToolCallView }) {
+  const args = parseArgs(props.tool);
+  const ticker = String(args.ticker ?? "");
+  const market = String(args.market ?? "");
+  const rows = createMemo(() => parseCandlestickTable(props.tool.output_preview ?? ""));
+  const last = () => rows().length > 0 ? rows()[rows().length - 1] : null;
+  const detail = () => {
+    const r = last();
+    if (!r) return [ticker, market].filter(Boolean).join(" · ");
+    const sign = r.pctChg >= 0 ? "+" : "";
+    return `${ticker} · ${r.close.toFixed(2)} (${sign}${r.pctChg.toFixed(2)}%)`;
+  };
+
+  return (
+    <CardShell
+      status={props.tool.status}
+      badge="market · k-line"
+      detail={detail()}
+      callId={props.tool.call_id}
+      span={2}
+    >
+      <Show
+        when={rows().length > 0}
+        fallback={
+          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+            <Show when={props.tool.status === "in_progress"} fallback="No candles.">
+              Fetching candlesticks…
             </Show>
           </div>
         }

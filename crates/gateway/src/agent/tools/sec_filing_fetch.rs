@@ -179,14 +179,13 @@ impl ToolHandler for SecFilingFetchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
-            description:
-                "List recent SEC EDGAR filings for a US-listed company by ticker. \
+            description: "List recent SEC EDGAR filings for a US-listed company by ticker. \
                  Returns filing metadata (form type, filed date, accession number, \
                  primary document URL). Use this to discover relevant 10-K / 10-Q / \
                  8-K / DEF 14A filings, then call `web_fetch` on a specific URL to \
-                 read the actual text. ONLY works for US tickers — for A-shares use \
-                 `tushare_quote`, for non-US use web_search."
-                    .into(),
+                 read the actual text. ONLY works for US tickers — for non-US filings \
+                 use web_search or web_fetch on the exchange disclosure site."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -220,18 +219,23 @@ impl ToolHandler for SecFilingFetchTool {
             .ok_or_else(|| anyhow!("missing 'ticker' argument"))?
             .trim()
             .to_string();
-        let form_filter = args.get("form_type").and_then(|v| v.as_str()).map(String::from);
+        let form_filter = args
+            .get("form_type")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
-            .map(|n| (n as usize).min(MAX_LIMIT).max(1))
+            .map(|n| (n as usize).clamp(1, MAX_LIMIT))
             .unwrap_or(DEFAULT_LIMIT);
 
         let cik = self.ticker_to_cik(&ticker, &cancel).await?;
         let submissions = self.fetch_filings(cik, &cancel).await?;
 
         let r = &submissions.filings.recent;
-        let n = r.accession_number.len()
+        let n = r
+            .accession_number
+            .len()
             .min(r.filing_date.len())
             .min(r.form.len())
             .min(r.primary_document.len());
@@ -248,11 +252,14 @@ impl ToolHandler for SecFilingFetchTool {
             let acc_no_dash = acc.replace('-', "");
             let primary = &r.primary_document[i];
             // EDGAR filing index URL — direct link to the primary document.
-            let url = format!(
-                "https://www.sec.gov/Archives/edgar/data/{cik}/{acc_no_dash}/{primary}"
-            );
+            let url =
+                format!("https://www.sec.gov/Archives/edgar/data/{cik}/{acc_no_dash}/{primary}");
             let report_date = r.report_date.get(i).cloned().unwrap_or_default();
-            let description = r.primary_doc_description.get(i).cloned().unwrap_or_default();
+            let description = r
+                .primary_doc_description
+                .get(i)
+                .cloned()
+                .unwrap_or_default();
 
             hits.push(serde_json::json!({
                 "form": form,
