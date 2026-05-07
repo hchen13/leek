@@ -47,6 +47,8 @@ enum Market {
 
 #[derive(Deserialize, Default, Clone, Copy)]
 enum Interval {
+    #[serde(rename = "15m")]
+    Minute15,
     #[serde(rename = "1d")]
     #[default]
     Day,
@@ -59,6 +61,7 @@ enum Interval {
 impl Interval {
     fn tushare_api(&self) -> &str {
         match self {
+            Interval::Minute15 => "stk_mins",
             Interval::Day => "daily",
             Interval::Week => "weekly",
             Interval::Month => "monthly",
@@ -67,6 +70,7 @@ impl Interval {
 
     fn yahoo_interval(&self) -> &str {
         match self {
+            Interval::Minute15 => "15m",
             Interval::Day => "1d",
             Interval::Week => "1wk",
             Interval::Month => "1mo",
@@ -75,6 +79,7 @@ impl Interval {
 
     fn binance_interval(&self) -> &str {
         match self {
+            Interval::Minute15 => "15m",
             Interval::Day => "1d",
             Interval::Week => "1w",
             Interval::Month => "1M",
@@ -83,6 +88,7 @@ impl Interval {
 
     fn label(&self) -> &str {
         match self {
+            Interval::Minute15 => "15m",
             Interval::Day => "Daily",
             Interval::Week => "Weekly",
             Interval::Month => "Monthly",
@@ -91,6 +97,7 @@ impl Interval {
 
     fn label_cn(&self) -> &str {
         match self {
+            Interval::Minute15 => "15分钟",
             Interval::Day => "日线",
             Interval::Week => "周线",
             Interval::Month => "月线",
@@ -124,6 +131,7 @@ impl ToolHandler for GetCandlesticksTool {
                 - A-share (CN equities): ts_code like \"600519.SH\", \"000001.SZ\", \"300750.SZ\"\n\
                 - US/HK stocks: ticker like \"AAPL\", \"TSLA\", \"0700.HK\", \"BABA\"\n\
                 - Crypto: Binance symbol like \"BTCUSDT\", \"ETHUSDT\", \"SOLUSDT\"\n\
+                Interval: 1d/1w/1mo for all markets; 15m only for US/HK/crypto until PyTDX is wired for A-share intraday/realtime.\n\
                 Returns a markdown table of OHLCV data sorted oldest→newest.\n\
                 Prefer this whenever price trend or mean-reversion context matters."
                 .into(),
@@ -140,7 +148,7 @@ impl ToolHandler for GetCandlesticksTool {
                     },
                     "interval": {
                         "type": "string",
-                        "enum": ["1d", "1w", "1mo"],
+                        "enum": ["15m", "1d", "1w", "1mo"],
                         "description": "Candle interval, default 1d"
                     },
                     "limit": {
@@ -202,6 +210,10 @@ impl GetCandlesticksTool {
                     .to_string());
             }
         };
+
+        if matches!(interval, Interval::Minute15) {
+            return Ok("[get_candlesticks: A-share intraday candles are not available through the current Tushare token. Tushare stk_mins requires separate permission; use daily/weekly/monthly for now. PyTDX integration is required for A-share intraday/realtime candles.]".to_string());
+        }
 
         let payload = serde_json::json!({
             "api_name": interval.tushare_api(),
@@ -326,7 +338,9 @@ impl GetCandlesticksTool {
         adjusted: bool,
         cancel: CancellationToken,
     ) -> Result<String> {
-        let range = if limit <= 60 {
+        let range = if matches!(interval, Interval::Minute15) {
+            "60d"
+        } else if limit <= 60 {
             "3mo"
         } else if limit <= 130 {
             "6mo"
@@ -415,9 +429,14 @@ impl GetCandlesticksTool {
                     .and_then(|v| v.as_ref())
                     .copied()
                     .unwrap_or(0.0);
+                let fmt = if matches!(interval, Interval::Minute15) {
+                    "%Y-%m-%d %H:%M"
+                } else {
+                    "%Y-%m-%d"
+                };
                 let date = DateTime::from_timestamp(ts, 0)
                     .unwrap()
-                    .format("%Y-%m-%d")
+                    .format(fmt)
                     .to_string();
                 Some(Row {
                     date,
@@ -440,11 +459,25 @@ impl GetCandlesticksTool {
             "## {symbol} · {} · {adj_label} ({limit})\n\n",
             interval.label()
         );
-        out.push_str("| Date       | Open    | High    | Low     | Close   | Volume   |\n");
-        out.push_str("|-----------|---------|---------|---------|---------|----------|\n");
+        let date_head = if matches!(interval, Interval::Minute15) {
+            "Date             "
+        } else {
+            "Date       "
+        };
+        let sep = if matches!(interval, Interval::Minute15) {
+            "------------------"
+        } else {
+            "-----------"
+        };
+        out.push_str(&format!(
+            "| {date_head} | Open    | High    | Low     | Close   | Volume   |\n"
+        ));
+        out.push_str(&format!(
+            "|{sep}|---------|---------|---------|---------|----------|\n"
+        ));
         for r in &rows {
             out.push_str(&format!(
-                "| {:<10} | {:>7.2} | {:>7.2} | {:>7.2} | {:>7.2} | {:>8} |\n",
+                "| {:<16} | {:>7.2} | {:>7.2} | {:>7.2} | {:>7.2} | {:>8} |\n",
                 r.date,
                 r.open,
                 r.high,
@@ -541,9 +574,14 @@ impl GetCandlesticksTool {
                 let low = parse_str_f64(arr.get(3)?)?;
                 let close = parse_str_f64(arr.get(4)?)?;
                 let volume = parse_str_f64(arr.get(5)?).unwrap_or(0.0);
+                let fmt = if matches!(interval, Interval::Minute15) {
+                    "%Y-%m-%d %H:%M"
+                } else {
+                    "%Y-%m-%d"
+                };
                 let date = DateTime::from_timestamp(ts_ms / 1000, 0)
                     .unwrap()
-                    .format("%Y-%m-%d")
+                    .format(fmt)
                     .to_string();
                 Some(Row {
                     date,
@@ -566,13 +604,25 @@ impl GetCandlesticksTool {
             "## {base}/USDT · {} · Binance ({limit})\n\n",
             interval.label()
         );
-        out.push_str("| Date       | Open        | High        | Low         | Close       | Volume       |\n");
-        out.push_str(
-            "|-----------|-------------|-------------|-------------|-------------|-------------|\n",
-        );
+        let date_head = if matches!(interval, Interval::Minute15) {
+            "Date             "
+        } else {
+            "Date       "
+        };
+        let sep = if matches!(interval, Interval::Minute15) {
+            "------------------"
+        } else {
+            "-----------"
+        };
+        out.push_str(&format!(
+            "| {date_head} | Open        | High        | Low         | Close       | Volume       |\n"
+        ));
+        out.push_str(&format!(
+            "|{sep}|-------------|-------------|-------------|-------------|-------------|\n",
+        ));
         for r in &rows {
             out.push_str(&format!(
-                "| {:<10} | {:>11} | {:>11} | {:>11} | {:>11} | {:>12} |\n",
+                "| {:<16} | {:>11} | {:>11} | {:>11} | {:>11} | {:>12} |\n",
                 r.date,
                 fmt_crypto_price(r.open),
                 fmt_crypto_price(r.high),
@@ -623,6 +673,7 @@ impl GetCandlesticksTool {
         // Step 2: OHLC. CoinGecko granularity: ≤2d=30min, ≤30d=4h, else=daily.
         // To get `limit` daily candles we request enough days.
         let days = match interval {
+            Interval::Minute15 => "2".to_string(),
             Interval::Day => limit.max(90).to_string(),
             Interval::Week => (limit * 7).max(90).to_string(),
             Interval::Month => "max".to_string(),

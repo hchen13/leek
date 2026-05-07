@@ -9,6 +9,7 @@ pub mod portfolio;
 pub mod sessions;
 pub mod static_files;
 pub mod stream;
+pub mod tools;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -72,6 +73,12 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/corpus/graph", get(corpus::graph_handler))
         .route("/api/v1/corpus/doc", get(corpus::doc_handler))
+        .route(
+            "/api/v1/tools/candlesticks",
+            get(tools::candlesticks_handler),
+        )
+        .route("/api/v1/tools/financials", get(tools::financials_handler))
+        .route("/api/v1/tools/quote", get(tools::quote_handler))
         .route(
             "/api/v1/sessions",
             get(sessions::list_handler).post(sessions::create_handler),

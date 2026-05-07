@@ -95,9 +95,18 @@ pub enum ToolSpec {
 /// Surfaced to the UI so users see what the agent is searching / opening.
 #[derive(Debug, Clone)]
 pub enum WebSearchAction {
-    Search { query: String },
-    OpenPage { url: String },
-    FindInPage { url: String, pattern: String },
+    Search {
+        query: String,
+        queries: Vec<String>,
+        sources: Vec<String>,
+    },
+    OpenPage {
+        url: String,
+    },
+    FindInPage {
+        url: String,
+        pattern: String,
+    },
     Other,
 }
 

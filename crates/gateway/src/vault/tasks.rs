@@ -130,6 +130,64 @@ pub async fn mark_delivered(pool: &SqlitePool, user_id: &str, task_id: &str) -> 
     Ok(())
 }
 
+pub async fn mark_failed(
+    pool: &SqlitePool,
+    user_id: &str,
+    task_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE tasks
+        SET status = 'failed', status_reason = ?, closed_at = ?
+        WHERE user_id = ? AND id = ? AND status IN ('in_progress', 'awaiting_user')
+        "#,
+    )
+    .bind(reason)
+    .bind(&now)
+    .bind(user_id)
+    .bind(task_id)
+    .execute(pool)
+    .await
+    .context("marking task failed")?;
+    Ok(())
+}
+
+pub async fn mark_awaiting_user(pool: &SqlitePool, user_id: &str, task_id: &str) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE tasks
+        SET status = 'awaiting_user', status_reason = 'awaiting_user'
+        WHERE user_id = ? AND id = ? AND status = 'in_progress'
+        "#,
+    )
+    .bind(user_id)
+    .bind(task_id)
+    .execute(pool)
+    .await
+    .context("marking task awaiting_user")?;
+    Ok(())
+}
+
+pub async fn mark_in_progress(pool: &SqlitePool, user_id: &str, task_id: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE tasks
+        SET status = 'in_progress', status_reason = NULL, started_at = COALESCE(started_at, ?)
+        WHERE user_id = ? AND id = ? AND status = 'awaiting_user'
+        "#,
+    )
+    .bind(&now)
+    .bind(user_id)
+    .bind(task_id)
+    .execute(pool)
+    .await
+    .context("marking task in_progress")?;
+    Ok(())
+}
+
 /// Update the `task_id` column for a message that was inserted before its
 /// task existed (POST handler writes user message first, then routing decides).
 pub async fn link_message(

@@ -55,6 +55,7 @@ mime_guess = "2"
 serde_yaml = "0.9"
 regex = "1"
 walkdir = "2"
+notify = "6"
 
 [profile.release]
 opt-level = 3

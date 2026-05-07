@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE};
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
 
@@ -45,8 +46,14 @@ pub struct TradingViewQuoteTool {
 
 impl TradingViewQuoteTool {
     pub fn new() -> Result<Self> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCEPT_LANGUAGE,
+            HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
+        );
         let http = Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .default_headers(headers)
             // TradingView's edge sometimes requires a real-ish UA.
             .user_agent("Mozilla/5.0 (compatible; leek-research-agent/0.1)")
             .build()?;
@@ -190,10 +197,10 @@ impl ToolHandler for TradingViewQuoteTool {
             tickers.len()
         ));
         out.push_str(
-            "| symbol            | name                  | close   | %chg   | abs    | volume        | mkt_cap        | tech |\n",
+            "| symbol            | name | close   | %chg   | abs    | volume        | mkt_cap        | tech |\n",
         );
         out.push_str(
-            "|-------------------|-----------------------|---------|--------|--------|---------------|----------------|------|\n",
+            "|-------------------|------|---------|--------|--------|---------------|----------------|------|\n",
         );
         for t in &tickers {
             let Some(d) = by_symbol.get(t) else {
@@ -209,9 +216,9 @@ impl ToolHandler for TradingViewQuoteTool {
             // COLUMNS index: 0=name, 1=description, 2=close, 3=change, 4=change_abs,
             //               5=volume, 6=market_cap_basic, 7=high, 8=low, 9=open, 10=Recommend.All
             out.push_str(&format!(
-                "| {:<17} | {:<21} | {:>7} | {:>6} | {:>6} | {:>13} | {:>14} | {:>4} |\n",
+                "| {:<17} | {} | {:>7} | {:>6} | {:>6} | {:>13} | {:>14} | {:>4} |\n",
                 t,
-                truncate(&cell(1), 21),
+                cell(1),
                 cell(2),
                 cell(3),
                 cell(4),
@@ -282,20 +289,6 @@ fn fmt_compact(n: f64) -> String {
     }
 }
 
-fn truncate(s: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max_chars {
-        s.to_string()
-    } else {
-        let mut t: String = chars
-            .into_iter()
-            .take(max_chars.saturating_sub(1))
-            .collect();
-        t.push('…');
-        t
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,13 +314,5 @@ mod tests {
         assert_eq!(fmt_number(2.34, 3), "+2.34"); // change %
         assert_eq!(fmt_number(-1.5, 4), "-1.50"); // change_abs
         assert_eq!(fmt_number(198.45, 2), "198.45"); // close
-    }
-
-    #[test]
-    fn truncate_chinese_chars() {
-        let s = "贵州茅台酒股份有限公司";
-        let t = truncate(s, 5);
-        assert!(t.chars().count() <= 5);
-        assert!(t.ends_with('…'));
     }
 }

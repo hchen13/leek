@@ -13,7 +13,7 @@ pub mod tools;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use sqlx::SqlitePool;
 use tokio::time::{sleep, Duration};
@@ -24,22 +24,21 @@ use crate::llm::{
     ChatMessage, ChatRequest, LlmEvent, LlmProvider, Role, ToolSpec, WebSearchAction,
 };
 use crate::vault::{
-    self, events as vault_events, messages as vault_messages, tasks as vault_tasks,
-    tool_runs as vault_tool_runs,
+    self, events as vault_events, messages as vault_messages, plans as vault_plans,
+    tasks as vault_tasks, tool_runs as vault_tool_runs,
 };
 
 use tools::{ToolContext, ToolRegistry};
 
 const DEFAULT_MODEL: &str = "gpt-5.5";
 
-/// Hard cap on tool-call rounds within a single user turn. Prevents runaway
-/// loops where the model keeps re-invoking tools without reaching a final
-/// answer. 8 turns covers fan-out research (search → open 3 pages → re-search)
-/// comfortably; anything beyond is almost certainly a bug or prompt issue.
-const MAX_TOOL_TURNS: usize = 8;
+/// Hard cap on tool-call rounds within a single user turn.
+const MAX_TOOL_TURNS: usize = 24;
 const MAX_PROVIDER_RETRIES: usize = 10;
 const PROVIDER_RETRY_BASE_MS: u64 = 1_000;
 const PROVIDER_RETRY_MAX_MS: u64 = 30_000;
+const PROVIDER_STREAM_IDLE_TIMEOUT_MS: u64 = 90_000;
+const MAX_PLAN_GUARD_REWRITES: usize = 3;
 
 /// When set, the agent's reply is treated as the deliverable for that task —
 /// vault.deliverables row is written and the task is marked delivered.
@@ -179,10 +178,17 @@ pub async fn run_chat_reply(
     let mut final_text = String::new();
     let mut stop_reason = "end_turn".to_string();
     let mut additional_inputs: Vec<serde_json::Value> = Vec::new();
+    let mut awaiting_user = false;
+    let mut plan_guard_rewrites = 0usize;
     let mut turn = 0usize;
+    let mut fatal_error: Option<String> = None;
     'turns: loop {
         if turn >= MAX_TOOL_TURNS {
             stop_reason = "max_tool_turns".to_string();
+            let message = format!(
+                "agent exceeded MAX_TOOL_TURNS ({MAX_TOOL_TURNS}); stopped before final response"
+            );
+            fatal_error = Some(message.clone());
             publish_and_persist(
                 &pool,
                 &user_id,
@@ -191,7 +197,7 @@ pub async fn run_chat_reply(
                 &event_bus,
                 "error",
                 serde_json::json!({
-                    "message": format!("agent exceeded MAX_TOOL_TURNS ({MAX_TOOL_TURNS}); aborting"),
+                    "message": message,
                 }),
             )
             .await?;
@@ -200,18 +206,26 @@ pub async fn run_chat_reply(
 
         let mut pending_calls: Vec<PendingCall> = Vec::new();
         let mut turn_text = String::new();
+        let mut narration_buffer = String::new();
         let mut provider_retries = 0usize;
 
         loop {
             pending_calls.clear();
             turn_text.clear();
+            narration_buffer.clear();
+            let mut request_inputs = additional_inputs.clone();
+            if let Some(plan_input) =
+                active_plan_reminder_input(&pool, &user_id, &session_id, task.as_ref()).await?
+            {
+                request_inputs.push(plan_input);
+            }
             let req = ChatRequest {
                 messages: messages.clone(),
                 system: Some(system_prompt.clone()),
                 model: DEFAULT_MODEL.to_string(),
                 max_output_tokens: None,
                 tools: tool_specs.clone(),
-                additional_inputs: additional_inputs.clone(),
+                additional_inputs: request_inputs,
                 reasoning_effort: None,
             };
 
@@ -235,6 +249,7 @@ pub async fn run_chat_reply(
                         .await?;
                         if !wait_retry(delay_ms, &cancel).await {
                             stop_reason = "user_aborted".to_string();
+                            fatal_error = Some("user_aborted".to_string());
                             break 'turns;
                         }
                         continue;
@@ -249,6 +264,17 @@ pub async fn run_chat_reply(
                         &e.to_string(),
                     )
                     .await?;
+                    if let Some(t) = task.as_ref() {
+                        fail_task(
+                            &pool,
+                            &user_id,
+                            &session_id,
+                            &event_bus,
+                            &t.task_id,
+                            &format!("provider_error: {}", e),
+                        )
+                        .await?;
+                    }
                     persist_partial_agent_message(
                         &pool,
                         &user_id,
@@ -267,7 +293,15 @@ pub async fn run_chat_reply(
                     biased;
                     _ = cancel.cancelled() => {
                         stop_reason = "user_aborted".to_string();
+                        fatal_error = Some("user_aborted".to_string());
                         break 'turns;
+                    }
+                    _ = sleep(Duration::from_millis(PROVIDER_STREAM_IDLE_TIMEOUT_MS)) => {
+                        stream_error = Some(anyhow!(
+                            "provider stream idle timeout after {}ms",
+                            PROVIDER_STREAM_IDLE_TIMEOUT_MS
+                        ));
+                        break 'stream;
                     }
                     evt_opt = stream.next() => {
                         let Some(event) = evt_opt else { break 'stream };
@@ -275,16 +309,50 @@ pub async fn run_chat_reply(
                             Ok(LlmEvent::TextDelta { text }) => {
                                 full_text.push_str(&text);
                                 turn_text.push_str(&text);
+                                narration_buffer.push_str(&text);
+                                publish_and_persist(
+                                    &pool,
+                                    &user_id,
+                                    &session_id,
+                                    task.as_ref().map(|t| t.task_id.as_str()),
+                                    &event_bus,
+                                    "agent_message_delta",
+                                    serde_json::json!({ "text": text }),
+                                )
+                                .await?;
                             }
                             Ok(LlmEvent::WebSearchCall { status, action }) => {
-                                let (action_kind, action_detail) = match &action {
-                                    Some(WebSearchAction::Search { query }) => ("search", query.clone()),
-                                    Some(WebSearchAction::OpenPage { url }) => ("open_page", url.clone()),
-                                    Some(WebSearchAction::FindInPage { url, pattern }) => {
-                                        ("find_in_page", format!("{pattern} @ {url}"))
+                                reset_agent_message_candidate(
+                                    &pool,
+                                    &user_id,
+                                    &session_id,
+                                    task.as_ref().map(|t| t.task_id.as_str()),
+                                    &event_bus,
+                                    &turn_text,
+                                )
+                                .await?;
+                                flush_agent_narration(
+                                    &pool,
+                                    &user_id,
+                                    &session_id,
+                                    task.as_ref().map(|t| t.task_id.as_str()),
+                                    &event_bus,
+                                    turn,
+                                    &mut narration_buffer,
+                                )
+                                .await?;
+                                let (action_kind, action_detail, queries, sources) = match &action {
+                                    Some(WebSearchAction::Search { query, queries, sources }) => {
+                                        ("search", query.clone(), queries.clone(), sources.clone())
                                     }
-                                    Some(WebSearchAction::Other) => ("other", String::new()),
-                                    None => ("unknown", String::new()),
+                                    Some(WebSearchAction::OpenPage { url }) => {
+                                        ("open_page", url.clone(), Vec::new(), Vec::new())
+                                    }
+                                    Some(WebSearchAction::FindInPage { url, pattern }) => {
+                                        ("find_in_page", format!("{pattern} @ {url}"), Vec::new(), Vec::new())
+                                    }
+                                    Some(WebSearchAction::Other) => ("other", String::new(), Vec::new(), Vec::new()),
+                                    None => ("unknown", String::new(), Vec::new(), Vec::new()),
                                 };
                                 publish_and_persist(
                                     &pool,
@@ -297,6 +365,8 @@ pub async fn run_chat_reply(
                                         "status": status,
                                         "action": action_kind,
                                         "detail": action_detail,
+                                        "queries": queries,
+                                        "sources": sources,
                                     }),
                                 )
                                 .await?;
@@ -354,6 +424,7 @@ pub async fn run_chat_reply(
                 .await?;
                 if !wait_retry(delay_ms, &cancel).await {
                     stop_reason = "user_aborted".to_string();
+                    fatal_error = Some("user_aborted".to_string());
                     break 'turns;
                 }
                 continue;
@@ -369,6 +440,17 @@ pub async fn run_chat_reply(
                 &e.to_string(),
             )
             .await?;
+            if let Some(t) = task.as_ref() {
+                fail_task(
+                    &pool,
+                    &user_id,
+                    &session_id,
+                    &event_bus,
+                    &t.task_id,
+                    &format!("provider_error: {}", e),
+                )
+                .await?;
+            }
             persist_partial_agent_message(
                 &pool,
                 &user_id,
@@ -382,38 +464,76 @@ pub async fn run_chat_reply(
 
         // No tool calls this turn → model is done.
         if pending_calls.is_empty() {
-            final_text = turn_text.clone();
-            if !final_text.is_empty() {
+            if let Some(guard) = plan_guard(&pool, &user_id, &session_id, task.as_ref()).await? {
+                reset_agent_message_candidate(
+                    &pool,
+                    &user_id,
+                    &session_id,
+                    task.as_ref().map(|t| t.task_id.as_str()),
+                    &event_bus,
+                    &turn_text,
+                )
+                .await?;
+                if plan_guard_rewrites < MAX_PLAN_GUARD_REWRITES {
+                    plan_guard_rewrites += 1;
+                    stop_reason = "plan_guard_continue".to_string();
+                    publish_and_persist(
+                        &pool,
+                        &user_id,
+                        &session_id,
+                        task.as_ref().map(|t| t.task_id.as_str()),
+                        &event_bus,
+                        "agent_narration",
+                        serde_json::json!({
+                            "turn": turn,
+                            "text": format!("当前计划还没完成：{}。我会继续执行，不把待办交还给你。", guard.reason),
+                        }),
+                    )
+                    .await?;
+                    additional_inputs.push(plan_guard_input(&guard, &turn_text));
+                    continue 'turns;
+                }
+                stop_reason = "plan_guard_exhausted".to_string();
+                let message = format!(
+                    "agent stopped before completing active plan: {}",
+                    guard.reason
+                );
+                fatal_error = Some(message.clone());
                 publish_and_persist(
                     &pool,
                     &user_id,
                     &session_id,
                     task.as_ref().map(|t| t.task_id.as_str()),
                     &event_bus,
-                    "agent_message_delta",
-                    serde_json::json!({ "text": final_text.clone() }),
+                    "error",
+                    serde_json::json!({ "message": message }),
                 )
                 .await?;
+                break 'turns;
             }
+            final_text = turn_text.clone();
             break 'turns;
         }
 
-        let narration_trimmed = turn_text.trim();
-        if !narration_trimmed.is_empty() {
-            publish_and_persist(
-                &pool,
-                &user_id,
-                &session_id,
-                task.as_ref().map(|t| t.task_id.as_str()),
-                &event_bus,
-                "agent_narration",
-                serde_json::json!({
-                    "turn": turn,
-                    "text": narration_trimmed,
-                }),
-            )
-            .await?;
-        }
+        reset_agent_message_candidate(
+            &pool,
+            &user_id,
+            &session_id,
+            task.as_ref().map(|t| t.task_id.as_str()),
+            &event_bus,
+            &turn_text,
+        )
+        .await?;
+        flush_agent_narration(
+            &pool,
+            &user_id,
+            &session_id,
+            task.as_ref().map(|t| t.task_id.as_str()),
+            &event_bus,
+            turn,
+            &mut narration_buffer,
+        )
+        .await?;
 
         for call in &pending_calls {
             publish_and_persist(
@@ -436,6 +556,7 @@ pub async fn run_chat_reply(
         // Execute pending tools sequentially (parallelism can come later;
         // most tools we'll ship are I/O bound so order rarely matters but
         // serializing keeps the audit trail simple).
+        let mut user_question: Option<serde_json::Value> = None;
         for call in pending_calls {
             let tool_started = Instant::now();
             vault_tool_runs::start(
@@ -464,6 +585,9 @@ pub async fn run_chat_reply(
                     (format!("[tool error: {msg}]"), "error", Some(msg))
                 }
             };
+            if call.name == tools::ask_user_question::TOOL_NAME && error.is_none() {
+                user_question = parse_user_question_output(&output_str);
+            }
             let duration_ms = tool_started
                 .elapsed()
                 .as_millis()
@@ -521,16 +645,46 @@ pub async fn run_chat_reply(
             }));
         }
 
+        if let Some(payload) = user_question {
+            awaiting_user = true;
+            stop_reason = "awaiting_user".to_string();
+            let question_text = payload
+                .get("question_text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("请补充一下你的要求。")
+                .to_string();
+            publish_and_persist(
+                &pool,
+                &user_id,
+                &session_id,
+                task.as_ref().map(|t| t.task_id.as_str()),
+                &event_bus,
+                "clarification_requested",
+                serde_json::json!({
+                    "question": question_text,
+                    "questions": payload.get("questions").cloned().unwrap_or(serde_json::Value::Null),
+                }),
+            )
+            .await?;
+            final_text = question_text;
+            publish_and_persist(
+                &pool,
+                &user_id,
+                &session_id,
+                task.as_ref().map(|t| t.task_id.as_str()),
+                &event_bus,
+                "agent_message_delta",
+                serde_json::json!({ "text": final_text.clone() }),
+            )
+            .await?;
+            break 'turns;
+        }
+
         turn += 1;
     }
 
-    let has_content = !final_text.trim().is_empty();
+    let has_content = fatal_error.is_none() && !final_text.trim().is_empty();
 
-    // Only persist a message + deliverable when there's actually content. An
-    // abort that fires before the first delta produces an empty `full_text`
-    // — we treat that as a clean cancel: no orphan empty message, no empty
-    // deliverable. The task is still marked delivered (no `cancelled` state
-    // by design — see memory:feedback_stop_is_stream_abort).
     let msg_seq = if has_content {
         Some(
             vault_messages::insert(
@@ -548,41 +702,57 @@ pub async fn run_chat_reply(
     };
 
     if let Some(t) = task.as_ref() {
-        if has_content {
-            let deliverable_id = vault_tasks::write_deliverable(
-                &pool,
-                &user_id,
-                &t.task_id,
-                &t.expected_deliverable,
-                &final_text,
-            )
-            .await?;
+        if let Some(reason) = fatal_error.as_deref() {
+            fail_task(&pool, &user_id, &session_id, &event_bus, &t.task_id, reason).await?;
+        } else if awaiting_user {
+            vault_tasks::mark_awaiting_user(&pool, &user_id, &t.task_id).await?;
             publish_and_persist(
                 &pool,
                 &user_id,
                 &session_id,
                 Some(&t.task_id),
                 &event_bus,
-                "deliverable_ready",
-                serde_json::json!({
-                    "deliverable_id": deliverable_id,
-                    "task_id": t.task_id,
-                    "kind": t.expected_deliverable,
-                }),
+                "task_awaiting_user",
+                serde_json::json!({ "task_id": t.task_id }),
+            )
+            .await?;
+        } else {
+            if has_content {
+                let deliverable_id = vault_tasks::write_deliverable(
+                    &pool,
+                    &user_id,
+                    &t.task_id,
+                    &t.expected_deliverable,
+                    &final_text,
+                )
+                .await?;
+                publish_and_persist(
+                    &pool,
+                    &user_id,
+                    &session_id,
+                    Some(&t.task_id),
+                    &event_bus,
+                    "deliverable_ready",
+                    serde_json::json!({
+                        "deliverable_id": deliverable_id,
+                        "task_id": t.task_id,
+                        "kind": t.expected_deliverable,
+                    }),
+                )
+                .await?;
+            }
+            vault_tasks::mark_delivered(&pool, &user_id, &t.task_id).await?;
+            publish_and_persist(
+                &pool,
+                &user_id,
+                &session_id,
+                Some(&t.task_id),
+                &event_bus,
+                "task_delivered",
+                serde_json::json!({ "task_id": t.task_id }),
             )
             .await?;
         }
-        vault_tasks::mark_delivered(&pool, &user_id, &t.task_id).await?;
-        publish_and_persist(
-            &pool,
-            &user_id,
-            &session_id,
-            Some(&t.task_id),
-            &event_bus,
-            "task_delivered",
-            serde_json::json!({ "task_id": t.task_id }),
-        )
-        .await?;
     }
 
     publish_and_persist(
@@ -602,6 +772,30 @@ pub async fn run_chat_reply(
     Ok(())
 }
 
+async fn fail_task(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    event_bus: &EventBus,
+    task_id: &str,
+    reason: &str,
+) -> Result<()> {
+    vault_tasks::mark_failed(pool, user_id, task_id, reason).await?;
+    publish_and_persist(
+        pool,
+        user_id,
+        session_id,
+        Some(task_id),
+        event_bus,
+        "task_failed",
+        serde_json::json!({
+            "task_id": task_id,
+            "reason": reason,
+        }),
+    )
+    .await
+}
+
 fn provider_retry_delay_ms(retry: usize) -> u64 {
     let exponent = retry.saturating_sub(1).min(5);
     (PROVIDER_RETRY_BASE_MS * (1_u64 << exponent)).min(PROVIDER_RETRY_MAX_MS)
@@ -613,6 +807,111 @@ async fn wait_retry(delay_ms: u64, cancel: &CancellationToken) -> bool {
         _ = cancel.cancelled() => false,
         _ = sleep(Duration::from_millis(delay_ms)) => true,
     }
+}
+
+fn parse_user_question_output(output: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(output).ok()?;
+    if value.get("status").and_then(|v| v.as_str()) != Some("awaiting_user") {
+        return None;
+    }
+    let question_text = value.get("question_text").and_then(|v| v.as_str())?;
+    if question_text.trim().is_empty() {
+        return None;
+    }
+    Some(value)
+}
+
+#[derive(Debug, Clone)]
+struct PlanGuard {
+    reason: String,
+    items: Vec<vault_plans::PlanItemRow>,
+}
+
+async fn active_plan_reminder_input(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    task: Option<&TaskBinding>,
+) -> Result<Option<serde_json::Value>> {
+    let task_id = task.map(|t| t.task_id.as_str());
+    let items = vault_plans::list_current(pool, user_id, session_id, task_id).await?;
+    if items.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::json!({
+        "role": "user",
+        "content": format!(
+            "ACTIVE PLAN STATUS\n{}\n\n继续从当前计划状态推进。完成项目后必须调用 update_plan 更新状态；所有项目 completed 后才输出最终结论。",
+            format_plan_items(&items)
+        ),
+    })))
+}
+
+async fn plan_guard(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    task: Option<&TaskBinding>,
+) -> Result<Option<PlanGuard>> {
+    let task_id = task.map(|t| t.task_id.as_str());
+    let items = vault_plans::list_current(pool, user_id, session_id, task_id).await?;
+    if items.is_empty() {
+        return Ok(task.map(|_| PlanGuard {
+            reason: "还没有为这个研究任务创建 active plan".to_string(),
+            items,
+        }));
+    }
+    let incomplete_count = items
+        .iter()
+        .filter(|item| item.status != "completed")
+        .count();
+    if incomplete_count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(PlanGuard {
+        reason: format!("{incomplete_count} 个计划项仍未完成"),
+        items,
+    }))
+}
+
+fn plan_guard_input(guard: &PlanGuard, draft: &str) -> serde_json::Value {
+    serde_json::json!({
+        "role": "user",
+        "content": format!(
+            "SYSTEM PLAN GATE\n\
+             你的上一版不能作为最终回答。\n\
+             原因：{}\n\n\
+             当前 active plan：\n{}\n\n\
+             上一版草稿摘录：\n{}\n\n\
+             继续执行计划。若还没有计划，先调用 update_plan 创建计划，参数使用 plan 数组；若计划项未完成，继续调用工具完成它们；\
+             完成后调用 update_plan 标记 completed 并写入 evidence。不要把未完成计划交还给用户。",
+            guard.reason,
+            format_plan_items(&guard.items),
+            preview(draft.trim(), 1200)
+        ),
+    })
+}
+
+fn format_plan_items(items: &[vault_plans::PlanItemRow]) -> String {
+    if items.is_empty() {
+        return "(no active plan)".to_string();
+    }
+    items
+        .iter()
+        .map(|item| {
+            let evidence = item
+                .evidence
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| format!(" evidence: {}", preview(text, 240)))
+                .unwrap_or_default();
+            format!(
+                "- [{}] {}. {}{}",
+                item.status, item.item_id, item.step, evidence
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -725,4 +1024,194 @@ pub async fn publish_and_persist(
         )
         .await;
     Ok(())
+}
+
+async fn flush_agent_narration(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    task_id: Option<&str>,
+    event_bus: &EventBus,
+    turn: usize,
+    buffer: &mut String,
+) -> Result<()> {
+    let text = buffer.trim().to_string();
+    buffer.clear();
+    if text.is_empty() {
+        return Ok(());
+    }
+    publish_and_persist(
+        pool,
+        user_id,
+        session_id,
+        task_id,
+        event_bus,
+        "agent_narration",
+        serde_json::json!({
+            "turn": turn,
+            "text": text,
+        }),
+    )
+    .await
+}
+
+async fn reset_agent_message_candidate(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    task_id: Option<&str>,
+    event_bus: &EventBus,
+    candidate: &str,
+) -> Result<()> {
+    if candidate.trim().is_empty() {
+        return Ok(());
+    }
+    publish_and_persist(
+        pool,
+        user_id,
+        session_id,
+        task_id,
+        event_bus,
+        "agent_message_reset",
+        serde_json::json!({}),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn plan_pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE agent_plan_items (
+                user_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                step TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'in_progress', 'completed')),
+                evidence TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, session_id, task_id, item_id)
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    fn task() -> TaskBinding {
+        TaskBinding {
+            task_id: "task-1".to_string(),
+            expected_deliverable: "decision_draft".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_guard_requires_plan_for_task() {
+        let pool = plan_pool().await;
+        let binding = task();
+        let guard = plan_guard(&pool, "u", "s", Some(&binding))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(guard.reason.contains("还没有"));
+    }
+
+    #[tokio::test]
+    async fn plan_guard_ignores_empty_free_chat() {
+        let pool = plan_pool().await;
+        assert!(plan_guard(&pool, "u", "s", None).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn plan_guard_catches_incomplete_plan() {
+        let pool = plan_pool().await;
+        let binding = task();
+        vault_plans::replace_current(
+            &pool,
+            "u",
+            "s",
+            Some(&binding.task_id),
+            &[
+                vault_plans::PlanItemInput {
+                    id: Some("p1".to_string()),
+                    step: "建立研究框架".to_string(),
+                    status: "completed".to_string(),
+                    evidence: Some("已调用 corpus_search".to_string()),
+                },
+                vault_plans::PlanItemInput {
+                    id: Some("p2".to_string()),
+                    step: "核验行业事实".to_string(),
+                    status: "pending".to_string(),
+                    evidence: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let guard = plan_guard(&pool, "u", "s", Some(&binding))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(guard.reason.contains("1 个计划项"));
+    }
+
+    #[tokio::test]
+    async fn plan_guard_catches_free_chat_active_plan() {
+        let pool = plan_pool().await;
+        vault_plans::replace_current(
+            &pool,
+            "u",
+            "s",
+            None,
+            &[vault_plans::PlanItemInput {
+                id: Some("p1".to_string()),
+                step: "核验事实".to_string(),
+                status: "in_progress".to_string(),
+                evidence: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let guard = plan_guard(&pool, "u", "s", None).await.unwrap().unwrap();
+        assert!(guard.reason.contains("1 个计划项"));
+    }
+
+    #[tokio::test]
+    async fn plan_guard_allows_completed_plan() {
+        let pool = plan_pool().await;
+        let binding = task();
+        vault_plans::replace_current(
+            &pool,
+            "u",
+            "s",
+            Some(&binding.task_id),
+            &[vault_plans::PlanItemInput {
+                id: Some("p1".to_string()),
+                step: "完成综合判断".to_string(),
+                status: "completed".to_string(),
+                evidence: Some("事实、反方和风险已综合".to_string()),
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert!(plan_guard(&pool, "u", "s", Some(&binding))
+            .await
+            .unwrap()
+            .is_none());
+    }
 }

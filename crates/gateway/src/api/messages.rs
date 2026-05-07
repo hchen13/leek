@@ -209,14 +209,22 @@ async fn handle_user_message(
     if let Some(task) = active {
         // Link the user message to the existing task and reply within it.
         vault_tasks::link_message(&pool, &user_id, &session_id, user_message_seq, &task.id).await?;
+        let task_binding = if task.status == "awaiting_user" {
+            vault_tasks::mark_in_progress(&pool, &user_id, &task.id).await?;
+            Some(TaskBinding {
+                task_id: task.id,
+                expected_deliverable: task.expected_deliverable,
+            })
+        } else {
+            None
+        };
         return agent::run_chat_reply(
             pool,
             user_id,
             session_id,
             provider,
             event_bus,
-            // Existing task: don't re-mark as delivered (it already is or in-flight)
-            None,
+            task_binding,
             cancel,
             tools,
             mandate_path,

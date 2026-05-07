@@ -15,6 +15,7 @@ const ENDPOINT: &str = "https://api.tushare.pro";
 const REQUEST_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_DAYS: i64 = 10;
 const MAX_DAYS: i64 = 30;
+const NORTHBOUND_DAILY_STOP_DATE: &str = "20240820";
 
 pub struct GetCapitalFlowTool {
     http: Client,
@@ -143,12 +144,9 @@ impl GetCapitalFlowTool {
         rows.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut out = format!("## {ts_code} · 资金流向（近{}日）\n\n", rows.len());
-        out.push_str("| 日期       | 超大单净流入 | 大单净流入  | 中单净流入  | 小单净流入  | 总净流入    |\n");
+        out.push_str("| 日期       | 超大单净流入 | 大单净流入  | 中单净流入  | 小单净流入  | 净流入额    |\n");
         out.push_str(
             "|-----------|------------|-----------|-----------|-----------|------------|\n",
-        );
-        out.push_str(
-            "| (单位: 万元) |            |           |           |           |            |\n",
         );
         for (date, elg, lg, md, sm, net) in &rows {
             let date_fmt = if date.len() == 8 {
@@ -161,7 +159,9 @@ impl GetCapitalFlowTool {
                 date_fmt, elg, lg, md, sm, net
             ));
         }
-        out.push('\n');
+        out.push_str(
+            "\n_单位: 万元；分档列为买入额 - 卖出额，净流入额为 Tushare 原始 net_mf_amount。_\n",
+        );
         Ok(out)
     }
 
@@ -176,13 +176,17 @@ impl GetCapitalFlowTool {
 
         let fmt_date =
             |d: chrono::NaiveDate| format!("{:04}{:02}{:02}", d.year(), d.month(), d.day());
+        let end_date = fmt_date(end);
+        if end_date.as_str() >= NORTHBOUND_DAILY_STOP_DATE {
+            return Ok(northbound_daily_unavailable());
+        }
 
         let payload = serde_json::json!({
             "api_name": "moneyflow_hsgt",
             "token": token,
             "params": {
                 "start_date": fmt_date(start),
-                "end_date": fmt_date(end)
+                "end_date": end_date
             },
             "fields": "trade_date,north_money,hgt,sgt,south_money"
         });
@@ -288,10 +292,11 @@ impl ToolHandler for GetCapitalFlowTool {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
             description: "Fetch A-share capital flow data: major/institutional money flow for individual stocks, \
-                and north-bound capital (Hong Kong → Mainland via Stock Connect) market-wide flow. \
+                and historical north-bound capital (Hong Kong → Mainland via Stock Connect) market-wide flow. \
                 Requires TUSHARE_TOKEN env var. \
                 - For individual stock flow: provide ts_code. \
-                - For north-bound capital only: omit ts_code, set data_type=\"northbound\"."
+                - Daily north-bound net-flow disclosure stopped after 2024-08-20; for current dates this tool returns \
+                  an explicit unavailable note instead of stale zero-like data."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -358,4 +363,12 @@ impl ToolHandler for GetCapitalFlowTool {
             }
         }
     }
+}
+
+fn northbound_daily_unavailable() -> String {
+    "## 北向资金（日度净流入已停更）\n\n\
+     [get_capital_flow: northbound_daily_unavailable since 2024-08-20; \
+     Tushare moneyflow_hsgt is historical-only for current analysis. \
+     Use stock_flow for individual stocks, and use hk_hold quarterly holdings or hsgt_top10-style turnover data when those tools are wired.]\n"
+        .to_string()
 }

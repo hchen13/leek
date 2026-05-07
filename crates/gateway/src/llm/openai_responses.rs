@@ -44,6 +44,11 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
         "store": false,
     });
 
+    let uses_web_search = req
+        .tools
+        .iter()
+        .any(|t| matches!(t, ToolSpec::WebSearch { .. }));
+
     if !req.tools.is_empty() {
         let tools_json: Vec<serde_json::Value> = req
             .tools
@@ -69,6 +74,10 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
             })
             .collect();
         body["tools"] = serde_json::Value::Array(tools_json);
+    }
+
+    if uses_web_search {
+        body["include"] = serde_json::json!(["web_search_call.action.sources"]);
     }
 
     // Append raw input items after messages (function_call / function_call_output
@@ -348,7 +357,36 @@ fn parse_web_search_action(v: &serde_json::Value) -> Option<WebSearchAction> {
                         .map(String::from)
                 })
                 .unwrap_or_default();
-            Some(WebSearchAction::Search { query })
+            let mut queries: Vec<String> = obj
+                .get("queries")
+                .and_then(|q| q.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if queries.is_empty() && !query.is_empty() {
+                queries.push(query.clone());
+            }
+            let sources = obj
+                .get("sources")
+                .and_then(|q| q.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.get("url").and_then(|url| url.as_str()))
+                        .filter(|s| !s.trim().is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(WebSearchAction::Search {
+                query,
+                queries,
+                sources,
+            })
         }
         "open_page" => {
             let url = obj
@@ -453,7 +491,47 @@ mod tests {
             LlmEvent::WebSearchCall { status, action } => {
                 assert_eq!(status, "in_progress");
                 match action {
-                    Some(super::WebSearchAction::Search { query }) => assert_eq!(query, "NVDA Q1"),
+                    Some(super::WebSearchAction::Search {
+                        query,
+                        queries,
+                        sources,
+                    }) => {
+                        assert_eq!(query, "NVDA Q1");
+                        assert_eq!(queries, &vec!["NVDA Q1".to_string()]);
+                        assert!(sources.is_empty());
+                    }
+                    other => panic!("expected Search action, got {other:?}"),
+                }
+            }
+            other => panic!("expected WebSearchCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_web_search_call_with_query_batch() {
+        let raw = "data: {\"type\":\"response.output_item.done\",\"item\":{\
+                       \"id\":\"ws_1\",\"type\":\"web_search_call\",\"status\":\"completed\",\
+                       \"action\":{\"type\":\"search\",\"query\":\"CRCL news\",\
+                       \"queries\":[\"CRCL news\",\"Circle latest news\"],\
+                       \"sources\":[{\"type\":\"url\",\"url\":\"https://www.circle.com/news\"}]}}}";
+        let evts = parse_one_event(raw).unwrap();
+        assert_eq!(evts.len(), 1);
+        match &evts[0] {
+            LlmEvent::WebSearchCall { status, action } => {
+                assert_eq!(status, "completed");
+                match action {
+                    Some(super::WebSearchAction::Search {
+                        query,
+                        queries,
+                        sources,
+                    }) => {
+                        assert_eq!(query, "CRCL news");
+                        assert_eq!(
+                            queries,
+                            &vec!["CRCL news".to_string(), "Circle latest news".to_string(),]
+                        );
+                        assert_eq!(sources, &vec!["https://www.circle.com/news".to_string()]);
+                    }
                     other => panic!("expected Search action, got {other:?}"),
                 }
             }
@@ -513,6 +591,10 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "web_search");
         assert_eq!(tools[0]["external_web_access"], true);
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["web_search_call.action.sources"])
+        );
     }
 
     #[test]

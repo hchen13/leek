@@ -5,7 +5,7 @@ import { Show } from "solid-js";
 import type { Scene } from "../scenes";
 import { Icon } from "./Icon";
 import { Composer } from "./Chat";
-import { BrainWidget } from "./BrainWidget";
+import { InsightSidebar, type AgentPlanView } from "./BrainWidget";
 import { canvasFor } from "./CanvasScenes";
 import { transcriptFor } from "./Transcripts";
 
@@ -41,20 +41,6 @@ export function Rail(_props: { active?: string }) {
 }
 
 function CanvasArea(props: { scene: Scene }) {
-  const fireIds = (): string[] | undefined => {
-    switch (props.scene) {
-      case "deep": return [
-        "p.economic-moat", "k.nvidia", "p.long-term-debt-cycle",
-        "k.hyperscaler-capex", "s.dalio.bigdebt", "p.margin-of-safety",
-        "p.buffett", "ks.ai.10qs",
-      ];
-      case "thinking-shallow": return ["k.nvidia", "p.paradigm-shifts", "k.hyperscaler-capex"];
-      case "delivered": return ["p.economic-moat", "p.long-term-debt-cycle", "k.hyperscaler-capex"];
-      case "clarify": return ["p.margin-of-safety", "p.concentration"];
-      default: return undefined;
-    }
-  };
-
   const headSubtitle = () => {
     switch (props.scene) {
       case "delivered": return "verdict · cached";
@@ -84,9 +70,21 @@ function CanvasArea(props: { scene: Scene }) {
 
       {canvasFor(props.scene)}
 
-      <BrainWidget scene={props.scene} fireIds={fireIds()} />
+      <InsightSidebar scene={props.scene} corpusTools={[]} plan={demoPlanFor(props.scene)} />
     </div>
   );
+}
+
+function demoPlanFor(scene: Scene): AgentPlanView | null {
+  if (scene === "idle") return null;
+  return {
+    explanation: "验证右侧进度栏布局；live 模式会使用 plan_updated 事件里的真实计划。",
+    items: [
+      { id: "p1", step: "检索 corpus 原则和已有知识", status: scene === "thinking-shallow" ? "in_progress" : "completed" },
+      { id: "p2", step: "补齐公司、行业、宏观和资金面事实", status: scene === "delivered" ? "completed" : "pending" },
+      { id: "p3", step: "综合反方解释并形成结论", status: scene === "delivered" ? "completed" : "pending" },
+    ],
+  };
 }
 
 export function Workbench(props: { scene: Scene }) {

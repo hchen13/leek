@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
@@ -14,7 +14,7 @@ const TUSHARE_ENDPOINT: &str = "https://api.tushare.pro";
 const FMP_BASE: &str = "https://financialmodelingprep.com/stable";
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_PERIODS: u64 = 4;
-const MAX_PERIODS: u64 = 8;
+const MAX_PERIODS: u64 = 24;
 
 pub struct GetFinancialsTool {
     http: Client,
@@ -47,7 +47,7 @@ impl ToolHandler for GetFinancialsTool {
                 - \"balance\": balance sheet (assets, liabilities, equity)\n\
                 - \"cashflow\": cash flow statement\n\
                 - \"ratios\": key financial ratios (ROE, ROA, PE, PB, margins, debt ratio)\n\
-                - \"all\": fetch income + ratios together (most useful for quick analysis)\n\
+                - \"all\": fetch income + balance sheet + cash flow + ratios\n\
                 Returns markdown tables with the most recent N periods."
                 .into(),
             parameters: serde_json::json!({
@@ -140,6 +140,8 @@ async fn fetch_a_share(
         }
         "all" => {
             parts.push(fetch_ashare_income(http, ts_code, periods, &token, &cancel).await?);
+            parts.push(fetch_ashare_balance(http, ts_code, periods, &token, &cancel).await?);
+            parts.push(fetch_ashare_cashflow(http, ts_code, periods, &token, &cancel).await?);
             parts.push(fetch_ashare_ratios(http, ts_code, periods, &token, &cancel).await?);
         }
         _ => bail!("unknown report_type: {report_type}"),
@@ -212,6 +214,29 @@ fn tushare_extract(body: &serde_json::Value) -> (Vec<String>, Vec<Vec<serde_json
         })
         .unwrap_or_default();
     (fields, items)
+}
+
+fn tushare_fetch_limit(periods: usize) -> usize {
+    (periods * 3).max(periods)
+}
+
+fn unique_rows_by_field(
+    rows: Vec<Vec<serde_json::Value>>,
+    fields: &[String],
+    field: &str,
+    limit: usize,
+) -> Vec<Vec<serde_json::Value>> {
+    let Some(index) = fields.iter().position(|f| f == field) else {
+        return rows.into_iter().take(limit).collect();
+    };
+    let mut seen = HashSet::new();
+    rows.into_iter()
+        .filter(|row| {
+            let key = row.get(index).map(fmt_val_str).unwrap_or_default();
+            !key.is_empty() && seen.insert(key)
+        })
+        .take(limit)
+        .collect()
 }
 
 fn col<'a>(row: &'a [serde_json::Value], fields: &[String], name: &str) -> &'a serde_json::Value {
@@ -291,8 +316,18 @@ async fn fetch_ashare_income(
     cancel: &CancellationToken,
 ) -> Result<String> {
     let fields = "ts_code,end_date,total_revenue,revenue,operate_profit,n_income,n_income_attr_p,basic_eps,diluted_eps,ebit,ebitda";
-    let body = tushare_call(http, token, "income_vip", ts_code, periods, fields, cancel).await?;
+    let body = tushare_call(
+        http,
+        token,
+        "income_vip",
+        ts_code,
+        tushare_fetch_limit(periods),
+        fields,
+        cancel,
+    )
+    .await?;
     let (field_names, items) = tushare_extract(&body);
+    let items = unique_rows_by_field(items, &field_names, "end_date", periods);
 
     if items.is_empty() {
         return Ok(format!("[get_financials: no income data for {ts_code}]"));
@@ -328,12 +363,13 @@ async fn fetch_ashare_balance(
         token,
         "balancesheet",
         ts_code,
-        periods,
+        tushare_fetch_limit(periods),
         fields,
         cancel,
     )
     .await?;
     let (field_names, items) = tushare_extract(&body);
+    let items = unique_rows_by_field(items, &field_names, "end_date", periods);
 
     if items.is_empty() {
         return Ok(format!(
@@ -365,18 +401,20 @@ async fn fetch_ashare_cashflow(
     token: &str,
     cancel: &CancellationToken,
 ) -> Result<String> {
-    let fields = "ts_code,end_date,net_operate_cashflow,n_cashflow_inv_act,n_cash_flows_fnc_act,free_cashflow";
+    let fields =
+        "ts_code,end_date,n_cashflow_act,n_cashflow_inv_act,n_cash_flows_fnc_act,free_cashflow";
     let body = tushare_call(
         http,
         token,
         "cashflow_vip",
         ts_code,
-        periods,
+        tushare_fetch_limit(periods),
         fields,
         cancel,
     )
     .await?;
     let (field_names, items) = tushare_extract(&body);
+    let items = unique_rows_by_field(items, &field_names, "end_date", periods);
 
     if items.is_empty() {
         return Ok(format!("[get_financials: no cashflow data for {ts_code}]"));
@@ -389,7 +427,7 @@ async fn fetch_ashare_cashflow(
     out.push_str("|--------|---------------|---------------|---------------|------------|\n");
     for row in &items {
         let period = ashare_period(col(row, &field_names, "end_date"));
-        let oper = fmt_yi(col(row, &field_names, "net_operate_cashflow"));
+        let oper = fmt_yi(col(row, &field_names, "n_cashflow_act"));
         let inv = fmt_yi(col(row, &field_names, "n_cashflow_inv_act"));
         let fin = fmt_yi(col(row, &field_names, "n_cash_flows_fnc_act"));
         let free = fmt_yi(col(row, &field_names, "free_cashflow"));
@@ -412,12 +450,13 @@ async fn fetch_ashare_ratios(
         token,
         "fina_indicator_vip",
         ts_code,
-        periods,
+        tushare_fetch_limit(periods),
         fields,
         cancel,
     )
     .await?;
     let (field_names, items) = tushare_extract(&body);
+    let items = unique_rows_by_field(items, &field_names, "end_date", periods);
 
     if items.is_empty() {
         return Ok(format!("[get_financials: no ratio data for {ts_code}]"));
@@ -478,6 +517,8 @@ async fn fetch_us_stock(
         }
         "all" => {
             parts.push(fetch_fmp_income(http, ticker, periods, &key, &cancel).await?);
+            parts.push(fetch_fmp_balance(http, ticker, periods, &key, &cancel).await?);
+            parts.push(fetch_fmp_cashflow(http, ticker, periods, &key, &cancel).await?);
             parts.push(fetch_fmp_ratios(http, ticker, periods, &key, &cancel).await?);
         }
         _ => bail!("unknown report_type: {report_type}"),
@@ -497,7 +538,13 @@ async fn fmp_get(
         r = http.get(url).send() => r?,
     };
     if !resp.status().is_success() {
-        bail!("FMP HTTP {}", resp.status().as_u16());
+        let status = resp.status().as_u16();
+        let body = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("aborted"),
+            r = resp.text() => r.unwrap_or_default(),
+        };
+        bail!("{}", fmp_http_error(status, &body));
     }
     let body: serde_json::Value = tokio::select! {
         biased;
@@ -508,6 +555,37 @@ async fn fmp_get(
         serde_json::Value::Array(arr) => Ok(arr),
         other => bail!("FMP unexpected response shape: {}", other),
     }
+}
+
+fn fmp_http_error(status: u16, body: &str) -> String {
+    let base = match status {
+        401 | 403 => format!(
+            "FMP HTTP {status}: authentication or endpoint permission denied. Check FMP_API_KEY and the API plan."
+        ),
+        402 => "FMP HTTP 402: API key was loaded, but the current FMP plan/quota does not allow this financial-statement endpoint.".to_string(),
+        429 => "FMP HTTP 429: provider rate limit exceeded. Retry later or lower request frequency.".to_string(),
+        _ => format!("FMP HTTP {status}: provider request failed."),
+    };
+    let detail = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if detail.is_empty() {
+        base
+    } else {
+        format!(
+            "{base} Provider response: {}",
+            truncate_error_detail(&detail, 180)
+        )
+    }
+}
+
+fn truncate_error_detail(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for ch in s.chars().take(max_chars) {
+        out.push(ch);
+    }
+    if s.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
 }
 
 fn fmp_str(row: &serde_json::Value, key: &str) -> String {
@@ -687,4 +765,17 @@ async fn fetch_fmp_ratios(
     }
     out.push_str("\n_Source: Financial Modeling Prep (ratios)_");
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmp_http_402_mentions_loaded_key_and_plan() {
+        let msg = fmp_http_error(402, "{\"Error Message\":\"Plan limit\"}");
+        assert!(msg.contains("API key was loaded"));
+        assert!(msg.contains("plan/quota"));
+        assert!(msg.contains("Plan limit"));
+    }
 }

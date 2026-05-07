@@ -21,12 +21,11 @@ const IDENTITY: &str = include_str!("../../../../harness/identity.md");
 const DISCIPLINE: &str = include_str!("../../../../harness/discipline.md");
 const CORPUS_ORIENTATION: &str = include_str!("../../../../harness/corpus_orientation.md");
 
-use crate::agent::tools::use_skill::SKILL_METADATA;
-/// Build artifact — populated by `leek corpus distill` and gitignored. On a
-/// fresh checkout, build.rs writes a placeholder so this macro doesn't fail;
-/// in production deployment the real distilled blob is generated as part of
-/// the build pipeline.
-const CORPUS_DISTILLED: &str = include_str!("../../assets/corpus_distilled.md");
+use crate::agent::tools::use_skill::skill_metadata;
+use std::path::PathBuf;
+
+const DEFAULT_CORPUS_PROMPT_PATH: &str = "crates/gateway/assets/corpus_distilled.md";
+const ENV_CORPUS_PROMPT_PATH: &str = "LEEK_CORPUS_PROMPT_PATH";
 
 /// Citation *surface* conventions — runtime rules for how to render citations
 /// (don't leak internal path ids, prefer titled markdown links). Different
@@ -50,6 +49,30 @@ then gather situation data, then stress-test the thesis, then translate it \
 into a decision frame only if the user is asking for one.\n\
 - The default chain is: user mandate → corpus principles → current facts → \
 opposing case → risk/exit conditions → answer.\n\
+- If the task scope, desired depth, risk tolerance, time horizon, or required \
+private context is genuinely unclear and materially changes the answer, call \
+`ask_user_question` before creating or executing the plan. Do not ask when a \
+reasonable default or read-only research can resolve the ambiguity.\n\
+- For non-trivial research tasks, create and maintain an active plan with \
+`update_plan` using the `plan` argument. Keep exactly one item in_progress unless all items are \
+completed. A final task answer is allowed only after the active plan is \
+completed.\n\
+- Ground before asking: inspect corpus, available tools, session history, and \
+current market facts before asking the user. Ask only for preferences or \
+private context that materially change the work.\n\
+- Persist through failures. A failed function call is not a stopping condition: \
+read the error, try a better query, another source, another tool, or mark the \
+specific plan item as blocked with evidence before concluding.\n\
+- Explore credible alternatives. If the first lens/source/tool produces a weak \
+or one-sided thesis, try another relevant lens or source path before answering.\n\
+- A final answer is allowed only after the declared research frame has been \
+acted on. If you say a working model needs industry, channel, macro, policy, \
+competition, or liquidity facts, gather those facts with tools before you \
+answer. Do not hand the checklist back to the user as the deliverable.\n\
+- For public-company research, corpus gaps normally require live external \
+grounding: use web_search/web_fetch for industry state, policy/macro context, \
+channel or competitive facts unless the user forbids web access or the tool \
+fails after a real attempt.\n\
 - Use `record_research_note` for reversible memory, preferences, mandate \
 candidates, or reusable lessons. Use `record_investment_action` only for a \
 clear capital commitment to a named instrument and direction.\n\
@@ -96,14 +119,11 @@ pub fn build_system_prompt(
         "Available skills (call `use_skill` with the skill name as your FIRST action \
          when the task matches — before any other tool call or analysis):\n\n",
     );
-    prompt.push_str(SKILL_METADATA);
+    prompt.push_str(&skill_metadata());
 
-    // Distilled corpus principles (~100K tokens when populated). Skip the
-    // placeholder on fresh checkouts so we don't pollute the prompt with
-    // build-script breadcrumbs.
-    if !CORPUS_DISTILLED.starts_with("<!-- placeholder") {
+    if let Some(corpus_prompt) = load_corpus_prompt() {
         prompt.push_str("\n\n");
-        prompt.push_str(CORPUS_DISTILLED);
+        prompt.push_str(&corpus_prompt);
     }
 
     // User mandate — discipline §5 promotes this to the source of truth
@@ -138,6 +158,37 @@ pub fn build_system_prompt(
     prompt
 }
 
+fn load_corpus_prompt() -> Option<String> {
+    corpus_prompt_candidates()
+        .into_iter()
+        .find_map(|path| read_corpus_prompt(&path))
+}
+
+fn corpus_prompt_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(path) = std::env::var(ENV_CORPUS_PROMPT_PATH) {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            out.push(PathBuf::from(trimmed));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        out.push(cwd.join(DEFAULT_CORPUS_PROMPT_PATH));
+    }
+    out.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/corpus_distilled.md"));
+    out
+}
+
+fn read_corpus_prompt(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.starts_with("<!-- placeholder") {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 pub fn build_subagent_prompt(role: &str, role_instruction: &str) -> String {
     format!(
         "{IDENTITY}\n\n{DISCIPLINE}\n\n{CORPUS_ORIENTATION}\n\n\
@@ -169,6 +220,29 @@ mod tests {
         assert!(p.contains("# Research Skills"));
         assert!(p.contains("equity-valuation"));
         assert!(p.contains("crypto-research"));
+    }
+
+    #[test]
+    fn read_corpus_prompt_ignores_placeholder() {
+        let tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join(format!("leek-placeholder-{}.md", std::process::id()));
+        std::fs::write(&path, "<!-- placeholder corpus_distilled.md -->\n").unwrap();
+        assert!(read_corpus_prompt(&path).is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_corpus_prompt_returns_trimmed_text() {
+        let tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join(format!("leek-corpus-prompt-{}.md", std::process::id()));
+        std::fs::write(&path, "\n# Corpus mind\n\nprinciples\n\n").unwrap();
+        assert_eq!(
+            read_corpus_prompt(&path).as_deref(),
+            Some("# Corpus mind\n\nprinciples")
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

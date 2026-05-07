@@ -5,8 +5,10 @@
 //! case-insensitive substring scoring with optional tier/layer/tag filters.
 //!
 //! P3 design notes:
-//! - No embeddings, no BM25 — flat substring scoring, ordered by hit-count
-//!   then by node degree (higher = more central in the corpus graph).
+//! - No embeddings, no BM25 — flat substring scoring, with synthesized wiki
+//!   pages preferred for default searches because they are the corpus' compiled
+//!   interpretation layer. Callers can still force `layer: "source"` when they
+//!   need primary text.
 //! - Returns top-N hits with a 240-char snippet around the first match so
 //!   the model sees enough context to decide whether to web_fetch / drill in.
 
@@ -172,10 +174,13 @@ impl ToolHandler for CorpusSearchTool {
                  Use this BEFORE web_search when the question is about value-investing \
                  principles, mental models, or the people / books you'd find in a serious \
                  investor's library — the corpus is hand-curated and more authoritative \
-                 than the open web for those topics. Returns top hits as JSON with id, \
-                 title, tier, layer, tags, and a snippet around the first match. Combine \
-                 with web_fetch (using the returned id as a wikilink reference) to read \
-                 the full document if needed."
+                 than the open web for those topics. Wiki hits are synthesized reasoning \
+                 lenses; source hits are supporting evidence candidates and should not be \
+                 treated as active context unless their snippet directly matters or the user \
+                 asks for primary-source grounding. Returns top hits as JSON with id, title, \
+                 tier, layer, usage_role, tags, and a snippet around the first match. Combine \
+                 with web_fetch (using the returned id as a wikilink reference) to read the \
+                 full document if needed."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -192,7 +197,7 @@ impl ToolHandler for CorpusSearchTool {
                     "layer": {
                         "type": "string",
                         "enum": ["wiki", "source"],
-                        "description": "Optional layer filter. wiki = synthesized concept page. source = primary source text."
+                        "description": "Optional layer filter. Prefer wiki for initial orientation; use source only when primary-source evidence is needed."
                     },
                     "tags": {
                         "type": "array",
@@ -280,19 +285,33 @@ impl ToolHandler for CorpusSearchTool {
             })
             .collect();
 
-        // Order: hit count desc, then title length asc (prefer concise titles).
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.title.len().cmp(&b.1.title.len())));
+        let normalized_query = normalize_rank_text(&query);
+        scored.sort_by(|a, b| {
+            let a_title = title_match_rank(a.1, &normalized_query, &terms);
+            let b_title = title_match_rank(b.1, &normalized_query, &terms);
+            b_title
+                .cmp(&a_title)
+                .then(layer_rank(b.1).cmp(&layer_rank(a.1)))
+                .then(b.0.cmp(&a.0))
+                .then(a.1.title.len().cmp(&b.1.title.len()))
+        });
         scored.truncate(limit);
 
         let hits: Vec<_> = scored
             .into_iter()
             .map(|(score, d, pos)| {
                 let snippet = build_snippet(&d.body, pos);
+                let usage_role = match d.layer.as_str() {
+                    "wiki" => "active_lens_candidate",
+                    "source" => "supporting_evidence_candidate",
+                    _ => "candidate",
+                };
                 serde_json::json!({
                     "id": d.id,
                     "title": d.title,
                     "tier": d.tier,
                     "layer": d.layer,
+                    "usage_role": usage_role,
                     "tags": d.tags,
                     "score": score,
                     "snippet": snippet,
@@ -308,10 +327,51 @@ impl ToolHandler for CorpusSearchTool {
                 "tags": tag_filter,
             },
             "total_corpus_docs": docs.len(),
+            "guidance": "Treat wiki hits as active reasoning lenses. Treat source hits as supporting evidence candidates; open/use them only when the snippet directly affects the task or primary-source grounding is required.",
             "hits": hits,
         })
         .to_string())
     }
+}
+
+fn layer_rank(doc: &CorpusDoc) -> usize {
+    match doc.layer.as_str() {
+        "wiki" => 2,
+        "source" => 1,
+        _ => 0,
+    }
+}
+
+fn title_match_rank(doc: &CorpusDoc, query: &str, terms: &[String]) -> usize {
+    let title = normalize_rank_text(&doc.title);
+    let id = normalize_rank_text(&doc.id);
+    if title == query || id.ends_with(query) {
+        return 4;
+    }
+    if title.contains(query) || id.contains(query) {
+        return 3;
+    }
+    if terms
+        .iter()
+        .all(|term| title.contains(term) || id.contains(term))
+    {
+        return 2;
+    }
+    if terms
+        .iter()
+        .any(|term| title.contains(term) || id.contains(term))
+    {
+        return 1;
+    }
+    0
+}
+
+fn normalize_rank_text(s: &str) -> String {
+    s.to_lowercase()
+        .replace(['-', '_', '/', '.'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Pull a ~240-char window around `pos` (which is a byte offset into the
@@ -398,6 +458,27 @@ mod tests {
         let first = &hits[0];
         assert!(first["title"].as_str().is_some());
         assert!(!first["snippet"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concept_query_prefers_wiki_over_source() {
+        let ctx = make_ctx().await;
+        let tool = CorpusSearchTool::new();
+        let out = tool
+            .call(
+                serde_json::json!({"query": "margin of safety", "limit": 5}),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let first = &v["hits"].as_array().unwrap()[0];
+        assert_eq!(
+            first["id"].as_str().unwrap(),
+            "wikis/principles/concepts/margin-of-safety"
+        );
+        assert_eq!(first["layer"].as_str().unwrap(), "wiki");
     }
 
     #[tokio::test]

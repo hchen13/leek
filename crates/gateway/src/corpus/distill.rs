@@ -1,5 +1,5 @@
-//! Distill `corpus/wikis/principles/{concepts,entities}/*.md` into a single
-//! markdown blob suitable for system-prompt embedding.
+//! Distill the runtime principles kernel into a single markdown blob suitable
+//! for system-prompt injection.
 //!
 //! Cleaning rules:
 //! - strip YAML frontmatter
@@ -15,13 +15,17 @@
 //! separated by horizontal rules. The whole blob is wrapped in a top-level
 //! H1 with a metadata comment carrying the input hash for drift detection.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use walkdir::WalkDir;
+const RUNTIME_KERNEL_PAGES: &[&str] = &[
+    "wikis/principles/concepts/principles-runtime-kernel.md",
+    "wikis/principles/entities/warren-buffett.md",
+    "wikis/principles/entities/charlie-munger.md",
+    "wikis/principles/entities/ray-dalio.md",
+];
 
 /// Strip the leading YAML frontmatter block `---\n...\n---\n?` if present.
 fn strip_frontmatter(text: &str) -> &str {
@@ -82,15 +86,10 @@ fn clean_page(raw: &str) -> String {
         "## 来源",
         "## Sources",
         "## 相关概念",
+        "## 相关概念地图",
         "## Related Concepts",
         "## Related",
-        // background / case material — heavy and better served by
-        // corpus_search at runtime when the conversation actually needs it.
-        // We keep 定义 / 核心要义 / 实践应用 / 常见误区 (the operational core).
-        "## 思想演变",
-        "## Evolution of Thought",
-        "## 典型案例",
-        "## Canonical Cases",
+        "## Corpus 覆盖范围",
         "## 开放问题",
         "## Open Questions",
     ] {
@@ -99,23 +98,14 @@ fn clean_page(raw: &str) -> String {
     simplify_wikilinks(&text).trim().to_string()
 }
 
-/// Stable content hash over `wikis/principles/**/*.md` (paths sorted, content
-/// concatenated with NUL separators). Used to detect drift between distilled
-/// output and the corpus it was distilled from.
-fn input_hash(principles_dir: &Path) -> Result<String> {
-    let mut paths: Vec<_> = WalkDir::new(principles_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("md"))
-        .map(|e| e.into_path())
-        .collect();
-    paths.sort();
-
+/// Stable content hash over the selected runtime-kernel pages. Used to detect
+/// drift between distilled output and the corpus it was distilled from.
+fn input_hash(corpus_root: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
-    for path in paths {
-        let rel = path.strip_prefix(principles_dir).unwrap_or(&path);
-        hasher.update(rel.to_string_lossy().as_bytes());
+    for rel in RUNTIME_KERNEL_PAGES {
+        hasher.update(rel.as_bytes());
         hasher.update(b"\0");
+        let path = corpus_root.join(rel);
         let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         hasher.update(&bytes);
     }
@@ -129,50 +119,46 @@ pub struct DistillReport {
     pub input_hash: String,
 }
 
-/// Distill the principles tier of a corpus into a single embeddable markdown
-/// blob. Pages from `wikis/principles/concepts/` and `wikis/principles/entities/`
-/// are sorted by slug for reproducibility.
+/// Distill the corpus runtime kernel into a single embeddable markdown blob.
 pub fn distill(corpus_root: &Path) -> Result<(String, DistillReport)> {
-    let principles_dir = corpus_root.join("wikis").join("principles");
-    if !principles_dir.exists() {
-        anyhow::bail!("expected wikis/principles/ at {}", principles_dir.display());
+    for rel in RUNTIME_KERNEL_PAGES {
+        let path = corpus_root.join(rel);
+        if !path.exists() {
+            anyhow::bail!("expected runtime kernel page at {}", path.display());
+        }
     }
 
-    let hash = input_hash(&principles_dir)?;
+    let hash = input_hash(corpus_root)?;
 
-    let mut pages: BTreeMap<String, String> = BTreeMap::new();
-    for entry in WalkDir::new(&principles_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("md"))
-    {
-        let raw = fs::read_to_string(entry.path())
-            .with_context(|| format!("read {}", entry.path().display()))?;
+    let mut pages = Vec::new();
+    for rel in RUNTIME_KERNEL_PAGES {
+        let path = corpus_root.join(rel);
+        let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let cleaned = clean_page(&raw);
         if cleaned.is_empty() {
             continue;
         }
-        let slug = entry
-            .path()
+        let slug = Path::new(rel)
             .file_stem()
             .unwrap()
             .to_string_lossy()
             .to_string();
-        pages.insert(slug, cleaned);
+        pages.push((slug, cleaned));
     }
     let pages_in = pages.len();
 
-    let mut out = String::with_capacity(200_000);
-    out.push_str("# Investing principles (your default mind)\n\n");
+    let mut out = String::with_capacity(64_000);
+    out.push_str("# Principles runtime kernel (your default mind)\n\n");
     out.push_str(&format!(
         "<!-- distilled from {pages_in} pages | input_hash={hash} -->\n\n"
     ));
     out.push_str(
-        "This is the wisdom you start every conversation with — the thinking \
-         framework, distilled from the corpus principles tier (Buffett, Munger, \
-         Dalio, …). You don't need to `corpus_search` these; they're already in \
-         your prompt. Use `corpus_search` for `wikis/knowledge/` (entities, \
-         current state) and `sources/` (raw material).\n\n---\n\n",
+        "This is the compact operating kernel you start every investment \
+         conversation with. It is distilled from four corpus wiki pages: the \
+         runtime kernel plus Warren Buffett, Charlie Munger, and Ray Dalio \
+         entity pages. Use it as the default reasoning protocol; use \
+         `corpus_search` when the task needs a specific concept page, source \
+         quote, knowledge page, company fact, or current-world evidence.\n\n---\n\n",
     );
     for (slug, body) in &pages {
         let title = slug.replace('-', " ");

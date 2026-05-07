@@ -18,7 +18,7 @@ const KIND_FILTERS: { id: string; label: string; predicate: (k: string) => boole
   { id: "agent",   label: "agent",   predicate: (k) => k.startsWith("agent_message_") },
   { id: "tool",    label: "tool",    predicate: (k) => k === "tool_call" || k === "web_search_call" },
   { id: "user",    label: "user",    predicate: (k) => k === "user_message" },
-  { id: "task",    label: "task",    predicate: (k) => k.startsWith("task_") || k === "deliverable_ready" || k === "clarification_requested" },
+  { id: "task",    label: "task",    predicate: (k) => k.startsWith("task_") || k === "plan_updated" || k === "deliverable_ready" || k === "clarification_requested" },
   { id: "usage",   label: "usage",   predicate: (k) => k === "llm_usage" },
   { id: "error",   label: "error",   predicate: (k) => k === "error" },
 ];
@@ -43,7 +43,7 @@ function summarize(kind: string, payload: unknown): string {
     case "agent_message_end":
       return `stop=${p.stop_reason ?? ""} seq=${p.message_seq ?? ""}`;
     case "web_search_call":
-      return `${p.action ?? ""} ${p.status ?? ""} ${p.detail ?? ""}`.trim();
+      return `${p.action ?? ""} ${p.status ?? ""} ${p.detail ?? (p.queries as unknown[])?.[0] ?? ""} ${Array.isArray(p.sources) && p.sources.length ? `${p.sources.length} sources` : ""}`.trim();
     case "tool_call":
       return `${p.name ?? ""} ${p.status ?? ""} ${p.output_bytes ? `(${p.output_bytes}B)` : ""}`.trim();
     case "llm_usage":
@@ -53,6 +53,8 @@ function summarize(kind: string, payload: unknown): string {
     case "task_started":
     case "task_delivered":
       return `${p.task_id ?? ""}`;
+    case "plan_updated":
+      return `${Array.isArray(p.items) ? p.items.length : 0} items ${p.explanation ?? ""}`.trim();
     case "deliverable_ready":
       return `kind=${p.kind ?? ""} id=${p.deliverable_id ?? ""}`;
     case "clarification_requested":
@@ -68,7 +70,7 @@ function kindColor(kind: string): string {
   if (kind.startsWith("agent_message_")) return "#9eb78f";
   if (kind === "tool_call" || kind === "web_search_call") return "#d9a76c";
   if (kind === "user_message") return "#a89e8c";
-  if (kind.startsWith("task_") || kind === "deliverable_ready") return "#c990d0";
+  if (kind.startsWith("task_") || kind === "plan_updated" || kind === "deliverable_ready") return "#c990d0";
   if (kind === "llm_usage") return "#7d99b3";
   if (kind === "error") return "#d97070";
   return "#a89e8c";

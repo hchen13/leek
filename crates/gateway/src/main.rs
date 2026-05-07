@@ -208,6 +208,9 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
     let event_bus = events::EventBus::new();
 
     let tools = agent::tools::ToolRegistry::builder()
+        .register(Arc::new(
+            agent::tools::ask_user_question::AskUserQuestionTool::new(),
+        ))
         .register(Arc::new(agent::tools::web_fetch::WebFetchTool::new()?))
         .register(Arc::new(
             agent::tools::get_candlesticks::GetCandlesticksTool::new()?,
@@ -239,7 +242,8 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
         .register(Arc::new(
             agent::tools::get_capital_flow::GetCapitalFlowTool::new()?,
         ))
-        .register(Arc::new(agent::tools::use_skill::UseSkillTool))
+        .register(Arc::new(agent::tools::use_skill::UseSkillTool::new()))
+        .register(Arc::new(agent::tools::update_plan::UpdatePlanTool::new()))
         .register(Arc::new(
             agent::tools::record_research_note::RecordResearchNoteTool::new(),
         ))

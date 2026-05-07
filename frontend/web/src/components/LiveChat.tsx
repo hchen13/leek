@@ -5,11 +5,11 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { AgentMsg, Composer, UserMsg, type SlashCommand } from "./Chat";
 import { EventsPanel } from "./EventsPanel";
-import { BrainWidget } from "./BrainWidget";
+import { InsightSidebar, type AgentPlanView } from "./BrainWidget";
 import { Rail, TopBar } from "./Workbench";
 import { NavRail } from "../App";
 import { SafeMarkdown } from "./SafeMarkdown";
-import { ArtifactPanel, extractLinkMeta } from "./ArtifactCards";
+import { ArtifactPanel, extractLinkMeta, type ArtifactEventView, type DecisionDraftView } from "./ArtifactCards";
 import { SessionMenu, type SessionRow } from "./SessionMenu";
 import { CorpusDocModal, type CorpusDoc } from "./CorpusDocModal";
 import type { Scene } from "../scenes";
@@ -40,12 +40,15 @@ interface SearchCall {
   status: "in_progress" | "completed" | string;
   action: "search" | "open_page" | "find_in_page" | "other" | "unknown" | string;
   detail: string;
+  queries?: string[];
+  sources?: string[];
 }
 
 /** Stable id for a search call so chat-row clicks can locate the canvas tile.
  *  Tool calls have a real `call_id`; searches don't, so we hash action+detail. */
 function searchKey(s: SearchCall): string {
-  return `search:${s.action}:${(s.detail || "").slice(0, 120)}`;
+  const detail = s.detail || s.queries?.[0] || "";
+  return `search:${s.action}:${detail.slice(0, 120)}`;
 }
 
 /** Scroll the canvas card with the matching `data-call-id` into view and
@@ -75,16 +78,34 @@ interface NarrationStep {
   text: string;
 }
 
-interface DecisionDraftPayload {
-  deliverable_id: string;
-  ticker: string;
-  direction: string;
-  size_pct?: number;
-  stop_loss?: number;
-  target?: number;
-  horizon_days?: number;
-  rationale: string;
+interface ArtifactEvent extends ArtifactEventView {
+  id: string;
+  kind: "narration" | "narration_group" | "search" | "tool" | "decision";
+  narration?: NarrationStep;
+  narrations?: NarrationStep[];
+  search?: SearchCall;
+  tool?: ToolCall;
+  decision?: DecisionDraftPayload;
 }
+
+interface ClarificationOption {
+  label: string;
+  description: string;
+}
+
+interface ClarificationQuestion {
+  id: string;
+  header: string;
+  question: string;
+  options: ClarificationOption[];
+}
+
+interface ClarificationPayload {
+  question: string;
+  questions: ClarificationQuestion[];
+}
+
+interface DecisionDraftPayload extends DecisionDraftView {}
 
 interface LiveMsg {
   /** `compaction_summary` rows are written by /compact and rendered as a
@@ -96,6 +117,8 @@ interface LiveMsg {
   searches?: SearchCall[];
   tool_calls?: ToolCall[];
   narrations?: NarrationStep[];
+  artifacts?: ArtifactEvent[];
+  clarification?: ClarificationPayload;
   /** Final elapsed seconds for the agent reply, frozen at message_end. */
   total_sec?: number;
   decision_draft?: DecisionDraftPayload;
@@ -360,10 +383,215 @@ function summarizeProcess(m: LiveMsg): string {
 }
 
 function firstCanvasTarget(m: LiveMsg): string | undefined {
-  if ((m.narrations?.length ?? 0) > 0) return "narration-trace";
+  const firstArtifact = m.artifacts?.[0]?.id;
+  if (firstArtifact) return firstArtifact;
+  const firstNarration = m.narrations?.[0];
+  if (firstNarration) return `narration:${firstNarration.turn}:0`;
   const firstSearch = m.searches?.[0];
   if (firstSearch) return searchKey(firstSearch);
   return m.tool_calls?.[0]?.call_id;
+}
+
+function upsertToolEvent(events: ArtifactEvent[] | undefined, call: ToolCall): ArtifactEvent[] {
+  const out = [...(events ?? [])];
+  const idx = out.findIndex((event) => event.kind === "tool" && event.id === call.call_id);
+  if (idx >= 0) {
+    const prev = out[idx].tool;
+    out[idx] = {
+      id: call.call_id,
+      kind: "tool",
+      tool: { ...(prev ?? call), ...call, arguments: prev?.arguments ?? call.arguments },
+    };
+  } else {
+    out.push({ id: call.call_id, kind: "tool", tool: call });
+  }
+  return out;
+}
+
+function upsertSearchEvent(events: ArtifactEvent[] | undefined, search: SearchCall): ArtifactEvent[] {
+  const out = [...(events ?? [])];
+  const id = searchKey(search);
+  const idx = out.findIndex((event) => event.kind === "search" && event.id === id);
+  if (idx >= 0) {
+    out[idx] = { id, kind: "search", search };
+    return out;
+  }
+  if (search.status === "completed") {
+    const pendingIdx = out.findIndex((event) =>
+      event.kind === "search" &&
+      event.search?.status === "in_progress" &&
+      (event.search.action === search.action || event.search.action === "unknown" || event.search.detail === search.detail)
+    );
+    if (pendingIdx >= 0) {
+      out[pendingIdx] = { id, kind: "search", search };
+      return out;
+    }
+  }
+  out.push({ id, kind: "search", search });
+  return out;
+}
+
+function appendNarrationEvent(
+  events: ArtifactEvent[] | undefined,
+  narration: NarrationStep,
+  eventId: string,
+): ArtifactEvent[] {
+  const text = normalizeNarrationText(narration.text);
+  if (!text) return [...(events ?? [])];
+  if (isSearchActionNarration(text)) return [...(events ?? [])];
+  if ((events ?? []).some((event) =>
+    event.kind === "narration" &&
+    normalizeNarrationText(event.narration?.text ?? "") === text
+  )) {
+    return [...(events ?? [])];
+  }
+  return [...(events ?? []), { id: eventId, kind: "narration", narration }];
+}
+
+function normalizeNarrationText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function appendNarrationStep(steps: NarrationStep[] | undefined, step: NarrationStep): NarrationStep[] {
+  const out = [...(steps ?? [])];
+  const text = normalizeNarrationText(step.text);
+  if (!text) return out;
+  if (isSearchActionNarration(text)) return out;
+  if (out.some((existing) => normalizeNarrationText(existing.text) === text)) return out;
+  out.push(step);
+  return out;
+}
+
+function isSearchActionNarration(text: string): boolean {
+  return /^我用\s*\d+\s*个相关查询做网页搜索[，,]\s*主查询是[:：]/.test(text)
+    || /^我做了一次网页搜索[:：]/.test(text)
+    || /^我打开了搜索结果页面[:：]/.test(text)
+    || /^我在页面内查找[:：]/.test(text);
+}
+
+function isFatalStopReason(stopReason: string | undefined): boolean {
+  return stopReason === "max_tool_turns" ||
+    stopReason === "plan_guard_exhausted" ||
+    stopReason === "user_aborted";
+}
+
+function mergeArtifactEvents(to: ArtifactEvent[] | undefined, from: ArtifactEvent[] | undefined): ArtifactEvent[] {
+  const out = [...(to ?? [])];
+  for (const event of from ?? []) {
+    if (
+      event.kind === "narration" &&
+      out.some((existing) =>
+        existing.kind === "narration" &&
+        normalizeNarrationText(existing.narration?.text ?? "") === normalizeNarrationText(event.narration?.text ?? "")
+      )
+    ) {
+      continue;
+    }
+    const idx = out.findIndex((existing) => existing.id === event.id && existing.kind === event.kind);
+    if (idx >= 0) out[idx] = { ...out[idx], ...event };
+    else out.push(event);
+  }
+  return out;
+}
+
+function isCanvasTool(t: ToolCall): boolean {
+  return t.name !== "update_plan";
+}
+
+function isCanvasArtifact(event: ArtifactEvent): boolean {
+  return event.kind !== "tool" || !event.tool || isCanvasTool(event.tool);
+}
+
+function parseClarificationPayload(p: any): ClarificationPayload | null {
+  const questions = Array.isArray(p?.questions)
+    ? p.questions
+        .map((q: any) => ({
+          id: String(q.id ?? "").trim(),
+          header: String(q.header ?? "").trim(),
+          question: String(q.question ?? "").trim(),
+          options: Array.isArray(q.options)
+            ? q.options
+                .map((o: any) => ({
+                  label: String(o.label ?? "").trim(),
+                  description: String(o.description ?? "").trim(),
+                }))
+                .filter((o: ClarificationOption) => o.label && o.description)
+            : [],
+        }))
+        .filter((q: ClarificationQuestion) => q.id && q.question && q.options.length > 0)
+    : [];
+  const fallbackQuestion = String(p?.question ?? "").trim();
+  if (questions.length === 0 && !fallbackQuestion) return null;
+  return {
+    question: fallbackQuestion || questions.map((q: ClarificationQuestion) => q.question).join("\n"),
+    questions,
+  };
+}
+
+function parsePlanPayload(p: any): AgentPlanView | null {
+  if (!Array.isArray(p?.items)) return null;
+  const items = p.items
+    .map((item: any) => ({
+      id: typeof item.id === "string" ? item.id : typeof item.item_id === "string" ? item.item_id : undefined,
+      seq: typeof item.seq === "number" ? item.seq : undefined,
+      step: String(item.step ?? "").trim(),
+      status: String(item.status ?? "pending"),
+      evidence: typeof item.evidence === "string" && item.evidence.trim() ? item.evidence.trim() : null,
+    }))
+    .filter((item: any) => item.step);
+  if (items.length === 0) return null;
+  return {
+    task_id: typeof p.task_id === "string" ? p.task_id : null,
+    explanation: typeof p.explanation === "string" && p.explanation.trim() ? p.explanation.trim() : null,
+    items,
+  };
+}
+
+function ClarificationRequestCard(props: {
+  payload: ClarificationPayload;
+  onPick: (text: string) => void;
+}) {
+  const questions = () => props.payload.questions.length > 0
+    ? props.payload.questions
+    : [{
+        id: "clarification",
+        header: "clarify",
+        question: props.payload.question,
+        options: [],
+      }];
+
+  function answerText(question: ClarificationQuestion, option: ClarificationOption) {
+    return `关于“${question.question}”，我的选择是：${option.label}。${option.description}`;
+  }
+
+  return (
+    <div class="lk-clarify live">
+      <For each={questions()}>{(q) => (
+        <div class="lk-clarify-block">
+          <div class="lk-clarify-q">
+            <b>{q.header || "L.E.E.K asks"} ·</b> {q.question}
+          </div>
+          <Show
+            when={q.options.length > 0}
+            fallback={<div class="lk-clarify-free">直接在输入框回复也可以。</div>}
+          >
+            <div class="lk-clarify-opts column">
+              <For each={q.options}>{(o) => (
+                <button
+                  type="button"
+                  class="lk-clarify-option"
+                  onClick={() => props.onPick(answerText(q, o))}
+                >
+                  <span>{o.label}</span>
+                  <em>{o.description}</em>
+                </button>
+              )}</For>
+            </div>
+          </Show>
+        </div>
+      )}</For>
+    </div>
+  );
 }
 
 interface UsageInfo {
@@ -407,6 +635,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
   const [compactionTrigger, setCompactionTrigger] = createSignal<string | null>(null);
   const [eventsOpen, setEventsOpen] = createSignal(false);
   const [liveTick, setLiveTick] = createSignal<LiveTick | null>(null);
+  const [agentPlan, setAgentPlan] = createSignal<AgentPlanView | null>(null);
   // Wall-clock seconds since the current agent reply started. Drives the
   // "thinking · 24s" status row above the streaming message.
   const [elapsedSec, setElapsedSec] = createSignal(0);
@@ -540,6 +769,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     setMessages([]);
     setUsage(null);
     setPending(false);
+    setAgentPlan(null);
 
     let hist: LiveMsg[] = [];
     try {
@@ -562,6 +792,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
             searches: [],
             tool_calls: [],
             narrations: [],
+            artifacts: [],
           } as LiveMsg;
         });
       }
@@ -577,6 +808,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
         let cursor = -1; // index into event-created agent slots
         let usageSnap: UsageInfo | null = null;
         let lastSec: number | undefined;
+        let planSnap: AgentPlanView | null = null;
         const mergeAgentActivity = (fromIdx: number, toIdx: number) => {
           const from = hist[fromIdx];
           const to = hist[toIdx];
@@ -587,7 +819,11 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
             byCall.set(t.call_id, { ...(prev ?? t), ...t, arguments: prev?.arguments ?? t.arguments });
           }
           to.tool_calls = Array.from(byCall.values());
-          to.narrations = [...(to.narrations ?? []), ...(from.narrations ?? [])];
+          let narrations = to.narrations ?? [];
+          for (const step of from.narrations ?? []) narrations = appendNarrationStep(narrations, step);
+          to.narrations = narrations;
+          to.artifacts = mergeArtifactEvents(to.artifacts, from.artifacts);
+          to.clarification = from.clarification ?? to.clarification;
           to.total_sec = from.total_sec ?? to.total_sec;
           from.hidden = true;
         };
@@ -604,6 +840,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
                 searches: [],
                 tool_calls: [],
                 narrations: [],
+                artifacts: [],
               });
               agentIdxs.push(hist.length - 1);
               break;
@@ -638,6 +875,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
                   calls.push(next);
                 }
                 msg.tool_calls = calls;
+                msg.artifacts = upsertToolEvent(msg.artifacts, next);
               }
               break;
             case "web_search_call":
@@ -648,6 +886,12 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
                   status: p.status ?? "in_progress",
                   action: p.action ?? "unknown",
                   detail: p.detail ?? "",
+                  queries: Array.isArray(p.queries)
+                    ? p.queries.filter((q: unknown): q is string => typeof q === "string")
+                    : undefined,
+                  sources: Array.isArray(p.sources)
+                    ? p.sources.filter((s: unknown): s is string => typeof s === "string")
+                    : undefined,
                 };
                 if (sc.status === "completed") {
                   const idx2 = searches.findIndex((s) =>
@@ -659,16 +903,39 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
                   searches.push(sc);
                 }
                 msg.searches = searches;
+                msg.artifacts = upsertSearchEvent(msg.artifacts, sc);
               }
               break;
             case "agent_narration":
               if (cursor >= 0 && cursor < agentIdxs.length) {
                 const msg = hist[agentIdxs[cursor]];
-                const ns = msg.narrations ?? [];
-                ns.push({ turn: typeof p.turn === "number" ? p.turn : 0, text: String(p.text ?? "") });
+                const step = { turn: typeof p.turn === "number" ? p.turn : 0, text: String(p.text ?? "") };
+                const ns = appendNarrationStep(msg.narrations, step);
+                if (ns.length === (msg.narrations?.length ?? 0)) break;
                 msg.narrations = ns;
+                msg.artifacts = appendNarrationEvent(msg.artifacts, step, `narration:${row.seq ?? row.id ?? ns.length}:${ns.length}`);
               }
               break;
+            case "clarification_requested": {
+              const clarification = parseClarificationPayload(p);
+              if (!clarification) break;
+              let idx = cursor >= 0 && cursor < agentIdxs.length ? agentIdxs[cursor] : -1;
+              if (idx < 0) {
+                for (let i = hist.length - 1; i >= 0; i--) {
+                  if (hist[i].role === "agent") {
+                    idx = i;
+                    break;
+                  }
+                }
+              }
+              if (idx >= 0) hist[idx].clarification = clarification;
+              break;
+            }
+            case "plan_updated": {
+              const nextPlan = parsePlanPayload(p);
+              if (nextPlan) planSnap = nextPlan;
+              break;
+            }
             case "llm_usage":
               usageSnap = {
                 inTokens: typeof p.input_tokens === "number" ? p.input_tokens : 0,
@@ -687,6 +954,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
           }
         }
         if (usageSnap) setUsage(usageSnap);
+        if (planSnap) setAgentPlan(planSnap);
 
         // Restore compaction state: if the most recent compaction.started has
         // no matching completed/aborted after it, compaction is still running.
@@ -737,7 +1005,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
         if (last && last.role === "agent" && last.streaming) return prev;
         return [
           ...prev,
-          { role: "agent", text: "", ts: fmtTime(), streaming: true, searches: [], tool_calls: [], narrations: [] },
+          { role: "agent", text: "", ts: fmtTime(), streaming: true, searches: [], tool_calls: [], narrations: [], artifacts: [] },
         ];
       });
       if (!elapsedTimer) {
@@ -779,7 +1047,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
           } else {
             tool_calls.push(call);
           }
-          out[out.length - 1] = { ...last, tool_calls };
+          out[out.length - 1] = { ...last, tool_calls, artifacts: upsertToolEvent(last.artifacts, call) };
           return out;
         });
       } catch {
@@ -795,6 +1063,12 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
           status: data.status ?? "in_progress",
           action: data.action ?? "unknown",
           detail: data.detail ?? "",
+          queries: Array.isArray(data.queries)
+            ? data.queries.filter((q: unknown): q is string => typeof q === "string")
+            : undefined,
+          sources: Array.isArray(data.sources)
+            ? data.sources.filter((s: unknown): s is string => typeof s === "string")
+            : undefined,
         };
         setMessages((prev) => {
           const out = [...prev];
@@ -815,7 +1089,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
           } else {
             searches.push(call);
           }
-          out[out.length - 1] = { ...last, searches };
+          out[out.length - 1] = { ...last, searches, artifacts: upsertSearchEvent(last.artifacts, call) };
           return out;
         });
       } catch {
@@ -833,6 +1107,18 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
       }
     });
 
+    evtSrc.addEventListener("agent_message_reset", (e: MessageEvent) => {
+      agentBuffer = "";
+      setMessages((prev) => {
+        const out = [...prev];
+        const last = out[out.length - 1];
+        if (!last || last.role !== "agent" || !last.streaming) return prev;
+        out[out.length - 1] = { ...last, text: "" };
+        return out;
+      });
+      try { emitTick(e, "agent_message_reset", JSON.parse(e.data)); } catch { /* skip */ }
+    });
+
     evtSrc.addEventListener("agent_narration", (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data);
@@ -845,10 +1131,27 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
           const out = [...prev];
           const last = out[out.length - 1];
           if (!last || last.role !== "agent" || !last.streaming) return prev;
-          const narrations = [...(last.narrations ?? []), step];
-          out[out.length - 1] = { ...last, narrations };
+          const narrations = appendNarrationStep(last.narrations, step);
+          if (narrations.length === (last.narrations?.length ?? 0)) return prev;
+          const eventId = `narration:${e.lastEventId || Date.now()}:${narrations.length}`;
+          out[out.length - 1] = {
+            ...last,
+            narrations,
+            artifacts: appendNarrationEvent(last.artifacts, step, eventId),
+          };
           return out;
         });
+      } catch {
+        // skip malformed
+      }
+    });
+
+    evtSrc.addEventListener("plan_updated", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        emitTick(e, "plan_updated", data);
+        const nextPlan = parsePlanPayload(data);
+        if (nextPlan) setAgentPlan(nextPlan);
       } catch {
         // skip malformed
       }
@@ -878,8 +1181,14 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     });
 
     evtSrc.addEventListener("agent_message_end", (e: MessageEvent) => {
+      let data: any = {};
+      try {
+        data = JSON.parse(e.data);
+      } catch {
+        data = {};
+      }
       setPending(false);
-      setError(null);
+      if (!isFatalStopReason(String(data.stop_reason ?? ""))) setError(null);
       if (elapsedTimer) {
         clearInterval(elapsedTimer);
         elapsedTimer = undefined;
@@ -896,7 +1205,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
         return out;
       });
       setElapsedSec(0);
-      try { emitTick(e, "agent_message_end", JSON.parse(e.data)); } catch { /* skip */ }
+      emitTick(e, "agent_message_end", data);
     });
 
     evtSrc.addEventListener("decision_draft_ready", (e: MessageEvent) => {
@@ -910,10 +1219,50 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
       } catch { /* skip */ }
     });
 
-    // task_created / task_delivered / clarification_requested are emitted by
-    // the routing layer for backend audit. P1 UI doesn't surface them per
-    // memory:feedback_codex_claude_code_baseline — the chat flow is the
-    // user-facing source of truth.
+    evtSrc.addEventListener("clarification_requested", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        emitTick(e, "clarification_requested", data);
+        const clarification = parseClarificationPayload(data);
+        if (!clarification) return;
+        setMessages((prev) => {
+          const out = [...prev];
+          const last = out[out.length - 1];
+          if (!last || last.role !== "agent" || !last.streaming) return prev;
+          out[out.length - 1] = { ...last, clarification };
+          return out;
+        });
+      } catch {
+        // skip malformed
+      }
+    });
+
+    evtSrc.addEventListener("task_started", (e: MessageEvent) => {
+      setAgentPlan(null);
+      try { emitTick(e, "task_started", JSON.parse(e.data)); } catch { /* skip */ }
+    });
+    evtSrc.addEventListener("task_created", (e: MessageEvent) => {
+      try { emitTick(e, "task_created", JSON.parse(e.data)); } catch { /* skip */ }
+    });
+    evtSrc.addEventListener("task_delivered", (e: MessageEvent) => {
+      try { emitTick(e, "task_delivered", JSON.parse(e.data)); } catch { /* skip */ }
+    });
+    evtSrc.addEventListener("task_awaiting_user", (e: MessageEvent) => {
+      try { emitTick(e, "task_awaiting_user", JSON.parse(e.data)); } catch { /* skip */ }
+    });
+    evtSrc.addEventListener("task_failed", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        setError(data.reason ?? "task failed");
+        emitTick(e, "task_failed", data);
+      } catch {
+        setError("task failed");
+      }
+    });
+
+    // Task lifecycle is audit data; the right sidebar only keeps the active
+    // plan, so a new task clears the prior completed checklist until the next
+    // update_plan arrives.
 
     // Compaction lifecycle. Backend emits `started` synchronously when the
     // POST handler runs, then `completed` (success) or `aborted` (Esc /
@@ -978,7 +1327,8 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
         const hasActivity =
           (last.searches?.length ?? 0) > 0 ||
           (last.tool_calls?.length ?? 0) > 0 ||
-          (last.narrations?.length ?? 0) > 0;
+          (last.narrations?.length ?? 0) > 0 ||
+          (last.artifacts?.length ?? 0) > 0;
         if (!last.text && !hasActivity) return prev.slice(0, -1); // empty bubble → remove
         const out = [...prev];
         out[out.length - 1] = { ...last, streaming: false, total_sec: finalSec };
@@ -1057,6 +1407,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
 
   async function send(text: string) {
     setError(null);
+    setAgentPlan(null);
     // While a compaction is in flight, hold the message in a local queue
     // rather than firing it. The compaction.completed handler flushes the
     // queue into the new session in order. Modeled on Claude Code's
@@ -1072,7 +1423,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     setMessages((prev) => [
       ...prev,
       { role: "user", text, ts: fmtTime() },
-      { role: "agent", text: "", ts: fmtTime(), streaming: true, searches: [], tool_calls: [], narrations: [] },
+      { role: "agent", text: "", ts: fmtTime(), streaming: true, searches: [], tool_calls: [], narrations: [], artifacts: [] },
     ]);
     setPending(true);
     agentStartTs = Date.now();
@@ -1199,6 +1550,9 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     }
     return out;
   });
+  const visibleSessionTools = createMemo<ToolCall[]>(() =>
+    sessionTools().filter(isCanvasTool)
+  );
   const sessionSearches = createMemo<SearchCall[]>(() => {
     const out: SearchCall[] = [];
     for (const m of messages()) {
@@ -1235,24 +1589,39 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     return out;
   });
 
-  // Wikilink ids the agent has touched via corpus_search this session.
-  // Drives the brain widget's activation halo. We scrape the truncated
-  // output_preview because the full output isn't kept client-side; ids
-  // that get cut mid-string are simply skipped — better than nothing
-  // until we wire structured tool outputs end-to-end.
-  const ID_RE = /"id":"((?:wikis|sources)\/[^"]+)"/g;
-  const activatedCorpusIds = createMemo<string[]>(() => {
-    const ids = new Set<string>();
-    for (const t of sessionTools()) {
-      if (t.name !== "corpus_search" || !t.output_preview) continue;
-      let m: RegExpExecArray | null;
-      ID_RE.lastIndex = 0;
-      while ((m = ID_RE.exec(t.output_preview)) !== null) {
-        ids.add(m[1]);
+  const sessionArtifactEvents = createMemo<ArtifactEvent[]>(() => {
+    const out: ArtifactEvent[] = [];
+    for (const m of messages()) {
+      if (m.role === "decision_draft" && m.decision_draft) {
+        out.push({
+          id: `decision:${m.decision_draft.deliverable_id}`,
+          kind: "decision",
+          decision: m.decision_draft,
+        });
+        continue;
+      }
+      if (m.role !== "agent") continue;
+      if (m.artifacts && m.artifacts.length > 0) {
+        out.push(...m.artifacts.filter(isCanvasArtifact));
+        continue;
+      }
+      for (const n of m.narrations ?? []) {
+        out.push({ id: `narration:${n.turn}:${out.length}`, kind: "narration", narration: n });
+      }
+      for (const s of m.searches ?? []) {
+        out.push({ id: searchKey(s), kind: "search", search: s });
+      }
+      for (const t of m.tool_calls ?? []) {
+        if (!isCanvasTool(t)) continue;
+        out.push({ id: t.call_id, kind: "tool", tool: t });
       }
     }
-    return Array.from(ids);
+    return out;
   });
+
+  const corpusTools = createMemo<ToolCall[]>(() =>
+    sessionTools().filter((t) => t.name === "corpus_search")
+  );
 
   const headTitle = () => messages().length === 0
     ? "NEW SESSION"
@@ -1385,18 +1754,28 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
                       </div>
                     </div>
                   </Show>
+                  <Show when={m.clarification}>
+                    {(clarification) => (
+                      <ClarificationRequestCard
+                        payload={clarification()}
+                        onPick={(text) => void send(text)}
+                      />
+                    )}
+                  </Show>
                   {/* While streaming, show plain text + blinker — markdown
                       renderer would re-parse on every delta, glitching mid-
                       stream (especially for tables / code blocks before they
                       close). Once the message is done, render real markdown
                       so headers / tables / lists / code / links all show up.
                   */}
-                  <Show
-                    when={m.streaming}
-                    fallback={<SafeMarkdown source={m.text} onWikiOpen={(id) => void openWiki(id)} urlTitles={urlTitles()} />}
-                  >
-                    <span>{m.text}</span>
-                    <span class="lk-stream" />
+                  <Show when={!m.clarification || (m.text.trim() && m.text.trim() !== m.clarification.question.trim())}>
+                    <Show
+                      when={m.streaming}
+                      fallback={<SafeMarkdown source={m.text} onWikiOpen={(id) => void openWiki(id)} urlTitles={urlTitles()} />}
+                    >
+                      <span>{m.text}</span>
+                      <span class="lk-stream" />
+                    </Show>
                   </Show>
                 </AgentMsg>
               </Show>
@@ -1440,10 +1819,12 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
 
         <CanvasArea
           scene={derivedScene()}
-          tools={sessionTools()}
+          tools={visibleSessionTools()}
           searches={sessionSearches()}
           narrations={sessionNarrations()}
-          activatedIds={activatedCorpusIds()}
+          artifactEvents={sessionArtifactEvents()}
+          corpusTools={corpusTools()}
+          plan={agentPlan()}
           onOpenDoc={openWiki}
         />
       </div>
@@ -1470,16 +1851,16 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
   );
 }
 
-/** Live canvas — currently shows the most recent tool call activity as a
- *  list of "artifact" rows on the left, plus the brain on the right. As we
- *  wire richer tool outputs (charts, tables, filings preview) each kind
- *  will render its own Panel-style component. */
+/** Live canvas — tool artifacts stay on the canvas; persistent agent state
+ *  (corpus trace + active plan) lives in the right insight sidebar. */
 function CanvasArea(props: {
   scene: Scene;
   tools: ToolCall[];
   searches: SearchCall[];
   narrations: NarrationStep[];
-  activatedIds: string[];
+  artifactEvents: ArtifactEvent[];
+  corpusTools: ToolCall[];
+  plan: AgentPlanView | null;
   onOpenDoc: (id: string, title?: string) => void;
 }) {
   const subtitle = () => props.scene === "thinking-shallow"
@@ -1489,7 +1870,7 @@ function CanvasArea(props: {
     : "no thread";
 
   const hasArtifacts = () =>
-    props.tools.length + props.searches.length + props.narrations.length > 0;
+    props.artifactEvents.length > 0 || props.tools.length + props.searches.length + props.narrations.length > 0;
 
   return (
     <div class="lk-canvas">
@@ -1516,14 +1897,15 @@ function CanvasArea(props: {
           searches={props.searches}
           tools={props.tools}
           narrations={props.narrations}
+          events={props.artifactEvents}
           callbacks={{ onOpenDoc: (id, title) => props.onOpenDoc(id, title) }}
         />
       </Show>
 
-      <BrainWidget
+      <InsightSidebar
         scene={props.scene}
-        fireIds={undefined}
-        activatedIds={props.activatedIds}
+        corpusTools={props.corpusTools}
+        plan={props.plan}
         onOpenDoc={(id, title) => props.onOpenDoc(id, title)}
       />
     </div>

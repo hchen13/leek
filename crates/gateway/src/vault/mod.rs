@@ -8,6 +8,7 @@ pub mod decisions;
 pub mod events;
 pub mod holdings;
 pub mod messages;
+pub mod plans;
 pub mod provider_configs;
 pub mod sessions;
 pub mod subagents;

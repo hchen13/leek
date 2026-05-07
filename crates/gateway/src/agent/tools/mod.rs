@@ -8,6 +8,7 @@
 //! Server-side tools (codex's built-in `web_search`) bypass this — they're
 //! advertised through `ToolSpec::WebSearch` and execute on OpenAI's side.
 
+pub mod ask_user_question;
 pub mod corpus_search;
 pub mod delegate_research;
 pub mod get_candlesticks;
@@ -20,6 +21,7 @@ pub mod record_investment_action;
 pub mod record_research_note;
 pub mod sec_filing_fetch;
 pub mod tradingview_quote;
+pub mod update_plan;
 pub mod use_skill;
 pub mod web_fetch;
 
