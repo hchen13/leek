@@ -324,6 +324,20 @@ pub enum StopReason {
     Other,
 }
 
+impl StopReason {
+    /// Stable snake_case string for downstream consumers (`task_metrics.stop_reason`,
+    /// SSE event payloads). Cannot rely on `format!("{:?}", ...).to_lowercase()`
+    /// because that produces `"endturn"` (no underscore) for `EndTurn`. The
+    /// M1.QA1 review caught this in E2E Case 1.
+    pub fn as_snake_case(&self) -> &'static str {
+        match self {
+            StopReason::EndTurn => "end_turn",
+            StopReason::MaxTokens => "max_tokens",
+            StopReason::Other => "other",
+        }
+    }
+}
+
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     #[allow(dead_code)] // used by registry / fallback chain in later slices

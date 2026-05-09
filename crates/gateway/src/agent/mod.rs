@@ -634,7 +634,7 @@ pub async fn run_chat_reply(
                                 .await?;
                             }
                             Ok(LlmEvent::MessageEnd { stop_reason: sr }) => {
-                                stop_reason = format!("{sr:?}").to_lowercase();
+                                stop_reason = sr.as_snake_case().to_string();
                             }
                             Err(e) => {
                                 stream_error = Some(e);
