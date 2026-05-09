@@ -15,21 +15,16 @@ use crate::vault::{
     tasks as vault_tasks,
 };
 
-/// Default model context window for the codex backend's gpt-5.5
-/// surface. Used together with `LlmTuning.guards.auto_compact_threshold`
-/// (a fraction in [0.0, 1.0]) to derive the absolute pre-turn token
-/// trigger.
-///
-/// Pinned here rather than in a per-model price table because the
-/// auto-compactor only needs *one* number — the active model's window
-/// — and leek's main agent currently always runs on gpt-5.5. When
-/// per-model windows matter (M2.5 skill model overrides, etc.) this
-/// becomes a `pricing`-style lookup keyed on `req.model`.
-const MAIN_CONTEXT_WINDOW_TOKENS: i64 = 400_000;
+/// Active main-agent model. Pre-skills, this is always `gpt-5.5`.
+/// Used by `auto_compact_threshold` to look up the model's context
+/// window via `crate::llm::pricing::context_window`. Once skills land
+/// (M2.5) and per-task model overrides become first-class, this
+/// constant goes away in favor of reading the active task's model.
+const MAIN_AGENT_MODEL: &str = "gpt-5.5";
 
 /// Auto-compaction trigger.
 ///
-/// Resolves to `MAIN_CONTEXT_WINDOW_TOKENS × tuning.guards.auto_compact_threshold`,
+/// Resolves to `crate::llm::pricing::context_window(MAIN_AGENT_MODEL) × tuning.guards.auto_compact_threshold`,
 /// then optionally overridden by `LEEK_AUTO_COMPACT_THRESHOLD` (kept
 /// for tests / low-budget tiers; takes precedence over the tuning
 /// fraction).
@@ -46,7 +41,7 @@ fn auto_compact_threshold(tuning: &crate::llm::LlmTuning) -> i64 {
     // would compact on every message, and `LEEK_AUTO_COMPACT_THRESHOLD=10`
     // (intended as 10% but parsed as 10 tokens) would do the same.
     // Round-1 review fix.
-    let floor = (MAIN_CONTEXT_WINDOW_TOKENS / 100).max(1_000);
+    let floor = (crate::llm::pricing::context_window(MAIN_AGENT_MODEL) / 100).max(1_000);
     if let Ok(v) = std::env::var("LEEK_AUTO_COMPACT_THRESHOLD") {
         match v.parse::<i64>() {
             Ok(parsed) if parsed >= floor => {
@@ -73,7 +68,7 @@ fn auto_compact_threshold(tuning: &crate::llm::LlmTuning) -> i64 {
         }
     }
     let frac = tuning.guards.auto_compact_threshold.clamp(0.0, 1.0) as f64;
-    (MAIN_CONTEXT_WINDOW_TOKENS as f64 * frac) as i64
+    (crate::llm::pricing::context_window(MAIN_AGENT_MODEL) as f64 * frac) as i64
 }
 
 #[derive(Deserialize)]

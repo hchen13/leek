@@ -422,6 +422,20 @@ pub async fn run_chat_reply(
             let mut stream = match provider.chat(req).await {
                 Ok(stream) => stream,
                 Err(e) => {
+                    // R3 fix: classify the error before retrying. Auth-class
+                    // errors (token expired/missing/forbidden) won't recover
+                    // without operator intervention; retrying 10× with
+                    // up-to-30s backoff burns ~3 minutes of UI spinner for
+                    // nothing. Round 1 E2E Case 1 caught a 5-min spinner
+                    // chasing exactly this. Until a structured `LlmError`
+                    // enum lands (deferred to a future milestone — would
+                    // change the `LlmProvider` trait), grep-classify the
+                    // error string. Prefer false-negatives (retry an
+                    // ambiguous error) over false-positives (don't fail
+                    // fast on a transient).
+                    if is_terminal_provider_error(&e) {
+                        provider_retries = MAX_PROVIDER_RETRIES;
+                    }
                     if provider_retries < MAX_PROVIDER_RETRIES {
                         provider_retries += 1;
                         let delay_ms = provider_retry_delay_ms(provider_retries);
@@ -486,6 +500,7 @@ pub async fn run_chat_reply(
                             first_triggered_guard.as_deref(),
                             Some(&format!("provider_error: {}", e)),
                             DEFAULT_MODEL,
+                            Some(&event_bus),
                         )
                         .await;
                     }
@@ -752,6 +767,7 @@ pub async fn run_chat_reply(
                     first_triggered_guard.as_deref(),
                     Some(&format!("provider_error: {}", e)),
                     DEFAULT_MODEL,
+                    Some(&event_bus),
                 )
                 .await;
             }
@@ -903,6 +919,31 @@ pub async fn run_chat_reply(
                 stop_reason = "user_aborted".to_string();
                 fatal_error = Some("user_aborted".to_string());
                 break 'turns;
+            }
+            // R3 fix: also check the wall-clock deadline between tools.
+            // The iteration-top check at L309 only fires after the entire
+            // tool batch drains; with a 5-tool batch where each tool
+            // takes minutes, wall_clock could be exceeded by 10+ min
+            // before the loop top notices. Same boundary semantics as
+            // the user-abort check immediately above.
+            if let Some(deadline) = task_deadline {
+                if Instant::now() >= deadline {
+                    let secs = tuning
+                        .guards
+                        .turn_wall_clock
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    stop_reason = "wall_clock_exceeded".to_string();
+                    fatal_error = Some(format!(
+                        "turn wall-clock {}s exceeded mid-batch",
+                        secs
+                    ));
+                    if first_triggered_guard.is_none() {
+                        first_triggered_guard =
+                            Some("wall_clock_exceeded".to_string());
+                    }
+                    break 'turns;
+                }
             }
             let tool_started = Instant::now();
             vault_tool_runs::start(
@@ -1238,6 +1279,7 @@ pub async fn run_chat_reply(
             first_triggered_guard.as_deref(),
             fatal_error.as_deref(),
             DEFAULT_MODEL,
+            Some(&event_bus),
         )
         .await;
     }
@@ -1381,6 +1423,30 @@ fn soft_deadline_input(deadline: Instant) -> Option<serde_json::Value> {
     })
 }
 
+/// R3 fix — classify a provider error string as "terminal" (no retry will
+/// help; fail fast) vs "transient" (worth retrying). Pure pattern match
+/// over the lowercased error string until a structured `LlmError` enum
+/// lands. False-negatives (treat ambiguous as transient) are safer than
+/// false-positives (skip retry on a transient).
+///
+/// Patterns chosen from observed real errors:
+/// - "not configured" — leek's codex_oauth says this when the token row
+///   is missing
+/// - "401" / "unauthorized" / "forbidden" / "403" — HTTP auth/authz failures
+/// - "invalid_grant" / "invalid_token" — OAuth token expired/revoked
+fn is_terminal_provider_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string().to_ascii_lowercase();
+    s.contains("not configured")
+        || s.contains("unauthorized")
+        || s.contains("forbidden")
+        || s.contains("invalid_grant")
+        || s.contains("invalid_token")
+        || s.contains(" 401")
+        || s.contains(" 403")
+        || s.contains("http 401")
+        || s.contains("http 403")
+}
+
 /// Round-1 review fix — shared writer for the per-task observability row.
 ///
 /// Called from three sites in `run_chat_reply`:
@@ -1418,17 +1484,19 @@ async fn write_task_metrics_row(
     first_triggered_guard: Option<&str>,
     fatal_error: Option<&str>,
     model: &str,
+    event_bus: Option<&EventBus>,
 ) {
     let max_iter = iter_latencies_ms.iter().copied().max();
     let p50_iter = vault_task_metrics::p50_ms(iter_latencies_ms);
     let ended_at = chrono::Utc::now().to_rfc3339();
+    let wall_clock_ms = started_instant.elapsed().as_millis() as i64;
     let m = vault_task_metrics::NewTaskMetrics {
         user_id,
         task_id,
         session_id,
         started_at,
         ended_at: &ended_at,
-        wall_clock_ms: started_instant.elapsed().as_millis() as i64,
+        wall_clock_ms,
         iteration_count,
         tool_call_count,
         tool_error_count,
@@ -1451,6 +1519,50 @@ async fn write_task_metrics_row(
             task_id = %task_id,
             "task_metrics insert failed (non-fatal)",
         );
+        return;
+    }
+    // R3 fix — surface the row over SSE so frontend / external
+    // observers can subscribe without a vault round-trip. The HIGH
+    // finding from R3 review was that `task_metrics` was write-only;
+    // emitting this event makes the data readable from where it's
+    // most useful (live dashboards, postmortem replay). Also gives
+    // the implementer a place to render a "task complete · 12 iter,
+    // $0.20, 38s" summary card later. Best-effort emit; if no bus
+    // is provided (e.g. pure-DB call sites) just skip.
+    if let Some(bus) = event_bus {
+        let payload = serde_json::json!({
+            "task_id": task_id,
+            "stop_reason": stop_reason,
+            "iteration_count": iteration_count,
+            "tool_call_count": tool_call_count,
+            "tool_error_count": tool_error_count,
+            "wall_clock_ms": wall_clock_ms,
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+            "total_cost_usd": total_cost_usd,
+            "max_iter_latency_ms": max_iter,
+            "p50_iter_latency_ms": p50_iter,
+            "first_triggered_guard": first_triggered_guard,
+            "fatal_error": fatal_error,
+            "model": model,
+        });
+        if let Err(e) = publish_and_persist(
+            pool,
+            user_id,
+            session_id,
+            Some(task_id),
+            bus,
+            "task_metrics_recorded",
+            payload,
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %e,
+                task_id = %task_id,
+                "task_metrics_recorded SSE emit failed (non-fatal)",
+            );
+        }
     }
 }
 
@@ -2118,5 +2230,40 @@ mod tests {
         // refuse to fire (defense against stale state).
         let w = deque(&[("x", "{}"), ("x", "{}"), ("x", "{}"), ("x", "{}")]);
         assert!(!detect_doom_loop(&w, 3));
+    }
+
+    // ── R3 is_terminal_provider_error ────────────────────────────
+
+    #[test]
+    fn terminal_provider_error_recognizes_not_configured() {
+        let e = anyhow::anyhow!("codex_oauth not configured for user 'local'");
+        assert!(is_terminal_provider_error(&e));
+    }
+
+    #[test]
+    fn terminal_provider_error_recognizes_401_403() {
+        let e1 = anyhow::anyhow!("upstream returned HTTP 401");
+        assert!(is_terminal_provider_error(&e1));
+        let e2 = anyhow::anyhow!("403 Forbidden: token expired");
+        assert!(is_terminal_provider_error(&e2));
+    }
+
+    #[test]
+    fn terminal_provider_error_recognizes_oauth_classes() {
+        let e1 = anyhow::anyhow!("oauth: invalid_grant");
+        assert!(is_terminal_provider_error(&e1));
+        let e2 = anyhow::anyhow!("oauth: invalid_token");
+        assert!(is_terminal_provider_error(&e2));
+    }
+
+    #[test]
+    fn terminal_provider_error_passes_transient() {
+        // 5xx, network blips, parse errors should retry.
+        let e1 = anyhow::anyhow!("upstream returned HTTP 502");
+        assert!(!is_terminal_provider_error(&e1));
+        let e2 = anyhow::anyhow!("connection reset by peer");
+        assert!(!is_terminal_provider_error(&e2));
+        let e3 = anyhow::anyhow!("provider stream idle timeout after 90000ms");
+        assert!(!is_terminal_provider_error(&e3));
     }
 }

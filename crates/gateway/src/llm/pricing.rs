@@ -32,6 +32,27 @@ pub struct ModelPrice {
     /// has no separate cache pricing — use the regular `input_per_million`
     /// rate for cache hits.
     pub cached_input_per_million: Option<f64>,
+    /// Effective context window in tokens. Used by the auto-compactor
+    /// to derive the absolute trigger from `tuning.guards.auto_compact_threshold`
+    /// (a fraction). When a model isn't in the table, callers should
+    /// fall back to a conservative default (see `MAIN_CONTEXT_WINDOW_TOKENS`
+    /// in api/messages.rs) — guessing wrong here means we either
+    /// over-trigger compaction (cheap) or under-trigger and overflow
+    /// the window (catastrophic).
+    pub context_window_tokens: i64,
+}
+
+/// Convenience accessor: `pricing::context_window(model)` returns the
+/// model's effective window in tokens. Defaults to 400K (gpt-5.5
+/// equivalent) when unknown — conservative on the high side.
+///
+/// R3 fix: `api::messages::auto_compact_threshold` previously hardcoded
+/// 400K regardless of which model the active call uses. Once future
+/// surfaces (skills, subagents) start specifying per-call models, that
+/// hardcode silently fails on smaller-window models. This lookup gives
+/// the right number per model without a separate table.
+pub fn context_window(model: &str) -> i64 {
+    lookup(model).map(|p| p.context_window_tokens).unwrap_or(400_000)
 }
 
 /// Exact-match lookup. Returns `None` for unknown models — callers
@@ -49,11 +70,13 @@ pub fn lookup(model: &str) -> Option<ModelPrice> {
             input_per_million: 1.25,
             output_per_million: 10.0,
             cached_input_per_million: Some(0.125),
+            context_window_tokens: 400_000,
         }),
         "gpt-5-mini" => Some(ModelPrice {
             input_per_million: 0.25,
             output_per_million: 2.0,
             cached_input_per_million: Some(0.025),
+            context_window_tokens: 200_000,
         }),
         // gpt-5.5 — leek's default model via codex backend. Pricing is
         // an estimate; revise when public numbers exist.
@@ -61,6 +84,7 @@ pub fn lookup(model: &str) -> Option<ModelPrice> {
             input_per_million: 5.0,
             output_per_million: 15.0,
             cached_input_per_million: Some(0.5),
+            context_window_tokens: 400_000,
         }),
         // Common helper-tier models in case other surfaces ever request
         // them directly.
@@ -68,32 +92,38 @@ pub fn lookup(model: &str) -> Option<ModelPrice> {
             input_per_million: 2.5,
             output_per_million: 10.0,
             cached_input_per_million: Some(1.25),
+            context_window_tokens: 128_000,
         }),
         "gpt-4o-mini" => Some(ModelPrice {
             input_per_million: 0.15,
             output_per_million: 0.6,
             cached_input_per_million: Some(0.075),
+            context_window_tokens: 128_000,
         }),
         // o-series (reasoning)
         "o1" | "o1-2024-12-17" => Some(ModelPrice {
             input_per_million: 15.0,
             output_per_million: 60.0,
             cached_input_per_million: Some(7.5),
+            context_window_tokens: 200_000,
         }),
         "o1-mini" => Some(ModelPrice {
             input_per_million: 3.0,
             output_per_million: 12.0,
             cached_input_per_million: Some(1.5),
+            context_window_tokens: 128_000,
         }),
         "o3" => Some(ModelPrice {
             input_per_million: 10.0,
             output_per_million: 40.0,
             cached_input_per_million: Some(2.5),
+            context_window_tokens: 200_000,
         }),
         "o3-mini" | "o4-mini" => Some(ModelPrice {
             input_per_million: 1.1,
             output_per_million: 4.4,
             cached_input_per_million: Some(0.275),
+            context_window_tokens: 200_000,
         }),
         _ => None,
     }
