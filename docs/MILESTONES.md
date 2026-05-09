@@ -79,10 +79,25 @@ according to whether they're well-understood guards or aggressive ones.
   in M1.1 / M1.2 / M1.6 commit messages. Folded into the M1 QA cycle
   if it's exercised in E2E.
 
-### Post-M1 QA cycle (in progress)
-- 5 rounds of: deep code review via opus max-thinking subagent → fix
-  issues → ≥ 3 E2E cases serially via opus xhigh-thinking subagents
-  → fix test issues. Then milestone wrap-up.
+### Post-M1 QA cycle [DONE]
+
+5 rounds (commits `034fad2` → `b739cd5`). 145/145 unit tests pass.
+Backend rebuilt + restarted between rounds; vault
+`/tmp/leek-e2e-vault-2026-05-08.db` carries durable evidence.
+
+| Round | Findings              | Fix commit | E2E cases | Verdict |
+|-------|----------------------|------------|-----------|---------|
+| 1     | 3 HIGH + 3 MEDIUM    | `034fad2`+`b0e61fe` | 3 happy/clarification/multi-tool | All passed (caught 2 latent bugs: `endturn` format + stale-binary M1.5 zero-tokens) |
+| 2     | 1 HIGH + 4 MEDIUM    | `732d9fd`  | 1 chat-followup | Passed; verified `ask_user_question` exclusion |
+| 3     | 1 HIGH + 3 MEDIUM    | `807bbea`  | 1 metrics_recorded SSE | Passed (after rebuild — caught stale-binary again) |
+| 4     | 1 HIGH + 1 MEDIUM    | `b739cd5`  | (collapsed into R5 per reviewer suggestion) | — |
+| 5     | (validation only)    | —          | 1 session-delete cascade | Passed; all R4 invariants verified |
+
+Aggregate: **6 HIGH + 11 MEDIUM** found across 5 review rounds; all fixed.
+Remaining LOWs (intentionally deferred): SSE `iteration_count` rename
+on more event kinds; LlmError enum (structured error classification);
+chat-only follow-up turns lack durable per-turn metrics row;
+auto-compact env var unit clarity; doom-loop window args memory.
 
 ### Design decisions (locked)
 
