@@ -37,7 +37,14 @@ const MAX_TOOL_TURNS: usize = 24;
 const MAX_PROVIDER_RETRIES: usize = 10;
 const PROVIDER_RETRY_BASE_MS: u64 = 1_000;
 const PROVIDER_RETRY_MAX_MS: u64 = 30_000;
-const PROVIDER_STREAM_IDLE_TIMEOUT_MS: u64 = 90_000;
+/// M1.2: budget for consecutive provider-stream-idle hits *within one
+/// task lifecycle*. The first N-1 are recoverable (retry the chat
+/// call); the Nth promotes the failure mode to a hard
+/// `stop_reason="idle_timeout"` because at that point the provider is
+/// not coming back and burning more retries just keeps the user
+/// staring at a spinner. Tunable later if real users hit edge cases;
+/// defer that until evidence appears.
+const MAX_STREAM_IDLE_HITS_PER_TASK: usize = 3;
 const MAX_PLAN_GUARD_REWRITES: usize = 3;
 
 /// When set, the agent's reply is treated as the deliverable for that task —
@@ -227,6 +234,10 @@ pub async fn run_chat_reply(
     let mut tool_call_count: i64 = 0;
     let mut tool_error_count: i64 = 0;
     let mut iter_latencies_ms: Vec<i64> = Vec::new();
+    // M1.2: count provider-stream-idle hits across the whole task
+    // lifecycle. Used by the stream-error retry block to promote the
+    // failure to `idle_timeout` once the budget is exhausted.
+    let mut stream_idle_hits: usize = 0;
 
     'turns: loop {
         // Mark the iteration start at the loop top so each iteration's
@@ -346,10 +357,29 @@ pub async fn run_chat_reply(
                         fatal_error = Some("user_aborted".to_string());
                         break 'turns;
                     }
-                    _ = sleep(Duration::from_millis(PROVIDER_STREAM_IDLE_TIMEOUT_MS)) => {
+                    // M1.2: idle-timeout sleep is dynamic — `None` in the
+                    // GuardConfig disables the watchdog entirely (the
+                    // `pending` future never resolves), `Some(d)` arms it
+                    // for `d`. Default is `Some(90s)`; matches
+                    // claude-code's `CLAUDE_STREAM_IDLE_TIMEOUT_MS` and
+                    // openclaw's `turnCompletionIdleTimeoutMs` analogues.
+                    _ = async {
+                        match tuning.guards.idle_timeout {
+                            Some(d) => sleep(d).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        stream_idle_hits += 1;
+                        let idle_ms = tuning
+                            .guards
+                            .idle_timeout
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
                         stream_error = Some(anyhow!(
-                            "provider stream idle timeout after {}ms",
-                            PROVIDER_STREAM_IDLE_TIMEOUT_MS
+                            "provider stream idle timeout after {}ms (hit {}/{})",
+                            idle_ms,
+                            stream_idle_hits,
+                            MAX_STREAM_IDLE_HITS_PER_TASK,
                         ));
                         break 'stream;
                     }
@@ -446,6 +476,46 @@ pub async fn run_chat_reply(
             let Some(e) = stream_error else {
                 break;
             };
+
+            // M1.2: stream-idle hit budget. Earlier idle hits are
+            // recoverable (provider hiccup, transient network); the
+            // Nth stream-idle in a single task means the provider is
+            // not coming back, so promote to a hard task-level abort
+            // with `stop_reason="idle_timeout"`. Other failure modes
+            // (provider-error, deserialization, etc.) still flow
+            // through the normal retry path below.
+            if stream_idle_hits >= MAX_STREAM_IDLE_HITS_PER_TASK {
+                let idle_secs = tuning
+                    .guards
+                    .idle_timeout
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                stop_reason = "idle_timeout".to_string();
+                fatal_error = Some(format!(
+                    "stream idle timeout exhausted budget — {} consecutive {}s idle hits",
+                    stream_idle_hits, idle_secs,
+                ));
+                if let Some(t) = task.as_ref() {
+                    fail_task(
+                        &pool,
+                        &user_id,
+                        &session_id,
+                        &event_bus,
+                        &t.task_id,
+                        fatal_error.as_deref().unwrap_or("idle_timeout"),
+                    )
+                    .await?;
+                }
+                persist_partial_agent_message(
+                    &pool,
+                    &user_id,
+                    &session_id,
+                    &full_text,
+                    task.as_ref().map(|t| t.task_id.as_str()),
+                )
+                .await;
+                break 'turns;
+            }
 
             if provider_retries < MAX_PROVIDER_RETRIES {
                 provider_retries += 1;
