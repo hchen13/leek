@@ -23,39 +23,37 @@ Schema:
   "task_draft": null | {
     "title": "<short>",
     "goal": "<1-2 sentences>",
-    "expected_deliverable": "decision_draft" | "research_brief" | "delegated_brief" | "review" | "comparison" | "morning_brief" | "free_form"
+    "expected_deliverable": "research_brief" | "review" | "comparison" | "morning_brief" | "free_form"
   },
   "chat_reply_text": null | "<full reply>",
   "clarification_question": null | "<one short question>"
 }
 
 Decision rules:
-- new_task: user asks for research / decision / comparison / review on a SUBJECT THE PRIOR TASK DID NOT ALREADY COVER (different ticker, different question class, or a clearly fresh start).
+- new_task: user asks for research / comparison / review on a SUBJECT THE PRIOR TASK DID NOT ALREADY COVER (different ticker, different question class, or a clearly fresh start).
 - chat_reply: greeting / casual / meta question about LEEK itself / one-shot definition that needs no investigation, OR a continuation / challenge / refinement of the prior task in the same session (asking "what if X", "challenge your view", "give a final action boundary", "decompose the bear case", "translate to portfolio guardrails", referencing "你刚才"/"上面"/"那个"/"如果", or otherwise riding on the prior subject). Continuations stay chat_reply — do NOT fork a duplicate task on the same subject just because the user pushed for more depth or asked for a translation step.
 - ambiguous: subject unclear, needs one clarifying question.
 
 expected_deliverable inference (only used when decision=new_task):
-- User explicitly asks the agent to invoke a specific subagent / delegate ("调用 delegate_research", "让 risk_manager 列三点", "让 X 给我 Y", "use the X subagent to ...") => delegated_brief
-- "buy / sell / add / trim / stop-loss / 加仓 / 减仓 / 平仓 / 出清 / 进场" with a clear capital-commitment ask => decision_draft
 - post-mortem / 复盘 / look back at last decision => review
 - compare / vs / 比较 / 哪个更好 => comparison
 - "research / look into / 调研 / 研究 / analyze / 评估 / 分析 / 估值 / 风险 / 列出 …" => research_brief
 - morning brief / 晨报 => morning_brief
 - otherwise => free_form
 
-decision_draft is RESERVED for explicit capital-commitment asks. "评估能不能加仓" is research_brief, not decision_draft, unless the user has made it clear they want a recordable action recommendation. A risk list, a comparison, a post-mortem, or a "what's the impact on portfolio" question is NEVER decision_draft.
-
-delegated_brief means the user has named a specific worker / subagent and the main agent's job is to dispatch that worker and present its result, NOT to redo the research itself. The main agent should not run plan/critic rigor here — the user wants the named worker's output, not a full audited brief. If the user just asks "what are the risks" without naming a worker, that is research_brief.
-
 Examples:
 - "你好" -> chat_reply, chat_reply_text greets back briefly
 - "什么是经济护城河" -> chat_reply, chat_reply_text gives one-line definition (no investigation)
-- "NVDA 现在能加仓吗？" -> new_task, research_brief (no explicit "buy" — user wants the analysis)
-- "请提交一个 NVDA 加仓 decision draft" -> new_task, decision_draft (explicit ask)
-- "请直接调用 delegate_research，让 risk_manager 用三点列出 NVDA 加仓风险" -> new_task, delegated_brief (named worker, present-its-output ask)
+- "NVDA 现在能加仓吗？" -> new_task, research_brief
 - "看一下我的持仓" -> ambiguous (re-balance? risk check? performance review?)
 - (after a NVDA analysis just delivered) "如果像 ASIC 这样的竞争呢？" -> chat_reply (challenge to prior task)
 - (after a NVDA analysis just delivered) "假设单票上限 5%，那现在还能加吗？" -> chat_reply (refinement of prior task with new constraint)
+
+Note: `decision_draft` and `delegated_brief` deliverable kinds were
+removed in the rebuild slice — the underlying tools (record_investment_action,
+delegate_research) are gone. If the user explicitly asks for either,
+classify as `research_brief` (or `chat_reply` for follow-ups) and let
+the main agent answer in prose.
 
 Respond with the JSON object only.
 "#;

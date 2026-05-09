@@ -209,13 +209,17 @@ pub fn build_system_prompt(
                but the answer shape is dialog, not a fresh structured note.",
         );
     } else if let Some(kind) = expected_deliverable.map(str::trim).filter(|s| !s.is_empty()) {
+        // Phase 0 simplifies the framing: removed `decision_draft` (no
+        // record_investment_action tool anymore) and `delegated_brief`
+        // (no delegate_research tool anymore). The remaining kinds keep
+        // a one-line orientation rather than the prior 2-3 sentence
+        // rigor list — corpus + discipline already carry that load.
         let line = match kind {
-            "decision_draft" => "**Expected deliverable: decision_draft.** Land on a buy/sell/close call and call `record_investment_action` once you can supply ticker, direction, rationale, risks (≥1), opposing_case, corpus_refs, mandate_check, invalidation_conditions. If you can't supply all of those honestly, say so — don't fake them. Until the draft is recorded, do not declare the task finished.",
-            "research_brief" => "**Expected deliverable: research_brief.** Produce a structured note: facts vs. inference vs. speculation; the corpus principles in play; opposing case; what would change your mind. No buy/sell call required, but every claim must be sourced or labeled inference.",
-            "review" => "**Expected deliverable: review.** Audit a prior decision or position against current facts. Restate the original thesis, score what was right / wrong / unfalsifiable, decide hold / trim / exit / re-double-check.",
-            "comparison" => "**Expected deliverable: comparison.** Two or more named instruments, scored side-by-side on dimensions that actually matter for the decision (not all dimensions). End with a ranked recommendation tied to the user's mandate.",
+            "research_brief" => "**Expected deliverable: research_brief.** Produce a structured prose note: separate facts (with sources), inference, and speculation; surface the corpus principles in play; include the strongest opposing case and what would change your mind.",
+            "review" => "**Expected deliverable: review.** Audit a prior decision or position against current facts. Restate the original thesis, score what was right / wrong / unfalsifiable, recommend hold / trim / exit / re-evaluate.",
+            "comparison" => "**Expected deliverable: comparison.** Two or more named instruments, scored side-by-side on dimensions that actually matter for the decision (not every dimension). End with a ranked recommendation tied to the user's mandate.",
             "morning_brief" => "**Expected deliverable: morning_brief.** Tight market-context summary scoped to the user's holdings + watchlist. No new theses; surface what *changed* and what to watch.",
-            "free_form" | _ => "**Expected deliverable: free_form.** No fixed structure required, but apply the same discipline (fact/inference/speculation, opposing case, citations).",
+            "free_form" | _ => "**Expected deliverable: free_form.** No fixed structure required, but apply the same discipline (fact / inference / speculation, opposing case, citations).",
         };
         prompt.push_str("\n\n# Task framing\n\n");
         prompt.push_str(line);
