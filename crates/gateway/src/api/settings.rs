@@ -90,6 +90,12 @@ pub async fn patch_handler(
         compaction: apply_surface(current.compaction, body.compaction)
             .map_err(AppError::bad_request)?,
         subagent: apply_surface(current.subagent, body.subagent).map_err(AppError::bad_request)?,
+        // Settings PATCH only touches surface tunings (reasoning_effort /
+        // verbosity per surface). Guards have no UI surface yet — they're
+        // wired through M1.2-1.6 and exposed once the per-user override
+        // schema in user_settings supports them. For now, preserve the
+        // currently active GuardConfig.
+        guards: current.guards,
     };
 
     user_settings::save_tuning(&state.pool, &state.user_id, next).await?;

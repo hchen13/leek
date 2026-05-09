@@ -7,6 +7,8 @@
 pub mod codex_oauth;
 pub mod openai_responses;
 
+use std::time::Duration;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -118,6 +120,9 @@ pub struct LlmTuning {
     pub routing: SurfaceTuning,
     pub compaction: SurfaceTuning,
     pub subagent: SurfaceTuning,
+    /// Agent-loop safety nets. See `GuardConfig` and `docs/MILESTONES.md`
+    /// (Milestone 1) for the why-this-default rationale of each field.
+    pub guards: GuardConfig,
 }
 
 impl LlmTuning {
@@ -140,11 +145,73 @@ impl LlmTuning {
             routing: cheap,
             compaction: cheap,
             subagent: cheap,
+            guards: GuardConfig::defaults(),
         }
     }
 }
 
 impl Default for LlmTuning {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+/// Per-turn safety nets. The fields live in `LlmTuning.guards` so they
+/// can be overridden per-user via `vault.user_settings`. Defaults below
+/// match Milestone 1's locked design (see `docs/MILESTONES.md`):
+///
+/// | field | default | rationale |
+/// |-------|---------|-----------|
+/// | `turn_wall_clock` | `Some(30 min)` | claude-code removed a 5-min hardcoded version as a *bug*; 30 min is a true edge-case ceiling. |
+/// | `idle_timeout` | `Some(90 s)` | mirrors claude-code's `CLAUDE_STREAM_IDLE_TIMEOUT_MS=90000`. |
+/// | `max_iterations` | `None` (off) | codex / claude-code don't enforce one; they trust auto-compaction. |
+/// | `cost_cap_usd` | `None` (off) | codex doesn't track cost. Opt-in for production deployments. |
+/// | `doom_loop_threshold` | `Some(3)` | leek-original; nobody else has it. |
+/// | `auto_compact_threshold` | `0.90` | mirrors codex's hardcoded `(ctx_window * 9) / 10`. |
+///
+/// Wiring schedule:
+///   - M1.1 (this commit): fields exist, defaults set; agent loop reads
+///     them but only `auto_compact_threshold` is honored (existing 95%
+///     site flips to read this field — actual switch to 90% lands in M1.7).
+///   - M1.2 hooks `idle_timeout`.
+///   - M1.3 hooks `turn_wall_clock` + soft-prompt staging.
+///   - M1.4 hooks `max_iterations` (currently the agent uses
+///     `MAX_TOOL_TURNS=24` constant which becomes a default-off override).
+///   - M1.5 hooks `cost_cap_usd` once a per-model price table lands.
+///   - M1.6 hooks `doom_loop_threshold`.
+///   - M1.7 changes `auto_compact_threshold` default 0.95 → 0.90.
+///
+/// Until those wiring milestones land, the fields appear dead to the
+/// compiler — `#[allow(dead_code)]` is intentional. Each field's
+/// reader will be added in the milestone listed in the rationale.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub struct GuardConfig {
+    pub turn_wall_clock: Option<Duration>,
+    pub idle_timeout: Option<Duration>,
+    pub max_iterations: Option<usize>,
+    pub cost_cap_usd: Option<f64>,
+    pub doom_loop_threshold: Option<usize>,
+    pub auto_compact_threshold: f32,
+}
+
+impl GuardConfig {
+    pub fn defaults() -> Self {
+        Self {
+            turn_wall_clock: Some(Duration::from_secs(30 * 60)),
+            idle_timeout: Some(Duration::from_secs(90)),
+            max_iterations: None,
+            cost_cap_usd: None,
+            doom_loop_threshold: Some(3),
+            // M1.7 lowers this to 0.90. M1.1 ships the field but keeps
+            // the existing 0.95 to avoid a behavior change in an
+            // observability-only milestone.
+            auto_compact_threshold: 0.95,
+        }
+    }
+}
+
+impl Default for GuardConfig {
     fn default() -> Self {
         Self::defaults()
     }

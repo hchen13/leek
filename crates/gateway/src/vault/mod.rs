@@ -12,6 +12,7 @@ pub mod plans;
 pub mod provider_configs;
 pub mod sessions;
 pub mod subagents;
+pub mod task_metrics;
 pub mod tasks;
 pub mod tool_runs;
 pub mod user_settings;

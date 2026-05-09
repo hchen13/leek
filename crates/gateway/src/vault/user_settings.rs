@@ -60,6 +60,10 @@ impl StoredTuning {
             routing: self.routing.into_runtime(defaults.routing),
             compaction: self.compaction.into_runtime(defaults.compaction),
             subagent: self.subagent.into_runtime(defaults.subagent),
+            // Guards aren't user-tunable yet (no UI surface). Always
+            // start from `defaults`; once a per-user override schema
+            // lands the field flips to `self.guards.into_runtime(...)`.
+            guards: defaults.guards,
         }
     }
 }

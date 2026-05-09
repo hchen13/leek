@@ -25,7 +25,7 @@ use crate::llm::{
 };
 use crate::vault::{
     self, events as vault_events, messages as vault_messages, plans as vault_plans,
-    tasks as vault_tasks, tool_runs as vault_tool_runs,
+    task_metrics as vault_task_metrics, tasks as vault_tasks, tool_runs as vault_tool_runs,
 };
 
 use tools::{ToolContext, ToolRegistry};
@@ -214,7 +214,28 @@ pub async fn run_chat_reply(
     let mut plan_guard_rewrites = 0usize;
     let mut turn = 0usize;
     let mut fatal_error: Option<String> = None;
+
+    // Per-task observability — accumulated across the whole turn loop and
+    // flushed once at the lifecycle endpoint via `vault::task_metrics::insert`.
+    // M1.1 ships the wiring; later guards (M1.2 idle / M1.3 wall-clock /
+    // M1.4 max_iter / M1.5 cost / M1.6 doom-loop) populate the columns
+    // they own. M1.4 also renames the `turn` counter to `iteration_count`
+    // both here and in the metrics field — it's already an iteration
+    // counter, just misnamed historically.
+    let task_started_instant = Instant::now();
+    let task_started_at_str = chrono::Utc::now().to_rfc3339();
+    let mut tool_call_count: i64 = 0;
+    let mut tool_error_count: i64 = 0;
+    let mut iter_latencies_ms: Vec<i64> = Vec::new();
+
     'turns: loop {
+        // Mark the iteration start at the loop top so each iteration's
+        // latency includes the LLM call + every tool dispatch in this
+        // round. The push happens at the bottom of the loop only on the
+        // happy continue path — `break 'turns` exits don't pollute the
+        // distribution with terminal-event samples.
+        let iter_started = Instant::now();
+
         if turn >= MAX_TOOL_TURNS {
             // Phase 0 hard cap. Milestone 1 will replace this with proper
             // turn-level cost / wall-clock / stuck-detection guards plus
@@ -581,6 +602,13 @@ pub async fn run_chat_reply(
             let exec_result = tools
                 .dispatch(&call.name, &call.arguments, cancel.clone(), &ctx)
                 .await;
+            // Per-task observability: count every dispatched tool call and
+            // separately count the failed ones. Aggregated into
+            // `task_metrics` at the lifecycle endpoint.
+            tool_call_count += 1;
+            if exec_result.is_err() {
+                tool_error_count += 1;
+            }
 
             // Treat tool errors as a delivered output: the model sees the
             // error string and decides what to do (retry / give up / keep
@@ -717,6 +745,12 @@ pub async fn run_chat_reply(
             break 'turns;
         }
 
+        // Iteration completed normally (will go around for another LLM
+        // call). Record the wall-clock duration of this iteration for the
+        // per-task latency summary. Iterations that exit via `break 'turns`
+        // are intentionally excluded — they're terminal events, not
+        // representative of steady-state per-iteration cost.
+        iter_latencies_ms.push(iter_started.elapsed().as_millis() as i64);
         turn += 1;
     }
 
@@ -809,6 +843,57 @@ pub async fn run_chat_reply(
                 }),
             )
             .await?;
+        }
+    }
+
+    // Best-effort task_metrics write at the lifecycle endpoint. Failure
+    // to insert is logged and swallowed: observability must not block
+    // the user-facing response. Only runs when there's a bound task_id
+    // (no FK target otherwise) — chat-only "no task" conversations
+    // produce no metrics row, which is intentional.
+    //
+    // Known limitation (documented for M1.6): the `return Err(e)` path
+    // taken after exhausted provider retries (around the
+    // `publish_provider_error` site) does not write metrics. That
+    // path is rare and short — the per-turn guards landing in M1.2/1.3
+    // will reach it with stop_reason="provider_error" and the metric
+    // will be wired then.
+    if let Some(t) = task.as_ref() {
+        let max_iter = iter_latencies_ms.iter().copied().max();
+        let p50_iter = vault_task_metrics::p50_ms(&iter_latencies_ms);
+        let m = vault_task_metrics::NewTaskMetrics {
+            user_id: &user_id,
+            task_id: &t.task_id,
+            session_id: &session_id,
+            started_at: &task_started_at_str,
+            ended_at: &chrono::Utc::now().to_rfc3339(),
+            wall_clock_ms: task_started_instant.elapsed().as_millis() as i64,
+            iteration_count: turn as i64,
+            tool_call_count,
+            tool_error_count,
+            // Token / cost columns: M1.5 fills these from LLM `usage`
+            // blocks once provider price tables land.
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cost_usd: 0.0,
+            max_iter_latency_ms: max_iter,
+            p50_iter_latency_ms: p50_iter,
+            stop_reason: &stop_reason,
+            // M1.6 wires `first_triggered_guard` once doom-loop / cap
+            // detectors emit a guard-trigger signal.
+            first_triggered_guard: None,
+            fatal_error: fatal_error.as_deref(),
+            // M2.7 wires subagent linkage (parent_task_id, depth).
+            parent_task_id: None,
+            depth: 0,
+            model: DEFAULT_MODEL,
+        };
+        if let Err(e) = vault_task_metrics::insert(&pool, m).await {
+            tracing::warn!(
+                error = %e,
+                task_id = %t.task_id,
+                "task_metrics insert failed (non-fatal)",
+            );
         }
     }
 
