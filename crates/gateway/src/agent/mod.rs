@@ -42,13 +42,18 @@ const MAX_PROVIDER_RETRIES: usize = 10;
 const PROVIDER_RETRY_BASE_MS: u64 = 1_000;
 const PROVIDER_RETRY_MAX_MS: u64 = 30_000;
 /// M1.2: budget for consecutive provider-stream-idle hits *within one
-/// task lifecycle*. The first N-1 are recoverable (retry the chat
-/// call); the Nth promotes the failure mode to a hard
-/// `stop_reason="idle_timeout"` because at that point the provider is
-/// not coming back and burning more retries just keeps the user
-/// staring at a spinner. Tunable later if real users hit edge cases;
-/// defer that until evidence appears.
-const MAX_STREAM_IDLE_HITS_PER_TASK: usize = 3;
+/// invocation of `run_chat_reply`* (i.e. one user turn — a single
+/// user prompt → final answer cycle). A task that goes through
+/// awaiting_user → user replies will start fresh because that's a
+/// new `run_chat_reply` invocation; the budget is intentionally
+/// per-turn so a stalled previous turn doesn't poison the next one.
+///
+/// The first N-1 idle hits are recoverable (retry the chat call); the
+/// Nth promotes to a hard `stop_reason="idle_timeout"` because at that
+/// point the provider is not coming back and burning more retries just
+/// keeps the user staring at a spinner. Tunable later if real users
+/// hit edge cases; defer that until evidence appears.
+const MAX_STREAM_IDLE_HITS_PER_TURN: usize = 3;
 const MAX_PLAN_GUARD_REWRITES: usize = 3;
 
 /// When set, the agent's reply is treated as the deliverable for that task —
@@ -265,9 +270,11 @@ pub async fn run_chat_reply(
     // it doesn't change — the *first* guard is what matters for
     // postmortem analysis even if other guards subsequently fire.
     let mut first_triggered_guard: Option<String> = None;
-    // M1.2: count provider-stream-idle hits across the whole task
-    // lifecycle. Used by the stream-error retry block to promote the
-    // failure to `idle_timeout` once the budget is exhausted.
+    // M1.2: count provider-stream-idle hits within this user turn (one
+    // `run_chat_reply` invocation). Used by the stream-error retry block
+    // to promote the failure to `idle_timeout` once the budget is
+    // exhausted. Resets implicitly on the next user turn since each
+    // invocation creates a fresh local.
     let mut stream_idle_hits: usize = 0;
 
     // M1.3: hard wall-clock deadline for this entire task. None when the
@@ -447,6 +454,30 @@ pub async fn run_chat_reply(
                             &format!("provider_error: {}", e),
                         )
                         .await?;
+                        // Round-1 review fix: write metrics before
+                        // returning — closes the previously-documented
+                        // observability gap on the initial-chat
+                        // retry-exhausted path.
+                        write_task_metrics_row(
+                            &pool,
+                            &user_id,
+                            &t.task_id,
+                            &session_id,
+                            &task_started_at_str,
+                            task_started_instant,
+                            iteration_count as i64,
+                            tool_call_count,
+                            tool_error_count,
+                            &iter_latencies_ms,
+                            total_input_tokens,
+                            total_output_tokens,
+                            total_cost_usd,
+                            "fatal_error",
+                            first_triggered_guard.as_deref(),
+                            Some(&format!("provider_error: {}", e)),
+                            DEFAULT_MODEL,
+                        )
+                        .await;
                     }
                     persist_partial_agent_message(
                         &pool,
@@ -491,7 +522,7 @@ pub async fn run_chat_reply(
                             "provider stream idle timeout after {}ms (hit {}/{})",
                             idle_ms,
                             stream_idle_hits,
-                            MAX_STREAM_IDLE_HITS_PER_TASK,
+                            MAX_STREAM_IDLE_HITS_PER_TURN,
                         ));
                         break 'stream;
                     }
@@ -571,6 +602,17 @@ pub async fn run_chat_reply(
                                 if let Some(cap) = tuning.guards.cost_cap_usd {
                                     if total_cost_usd >= cap {
                                         cost_cap_hit = true;
+                                        // Round-1 review fix: record the trigger
+                                        // at the moment of detection (in stream
+                                        // order) rather than later at the
+                                        // iteration-boundary break, so
+                                        // `first_triggered_guard` is correct even
+                                        // if the model finishes in the same
+                                        // iteration and skips the boundary check.
+                                        if first_triggered_guard.is_none() {
+                                            first_triggered_guard =
+                                                Some("cost_cap_exceeded".to_string());
+                                        }
                                     }
                                 }
                                 publish_and_persist(
@@ -614,7 +656,7 @@ pub async fn run_chat_reply(
             // with `stop_reason="idle_timeout"`. Other failure modes
             // (provider-error, deserialization, etc.) still flow
             // through the normal retry path below.
-            if stream_idle_hits >= MAX_STREAM_IDLE_HITS_PER_TASK {
+            if stream_idle_hits >= MAX_STREAM_IDLE_HITS_PER_TURN {
                 let idle_secs = tuning
                     .guards
                     .idle_timeout
@@ -628,25 +670,11 @@ pub async fn run_chat_reply(
                 if first_triggered_guard.is_none() {
                     first_triggered_guard = Some("idle_timeout".to_string());
                 }
-                if let Some(t) = task.as_ref() {
-                    fail_task(
-                        &pool,
-                        &user_id,
-                        &session_id,
-                        &event_bus,
-                        &t.task_id,
-                        fatal_error.as_deref().unwrap_or("idle_timeout"),
-                    )
-                    .await?;
-                }
-                persist_partial_agent_message(
-                    &pool,
-                    &user_id,
-                    &session_id,
-                    &full_text,
-                    task.as_ref().map(|t| t.task_id.as_str()),
-                )
-                .await;
+                // Round-1 review fix: don't call `fail_task` /
+                // `persist_partial_agent_message` here — the unified
+                // lifecycle endpoint at the function tail handles both
+                // when `fatal_error` is set. The previous inline call
+                // double-fired the `task_failed` SSE event.
                 break 'turns;
             }
 
@@ -693,6 +721,29 @@ pub async fn run_chat_reply(
                     &format!("provider_error: {}", e),
                 )
                 .await?;
+                // Round-1 review fix: write metrics before returning —
+                // closes the previously-documented observability gap on
+                // the stream-error retry-exhausted path.
+                write_task_metrics_row(
+                    &pool,
+                    &user_id,
+                    &t.task_id,
+                    &session_id,
+                    &task_started_at_str,
+                    task_started_instant,
+                    iteration_count as i64,
+                    tool_call_count,
+                    tool_error_count,
+                    &iter_latencies_ms,
+                    total_input_tokens,
+                    total_output_tokens,
+                    total_cost_usd,
+                    "fatal_error",
+                    first_triggered_guard.as_deref(),
+                    Some(&format!("provider_error: {}", e)),
+                    DEFAULT_MODEL,
+                )
+                .await;
             }
             persist_partial_agent_message(
                 &pool,
@@ -742,6 +793,17 @@ pub async fn run_chat_reply(
                     )
                     .await?;
                     additional_inputs.push(plan_guard_input(&guard, &turn_text));
+                    // Round-1 review fix: a plan-guard rewrite IS an
+                    // iteration from the LLM-call perspective — it
+                    // produced output, drained tool calls, and is
+                    // about to spin into another LLM call. Treat it
+                    // as such so `iteration_count` and `iter_latencies_ms`
+                    // stay consistent (and a future opt-in
+                    // `max_iterations` cap legitimately bounds replan
+                    // chains, not just the path that runs through the
+                    // bottom of `'turns: loop`).
+                    iter_latencies_ms.push(iter_started.elapsed().as_millis() as i64);
+                    iteration_count += 1;
                     continue 'turns;
                 }
                 // Out of rewrites — fail the task. (Milestone 1 will turn
@@ -752,6 +814,20 @@ pub async fn run_chat_reply(
             }
 
             final_text = turn_text.clone();
+            // Round-1 review fix: even on natural completion, if a
+            // mid-iteration flag was set (cost cap exceeded mid-stream,
+            // doom-loop detected during dispatch), promote the
+            // `stop_reason` so the metrics row records the trigger.
+            // We *keep* the answer (the model already produced one;
+            // discarding it is worse UX than recording the postmortem
+            // signal) but the row's stop_reason reflects the cap.
+            // `first_triggered_guard` was already set at the flag's
+            // detection site; this only fixes `stop_reason`.
+            if cost_cap_hit && stop_reason == "end_turn" {
+                stop_reason = "cost_cap_exceeded".to_string();
+            } else if doom_loop_hit && stop_reason == "end_turn" {
+                stop_reason = "doom_loop".to_string();
+            }
             break 'turns;
         }
 
@@ -829,6 +905,14 @@ pub async fn run_chat_reply(
                 }
                 if detect_doom_loop(&recent_tool_calls, threshold) {
                     doom_loop_hit = true;
+                    // Round-1 review fix: record the trigger here, in
+                    // tool-dispatch order, rather than at the iteration-
+                    // boundary break — so `first_triggered_guard` is
+                    // accurate even if a subsequent guard at the loop
+                    // top happens to fire on the same break path.
+                    if first_triggered_guard.is_none() {
+                        first_triggered_guard = Some("doom_loop".to_string());
+                    }
                 }
             }
 
@@ -1074,45 +1158,32 @@ pub async fn run_chat_reply(
     // (no FK target otherwise) — chat-only "no task" conversations
     // produce no metrics row, which is intentional.
     //
-    // Known limitation (documented for M1.6): the `return Err(e)` path
-    // taken after exhausted provider retries (around the
-    // `publish_provider_error` site) does not write metrics. That
-    // path is rare and short — the per-turn guards landing in M1.2/1.3
-    // will reach it with stop_reason="provider_error" and the metric
-    // will be wired then.
+    // Round-1 review fix: this same helper is also called from the
+    // two `return Err(e)` paths above (initial-chat retry exhausted
+    // and stream-error retry exhausted) so the previously-documented
+    // "provider-retries-exhausted skips metrics" limitation no longer
+    // exists.
     if let Some(t) = task.as_ref() {
-        let max_iter = iter_latencies_ms.iter().copied().max();
-        let p50_iter = vault_task_metrics::p50_ms(&iter_latencies_ms);
-        let m = vault_task_metrics::NewTaskMetrics {
-            user_id: &user_id,
-            task_id: &t.task_id,
-            session_id: &session_id,
-            started_at: &task_started_at_str,
-            ended_at: &chrono::Utc::now().to_rfc3339(),
-            wall_clock_ms: task_started_instant.elapsed().as_millis() as i64,
-            iteration_count: iteration_count as i64,
+        write_task_metrics_row(
+            &pool,
+            &user_id,
+            &t.task_id,
+            &session_id,
+            &task_started_at_str,
+            task_started_instant,
+            iteration_count as i64,
             tool_call_count,
             tool_error_count,
+            &iter_latencies_ms,
             total_input_tokens,
             total_output_tokens,
             total_cost_usd,
-            max_iter_latency_ms: max_iter,
-            p50_iter_latency_ms: p50_iter,
-            stop_reason: &stop_reason,
-            first_triggered_guard: first_triggered_guard.as_deref(),
-            fatal_error: fatal_error.as_deref(),
-            // M2.7 wires subagent linkage (parent_task_id, depth).
-            parent_task_id: None,
-            depth: 0,
-            model: DEFAULT_MODEL,
-        };
-        if let Err(e) = vault_task_metrics::insert(&pool, m).await {
-            tracing::warn!(
-                error = %e,
-                task_id = %t.task_id,
-                "task_metrics insert failed (non-fatal)",
-            );
-        }
+            &stop_reason,
+            first_triggered_guard.as_deref(),
+            fatal_error.as_deref(),
+            DEFAULT_MODEL,
+        )
+        .await;
     }
 
     publish_and_persist(
@@ -1252,6 +1323,79 @@ fn soft_deadline_input(deadline: Instant) -> Option<serde_json::Value> {
             "content": hint,
         })
     })
+}
+
+/// Round-1 review fix — shared writer for the per-task observability row.
+///
+/// Called from three sites in `run_chat_reply`:
+///   1. The lifecycle endpoint (function tail) — happy path + every
+///      `break 'turns` exit.
+///   2. The initial-`provider.chat()` retry-exhausted `return Err` path.
+///   3. The mid-stream-error retry-exhausted `return Err` path.
+///
+/// All three sites carry the same accumulator state (`iteration_count`,
+/// `tool_call_count`, `iter_latencies_ms`, etc.) but only #1 currently
+/// fills `total_cost_usd` with a non-zero value (the `return Err`
+/// paths typically fail before any `Usage` event arrives). The cost
+/// column is still passed through so a future change that surfaces
+/// per-call cost before stream completion automatically benefits.
+///
+/// Errors from the insert itself are logged and swallowed —
+/// observability must not block the user-facing flow. The function
+/// returns `()` rather than `Result` for that reason.
+#[allow(clippy::too_many_arguments)]
+async fn write_task_metrics_row(
+    pool: &SqlitePool,
+    user_id: &str,
+    task_id: &str,
+    session_id: &str,
+    started_at: &str,
+    started_instant: Instant,
+    iteration_count: i64,
+    tool_call_count: i64,
+    tool_error_count: i64,
+    iter_latencies_ms: &[i64],
+    total_input_tokens: i64,
+    total_output_tokens: i64,
+    total_cost_usd: f64,
+    stop_reason: &str,
+    first_triggered_guard: Option<&str>,
+    fatal_error: Option<&str>,
+    model: &str,
+) {
+    let max_iter = iter_latencies_ms.iter().copied().max();
+    let p50_iter = vault_task_metrics::p50_ms(iter_latencies_ms);
+    let ended_at = chrono::Utc::now().to_rfc3339();
+    let m = vault_task_metrics::NewTaskMetrics {
+        user_id,
+        task_id,
+        session_id,
+        started_at,
+        ended_at: &ended_at,
+        wall_clock_ms: started_instant.elapsed().as_millis() as i64,
+        iteration_count,
+        tool_call_count,
+        tool_error_count,
+        total_input_tokens,
+        total_output_tokens,
+        total_cost_usd,
+        max_iter_latency_ms: max_iter,
+        p50_iter_latency_ms: p50_iter,
+        stop_reason,
+        first_triggered_guard,
+        fatal_error,
+        // M2.7 wires subagent linkage (parent_task_id, depth).
+        parent_task_id: None,
+        depth: 0,
+        model,
+    };
+    if let Err(e) = vault_task_metrics::insert(pool, m).await {
+        tracing::warn!(
+            error = %e,
+            task_id = %task_id,
+            "task_metrics insert failed (non-fatal)",
+        );
+    }
 }
 
 /// M1.6 — doom-loop detector. Returns true when the rolling window is

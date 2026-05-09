@@ -41,9 +41,35 @@ const MAIN_CONTEXT_WINDOW_TOKENS: i64 = 400_000;
 /// user message, system prompt delta, and tool outputs (was 20K under
 /// the old 95% trigger; the extra 20K headroom is what M1.7 buys).
 fn auto_compact_threshold(tuning: &crate::llm::LlmTuning) -> i64 {
+    // Floor on the env-var override: 1% of the active context window.
+    // Without a floor, `LEEK_AUTO_COMPACT_THRESHOLD=0` (or negative)
+    // would compact on every message, and `LEEK_AUTO_COMPACT_THRESHOLD=10`
+    // (intended as 10% but parsed as 10 tokens) would do the same.
+    // Round-1 review fix.
+    let floor = (MAIN_CONTEXT_WINDOW_TOKENS / 100).max(1_000);
     if let Ok(v) = std::env::var("LEEK_AUTO_COMPACT_THRESHOLD") {
-        if let Ok(parsed) = v.parse::<i64>() {
-            return parsed;
+        match v.parse::<i64>() {
+            Ok(parsed) if parsed >= floor => {
+                tracing::info!(
+                    override_threshold = parsed,
+                    "auto-compact threshold overridden by LEEK_AUTO_COMPACT_THRESHOLD",
+                );
+                return parsed;
+            }
+            Ok(parsed) => {
+                tracing::warn!(
+                    override_threshold = parsed,
+                    floor,
+                    "LEEK_AUTO_COMPACT_THRESHOLD below floor — ignoring",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    raw = %v,
+                    error = %e,
+                    "LEEK_AUTO_COMPACT_THRESHOLD failed to parse as i64 — ignoring",
+                );
+            }
         }
     }
     let frac = tuning.guards.auto_compact_threshold.clamp(0.0, 1.0) as f64;
