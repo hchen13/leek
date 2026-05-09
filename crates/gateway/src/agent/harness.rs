@@ -21,7 +21,6 @@ const IDENTITY: &str = include_str!("../../../../harness/identity.md");
 const DISCIPLINE: &str = include_str!("../../../../harness/discipline.md");
 const CORPUS_ORIENTATION: &str = include_str!("../../../../harness/corpus_orientation.md");
 
-use crate::agent::tools::use_skill::skill_metadata;
 use std::path::PathBuf;
 
 const DEFAULT_CORPUS_PROMPT_PATH: &str = "crates/gateway/assets/corpus_distilled.md";
@@ -146,12 +145,20 @@ pub fn build_system_prompt(
     prompt.push_str("\n\n");
     prompt.push_str(METHOD_AND_DELEGATION);
     prompt.push_str("\n\n");
-    prompt.push_str("# Research Skills\n\n");
-    prompt.push_str(
-        "Available skills (call `use_skill` with the skill name as your FIRST action \
-         when the task matches — before any other tool call or analysis):\n\n",
-    );
-    prompt.push_str(&skill_metadata());
+    // Phase 0: skills are statically baked into the system prompt — every
+    // SKILL.md from `harness/skills/<name>/` is concatenated unconditionally.
+    // Milestone 2.5 will replace this with the lazy / hot-reload / route-aware
+    // skill mechanism described in the rebuild plan (modeled on Claude Code).
+    let bundled_skills = bundled_skills_concat();
+    if !bundled_skills.is_empty() {
+        prompt.push_str("# Research Skills\n\n");
+        prompt.push_str(
+            "The frameworks below are part of your investing mind. Apply the \
+             one that matches the task; treat them as methodology, not as a \
+             tool checklist.\n\n",
+        );
+        prompt.push_str(&bundled_skills);
+    }
 
     if let Some(corpus_prompt) = load_corpus_prompt() {
         prompt.push_str("\n\n");
@@ -227,6 +234,56 @@ pub fn build_system_prompt(
     prompt
 }
 
+/// Phase 0: load every `harness/skills/<name>/SKILL.md` and concat their
+/// bodies into a single block destined for the system prompt. The strategy
+/// is intentionally crude — full content for every skill, every turn — so
+/// the agent doesn't lose access to its investing frameworks while the
+/// sophisticated skill machinery (lazy load, frontmatter routing, hot
+/// reload) is being designed for Milestone 2.5. The deliberate concession
+/// is that the skill set is small (currently 2 files), so the token cost
+/// is bounded; once it grows past ~3 skills the lazy mechanism must land.
+fn bundled_skills_concat() -> String {
+    use std::fs;
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .map(|p| p.to_path_buf());
+    let skills_dir = match workspace_root {
+        Some(root) => root.join("harness").join("skills"),
+        None => return String::new(),
+    };
+    let Ok(entries) = fs::read_dir(&skills_dir) else {
+        return String::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            if path.is_dir() {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+    let mut out = String::new();
+    for name in names {
+        let skill_path = skills_dir.join(&name).join("SKILL.md");
+        let Ok(body) = fs::read_to_string(&skill_path) else {
+            continue;
+        };
+        out.push_str("## skill: ");
+        out.push_str(&name);
+        out.push_str("\n\n");
+        out.push_str(body.trim());
+        out.push_str("\n\n---\n\n");
+    }
+    out
+}
+
 fn load_corpus_prompt() -> Option<String> {
     corpus_prompt_candidates()
         .into_iter()
@@ -285,19 +342,6 @@ fn read_corpus_prompt(path: &std::path::Path) -> Option<String> {
     }
 }
 
-pub fn build_subagent_prompt(role: &str, role_instruction: &str) -> String {
-    format!(
-        "{IDENTITY}\n\n{DISCIPLINE}\n\n{CORPUS_ORIENTATION}\n\n\
-         # Subagent role\n\n\
-         You are `{role}`, a focused research subagent inside L.E.E.K. \
-         {role_instruction}\n\n\
-         Output in Chinese. Keep the report compact but decision-useful. \
-         Separate facts, inference, speculation, missing data, and the strongest \
-         opposing view. Do not claim you fetched data unless the main agent gave \
-         it to you in context."
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,7 +356,6 @@ mod tests {
         assert!(p.contains("# corpus orientation"));
         assert!(p.contains("Citation surface conventions"));
         assert!(p.contains("General research method"));
-        assert!(p.contains("delegate_research"));
         assert!(p.contains("# Research Skills"));
         assert!(p.contains("equity-valuation"));
         assert!(p.contains("crypto-research"));

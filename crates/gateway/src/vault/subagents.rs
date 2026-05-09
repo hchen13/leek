@@ -1,3 +1,11 @@
+// Phase 0: the `delegate_research` tool was removed and no other code
+// path emits subagent_runs at the moment. The schema + helpers stay so
+// that (a) `vault::sessions::delete` can still wipe the table for an
+// archived session, and (b) reintroducing a subagent system later
+// doesn't require resurrecting the row format. Quiet the dead-code
+// warnings until that happens.
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use sqlx::SqlitePool;

@@ -226,49 +226,43 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
         }
     }
 
+    // Phase 0 minimal toolset:
+    //   - generic: ask_user_question, web_fetch, update_plan
+    //   - corpus:  corpus_search, corpus_read
+    //   - market:  tradingview_quote (= market_quote), get_candlesticks
+    //   - A-share fundamentals: get_financials (Tushare for A-share, SEC for
+    //                          US until that path is consolidated),
+    //                          get_company_info, get_capital_flow
+    // Removed in the rebuild slice: critic-driven decision_draft pipeline
+    // (`record_investment_action`, `record_research_note`), 4-persona
+    // subagent (`delegate_research`), skill-as-a-tool (`use_skill`,
+    // replaced by static skill injection in build_system_prompt), US-only
+    // filings tool (`sec_filing_fetch`), and crypto tools (`get_funding_rate`,
+    // `get_crypto_market`) since the active vertical is A-shares.
     let tools = agent::tools::ToolRegistry::builder()
         .register(Arc::new(
             agent::tools::ask_user_question::AskUserQuestionTool::new(),
         ))
         .register(Arc::new(agent::tools::web_fetch::WebFetchTool::new()?))
-        .register(Arc::new(
-            agent::tools::get_candlesticks::GetCandlesticksTool::new()?,
-        ))
+        .register(Arc::new(agent::tools::update_plan::UpdatePlanTool::new()))
         .register(Arc::new(
             agent::tools::corpus_search::CorpusSearchTool::new(),
         ))
         .register(Arc::new(agent::tools::corpus_read::CorpusReadTool::new()))
         .register(Arc::new(
-            agent::tools::sec_filing_fetch::SecFilingFetchTool::new()?,
-        ))
-        .register(Arc::new(
             agent::tools::tradingview_quote::TradingViewQuoteTool::new()?,
         ))
         .register(Arc::new(
-            agent::tools::record_investment_action::RecordInvestmentActionTool::new(),
+            agent::tools::get_candlesticks::GetCandlesticksTool::new()?,
         ))
         .register(Arc::new(
             agent::tools::get_financials::GetFinancialsTool::new()?,
-        ))
-        .register(Arc::new(
-            agent::tools::get_funding_rate::GetFundingRateTool::new()?,
-        ))
-        .register(Arc::new(
-            agent::tools::get_crypto_market::GetCryptoMarketTool::new()?,
         ))
         .register(Arc::new(
             agent::tools::get_company_info::GetCompanyInfoTool::new()?,
         ))
         .register(Arc::new(
             agent::tools::get_capital_flow::GetCapitalFlowTool::new()?,
-        ))
-        .register(Arc::new(agent::tools::use_skill::UseSkillTool::new()))
-        .register(Arc::new(agent::tools::update_plan::UpdatePlanTool::new()))
-        .register(Arc::new(
-            agent::tools::record_research_note::RecordResearchNoteTool::new(),
-        ))
-        .register(Arc::new(
-            agent::tools::delegate_research::DelegateResearchTool::new(provider.clone()),
         ))
         .build();
 

@@ -6,7 +6,6 @@
 //! surface lifecycle events for the UI.
 
 pub mod compact;
-pub mod critic;
 pub mod harness;
 pub mod routing;
 pub mod tools;
@@ -213,65 +212,16 @@ pub async fn run_chat_reply(
     let mut additional_inputs: Vec<serde_json::Value> = Vec::new();
     let mut awaiting_user = false;
     let mut plan_guard_rewrites = 0usize;
-    let mut critic_rewrites = 0usize;
     let mut turn = 0usize;
     let mut fatal_error: Option<String> = None;
-    // Set when budget caps trip; the next iteration is a recovery turn that
-    // disables substantive tools and instructs the model to ship a checkpoint
-    // answer. See design/decisions/0012-plan-resolution-and-budget-recovery.md.
-    let mut finalization: Option<&'static str> = None;
-    let mut finalization_emitted = false;
-    let mut budget_limited = false;
-    let user_question_for_critic = messages
-        .iter()
-        .rev()
-        .find(|m| matches!(m.role, Role::User))
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
     'turns: loop {
-        if turn >= MAX_TOOL_TURNS && finalization.is_none() {
-            // Budget cap. Don't fail — convert into a single recovery turn
-            // that produces a checkpoint answer (per design 0012 §"Budget as
-            // recovery boundary").
-            finalization = Some("max_tool_turns");
-        }
-        // Activate finalization mode if just entered. Auto-close any open
-        // plan items as `blocked`, emit a visible event, and inject the
-        // checkpoint instruction so the model knows tools are off.
-        if finalization.is_some() && !finalization_emitted {
-            finalization_emitted = true;
-            budget_limited = true;
-            let reason = finalization.unwrap();
-            let closed = vault_plans::close_open_items(
-                &pool,
-                &user_id,
-                &session_id,
-                task.as_ref().map(|t| t.task_id.as_str()),
-                "blocked",
-                "budget exhausted: agent hit cap before all plan items completed",
-            )
-            .await
-            .unwrap_or_default();
-            let plan_summary = format_plan_items(&closed);
-            publish_and_persist(
-                &pool,
-                &user_id,
-                &session_id,
-                task.as_ref().map(|t| t.task_id.as_str()),
-                &event_bus,
-                "budget_finalization",
-                serde_json::json!({
-                    "reason": reason,
-                    "plan_summary": plan_summary,
-                    "closed_items": closed.iter().map(plan_item_summary).collect::<Vec<_>>(),
-                }),
-            )
-            .await?;
-            additional_inputs.push(finalization_input(reason, &plan_summary));
-        }
-        if finalization.is_some() && turn >= MAX_TOOL_TURNS + 1 {
-            // Already used the recovery turn — stop. final_text was filled
-            // (or left empty if the model produced nothing).
+        if turn >= MAX_TOOL_TURNS {
+            // Phase 0 hard cap. Milestone 1 will replace this with proper
+            // turn-level cost / wall-clock / stuck-detection guards plus
+            // a graceful finalization turn; for now hitting MAX_TOOL_TURNS
+            // simply fails the task with a clear reason.
+            stop_reason = "max_tool_turns".to_string();
+            fatal_error = Some(format!("max_tool_turns ({MAX_TOOL_TURNS}) hit"));
             break 'turns;
         }
 
@@ -290,23 +240,12 @@ pub async fn run_chat_reply(
             turn_text.clear();
             thinking_committed_len = 0;
             let mut request_inputs = additional_inputs.clone();
-            // The recovery turn does not need (and must not invite) more
-            // research — leave the plan reminder out and strip every tool
-            // from the spec list. The model's job is to ship a checkpoint
-            // synthesis from what it already knows.
-            let in_finalization = finalization.is_some();
-            if !in_finalization {
-                if let Some(plan_input) =
-                    active_plan_reminder_input(&pool, &user_id, &session_id, task.as_ref()).await?
-                {
-                    request_inputs.push(plan_input);
-                }
+            if let Some(plan_input) =
+                active_plan_reminder_input(&pool, &user_id, &session_id, task.as_ref()).await?
+            {
+                request_inputs.push(plan_input);
             }
-            let turn_tools: Vec<ToolSpec> = if in_finalization {
-                Vec::new()
-            } else {
-                tool_specs.clone()
-            };
+            let turn_tools: Vec<ToolSpec> = tool_specs.clone();
             let req = ChatRequest {
                 messages: messages.clone(),
                 system: Some(system_prompt.clone()),
@@ -545,17 +484,11 @@ pub async fn run_chat_reply(
 
         // No tool calls this turn → model is done.
         if pending_calls.is_empty() {
-            // Finalization recovery turn: whatever the model said is the
-            // checkpoint answer. Skip plan guard / critic — they assume an
-            // intact research budget.
-            if finalization.is_some() {
-                final_text = turn_text.clone();
-                stop_reason = format!(
-                    "budget_finalization:{}",
-                    finalization.unwrap_or("unknown")
-                );
-                break 'turns;
-            }
+            // Plan guard: keep agents from declaring victory while the plan
+            // they themselves wrote still has open items. Phase 0 simplifies
+            // this to a soft re-prompt with a small rewrite budget; the
+            // critic-driven rewrite path and the budget_finalization recovery
+            // turn have been removed.
             if let Some(guard) = plan_guard(&pool, &user_id, &session_id, task.as_ref()).await? {
                 commit_thinking_card(
                     &pool,
@@ -587,73 +520,11 @@ pub async fn run_chat_reply(
                     additional_inputs.push(plan_guard_input(&guard, &turn_text));
                     continue 'turns;
                 }
-                // Out of rewrites — convert into a finalization recovery turn
-                // instead of failing the task. The next loop pass will close
-                // open plan items as `blocked`, strip tools, and ask for a
-                // checkpoint answer.
-                finalization = Some("plan_guard_exhausted");
-                stop_reason = "budget_finalization:plan_guard_exhausted".to_string();
-                continue 'turns;
-            }
-
-            // Critic gate — run only for tasks where rigor matters
-            // (decision_draft / research_brief / review / comparison) and
-            // only as long as we have rewrites left. Cancellation aborts.
-            if !cancel.is_cancelled()
-                && critic_rewrites < critic::MAX_CRITIC_REWRITES
-                && critic::should_run_critic(task.as_ref().map(|t| t.expected_deliverable.as_str()))
-                && !turn_text.trim().is_empty()
-            {
-                let kind = task
-                    .as_ref()
-                    .map(|t| t.expected_deliverable.clone())
-                    .unwrap_or_default();
-                let critique_result = critic::evaluate_draft(
-                    provider.clone(),
-                    &kind,
-                    &user_question_for_critic,
-                    &turn_text,
-                    cancel.clone(),
-                )
-                .await;
-                match critique_result {
-                    Ok(Some(critique)) if critique.needs_rewrite() => {
-                        commit_thinking_card(
-                            &pool,
-                            &user_id,
-                            &session_id,
-                            task.as_ref().map(|t| t.task_id.as_str()),
-                            &event_bus,
-                            turn,
-                            &turn_text,
-                            &mut thinking_committed_len,
-                        )
-                        .await?;
-                        critic_rewrites += 1;
-                        stop_reason = "critic_continue".to_string();
-                        let gaps = critique.gaps.join("; ");
-                        publish_and_persist(
-                            &pool,
-                            &user_id,
-                            &session_id,
-                            task.as_ref().map(|t| t.task_id.as_str()),
-                            &event_bus,
-                            "agent_narration",
-                            serde_json::json!({
-                                "turn": turn,
-                                "text": format!("评审发现缺口：{}。我重写一遍。", gaps),
-                            }),
-                        )
-                        .await?;
-                        additional_inputs.push(critic::critic_input(&critique, &turn_text));
-                        continue 'turns;
-                    }
-                    Ok(_) => { /* ship */ }
-                    Err(err) => {
-                        // Critic failure must not block the user — log and ship.
-                        tracing::warn!(error = %err, "critic call failed; shipping draft as-is");
-                    }
-                }
+                // Out of rewrites — fail the task. (Milestone 1 will turn
+                // this into a turn-level cost cap + graceful finalization.)
+                stop_reason = "plan_guard_exhausted".to_string();
+                fatal_error = Some(format!("plan_guard exhausted after {plan_guard_rewrites} rewrites; reason: {}", guard.reason));
+                break 'turns;
             }
 
             final_text = turn_text.clone();
@@ -922,37 +793,23 @@ pub async fn run_chat_reply(
                         "deliverable_id": deliverable_id,
                         "task_id": t.task_id,
                         "kind": t.expected_deliverable,
-                        "budget_limited": budget_limited,
                     }),
                 )
                 .await?;
             }
-            if budget_limited && !has_content {
-                fail_task(
-                    &pool,
-                    &user_id,
-                    &session_id,
-                    &event_bus,
-                    &t.task_id,
-                    "budget_finalization produced no checkpoint text",
-                )
-                .await?;
-            } else {
-                vault_tasks::mark_delivered(&pool, &user_id, &t.task_id).await?;
-                publish_and_persist(
-                    &pool,
-                    &user_id,
-                    &session_id,
-                    Some(&t.task_id),
-                    &event_bus,
-                    "task_delivered",
-                    serde_json::json!({
-                        "task_id": t.task_id,
-                        "budget_limited": budget_limited,
-                    }),
-                )
-                .await?;
-            }
+            vault_tasks::mark_delivered(&pool, &user_id, &t.task_id).await?;
+            publish_and_persist(
+                &pool,
+                &user_id,
+                &session_id,
+                Some(&t.task_id),
+                &event_bus,
+                "task_delivered",
+                serde_json::json!({
+                    "task_id": t.task_id,
+                }),
+            )
+            .await?;
         }
     }
 
@@ -1185,41 +1042,6 @@ fn format_plan_items(items: &[vault_plans::PlanItemRow]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn plan_item_summary(item: &vault_plans::PlanItemRow) -> serde_json::Value {
-    serde_json::json!({
-        "id": item.item_id,
-        "seq": item.seq,
-        "step": item.step,
-        "status": item.status,
-        "resolution": item.resolution,
-        "evidence": item.evidence,
-    })
-}
-
-fn finalization_input(reason: &str, plan_summary: &str) -> serde_json::Value {
-    let label = match reason {
-        "max_tool_turns" => "本轮已达到最大工具调用步数",
-        "plan_guard_exhausted" => "计划闸口已用完所有重写机会",
-        other => other,
-    };
-    serde_json::json!({
-        "role": "user",
-        "content": format!(
-            "BUDGET FINALIZATION\n\
-             {label}。系统已自动把所有未完成的 plan item 关闭为 `blocked`，并禁用所有工具。\n\
-             你只剩这一轮回答机会。请基于已经掌握的事实输出一份 checkpoint 答复，包含：\n\
-             1. 已经做了什么、看到了什么。\n\
-             2. 还缺什么、为什么没拿到。\n\
-             3. 这些缺口如何降低你结论的置信度。\n\
-             4. 在当前信息条件下，最保守的动作边界是什么（行动 / 等待 / 缩仓位）。\n\
-             5. 如果继续推进，下一步具体会做什么、找什么证据。\n\
-             不要再调用任何工具；不要把未完成项目甩给用户；不要假装还能继续研究。\n\
-             给出一份对用户真正有用的部分答案。\n\n\
-             plan 关闭快照：\n{plan_summary}",
-        ),
-    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1600,16 +1422,4 @@ mod tests {
             .is_none());
     }
 
-    /// finalization_input renders a checkpoint instruction the model can act
-    /// on without further tools.
-    #[test]
-    fn finalization_input_describes_checkpoint() {
-        let summary = "- [completed → blocked] p1. 拉财报 evidence: 504";
-        let payload = finalization_input("max_tool_turns", summary);
-        let content = payload["content"].as_str().unwrap();
-        assert!(content.contains("BUDGET FINALIZATION"));
-        assert!(content.contains("最大工具调用步数"));
-        assert!(content.contains("checkpoint"));
-        assert!(content.contains(summary));
-    }
 }

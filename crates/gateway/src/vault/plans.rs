@@ -130,47 +130,6 @@ pub async fn list_current(
     .context("listing current agent plan")
 }
 
-/// Force every open (pending / in_progress) item into `completed` with the
-/// supplied resolution. Used by the budget-finalization recovery turn so the
-/// plan reflects honest closure even when the agent ran out of substantive
-/// turns. Returns the post-image rows.
-pub async fn close_open_items(
-    pool: &SqlitePool,
-    user_id: &str,
-    session_id: &str,
-    task_id: Option<&str>,
-    resolution: &str,
-    evidence: &str,
-) -> Result<Vec<PlanItemRow>> {
-    if !VALID_RESOLUTIONS.contains(&resolution) {
-        return Err(anyhow!("invalid resolution for close_open_items: {resolution}"));
-    }
-    let task_id_str = scope_task_id(task_id);
-    let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE agent_plan_items
-        SET status = 'completed',
-            resolution = ?,
-            evidence = COALESCE(NULLIF(TRIM(evidence), ''), ?),
-            updated_at = ?
-        WHERE user_id = ? AND session_id = ? AND task_id = ?
-          AND status IN ('pending', 'in_progress')
-        "#,
-    )
-    .bind(resolution)
-    .bind(evidence.trim())
-    .bind(&now)
-    .bind(user_id)
-    .bind(session_id)
-    .bind(&task_id_str)
-    .execute(pool)
-    .await
-    .context("auto-closing open plan items")?;
-
-    list_current(pool, user_id, session_id, Some(&task_id_str)).await
-}
-
 pub fn scope_task_id(task_id: Option<&str>) -> String {
     task_id.unwrap_or("").to_string()
 }
@@ -323,32 +282,4 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn close_open_items_marks_pending_blocked() {
-        let pool = pool().await;
-        let task = Some("t1");
-        replace_current(
-            &pool,
-            "u",
-            "s",
-            task,
-            &[
-                item("p1", "x", "completed", Some("done"), Some("ok")),
-                item("p2", "y", "pending", None, None),
-            ],
-        )
-        .await
-        .unwrap();
-        let rows = close_open_items(&pool, "u", "s", task, "blocked", "budget exhausted")
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 2);
-        let p2 = rows.iter().find(|r| r.item_id == "p2").unwrap();
-        assert_eq!(p2.status, "completed");
-        assert_eq!(p2.resolution.as_deref(), Some("blocked"));
-        assert_eq!(p2.evidence.as_deref(), Some("budget exhausted"));
-        let p1 = rows.iter().find(|r| r.item_id == "p1").unwrap();
-        // already completed/done — not overwritten.
-        assert_eq!(p1.resolution.as_deref(), Some("done"));
-    }
 }

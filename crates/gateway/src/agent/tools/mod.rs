@@ -8,25 +8,22 @@
 //! Server-side tools (codex's built-in `web_search`) bypass this — they're
 //! advertised through `ToolSpec::WebSearch` and execute on OpenAI's side.
 
+// Phase 0 minimal toolset (rebuild slice). Deleted modules
+// (`delegate_research`, `get_crypto_market`, `get_funding_rate`,
+// `record_investment_action`, `record_research_note`, `sec_filing_fetch`,
+// `use_skill`) are gone entirely — their functionality either had no
+// active path after the harness simplification or was replaced (skill
+// content is now statically injected into the system prompt via
+// `harness::build_system_prompt`).
 pub mod ask_user_question;
 pub mod corpus_read;
 pub mod corpus_search;
-pub mod delegate_research;
 pub mod get_candlesticks;
 pub mod get_capital_flow;
 pub mod get_company_info;
-pub mod get_crypto_market;
 pub mod get_financials;
-pub mod get_funding_rate;
-pub mod record_investment_action;
-pub mod record_research_note;
-pub mod sec_filing_fetch;
 pub mod tradingview_quote;
-// `tushare_quote` was an unused dead module — `market_quote` (via
-// `tradingview_quote`) is the unified quote tool, and `get_candlesticks`
-// has Tushare integration baked in for OHLC. Removed in 0.5 cleanup.
 pub mod update_plan;
-pub mod use_skill;
 pub mod web_fetch;
 
 use std::collections::HashMap;
@@ -40,9 +37,11 @@ use crate::llm::ToolSpec;
 
 /// Per-request context injected by the agent loop into every tool call.
 /// Stateless tools (web_fetch, corpus_search, etc.) may ignore it.
-/// Stateful tools (record_investment_action, etc.) need it to write to vault.
-/// `tuning` carries the active per-surface reasoning/verbosity knobs so tools
-/// that spawn LLM calls (delegate_research) match the user's Settings.
+/// Stateful tools that need to write to vault use `pool` / `user_id` /
+/// `session_id` / `task_id`. `tuning` carries the per-surface
+/// reasoning/verbosity knobs; currently no Phase-0 tool reads it but it
+/// is retained for Milestone 1 (cost cap will need provider price
+/// lookups parameterized off the active model in `tuning`).
 #[derive(Clone)]
 pub struct ToolContext {
     pub pool: sqlx::SqlitePool,
@@ -50,6 +49,7 @@ pub struct ToolContext {
     pub user_id: String,
     pub session_id: String,
     pub task_id: Option<String>,
+    #[allow(dead_code)]
     pub tuning: crate::llm::LlmTuning,
 }
 
