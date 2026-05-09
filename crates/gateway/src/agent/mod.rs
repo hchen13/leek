@@ -200,6 +200,16 @@ pub async fn run_chat_reply(
         "update_plan",
         "delegate_research",
         "record_investment_action",
+        // R2 fix: when `task = None` (chat-only follow-up), the lifecycle
+        // endpoint can't persist `awaiting_user` state — there's no task
+        // row to attach to. The model would call ask_user_question, the
+        // ClarificationCard would render on UI, but the backend would
+        // silently drop the lifecycle update; the next user POST has no
+        // way to know "we're waiting on a clarification". Excluding the
+        // tool in followup mode forces the model to answer with what
+        // it has from the prior turn instead of starting a new
+        // research arc that could need disambiguation.
+        "ask_user_question",
     ];
     tool_specs.extend(tools.specs().into_iter().filter(|spec| {
         if !is_followup {
@@ -810,23 +820,39 @@ pub async fn run_chat_reply(
                 // this into a turn-level cost cap + graceful finalization.)
                 stop_reason = "plan_guard_exhausted".to_string();
                 fatal_error = Some(format!("plan_guard exhausted after {plan_guard_rewrites} rewrites; reason: {}", guard.reason));
+                // R2 fix: plan-guard is a guard like the others; record
+                // it in `first_triggered_guard` so postmortem queries
+                // can group "task killed by plan-guard" alongside the
+                // M1.x guards.
+                if first_triggered_guard.is_none() {
+                    first_triggered_guard = Some("plan_guard_exhausted".to_string());
+                }
                 break 'turns;
             }
 
             final_text = turn_text.clone();
-            // Round-1 review fix: even on natural completion, if a
-            // mid-iteration flag was set (cost cap exceeded mid-stream,
-            // doom-loop detected during dispatch), promote the
-            // `stop_reason` so the metrics row records the trigger.
-            // We *keep* the answer (the model already produced one;
-            // discarding it is worse UX than recording the postmortem
-            // signal) but the row's stop_reason reflects the cap.
-            // `first_triggered_guard` was already set at the flag's
-            // detection site; this only fixes `stop_reason`.
-            if cost_cap_hit && stop_reason == "end_turn" {
+            // Round-2 review fix: if a mid-iteration guard fired
+            // during this iteration (cost cap exceeded mid-stream,
+            // doom-loop detected during dispatch), promote BOTH the
+            // `stop_reason` AND `fatal_error` — guard hits are the
+            // user's explicit "stop at this threshold" instruction,
+            // so the deliverable should not be shipped. The lifecycle
+            // endpoint will fail_task instead of mark_delivered when
+            // fatal_error is Some, which keeps the metrics row's
+            // stop_reason consistent with the task's lifecycle status
+            // (Round 1's "ship the answer anyway" decision left a
+            // contradiction: stop_reason="cost_cap_exceeded" coexisting
+            // with task_delivered SSE event).
+            if cost_cap_hit && fatal_error.is_none() {
                 stop_reason = "cost_cap_exceeded".to_string();
-            } else if doom_loop_hit && stop_reason == "end_turn" {
+                fatal_error = Some(format!(
+                    "cost cap exceeded mid-stream — total ${:.4}",
+                    total_cost_usd,
+                ));
+            } else if doom_loop_hit && fatal_error.is_none() {
                 stop_reason = "doom_loop".to_string();
+                fatal_error =
+                    Some("doom-loop detected mid-stream".to_string());
             }
             break 'turns;
         }
@@ -866,6 +892,18 @@ pub async fn run_chat_reply(
         // serializing keeps the audit trail simple).
         let mut user_question: Option<serde_json::Value> = None;
         for call in pending_calls {
+            // R2 fix: honor user abort between tools. The dispatched
+            // tool itself receives `cancel.clone()` and respects it,
+            // but the loop body never observed cancel — so a 5-tool
+            // batch with one slow tool could ignore Esc for minutes
+            // while subsequent tools dispatched anyway. Now we bail
+            // cleanly between tools and let the unified lifecycle
+            // endpoint write a metrics row with stop_reason=user_aborted.
+            if cancel.is_cancelled() {
+                stop_reason = "user_aborted".to_string();
+                fatal_error = Some("user_aborted".to_string());
+                break 'turns;
+            }
             let tool_started = Instant::now();
             vault_tool_runs::start(
                 &pool,
@@ -1023,6 +1061,24 @@ pub async fn run_chat_reply(
         if let Some(payload) = user_question {
             awaiting_user = true;
             stop_reason = "awaiting_user".to_string();
+            // R2 fix: if a mid-iteration guard fired in the same iteration
+            // that produced the clarification request, the guard takes
+            // precedence for stop_reason + fatal_error (consistent with
+            // the natural-completion branch's R2 fix above). The
+            // ClarificationCard the user sees is a side-effect already
+            // emitted via `clarification_requested`; backend records the
+            // cap as the actual stop reason for postmortem.
+            if cost_cap_hit && fatal_error.is_none() {
+                stop_reason = "cost_cap_exceeded".to_string();
+                fatal_error = Some(format!(
+                    "cost cap exceeded during clarification turn — total ${:.4}",
+                    total_cost_usd,
+                ));
+            } else if doom_loop_hit && fatal_error.is_none() {
+                stop_reason = "doom_loop".to_string();
+                fatal_error =
+                    Some("doom-loop detected during clarification turn".to_string());
+            }
             let question_text = payload
                 .get("question_text")
                 .and_then(|v| v.as_str())
