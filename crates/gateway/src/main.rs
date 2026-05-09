@@ -227,24 +227,25 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
     }
 
     // Phase 0 minimal toolset:
-    //   - generic: ask_user_question, web_fetch, update_plan
-    //   - corpus:  corpus_search, corpus_read
-    //   - market:  tradingview_quote (= market_quote), get_candlesticks
-    //   - A-share fundamentals: get_financials (Tushare for A-share, SEC for
-    //                          US until that path is consolidated),
-    //                          get_company_info, get_capital_flow
+    //   - generic:   ask_user_question, web_fetch, update_plan, use_skill
+    //   - corpus:    corpus_search, corpus_read
+    //   - market:    tradingview_quote (= market_quote), get_candlesticks
+    //   - A-share fundamentals: get_financials (Tushare for A-share,
+    //                           SEC EDGAR for US until that path is
+    //                           consolidated), get_company_info,
+    //                           get_capital_flow
     // Removed in the rebuild slice: critic-driven decision_draft pipeline
     // (`record_investment_action`, `record_research_note`), 4-persona
-    // subagent (`delegate_research`), skill-as-a-tool (`use_skill`,
-    // replaced by static skill injection in build_system_prompt), US-only
-    // filings tool (`sec_filing_fetch`), and crypto tools (`get_funding_rate`,
-    // `get_crypto_market`) since the active vertical is A-shares.
+    // subagent (`delegate_research`), US-only filings tool
+    // (`sec_filing_fetch`), and crypto tools (`get_funding_rate`,
+    // `get_crypto_market`) — the active vertical is A-shares.
     let tools = agent::tools::ToolRegistry::builder()
         .register(Arc::new(
             agent::tools::ask_user_question::AskUserQuestionTool::new(),
         ))
         .register(Arc::new(agent::tools::web_fetch::WebFetchTool::new()?))
         .register(Arc::new(agent::tools::update_plan::UpdatePlanTool::new()))
+        .register(Arc::new(agent::tools::use_skill::UseSkillTool::new()))
         .register(Arc::new(
             agent::tools::corpus_search::CorpusSearchTool::new(),
         ))

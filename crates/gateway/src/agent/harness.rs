@@ -145,17 +145,22 @@ pub fn build_system_prompt(
     prompt.push_str("\n\n");
     prompt.push_str(METHOD_AND_DELEGATION);
     prompt.push_str("\n\n");
-    // Phase 0: skills are statically baked into the system prompt — every
-    // SKILL.md from `harness/skills/<name>/` is concatenated unconditionally.
-    // Milestone 2.5 will replace this with the lazy / hot-reload / route-aware
-    // skill mechanism described in the rebuild plan (modeled on Claude Code).
-    let bundled_skills = bundled_skills_concat();
+    // Skill discovery: progressive disclosure (Claude Code / Codex style).
+    // We list every skill's frontmatter `description` here so the model
+    // knows the skill exists and what it's for; the *body* of each
+    // SKILL.md only enters context when the model calls
+    // `use_skill(name)`. Keeps the per-turn prompt cost bounded as the
+    // skill catalog grows. Milestone 2.5 will widen discovery to user
+    // (`~/.leek/skills/`) and project (`<project>/.leek/skills/`)
+    // directories and add hot reload via fsnotify.
+    let bundled_skills = bundled_skills_index();
     if !bundled_skills.is_empty() {
         prompt.push_str("# Research Skills\n\n");
         prompt.push_str(
-            "The frameworks below are part of your investing mind. Apply the \
-             one that matches the task; treat them as methodology, not as a \
-             tool checklist.\n\n",
+            "The skills below are methodology frameworks bundled with leek. \
+             When a task matches one, call `use_skill(name)` to load its full \
+             body before doing analysis. Don't paraphrase or guess at a skill's \
+             content from the description alone — load it.\n\n",
         );
         prompt.push_str(&bundled_skills);
     }
@@ -238,54 +243,112 @@ pub fn build_system_prompt(
     prompt
 }
 
-/// Phase 0: load every `harness/skills/<name>/SKILL.md` and concat their
-/// bodies into a single block destined for the system prompt. The strategy
-/// is intentionally crude — full content for every skill, every turn — so
-/// the agent doesn't lose access to its investing frameworks while the
-/// sophisticated skill machinery (lazy load, frontmatter routing, hot
-/// reload) is being designed for Milestone 2.5. The deliberate concession
-/// is that the skill set is small (currently 2 files), so the token cost
-/// is bounded; once it grows past ~3 skills the lazy mechanism must land.
-fn bundled_skills_concat() -> String {
-    use std::fs;
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+/// Workspace root, used by skill loading. `CARGO_MANIFEST_DIR` points at
+/// `crates/gateway/`; ancestors[2] climbs to the workspace root where
+/// `harness/skills/` lives.
+pub(crate) fn workspace_root() -> Option<PathBuf> {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
-        .map(|p| p.to_path_buf());
-    let skills_dir = match workspace_root {
-        Some(root) => root.join("harness").join("skills"),
-        None => return String::new(),
+        .map(|p| p.to_path_buf())
+}
+
+/// Sorted list of bundled skill directory names (each contains a
+/// `SKILL.md`). Used both by the system-prompt index and by
+/// `use_skill` for input validation.
+pub(crate) fn list_skill_names() -> Vec<String> {
+    use std::fs;
+    let Some(root) = workspace_root() else {
+        return Vec::new();
     };
+    let skills_dir = root.join("harness").join("skills");
     let Ok(entries) = fs::read_dir(&skills_dir) else {
-        return String::new();
+        return Vec::new();
     };
     let mut names: Vec<String> = entries
         .filter_map(|e| e.ok())
         .filter_map(|e| {
-            let path = e.path();
-            if path.is_dir() {
-                path.file_name()
+            if e.path().is_dir() {
+                e.path()
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .map(|s| s.to_string())
             } else {
                 None
             }
         })
+        .filter(|name| {
+            // Only count directories that actually have a SKILL.md.
+            skills_dir.join(name).join("SKILL.md").is_file()
+        })
         .collect();
     names.sort();
+    names
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct SkillFrontmatter {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// Read SKILL.md and parse its YAML frontmatter (`---\n...\n---`).
+/// Returns `None` if no frontmatter or parse failure (caller falls
+/// back to the directory name as the visible identifier).
+fn read_skill_frontmatter(skill_path: &std::path::Path) -> Option<SkillFrontmatter> {
+    let raw = std::fs::read_to_string(skill_path).ok()?;
+    let trimmed = raw.trim_start_matches('\u{FEFF}');
+    let after_open = trimmed.strip_prefix("---")?.trim_start_matches('\n');
+    // Match the closing `---` on its own line.
+    let close_idx = after_open
+        .find("\n---\n")
+        .or_else(|| {
+            // Tolerate trailing whitespace / EOF after the closing fence.
+            after_open
+                .find("\n---")
+                .filter(|&i| {
+                    after_open
+                        .as_bytes()
+                        .get(i + 4)
+                        .map(|b| matches!(*b, b'\n' | b'\r' | b' ' | b'\t'))
+                        .unwrap_or(true)
+                })
+        })?;
+    let yaml = &after_open[..close_idx];
+    serde_yaml::from_str::<SkillFrontmatter>(yaml).ok()
+}
+
+/// Build the "Available skills" index for the system prompt. One bullet
+/// per skill, showing `name` (from frontmatter, or directory if absent)
+/// and `description` collapsed onto a single line.
+fn bundled_skills_index() -> String {
+    let Some(root) = workspace_root() else {
+        return String::new();
+    };
+    let skills_dir = root.join("harness").join("skills");
+    let names = list_skill_names();
     let mut out = String::new();
-    for name in names {
-        let skill_path = skills_dir.join(&name).join("SKILL.md");
-        let Ok(body) = fs::read_to_string(&skill_path) else {
-            continue;
-        };
-        out.push_str("## skill: ");
-        out.push_str(&name);
-        out.push_str("\n\n");
-        out.push_str(body.trim());
-        out.push_str("\n\n---\n\n");
+    for dir_name in names {
+        let path = skills_dir.join(&dir_name).join("SKILL.md");
+        let fm = read_skill_frontmatter(&path).unwrap_or_default();
+        let display_name = fm.name.unwrap_or_else(|| dir_name.clone());
+        let description = fm
+            .description
+            .map(|d| collapse_whitespace(&d))
+            .unwrap_or_else(|| "(no description)".to_string());
+        out.push_str("- **");
+        out.push_str(&display_name);
+        out.push_str("** — ");
+        out.push_str(&description);
+        out.push('\n');
     }
     out
+}
+
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn load_corpus_prompt() -> Option<String> {

@@ -10,11 +10,11 @@
 
 // Phase 0 minimal toolset (rebuild slice). Deleted modules
 // (`delegate_research`, `get_crypto_market`, `get_funding_rate`,
-// `record_investment_action`, `record_research_note`, `sec_filing_fetch`,
-// `use_skill`) are gone entirely — their functionality either had no
-// active path after the harness simplification or was replaced (skill
-// content is now statically injected into the system prompt via
-// `harness::build_system_prompt`).
+// `record_investment_action`, `record_research_note`, `sec_filing_fetch`)
+// are gone entirely. `use_skill` is back: per Claude Code / Codex
+// convention, the system prompt lists each skill's frontmatter
+// `description`, and the model calls `use_skill(name)` to lazy-load
+// the full body when a task matches.
 pub mod ask_user_question;
 pub mod corpus_read;
 pub mod corpus_search;
@@ -24,6 +24,7 @@ pub mod get_company_info;
 pub mod get_financials;
 pub mod tradingview_quote;
 pub mod update_plan;
+pub mod use_skill;
 pub mod web_fetch;
 
 use std::collections::HashMap;
