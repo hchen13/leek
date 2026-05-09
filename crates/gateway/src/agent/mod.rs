@@ -252,6 +252,19 @@ pub async fn run_chat_reply(
     let mut total_output_tokens: i64 = 0;
     let mut total_cost_usd: f64 = 0.0;
     let mut cost_cap_hit: bool = false;
+    // M1.6: rolling window of recent (tool_name, args) tuples for the
+    // doom-loop detector. Window size = `doom_loop_threshold`. When
+    // the entire window collapses to a single distinct value, we've
+    // observed N consecutive identical tool calls — almost always a
+    // model that's stuck and burning resources. Default threshold = 3.
+    let mut recent_tool_calls: std::collections::VecDeque<(String, String)> =
+        std::collections::VecDeque::new();
+    let mut doom_loop_hit: bool = false;
+    // M1.6: name of the first guard that fired during this task,
+    // recorded into `task_metrics.first_triggered_guard`. Once set
+    // it doesn't change — the *first* guard is what matters for
+    // postmortem analysis even if other guards subsequently fire.
+    let mut first_triggered_guard: Option<String> = None;
     // M1.2: count provider-stream-idle hits across the whole task
     // lifecycle. Used by the stream-error retry block to promote the
     // failure to `idle_timeout` once the budget is exhausted.
@@ -287,6 +300,9 @@ pub async fn run_chat_reply(
                     .unwrap_or(0);
                 stop_reason = "wall_clock_exceeded".to_string();
                 fatal_error = Some(format!("turn wall-clock {}s exceeded", secs));
+                if first_triggered_guard.is_none() {
+                    first_triggered_guard = Some("wall_clock_exceeded".to_string());
+                }
                 break 'turns;
             }
         }
@@ -302,6 +318,27 @@ pub async fn run_chat_reply(
                 "cost cap (${:.4}) reached — total ${:.4}",
                 cap, total_cost_usd,
             ));
+            if first_triggered_guard.is_none() {
+                first_triggered_guard = Some("cost_cap_exceeded".to_string());
+            }
+            break 'turns;
+        }
+
+        // M1.6: doom-loop detector. The flag is set inside the inner
+        // tool-dispatch loop when the rolling window collapses to N
+        // identical (tool_name, args) tuples. Like cost_cap, we act
+        // at the iteration boundary so the dispatched batch finishes
+        // draining first.
+        if doom_loop_hit {
+            let n = tuning.guards.doom_loop_threshold.unwrap_or(0);
+            stop_reason = "doom_loop".to_string();
+            fatal_error = Some(format!(
+                "doom-loop: {} consecutive identical tool calls",
+                n,
+            ));
+            if first_triggered_guard.is_none() {
+                first_triggered_guard = Some("doom_loop".to_string());
+            }
             break 'turns;
         }
 
@@ -314,6 +351,9 @@ pub async fn run_chat_reply(
             if iteration_count >= cap {
                 stop_reason = "max_iterations".to_string();
                 fatal_error = Some(format!("max_iterations cap ({cap}) reached"));
+                if first_triggered_guard.is_none() {
+                    first_triggered_guard = Some("max_iterations".to_string());
+                }
                 break 'turns;
             }
         }
@@ -585,6 +625,9 @@ pub async fn run_chat_reply(
                     "stream idle timeout exhausted budget — {} consecutive {}s idle hits",
                     stream_idle_hits, idle_secs,
                 ));
+                if first_triggered_guard.is_none() {
+                    first_triggered_guard = Some("idle_timeout".to_string());
+                }
                 if let Some(t) = task.as_ref() {
                     fail_task(
                         &pool,
@@ -769,6 +812,24 @@ pub async fn run_chat_reply(
             tool_call_count += 1;
             if exec_result.is_err() {
                 tool_error_count += 1;
+            }
+            // M1.6: doom-loop detection. Push (name, args) into the
+            // rolling window; when the window is full and every entry
+            // is identical, set the flag — the *outer* iteration loop
+            // checks the flag at its next boundary and breaks with
+            // `stop_reason="doom_loop"`. We don't break here in the
+            // inner dispatch loop because we want the rest of the
+            // already-issued tool calls in this batch to drain
+            // cleanly (so their tool_runs rows close, the model sees
+            // their outputs in the eventual final-text retry, etc.).
+            if let Some(threshold) = tuning.guards.doom_loop_threshold {
+                recent_tool_calls.push_back((call.name.clone(), call.arguments.clone()));
+                while recent_tool_calls.len() > threshold {
+                    recent_tool_calls.pop_front();
+                }
+                if detect_doom_loop(&recent_tool_calls, threshold) {
+                    doom_loop_hit = true;
+                }
             }
 
             // Treat tool errors as a delivered output: the model sees the
@@ -1038,9 +1099,7 @@ pub async fn run_chat_reply(
             max_iter_latency_ms: max_iter,
             p50_iter_latency_ms: p50_iter,
             stop_reason: &stop_reason,
-            // M1.6 wires `first_triggered_guard` once doom-loop / cap
-            // detectors emit a guard-trigger signal.
-            first_triggered_guard: None,
+            first_triggered_guard: first_triggered_guard.as_deref(),
             fatal_error: fatal_error.as_deref(),
             // M2.7 wires subagent linkage (parent_task_id, depth).
             parent_task_id: None,
@@ -1193,6 +1252,30 @@ fn soft_deadline_input(deadline: Instant) -> Option<serde_json::Value> {
             "content": hint,
         })
     })
+}
+
+/// M1.6 — doom-loop detector. Returns true when the rolling window is
+/// exactly `threshold` entries long *and* every entry is identical
+/// (same `(tool_name, arguments)` tuple). Caller is responsible for
+/// keeping the window trimmed to the threshold; this function does
+/// not mutate.
+///
+/// `threshold` is the value the agent loop pulled from
+/// `tuning.guards.doom_loop_threshold` — `None` over there means the
+/// detector is off and this function isn't called. We don't accept
+/// `None` here on purpose: the call-site contract is "if the user
+/// turned the detector off, don't even check".
+fn detect_doom_loop(
+    window: &std::collections::VecDeque<(String, String)>,
+    threshold: usize,
+) -> bool {
+    if threshold == 0 || window.len() != threshold {
+        return false;
+    }
+    let Some(first) = window.front() else {
+        return false;
+    };
+    window.iter().all(|c| c == first)
 }
 
 /// Whether the given expected_deliverable kind warrants the rigor of an
@@ -1774,5 +1857,66 @@ mod tests {
         // Deadline 25 min away → no hint.
         let deadline = Instant::now() + Duration::from_secs(25 * 60);
         assert!(soft_deadline_input(deadline).is_none());
+    }
+
+    // ── M1.6 doom-loop detector ────────────────────────────────────
+
+    fn deque(items: &[(&str, &str)]) -> std::collections::VecDeque<(String, String)> {
+        items
+            .iter()
+            .map(|(n, a)| (n.to_string(), a.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn detect_doom_loop_under_threshold_is_false() {
+        let w = deque(&[("get_financials", "{}"), ("get_financials", "{}")]);
+        assert!(!detect_doom_loop(&w, 3));
+    }
+
+    #[test]
+    fn detect_doom_loop_at_threshold_all_same_is_true() {
+        let w = deque(&[
+            ("get_financials", "{}"),
+            ("get_financials", "{}"),
+            ("get_financials", "{}"),
+        ]);
+        assert!(detect_doom_loop(&w, 3));
+    }
+
+    #[test]
+    fn detect_doom_loop_different_args_is_false() {
+        let w = deque(&[
+            ("get_financials", r#"{"ts_code":"600519.SH"}"#),
+            ("get_financials", r#"{"ts_code":"000001.SZ"}"#),
+            ("get_financials", r#"{"ts_code":"600519.SH"}"#),
+        ]);
+        assert!(!detect_doom_loop(&w, 3));
+    }
+
+    #[test]
+    fn detect_doom_loop_different_tools_is_false() {
+        let w = deque(&[
+            ("get_financials", "{}"),
+            ("get_company_info", "{}"),
+            ("get_financials", "{}"),
+        ]);
+        assert!(!detect_doom_loop(&w, 3));
+    }
+
+    #[test]
+    fn detect_doom_loop_zero_threshold_is_false() {
+        // threshold=0 means the detector is off; never fire.
+        let w = deque(&[("x", "{}")]);
+        assert!(!detect_doom_loop(&w, 0));
+    }
+
+    #[test]
+    fn detect_doom_loop_overflowed_window_is_ignored() {
+        // The detector contract says the caller keeps the window
+        // trimmed to the threshold. If the caller drifted, we
+        // refuse to fire (defense against stale state).
+        let w = deque(&[("x", "{}"), ("x", "{}"), ("x", "{}"), ("x", "{}")]);
+        assert!(!detect_doom_loop(&w, 3));
     }
 }
