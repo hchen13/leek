@@ -6,6 +6,7 @@
 
 pub mod codex_oauth;
 pub mod openai_responses;
+pub mod pricing;
 
 use std::time::Duration;
 

@@ -242,6 +242,16 @@ pub async fn run_chat_reply(
     let mut tool_call_count: i64 = 0;
     let mut tool_error_count: i64 = 0;
     let mut iter_latencies_ms: Vec<i64> = Vec::new();
+    // M1.5: per-task token + cost accumulators. Each LLM `Usage` event
+    // bumps these; the cost-cap check happens right after that bump
+    // so the very call that pushed us over the cap is the one that
+    // triggers the stop. Cost is computed via `llm::pricing` from
+    // `(model, usage)`; unknown models return 0.0, which effectively
+    // disables the cap for that model rather than guessing a price.
+    let mut total_input_tokens: i64 = 0;
+    let mut total_output_tokens: i64 = 0;
+    let mut total_cost_usd: f64 = 0.0;
+    let mut cost_cap_hit: bool = false;
     // M1.2: count provider-stream-idle hits across the whole task
     // lifecycle. Used by the stream-error retry block to promote the
     // failure to `idle_timeout` once the budget is exhausted.
@@ -279,6 +289,20 @@ pub async fn run_chat_reply(
                 fatal_error = Some(format!("turn wall-clock {}s exceeded", secs));
                 break 'turns;
             }
+        }
+
+        // M1.5: cost cap. The flag is set inside the LlmEvent::Usage
+        // handler when the running total crosses the opt-in cap; we
+        // act on it at iteration boundary for the same "don't
+        // truncate mid-stream" reason.
+        if cost_cap_hit {
+            let cap = tuning.guards.cost_cap_usd.unwrap_or(0.0);
+            stop_reason = "cost_cap_exceeded".to_string();
+            fatal_error = Some(format!(
+                "cost cap (${:.4}) reached — total ${:.4}",
+                cap, total_cost_usd,
+            ));
+            break 'turns;
         }
 
         // M1.4: opt-in iteration cap. `None` = unbounded (default,
@@ -493,6 +517,22 @@ pub async fn run_chat_reply(
                                 pending_calls.push(PendingCall { call_id, name, arguments });
                             }
                             Ok(LlmEvent::Usage(u)) => {
+                                // M1.5: accumulate + compute cost on every Usage
+                                // block. If the new total crosses the
+                                // opt-in cap, mark for break — actual
+                                // termination happens at the iteration
+                                // boundary so we don't truncate the
+                                // current LLM stream mid-flight.
+                                total_input_tokens += u.input_tokens as i64;
+                                total_output_tokens += u.output_tokens as i64;
+                                let call_cost =
+                                    crate::llm::pricing::compute_cost(DEFAULT_MODEL, &u);
+                                total_cost_usd += call_cost;
+                                if let Some(cap) = tuning.guards.cost_cap_usd {
+                                    if total_cost_usd >= cap {
+                                        cost_cap_hit = true;
+                                    }
+                                }
                                 publish_and_persist(
                                     &pool,
                                     &user_id,
@@ -505,6 +545,8 @@ pub async fn run_chat_reply(
                                         "input_tokens": u.input_tokens,
                                         "output_tokens": u.output_tokens,
                                         "cache_read_tokens": u.cache_read_tokens,
+                                        "call_cost_usd": call_cost,
+                                        "total_cost_usd": total_cost_usd,
                                     }),
                                 )
                                 .await?;
@@ -990,11 +1032,9 @@ pub async fn run_chat_reply(
             iteration_count: iteration_count as i64,
             tool_call_count,
             tool_error_count,
-            // Token / cost columns: M1.5 fills these from LLM `usage`
-            // blocks once provider price tables land.
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_cost_usd: 0.0,
+            total_input_tokens,
+            total_output_tokens,
+            total_cost_usd,
             max_iter_latency_ms: max_iter,
             p50_iter_latency_ms: p50_iter,
             stop_reason: &stop_reason,
