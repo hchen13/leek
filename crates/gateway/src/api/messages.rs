@@ -15,21 +15,39 @@ use crate::vault::{
     tasks as vault_tasks,
 };
 
-/// Auto-compaction threshold. When the session's last `llm_usage` event
-/// reports `input_tokens` ≥ this value, the next user message triggers a
-/// in-place compaction *before* the LLM is called again — otherwise the next
-/// turn would push the request over the model's context window.
+/// Default model context window for the codex backend's gpt-5.5
+/// surface. Used together with `LlmTuning.guards.auto_compact_threshold`
+/// (a fraction in [0.0, 1.0]) to derive the absolute pre-turn token
+/// trigger.
 ///
-/// Trigger at 95% of the 400K context window (= 380K), leaving ~20K for the
-/// working turn's user message, system prompt delta, and tool outputs.
-/// Override via `LEEK_AUTO_COMPACT_THRESHOLD` for tests / low-budget tiers.
-const AUTO_COMPACT_THRESHOLD_DEFAULT: i64 = 380_000;
+/// Pinned here rather than in a per-model price table because the
+/// auto-compactor only needs *one* number — the active model's window
+/// — and leek's main agent currently always runs on gpt-5.5. When
+/// per-model windows matter (M2.5 skill model overrides, etc.) this
+/// becomes a `pricing`-style lookup keyed on `req.model`.
+const MAIN_CONTEXT_WINDOW_TOKENS: i64 = 400_000;
 
-fn auto_compact_threshold() -> i64 {
-    std::env::var("LEEK_AUTO_COMPACT_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(AUTO_COMPACT_THRESHOLD_DEFAULT)
+/// Auto-compaction trigger.
+///
+/// Resolves to `MAIN_CONTEXT_WINDOW_TOKENS × tuning.guards.auto_compact_threshold`,
+/// then optionally overridden by `LEEK_AUTO_COMPACT_THRESHOLD` (kept
+/// for tests / low-budget tiers; takes precedence over the tuning
+/// fraction).
+///
+/// Default fraction = 0.90 (M1.7), mirroring codex-rs's hardcoded
+/// `(context_window * 9) / 10` in
+/// `codex-rs/protocol/src/openai_models.rs::auto_compact_token_limit()`.
+/// At 400K window that's 360K — leaving 40K for the working turn's
+/// user message, system prompt delta, and tool outputs (was 20K under
+/// the old 95% trigger; the extra 20K headroom is what M1.7 buys).
+fn auto_compact_threshold(tuning: &crate::llm::LlmTuning) -> i64 {
+    if let Ok(v) = std::env::var("LEEK_AUTO_COMPACT_THRESHOLD") {
+        if let Ok(parsed) = v.parse::<i64>() {
+            return parsed;
+        }
+    }
+    let frac = tuning.guards.auto_compact_threshold.clamp(0.0, 1.0) as f64;
+    (MAIN_CONTEXT_WINDOW_TOKENS as f64 * frac) as i64
 }
 
 #[derive(Deserialize)]
@@ -75,7 +93,7 @@ pub async fn post_handler(
     // already saw input_tokens ≥ threshold, reject this user message and
     // start compaction. Frontend queues the message and re-POSTs it to this
     // same session after `compaction.completed`.
-    let threshold = auto_compact_threshold();
+    let threshold = auto_compact_threshold(&state.tuning_snapshot());
     if let Some(latest) =
         vault_events::latest_input_tokens(&state.pool, &state.user_id, &session_id).await?
     {

@@ -180,12 +180,11 @@ impl Default for LlmTuning {
 ///     `MAX_TOOL_TURNS=24` constant which becomes a default-off override).
 ///   - M1.5 hooks `cost_cap_usd` once a per-model price table lands.
 ///   - M1.6 hooks `doom_loop_threshold`.
-///   - M1.7 changes `auto_compact_threshold` default 0.95 → 0.90.
+///   - M1.7 changes `auto_compact_threshold` default 0.95 → 0.90 and
+///     wires it through `api::messages::auto_compact_threshold`.
 ///
-/// Until those wiring milestones land, the fields appear dead to the
-/// compiler — `#[allow(dead_code)]` is intentional. Each field's
-/// reader will be added in the milestone listed in the rationale.
-#[allow(dead_code)]
+/// As of M1.7, every field has a reader; the `#[allow(dead_code)]`
+/// previously needed during milestone staging is gone.
 #[derive(Debug, Clone, Copy)]
 pub struct GuardConfig {
     pub turn_wall_clock: Option<Duration>,
@@ -204,10 +203,13 @@ impl GuardConfig {
             max_iterations: None,
             cost_cap_usd: None,
             doom_loop_threshold: Some(3),
-            // M1.7 lowers this to 0.90. M1.1 ships the field but keeps
-            // the existing 0.95 to avoid a behavior change in an
-            // observability-only milestone.
-            auto_compact_threshold: 0.95,
+            // M1.7: 90% of the active model's context window — mirrors
+            // codex-rs's hardcoded `(context_window * 9) / 10`. The
+            // previous 0.95 left only 5% headroom for the compaction-
+            // LLM's own working space, which is why occasional turns
+            // failed mid-compaction. 0.90 leaves 10% room — comfortably
+            // above the few-thousand-token compaction prompt overhead.
+            auto_compact_threshold: 0.90,
         }
     }
 }
