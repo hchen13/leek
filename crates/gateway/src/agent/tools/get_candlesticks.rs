@@ -130,8 +130,8 @@ impl ToolHandler for GetCandlesticksTool {
                 Market is controlled by the `market` parameter — this single tool covers all asset classes.\n\
                 - A-share (CN equities): ts_code like \"600519.SH\", \"000001.SZ\", \"300750.SZ\"\n\
                 - US/HK stocks: ticker like \"AAPL\", \"TSLA\", \"0700.HK\", \"BABA\"\n\
-                - Crypto: Binance symbol like \"BTCUSDT\", \"ETHUSDT\", \"SOLUSDT\"\n\
-                Interval: 1d/1w/1mo for all markets; 15m only for US/HK/crypto until PyTDX is wired for A-share intraday/realtime.\n\
+                - Crypto: pair symbol like \"BTCUSDT\", \"ETHUSDT\", \"SOLUSDT\"\n\
+                Interval: 1d/1w/1mo for all markets; 15m only for US/HK/crypto (A-share intraday not currently supported).\n\
                 Returns a markdown table of OHLCV data sorted oldest→newest.\n\
                 Prefer this whenever price trend or mean-reversion context matters."
                 .into(),
@@ -204,15 +204,20 @@ impl GetCandlesticksTool {
         let token = match std::env::var("TUSHARE_TOKEN") {
             Ok(t) => t,
             Err(_) => {
-                return Ok("[get_candlesticks: TUSHARE_TOKEN not configured — \
-                     A-share candlesticks unavailable. \
-                     Get a free token at https://tushare.pro/register]"
-                    .to_string());
+                tracing::warn!(
+                    tool = TOOL_NAME,
+                    "TUSHARE_TOKEN env var missing — A-share candlestick path disabled. \
+                     Set the env var (free token at https://tushare.pro/register) and restart the gateway.",
+                );
+                return Ok(
+                    "[get_candlesticks: A-share candles unavailable — provider not configured.]"
+                        .to_string(),
+                );
             }
         };
 
         if matches!(interval, Interval::Minute15) {
-            return Ok("[get_candlesticks: A-share intraday candles are not available through the current Tushare token. Tushare stk_mins requires separate permission; use daily/weekly/monthly for now. PyTDX integration is required for A-share intraday/realtime candles.]".to_string());
+            return Ok("[get_candlesticks: A-share intraday candles unavailable through the current data provider. Use daily/weekly/monthly instead; intraday support requires a separate integration.]".to_string());
         }
 
         let payload = serde_json::json!({
@@ -227,15 +232,24 @@ impl GetCandlesticksTool {
 
         let resp = tokio::select! {
             biased;
-            _ = cancel.cancelled() => bail!("aborted before tushare request"),
+            _ = cancel.cancelled() => bail!("aborted before A-share candlestick request"),
             r = self.http.post(TUSHARE_ENDPOINT).json(&payload).send() => r?,
         };
         if !resp.status().is_success() {
-            bail!("tushare returned HTTP {}", resp.status().as_u16());
+            let status = resp.status().as_u16();
+            tracing::warn!(
+                tool = TOOL_NAME,
+                upstream = "tushare",
+                api_name = interval.tushare_api(),
+                ts_code = ticker,
+                status,
+                "A-share candlestick upstream returned non-2xx",
+            );
+            bail!("A-share data provider returned HTTP {status}");
         }
         let body: serde_json::Value = tokio::select! {
             biased;
-            _ = cancel.cancelled() => bail!("aborted during tushare parse"),
+            _ = cancel.cancelled() => bail!("aborted during A-share candlestick parse"),
             r = resp.json() => r?,
         };
 
@@ -245,12 +259,27 @@ impl GetCandlesticksTool {
                 .get("msg")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
-            bail!("tushare error (code={code}): {msg}");
+            tracing::warn!(
+                tool = TOOL_NAME,
+                upstream = "tushare",
+                api_name = interval.tushare_api(),
+                ts_code = ticker,
+                code,
+                %msg,
+                "A-share candlestick upstream error",
+            );
+            bail!("A-share data provider error (code={code})");
         }
 
-        let data = body
-            .get("data")
-            .ok_or_else(|| anyhow!("tushare response missing 'data'"))?;
+        let data = body.get("data").ok_or_else(|| {
+            tracing::warn!(
+                tool = TOOL_NAME,
+                upstream = "tushare",
+                ts_code = ticker,
+                "A-share candlestick response missing 'data'",
+            );
+            anyhow!("A-share data provider response malformed (missing 'data')")
+        })?;
         let fields: Vec<String> = data
             .get("fields")
             .and_then(|v| v.as_array())
@@ -268,8 +297,8 @@ impl GetCandlesticksTool {
 
         if items.is_empty() {
             return Ok(format!(
-                "[get_candlesticks: no data returned for {ticker} from Tushare. \
-                 Verify the ts_code format.]"
+                "[get_candlesticks: no data returned for {ticker}. \
+                 Verify the ts_code format (e.g. `600519.SH`, `000001.SZ`).]"
             ));
         }
 
@@ -326,7 +355,6 @@ impl GetCandlesticksTool {
                 r[0], r[1], r[2], r[3], r[4], r[5], r[6]
             ));
         }
-        out.push_str("\n_来源: Tushare Pro (pro_bar)_\n");
         Ok(out)
     }
 
@@ -355,35 +383,45 @@ impl GetCandlesticksTool {
 
         let resp = tokio::select! {
             biased;
-            _ = cancel.cancelled() => bail!("aborted before yahoo request"),
+            _ = cancel.cancelled() => bail!("aborted before US/HK candlestick request"),
             r = self.http.get(&url).send() => r?,
         };
         if !resp.status().is_success() {
-            bail!("Yahoo Finance returned HTTP {}", resp.status().as_u16());
+            let status = resp.status().as_u16();
+            tracing::warn!(
+                tool = TOOL_NAME,
+                upstream = "yahoo-finance",
+                ticker,
+                status,
+                "US/HK candlestick upstream returned non-2xx",
+            );
+            bail!("US/HK data provider returned HTTP {status}");
         }
         let body: serde_json::Value = tokio::select! {
             biased;
-            _ = cancel.cancelled() => bail!("aborted during yahoo parse"),
+            _ = cancel.cancelled() => bail!("aborted during US/HK candlestick parse"),
             r = resp.json() => r?,
         };
 
-        let result = body
-            .pointer("/chart/result/0")
-            .ok_or_else(|| anyhow!("Yahoo Finance: unexpected response shape"))?;
+        let result = body.pointer("/chart/result/0").ok_or_else(|| {
+            tracing::warn!(tool = TOOL_NAME, upstream = "yahoo-finance", ticker, "unexpected response shape");
+            anyhow!("US/HK data provider response malformed")
+        })?;
 
         let symbol = result
             .pointer("/meta/symbol")
             .and_then(|v| v.as_str())
             .unwrap_or(ticker);
 
-        let timestamps = result
-            .pointer("/timestamp")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| anyhow!("Yahoo Finance: missing timestamps"))?;
+        let timestamps = result.pointer("/timestamp").and_then(|v| v.as_array()).ok_or_else(|| {
+            tracing::warn!(tool = TOOL_NAME, upstream = "yahoo-finance", ticker, "missing timestamps");
+            anyhow!("US/HK data provider response malformed (missing timestamps)")
+        })?;
 
-        let quote = result
-            .pointer("/indicators/quote/0")
-            .ok_or_else(|| anyhow!("Yahoo Finance: missing quote data"))?;
+        let quote = result.pointer("/indicators/quote/0").ok_or_else(|| {
+            tracing::warn!(tool = TOOL_NAME, upstream = "yahoo-finance", ticker, "missing quote data");
+            anyhow!("US/HK data provider response malformed (missing quote)")
+        })?;
 
         let opens = array_f64(quote, "open");
         let highs = array_f64(quote, "high");
@@ -486,7 +524,6 @@ impl GetCandlesticksTool {
                 fmt_vol(r.volume)
             ));
         }
-        out.push_str("\n_Source: Yahoo Finance_\n");
         Ok(out)
     }
 
@@ -526,28 +563,42 @@ impl GetCandlesticksTool {
             r = resp.json() => r?,
         };
 
-        // 400 typically means the symbol doesn't exist on Binance.
-        // Fall back to CoinGecko for less-liquid tokens.
+        // 400 typically means the symbol doesn't exist on the primary
+        // crypto upstream. Fall back to the secondary upstream for
+        // less-liquid tokens.
         if !status.is_success() {
-            let binance_msg = body
+            let upstream_msg = body
                 .get("msg")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            tracing::info!(symbol, %binance_msg, "Binance klines failed, trying CoinGecko");
+            tracing::info!(
+                tool = TOOL_NAME,
+                upstream = "binance",
+                symbol,
+                %upstream_msg,
+                "primary crypto upstream failed, trying fallback",
+            );
             return self
                 .fetch_coingecko(&raw, interval, limit, cancel)
                 .await
                 .map_err(|cg_err| {
-                    anyhow!(
-                        "Binance: {} (symbol={symbol}); CoinGecko fallback also failed: {cg_err}",
-                        binance_msg
-                    )
+                    tracing::warn!(
+                        tool = TOOL_NAME,
+                        symbol,
+                        primary_upstream = "binance",
+                        primary_msg = %upstream_msg,
+                        fallback_upstream = "coingecko",
+                        %cg_err,
+                        "both crypto upstreams failed",
+                    );
+                    anyhow!("crypto data provider failed for symbol={symbol}; both primary and fallback unavailable")
                 });
         }
 
-        let klines = body
-            .as_array()
-            .ok_or_else(|| anyhow!("Binance: unexpected response shape"))?;
+        let klines = body.as_array().ok_or_else(|| {
+            tracing::warn!(tool = TOOL_NAME, upstream = "binance", symbol, "unexpected response shape");
+            anyhow!("crypto data provider response malformed")
+        })?;
 
         if klines.is_empty() {
             return self.fetch_coingecko(&raw, interval, limit, cancel).await;
@@ -601,7 +652,7 @@ impl GetCandlesticksTool {
             .trim_end_matches("BTC")
             .trim_end_matches("ETH");
         let mut out = format!(
-            "## {base}/USDT · {} · Binance ({limit})\n\n",
+            "## {base}/USDT · {} ({limit})\n\n",
             interval.label()
         );
         let date_head = if matches!(interval, Interval::Minute15) {
@@ -631,11 +682,10 @@ impl GetCandlesticksTool {
                 fmt_vol(r.volume)
             ));
         }
-        out.push_str("\n_Source: Binance_\n");
         Ok(out)
     }
 
-    /// CoinGecko fallback for tokens not listed on Binance.
+    /// Secondary crypto upstream — covers tokens not listed on the primary.
     /// Uses /search to resolve symbol → coin_id, then /coins/{id}/ohlc.
     async fn fetch_coingecko(
         &self,
@@ -667,7 +717,10 @@ impl GetCandlesticksTool {
         let coin_id = search_body
             .pointer("/coins/0/id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("CoinGecko: no coin found for symbol '{base}'"))?
+            .ok_or_else(|| {
+                tracing::warn!(tool = TOOL_NAME, upstream = "coingecko", base, "no coin found");
+                anyhow!("crypto data provider: no asset found for symbol '{base}'")
+            })?
             .to_string();
 
         // Step 2: OHLC. CoinGecko granularity: ≤2d=30min, ≤30d=4h, else=daily.
@@ -687,23 +740,30 @@ impl GetCandlesticksTool {
             r = self.http.get(&ohlc_url).send() => r?,
         };
         if !ohlc_resp.status().is_success() {
-            bail!(
-                "CoinGecko OHLC returned HTTP {}",
-                ohlc_resp.status().as_u16()
+            let status = ohlc_resp.status().as_u16();
+            tracing::warn!(
+                tool = TOOL_NAME,
+                upstream = "coingecko",
+                coin_id,
+                status,
+                "crypto fallback OHLC returned non-2xx",
             );
+            bail!("crypto data provider returned HTTP {status}");
         }
         let ohlc_body: serde_json::Value = tokio::select! {
             biased;
-            _ = cancel.cancelled() => bail!("aborted during coingecko ohlc parse"),
+            _ = cancel.cancelled() => bail!("aborted during crypto fallback parse"),
             r = ohlc_resp.json() => r?,
         };
 
-        let candles = ohlc_body
-            .as_array()
-            .ok_or_else(|| anyhow!("CoinGecko: unexpected OHLC shape"))?;
+        let candles = ohlc_body.as_array().ok_or_else(|| {
+            tracing::warn!(tool = TOOL_NAME, upstream = "coingecko", coin_id, "unexpected OHLC shape");
+            anyhow!("crypto data provider response malformed")
+        })?;
 
         if candles.is_empty() {
-            bail!("CoinGecko: no OHLC data for '{coin_id}'");
+            tracing::warn!(tool = TOOL_NAME, upstream = "coingecko", coin_id, "no OHLC data");
+            bail!("crypto data provider returned no OHLC data for '{coin_id}'");
         }
 
         struct Row {
@@ -738,7 +798,7 @@ impl GetCandlesticksTool {
             .collect();
 
         rows.sort_by(|a, b| a.date.cmp(&b.date));
-        // Deduplicate by date (CoinGecko 4h candles → multiple per day).
+        // Deduplicate by date (fallback upstream emits 4h candles → multiple per day).
         rows.dedup_by(|a, b| {
             if a.date == b.date {
                 b.close = a.close;
@@ -752,7 +812,7 @@ impl GetCandlesticksTool {
         }
 
         let mut out = format!(
-            "## {base}/USD · {} · CoinGecko ({limit})\n\n",
+            "## {base}/USD · {} ({limit})\n\n",
             interval.label()
         );
         out.push_str("| Date       | Open        | High        | Low         | Close       |\n");
@@ -767,7 +827,6 @@ impl GetCandlesticksTool {
                 fmt_crypto_price(r.close),
             ));
         }
-        out.push_str("\n_Source: CoinGecko_\n");
         Ok(out)
     }
 }

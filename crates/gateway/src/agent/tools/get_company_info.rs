@@ -27,6 +27,8 @@ impl GetCompanyInfoTool {
 
     async fn tushare_post(
         &self,
+        api_name: &str,
+        ts_code: &str,
         payload: serde_json::Value,
         cancel: &CancellationToken,
     ) -> Result<serde_json::Value> {
@@ -36,7 +38,16 @@ impl GetCompanyInfoTool {
             r = self.http.post(ENDPOINT).json(&payload).send() => r?,
         };
         if !resp.status().is_success() {
-            bail!("tushare returned HTTP {}", resp.status().as_u16());
+            let status = resp.status().as_u16();
+            tracing::warn!(
+                tool = TOOL_NAME,
+                upstream = "tushare",
+                api_name,
+                ts_code,
+                status,
+                "A-share company-info upstream returned non-2xx",
+            );
+            bail!("A-share data provider returned HTTP {status}");
         }
         let body: serde_json::Value = tokio::select! {
             biased;
@@ -48,8 +59,17 @@ impl GetCompanyInfoTool {
             let msg = body
                 .get("msg")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown tushare error");
-            bail!("tushare error (code={code}): {msg}");
+                .unwrap_or("unknown error");
+            tracing::warn!(
+                tool = TOOL_NAME,
+                upstream = "tushare",
+                api_name,
+                ts_code,
+                code,
+                %msg,
+                "A-share company-info upstream error",
+            );
+            bail!("A-share data provider error (code={code})");
         }
         Ok(body)
     }
@@ -85,9 +105,9 @@ impl ToolHandler for GetCompanyInfoTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
-            description: "Fetch A-share company background and key financial indicators from Tushare. \
+            description: "Fetch A-share company background and key financial indicators. \
                 Use when researching a company's business, industry, management, and financial health. \
-                Requires TUSHARE_TOKEN env var. ts_code format: \"600519.SH\", \"000001.SZ\". \
+                ts_code format: \"600519.SH\" (Shanghai), \"000001.SZ\" (Shenzhen). \
                 Returns company profile + latest period key ratios in one call."
                 .into(),
             parameters: serde_json::json!({
@@ -95,7 +115,7 @@ impl ToolHandler for GetCompanyInfoTool {
                 "properties": {
                     "ts_code": {
                         "type": "string",
-                        "description": "Tushare ts_code, e.g. '600519.SH', '000001.SZ'"
+                        "description": "A-share code in `<symbol>.SH` / `<symbol>.SZ` / `<symbol>.BJ` format, e.g. '600519.SH', '000001.SZ'."
                     }
                 },
                 "required": ["ts_code"]
@@ -110,7 +130,12 @@ impl ToolHandler for GetCompanyInfoTool {
         _ctx: &super::ToolContext,
     ) -> Result<String> {
         let token = std::env::var("TUSHARE_TOKEN").map_err(|_| {
-            anyhow!("TUSHARE_TOKEN env var not set — A-share data unavailable. Get a token at https://tushare.pro/register")
+            tracing::warn!(
+                tool = TOOL_NAME,
+                "TUSHARE_TOKEN env var missing — A-share company-info path disabled. \
+                 Set the env var (free token at https://tushare.pro/register) and restart the gateway.",
+            );
+            anyhow!("[get_company_info: A-share data unavailable — provider not configured.]")
         })?;
         let ts_code = args
             .get("ts_code")
@@ -127,7 +152,9 @@ impl ToolHandler for GetCompanyInfoTool {
             "params": {"ts_code": ts_code, "exchange": exchange},
             "fields": "ts_code,com_name,exchange,chairman,manager,secretary,reg_capital,setup_date,province,city,introduction,website,employees,main_business,business_scope"
         });
-        let company_body = self.tushare_post(company_payload, &cancel).await?;
+        let company_body = self
+            .tushare_post("stock_company", &ts_code, company_payload, &cancel)
+            .await?;
 
         let fina_payload = serde_json::json!({
             "api_name": "fina_indicator_vip",
@@ -135,7 +162,9 @@ impl ToolHandler for GetCompanyInfoTool {
             "params": {"ts_code": ts_code, "limit": 1},
             "fields": "end_date,eps,bps,roe,roa,grossprofit_margin,debt_to_assets,current_ratio,quick_ratio,revenue_yoy,profit_yoy,pe_ttm,pb"
         });
-        let fina_body = self.tushare_post(fina_payload, &cancel).await?;
+        let fina_body = self
+            .tushare_post("fina_indicator_vip", &ts_code, fina_payload, &cancel)
+            .await?;
 
         let company_data = company_body
             .get("data")
@@ -281,7 +310,6 @@ impl ToolHandler for GetCompanyInfoTool {
             }
         }
 
-        out.push_str("\n_Source: Tushare Pro_\n");
         Ok(out)
     }
 }

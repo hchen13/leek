@@ -31,6 +31,7 @@ impl GetCapitalFlowTool {
 
     async fn tushare_post(
         &self,
+        api_name: &str,
         payload: serde_json::Value,
         cancel: &CancellationToken,
     ) -> Result<serde_json::Value> {
@@ -40,7 +41,15 @@ impl GetCapitalFlowTool {
             r = self.http.post(ENDPOINT).json(&payload).send() => r?,
         };
         if !resp.status().is_success() {
-            bail!("tushare returned HTTP {}", resp.status().as_u16());
+            let status = resp.status().as_u16();
+            tracing::warn!(
+                tool = TOOL_NAME,
+                upstream = "tushare",
+                api_name,
+                status,
+                "A-share capital-flow upstream returned non-2xx",
+            );
+            bail!("A-share data provider returned HTTP {status}");
         }
         let body: serde_json::Value = tokio::select! {
             biased;
@@ -52,8 +61,16 @@ impl GetCapitalFlowTool {
             let msg = body
                 .get("msg")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown tushare error");
-            bail!("tushare error (code={code}): {msg}");
+                .unwrap_or("unknown error");
+            tracing::warn!(
+                tool = TOOL_NAME,
+                upstream = "tushare",
+                api_name,
+                code,
+                %msg,
+                "A-share capital-flow upstream error",
+            );
+            bail!("A-share data provider error (code={code})");
         }
         Ok(body)
     }
@@ -71,7 +88,7 @@ impl GetCapitalFlowTool {
             "params": {"ts_code": ts_code, "limit": days},
             "fields": "trade_date,buy_elg_amount,sell_elg_amount,net_mf_amount,buy_lg_amount,sell_lg_amount,buy_md_amount,sell_md_amount,buy_sm_amount,sell_sm_amount"
         });
-        let body = self.tushare_post(payload, cancel).await?;
+        let body = self.tushare_post("moneyflow", payload, cancel).await?;
         let data = body
             .get("data")
             .ok_or_else(|| anyhow!("missing data in moneyflow response"))?;
@@ -160,7 +177,7 @@ impl GetCapitalFlowTool {
             ));
         }
         out.push_str(
-            "\n_单位: 万元；分档列为买入额 - 卖出额，净流入额为 Tushare 原始 net_mf_amount。_\n",
+            "\n_单位: 万元；分档列为买入额 - 卖出额，净流入额取自上游原始 net_mf_amount。_\n",
         );
         Ok(out)
     }
@@ -190,7 +207,7 @@ impl GetCapitalFlowTool {
             },
             "fields": "trade_date,north_money,hgt,sgt,south_money"
         });
-        let body = self.tushare_post(payload, cancel).await?;
+        let body = self.tushare_post("moneyflow_hsgt", payload, cancel).await?;
         let data = body
             .get("data")
             .ok_or_else(|| anyhow!("missing data in moneyflow_hsgt response"))?;
@@ -293,7 +310,6 @@ impl ToolHandler for GetCapitalFlowTool {
             name: TOOL_NAME.into(),
             description: "Fetch A-share capital flow data: major/institutional money flow for individual stocks, \
                 and historical north-bound capital (Hong Kong → Mainland via Stock Connect) market-wide flow. \
-                Requires TUSHARE_TOKEN env var. \
                 - For individual stock flow: provide ts_code. \
                 - Daily north-bound net-flow disclosure stopped after 2024-08-20; for current dates this tool returns \
                   an explicit unavailable note instead of stale zero-like data."
@@ -326,7 +342,12 @@ impl ToolHandler for GetCapitalFlowTool {
         _ctx: &super::ToolContext,
     ) -> Result<String> {
         let token = std::env::var("TUSHARE_TOKEN").map_err(|_| {
-            anyhow!("TUSHARE_TOKEN env var not set — A-share data unavailable. Get a token at https://tushare.pro/register")
+            tracing::warn!(
+                tool = TOOL_NAME,
+                "TUSHARE_TOKEN env var missing — A-share capital-flow path disabled. \
+                 Set the env var (free token at https://tushare.pro/register) and restart the gateway.",
+            );
+            anyhow!("[get_capital_flow: A-share data unavailable — provider not configured.]")
         })?;
 
         let data_type = args
@@ -367,8 +388,8 @@ impl ToolHandler for GetCapitalFlowTool {
 
 fn northbound_daily_unavailable() -> String {
     "## 北向资金（日度净流入已停更）\n\n\
-     [get_capital_flow: northbound_daily_unavailable since 2024-08-20; \
-     Tushare moneyflow_hsgt is historical-only for current analysis. \
-     Use stock_flow for individual stocks, and use hk_hold quarterly holdings or hsgt_top10-style turnover data when those tools are wired.]\n"
+     [get_capital_flow: northbound daily net-flow disclosure stopped after 2024-08-20; \
+     historical-only data isn't useful for current analysis. \
+     Use stock_flow for individual stocks, and rely on quarterly HK holdings or top-10 turnover data when those tools are available.]\n"
         .to_string()
 }

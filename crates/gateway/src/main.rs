@@ -226,13 +226,13 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
         }
     }
 
-    // Phase 0 minimal toolset:
+    // Phase 0 minimal toolset (names are what the LLM sees — never name
+    // upstream providers in tool names, descriptions, or output strings;
+    // see `phase-0e` for the naming-neutrality cleanup):
     //   - generic:   ask_user_question, web_fetch, update_plan, use_skill
     //   - corpus:    corpus_search, corpus_read
-    //   - market:    tradingview_quote (= market_quote), get_candlesticks
-    //   - A-share fundamentals: get_financials (Tushare for A-share,
-    //                           SEC EDGAR for US until that path is
-    //                           consolidated), get_company_info,
+    //   - market:    market_quote, get_candlesticks
+    //   - A-share fundamentals: get_financials, get_company_info,
     //                           get_capital_flow
     // Removed in the rebuild slice: critic-driven decision_draft pipeline
     // (`record_investment_action`, `record_research_note`), 4-persona
@@ -251,7 +251,7 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
         ))
         .register(Arc::new(agent::tools::corpus_read::CorpusReadTool::new()))
         .register(Arc::new(
-            agent::tools::tradingview_quote::TradingViewQuoteTool::new()?,
+            agent::tools::market_quote::MarketQuoteTool::new()?,
         ))
         .register(Arc::new(
             agent::tools::get_candlesticks::GetCandlesticksTool::new()?,

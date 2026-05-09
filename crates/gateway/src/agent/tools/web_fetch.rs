@@ -41,10 +41,10 @@ const DEFAULT_MAX_CHARS: usize = 50_000;
 const HARD_CAP_MAX_CHARS: usize = 100_000;
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const CACHE_CAPACITY: usize = 64;
-// SEC EDGAR's UA parser is finicky: it 403s anything with parens,
-// version markers, or URLs and only accepts a plain "Name email@domain"
-// shape. `sec_filing_fetch.rs` proved this format works against SEC, so
-// we mirror it here verbatim. Other hosts accept any reasonable UA.
+// Some upstreams (notably SEC EDGAR) have finicky UA parsers — they 403
+// anything with parens, version markers, or URLs and only accept a plain
+// "Name email@domain" shape. Other hosts accept any reasonable UA, so
+// we just standardize on the strict shape everywhere.
 const USER_AGENT: &str = "Leek Research gradschool.hchen13@gmail.com";
 
 /// Below this many chars Tier 1 readability output is considered "too thin"

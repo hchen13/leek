@@ -67,8 +67,8 @@ impl ToolHandler for GetFinancialsTool {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
             description: "Fetch financial statements and key ratios for a listed company.\n\
-                Covers A-shares (via Tushare Pro) and US stocks (via SEC EDGAR companyfacts).\n\
-                - A-share ts_code: \"600519.SH\", \"000001.SZ\"\n\
+                Covers A-shares and US stocks.\n\
+                - A-share code format: \"600519.SH\", \"000001.SZ\"\n\
                 - US ticker: \"AAPL\", \"TSLA\", \"NVDA\"\n\
                 report_type controls what to fetch:\n\
                 - \"income\": income statement (revenue, profit, EPS)\n\
@@ -76,8 +76,8 @@ impl ToolHandler for GetFinancialsTool {
                 - \"cashflow\": cash flow statement\n\
                 - \"ratios\": key financial ratios (margins, ROE, ROA, leverage)\n\
                 - \"all\": fetch income + balance sheet + cash flow + ratios\n\
-                Returns markdown tables with the most recent N periods (annual 10-K \
-                preferred, falls back to quarterly 10-Q when annual data is sparse)."
+                Returns markdown tables with the most recent N periods (annual \
+                preferred; falls back to quarterly when annual data is sparse)."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -146,9 +146,20 @@ async fn fetch_a_share(
     cancel: CancellationToken,
 ) -> Result<String> {
     let token = std::env::var("TUSHARE_TOKEN").map_err(|_| {
+        // Operator-visible: log full detail (env var + setup link) so a
+        // developer reading the gateway logs can fix the deployment.
+        // LLM-visible: a neutral "data unavailable" — keeps the agent
+        // from learning to lecture users about Tushare tokens.
+        tracing::warn!(
+            tool = TOOL_NAME,
+            market = "a_share",
+            ts_code,
+            "TUSHARE_TOKEN env var missing — A-share financials path disabled. \
+             Set the env var (free token at https://tushare.pro/register) and restart the gateway.",
+        );
         anyhow!(
-            "[get_financials: TUSHARE_TOKEN not set — A-share financials unavailable. \
-             Get a free token at https://tushare.pro/register]"
+            "[get_financials: A-share financials unavailable — provider not configured. \
+             Try the US path or another tool.]"
         )
     })?;
 
@@ -201,7 +212,16 @@ async fn tushare_call(
         r = http.post(TUSHARE_ENDPOINT).json(&payload).send() => r?,
     };
     if !resp.status().is_success() {
-        bail!("tushare HTTP {}", resp.status().as_u16());
+        let status = resp.status().as_u16();
+        tracing::warn!(
+            tool = TOOL_NAME,
+            upstream = "tushare",
+            api_name,
+            ts_code,
+            status,
+            "A-share fundamentals upstream returned non-2xx",
+        );
+        bail!("A-share data provider returned HTTP {status}");
     }
     let body: serde_json::Value = tokio::select! {
         biased;
@@ -214,7 +234,16 @@ async fn tushare_call(
             .get("msg")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown error");
-        bail!("tushare error (code={code}): {msg}");
+        tracing::warn!(
+            tool = TOOL_NAME,
+            upstream = "tushare",
+            api_name,
+            ts_code,
+            code,
+            %msg,
+            "A-share fundamentals upstream error",
+        );
+        bail!("A-share data provider error (code={code})");
     }
     Ok(body)
 }
@@ -375,7 +404,6 @@ async fn fetch_ashare_income(
             "| {period} | {revenue} | {op_profit} | {net_income} | {eps} |\n"
         ));
     }
-    out.push_str("\n_来源: Tushare Pro (income_vip)_");
     Ok(out)
 }
 
@@ -419,7 +447,6 @@ async fn fetch_ashare_balance(
             "| {period} | {assets} | {liab} | {equity} | {cash} |\n"
         ));
     }
-    out.push_str("\n_来源: Tushare Pro (balancesheet)_");
     Ok(out)
 }
 
@@ -462,7 +489,6 @@ async fn fetch_ashare_cashflow(
         let free = fmt_yi(col(row, &field_names, "free_cashflow"));
         out.push_str(&format!("| {period} | {oper} | {inv} | {fin} | {free} |\n"));
     }
-    out.push_str("\n_来源: Tushare Pro (cashflow_vip)_");
     Ok(out)
 }
 
@@ -507,7 +533,6 @@ async fn fetch_ashare_ratios(
             "| {period} | {eps} | {bps} | {roe} | {roa} | {gpm} | {d2a} | {cr} |\n"
         ));
     }
-    out.push_str("\n_来源: Tushare Pro (fina_indicator_vip)_");
     Ok(out)
 }
 
@@ -834,7 +859,6 @@ fn format_income(
             fmt_per_share(eps.get(k)),
         ));
     }
-    out.push_str("\n_Source: SEC EDGAR companyfacts (us-gaap, FY-preferred)_");
     out
 }
 
@@ -891,7 +915,6 @@ fn format_balance(
             fmt_money(lt_debt.get(k)),
         ));
     }
-    out.push_str("\n_Source: SEC EDGAR companyfacts (us-gaap, FY-preferred)_");
     out
 }
 
@@ -949,7 +972,6 @@ fn format_cashflow(
             fmt_money(free.as_ref()),
         ));
     }
-    out.push_str("\n_Source: SEC EDGAR companyfacts (us-gaap, FY-preferred)_");
     out
 }
 
@@ -1010,7 +1032,7 @@ fn format_ratios(
             },
         ));
     }
-    out.push_str("\n_Source: SEC EDGAR companyfacts (derived from us-gaap; market multiples like P/E, P/B not provided — combine with `market_quote` and your own EPS/Book inputs)._");
+    out.push_str("\n_Note: market multiples (P/E, P/B) not included — combine with `market_quote` and your own EPS / book-value inputs._");
     out
 }
 

@@ -1,5 +1,12 @@
-//! `tradingview_quote` — real-time-ish snapshot quotes via TradingView's
-//! undocumented scanner endpoint.
+//! `market_quote` — real-time-ish snapshot quotes for one or more tickers.
+//!
+//! Implementation note: backed by TradingView's undocumented scanner
+//! endpoint. We pin the data-source detail here (in code comments) so
+//! the quote provider stays swappable — neither the tool name, the
+//! advertised description, the output footer, nor any user-visible
+//! error string mentions the upstream. Operator/developer concerns
+//! (auth, headers, rate limits) live in this module; the agent loop
+//! and the LLM only see "market_quote".
 //!
 //! POST https://scanner.tradingview.com/{market}/scan
 //! Body: `{ symbols: { tickers: ["NASDAQ:NVDA", ...] }, columns: [...] }`
@@ -40,11 +47,11 @@ const COLUMNS: &[&str] = &[
     "Recommend.All", // -1..1 technical rating
 ];
 
-pub struct TradingViewQuoteTool {
+pub struct MarketQuoteTool {
     http: Client,
 }
 
-impl TradingViewQuoteTool {
+impl MarketQuoteTool {
     pub fn new() -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -54,7 +61,7 @@ impl TradingViewQuoteTool {
         let http = Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .default_headers(headers)
-            // TradingView's edge sometimes requires a real-ish UA.
+            // Upstream edge sometimes requires a real-ish UA.
             .user_agent("Mozilla/5.0 (compatible; leek-research-agent/0.1)")
             .build()?;
         Ok(Self { http })
@@ -62,7 +69,7 @@ impl TradingViewQuoteTool {
 }
 
 #[async_trait]
-impl ToolHandler for TradingViewQuoteTool {
+impl ToolHandler for MarketQuoteTool {
     fn name(&self) -> &str {
         TOOL_NAME
     }
@@ -137,7 +144,7 @@ impl ToolHandler for TradingViewQuoteTool {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "america".into());
         if !is_valid_market(&market) {
-            bail!("unknown TradingView market segment `{market}`");
+            bail!("unknown market segment `{market}`");
         }
 
         let url = ENDPOINT_TPL.replace("{market}", &market);
@@ -148,28 +155,36 @@ impl ToolHandler for TradingViewQuoteTool {
 
         let resp = tokio::select! {
             biased;
-            _ = cancel.cancelled() => bail!("aborted before tradingview request"),
+            _ = cancel.cancelled() => bail!("aborted before market_quote request"),
             r = self.http.post(&url).json(&payload).send() => r?,
         };
         let status = resp.status();
         if !status.is_success() {
             let body_preview = resp.text().await.unwrap_or_default();
-            bail!(
-                "tradingview scanner returned HTTP {} ({})",
-                status.as_u16(),
-                body_preview.chars().take(200).collect::<String>()
+            // Preserve full upstream detail in operator logs; surface only
+            // the abstract failure to the LLM / user.
+            tracing::warn!(
+                tool = TOOL_NAME,
+                upstream = "tradingview-scanner",
+                status = status.as_u16(),
+                preview = %body_preview.chars().take(200).collect::<String>(),
+                "market_quote upstream returned non-2xx",
             );
+            bail!("market_quote provider returned HTTP {}", status.as_u16());
         }
         let body: serde_json::Value = tokio::select! {
             biased;
-            _ = cancel.cancelled() => bail!("aborted during tradingview parse"),
+            _ = cancel.cancelled() => bail!("aborted during market_quote parse"),
             r = resp.json() => r?,
         };
 
         let rows = body
             .get("data")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| anyhow!("tradingview response missing 'data' array"))?;
+            .ok_or_else(|| {
+                tracing::warn!(tool = TOOL_NAME, upstream = "tradingview-scanner", body = %body, "missing 'data' array");
+                anyhow!("market_quote provider response malformed (missing 'data')")
+            })?;
         if rows.is_empty() {
             return Ok(format!(
                 "[market_quote: no rows returned for {} tickers in market '{market}'. \
@@ -227,7 +242,7 @@ impl ToolHandler for TradingViewQuoteTool {
                 cell(10),
             ));
         }
-        out.push_str("\n_Source: scanner.tradingview.com (delayed; undocumented internal API)._\n");
+        out.push_str("\n_Quotes may be 15-min delayed._\n");
         Ok(out)
     }
 }

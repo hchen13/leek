@@ -22,7 +22,7 @@ pub mod get_candlesticks;
 pub mod get_capital_flow;
 pub mod get_company_info;
 pub mod get_financials;
-pub mod tradingview_quote;
+pub mod market_quote;
 pub mod update_plan;
 pub mod use_skill;
 pub mod web_fetch;
