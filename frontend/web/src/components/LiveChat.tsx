@@ -908,7 +908,16 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
             case "agent_narration":
               if (cursor >= 0 && cursor < agentIdxs.length) {
                 const msg = hist[agentIdxs[cursor]];
-                const step = { turn: typeof p.turn === "number" ? p.turn : 0, text: String(p.text ?? "") };
+                // M1.4 backend renamed the SSE field to `iteration_count`;
+                // legacy `turn` is still emitted for one phase of vault
+                // backwards-compat. Read new name first, fall back to old.
+                const iter =
+                  typeof p.iteration_count === "number"
+                    ? p.iteration_count
+                    : typeof p.turn === "number"
+                      ? p.turn
+                      : 0;
+                const step = { turn: iter, text: String(p.text ?? "") };
                 const ns = appendNarrationStep(msg.narrations, step);
                 if (ns.length === (msg.narrations?.length ?? 0)) break;
                 msg.narrations = ns;
@@ -922,7 +931,16 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
               // narration cards in the artifacts strip.
               if (cursor >= 0 && cursor < agentIdxs.length) {
                 const msg = hist[agentIdxs[cursor]];
-                const step = { turn: typeof p.turn === "number" ? p.turn : 0, text: String(p.text ?? "") };
+                // M1.4 backend renamed the SSE field to `iteration_count`;
+                // legacy `turn` is still emitted for one phase of vault
+                // backwards-compat. Read new name first, fall back to old.
+                const iter =
+                  typeof p.iteration_count === "number"
+                    ? p.iteration_count
+                    : typeof p.turn === "number"
+                      ? p.turn
+                      : 0;
+                const step = { turn: iter, text: String(p.text ?? "") };
                 const ns = appendNarrationStep(msg.narrations, step);
                 if (ns.length === (msg.narrations?.length ?? 0)) break;
                 msg.narrations = ns;
@@ -1187,8 +1205,16 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
       try {
         const data = JSON.parse(e.data);
         emitTick(e, "agent_thinking_card", data);
+        // M1.4 SSE field rename: prefer `iteration_count`, fall back to
+        // `turn` for events emitted by older backend builds.
+        const iter =
+          typeof data.iteration_count === "number"
+            ? data.iteration_count
+            : typeof data.turn === "number"
+              ? data.turn
+              : 0;
         const step: NarrationStep = {
-          turn: typeof data.turn === "number" ? data.turn : 0,
+          turn: iter,
           text: String(data.text ?? ""),
         };
         setMessages((prev) => {
@@ -1214,8 +1240,16 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
       try {
         const data = JSON.parse(e.data);
         emitTick(e, "agent_narration", data);
+        // M1.4 SSE field rename: prefer `iteration_count`, fall back to
+        // `turn` for events emitted by older backend builds.
+        const iter =
+          typeof data.iteration_count === "number"
+            ? data.iteration_count
+            : typeof data.turn === "number"
+              ? data.turn
+              : 0;
         const step: NarrationStep = {
-          turn: typeof data.turn === "number" ? data.turn : 0,
+          turn: iter,
           text: String(data.text ?? ""),
         };
         setMessages((prev) => {

@@ -32,8 +32,12 @@ use tools::{ToolContext, ToolRegistry};
 
 const DEFAULT_MODEL: &str = "gpt-5.5";
 
-/// Hard cap on tool-call rounds within a single user turn.
-const MAX_TOOL_TURNS: usize = 24;
+// M1.4: the per-task iteration cap moved to `LlmTuning.guards.max_iterations`
+// (default `None` = unbounded, matching codex / claude-code which trust
+// auto-compaction to bound the loop indirectly). The previous hardcoded
+// `MAX_TOOL_TURNS = 24` was too tight for legitimately complex research
+// tasks; opt-in is the new default. To re-enable a cap for a specific
+// deployment, set `tuning.guards.max_iterations = Some(N)`.
 const MAX_PROVIDER_RETRIES: usize = 10;
 const PROVIDER_RETRY_BASE_MS: u64 = 1_000;
 const PROVIDER_RETRY_MAX_MS: u64 = 30_000;
@@ -219,7 +223,11 @@ pub async fn run_chat_reply(
     let mut additional_inputs: Vec<serde_json::Value> = Vec::new();
     let mut awaiting_user = false;
     let mut plan_guard_rewrites = 0usize;
-    let mut turn = 0usize;
+    // M1.4: renamed from `turn` (the historical name was misleading —
+    // a leek "turn" in user-facing language is the entire user-prompt-
+    // → final-answer cycle, while this counter tracks the LLM-call+
+    // tool-dispatch *iterations* within that turn).
+    let mut iteration_count = 0usize;
     let mut fatal_error: Option<String> = None;
 
     // Per-task observability — accumulated across the whole turn loop and
@@ -273,14 +281,17 @@ pub async fn run_chat_reply(
             }
         }
 
-        if turn >= MAX_TOOL_TURNS {
-            // Phase 0 hard cap. Milestone 1 will replace this with proper
-            // turn-level cost / wall-clock / stuck-detection guards plus
-            // a graceful finalization turn; for now hitting MAX_TOOL_TURNS
-            // simply fails the task with a clear reason.
-            stop_reason = "max_tool_turns".to_string();
-            fatal_error = Some(format!("max_tool_turns ({MAX_TOOL_TURNS}) hit"));
-            break 'turns;
+        // M1.4: opt-in iteration cap. `None` = unbounded (default,
+        // matching codex / claude-code). Sites that want a cap set
+        // `tuning.guards.max_iterations = Some(N)`. When a cap is set
+        // and reached, fail with `stop_reason="max_iterations"` so
+        // the M1.1 metrics row records exactly that.
+        if let Some(cap) = tuning.guards.max_iterations {
+            if iteration_count >= cap {
+                stop_reason = "max_iterations".to_string();
+                fatal_error = Some(format!("max_iterations cap ({cap}) reached"));
+                break 'turns;
+            }
         }
 
         let mut pending_calls: Vec<PendingCall> = Vec::new();
@@ -443,7 +454,7 @@ pub async fn run_chat_reply(
                                     &session_id,
                                     task.as_ref().map(|t| t.task_id.as_str()),
                                     &event_bus,
-                                    turn,
+                                    iteration_count,
                                     &turn_text,
                                     &mut thinking_committed_len,
                                 )
@@ -623,7 +634,7 @@ pub async fn run_chat_reply(
                     &session_id,
                     task.as_ref().map(|t| t.task_id.as_str()),
                     &event_bus,
-                    turn,
+                    iteration_count,
                     &turn_text,
                     &mut thinking_committed_len,
                 )
@@ -639,7 +650,8 @@ pub async fn run_chat_reply(
                         &event_bus,
                         "agent_narration",
                         serde_json::json!({
-                            "turn": turn,
+                            "iteration_count": iteration_count,
+                            "turn": iteration_count,
                             "text": format!("当前计划还没完成：{}。我会继续执行，不把待办交还给你。", guard.reason),
                         }),
                     )
@@ -664,7 +676,7 @@ pub async fn run_chat_reply(
             &session_id,
             task.as_ref().map(|t| t.task_id.as_str()),
             &event_bus,
-            turn,
+            iteration_count,
             &turn_text,
             &mut thinking_committed_len,
         )
@@ -858,7 +870,7 @@ pub async fn run_chat_reply(
         // are intentionally excluded — they're terminal events, not
         // representative of steady-state per-iteration cost.
         iter_latencies_ms.push(iter_started.elapsed().as_millis() as i64);
-        turn += 1;
+        iteration_count += 1;
     }
 
     let has_content = fatal_error.is_none() && !final_text.trim().is_empty();
@@ -975,7 +987,7 @@ pub async fn run_chat_reply(
             started_at: &task_started_at_str,
             ended_at: &chrono::Utc::now().to_rfc3339(),
             wall_clock_ms: task_started_instant.elapsed().as_millis() as i64,
-            iteration_count: turn as i64,
+            iteration_count: iteration_count as i64,
             tool_call_count,
             tool_error_count,
             // Token / cost columns: M1.5 fills these from LLM `usage`
@@ -1410,7 +1422,7 @@ async fn commit_thinking_card(
     session_id: &str,
     task_id: Option<&str>,
     event_bus: &EventBus,
-    turn: usize,
+    iteration: usize,
     turn_text: &str,
     committed_len: &mut usize,
 ) -> Result<()> {
@@ -1431,7 +1443,12 @@ async fn commit_thinking_card(
         event_bus,
         "agent_thinking_card",
         serde_json::json!({
-            "turn": turn,
+            // M1.4 renamed the field name. Legacy `turn` key kept
+            // alongside for one phase of frontend compatibility — the
+            // frontend reads `iteration_count` first, falls back to
+            // `turn`. Drop after the next vault session reset.
+            "iteration_count": iteration,
+            "turn": iteration,
             "text": chunk,
         }),
     )
