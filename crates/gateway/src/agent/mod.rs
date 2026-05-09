@@ -239,6 +239,14 @@ pub async fn run_chat_reply(
     // failure to `idle_timeout` once the budget is exhausted.
     let mut stream_idle_hits: usize = 0;
 
+    // M1.3: hard wall-clock deadline for this entire task. None when the
+    // user has explicitly set `tuning.guards.turn_wall_clock = None`.
+    // Computed once at task start; iterations check it at the loop top.
+    let task_deadline: Option<Instant> = tuning
+        .guards
+        .turn_wall_clock
+        .map(|d| task_started_instant + d);
+
     'turns: loop {
         // Mark the iteration start at the loop top so each iteration's
         // latency includes the LLM call + every tool dispatch in this
@@ -246,6 +254,24 @@ pub async fn run_chat_reply(
         // happy continue path — `break 'turns` exits don't pollute the
         // distribution with terminal-event samples.
         let iter_started = Instant::now();
+
+        // M1.3: hard wall-clock ceiling. Fires at iteration boundary so
+        // we don't truncate a turn mid-LLM-stream — that comes back as
+        // garbled output. The next LLM call won't start; in-flight
+        // tool calls (already dispatched this iteration) are not
+        // interrupted.
+        if let Some(deadline) = task_deadline {
+            if Instant::now() >= deadline {
+                let secs = tuning
+                    .guards
+                    .turn_wall_clock
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                stop_reason = "wall_clock_exceeded".to_string();
+                fatal_error = Some(format!("turn wall-clock {}s exceeded", secs));
+                break 'turns;
+            }
+        }
 
         if turn >= MAX_TOOL_TURNS {
             // Phase 0 hard cap. Milestone 1 will replace this with proper
@@ -276,6 +302,17 @@ pub async fn run_chat_reply(
                 active_plan_reminder_input(&pool, &user_id, &session_id, task.as_ref()).await?
             {
                 request_inputs.push(plan_input);
+            }
+            // M1.3: staged soft-prompt time hints — injected into *this*
+            // chat completion request only (ephemeral; not persisted to
+            // conversation history). Triggers only when the remaining
+            // wall-clock falls inside one of the staged buckets
+            // (≤ 10 / 5 / 2 / 1 min). > 10 min remaining injects nothing,
+            // so most turns never carry this overhead.
+            if let Some(deadline) = task_deadline {
+                if let Some(hint) = soft_deadline_input(deadline) {
+                    request_inputs.push(hint);
+                }
             }
             let turn_tools: Vec<ToolSpec> = tool_specs.clone();
             let req = ChatRequest {
@@ -1059,6 +1096,53 @@ async fn active_plan_reminder_input(
     })))
 }
 
+/// M1.3 — staged soft-prompt time hints. Returns a copy-text bucket
+/// keyed off the remaining wall-clock (in seconds). The four
+/// thresholds (10 / 5 / 2 / 1 min) are deliberately wide-spaced so
+/// that the model perceives an *escalating* sequence of nudges as a
+/// turn approaches its deadline rather than getting hammered with
+/// the same fixed text every block.
+///
+/// Returns `None` when more than 10 minutes remain — the soft-prompt
+/// system is opt-in via crossing into bucket boundaries; turns that
+/// finish in 5 minutes (the common case) never see any hint.
+///
+/// `remaining_secs` is always non-negative — callers pass
+/// `deadline.saturating_duration_since(now)` so post-deadline wall-clocks
+/// collapse to 0 and end up in the most-urgent bucket. The hard-ceiling
+/// guard at the loop top should fire before any of those reach this
+/// function in practice, but the saturating math keeps the bucket
+/// match total.
+fn soft_deadline_hint(remaining_secs: u64) -> Option<&'static str> {
+    match remaining_secs {
+        0..=60 => Some(
+            "[turn deadline ~60s — wrap up immediately with what you have, no new tool calls.]",
+        ),
+        61..=120 => Some(
+            "[turn deadline ~2 min — write a concise conclusion now; finish any pending tool call but do not start new ones.]",
+        ),
+        121..=300 => Some(
+            "[turn deadline ~5 min — start framing your final answer; defer any non-essential investigation.]",
+        ),
+        301..=600 => Some(
+            "[turn deadline ~10 min — consider scoping down further analysis; prefer breadth-first if multiple branches remain.]",
+        ),
+        _ => None,
+    }
+}
+
+/// Wraps `soft_deadline_hint` into an OpenAI Responses API input item
+/// (developer-role message). Returns `None` when no hint applies.
+fn soft_deadline_input(deadline: Instant) -> Option<serde_json::Value> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    soft_deadline_hint(remaining.as_secs()).map(|hint| {
+        serde_json::json!({
+            "role": "developer",
+            "content": hint,
+        })
+    })
+}
+
 /// Whether the given expected_deliverable kind warrants the rigor of an
 /// active plan + plan_guard. Lightweight kinds (delegated_brief —
 /// "dispatch a named worker and show its output"; free_form, morning_brief)
@@ -1576,4 +1660,62 @@ mod tests {
             .is_none());
     }
 
+    // ── M1.3 soft-prompt staging ───────────────────────────────────
+
+    #[test]
+    fn soft_deadline_hint_far_future_returns_none() {
+        // > 10 min remaining → no hint.
+        assert_eq!(soft_deadline_hint(601), None);
+        assert_eq!(soft_deadline_hint(3600), None);
+    }
+
+    #[test]
+    fn soft_deadline_hint_10min_bucket() {
+        // 5..=10 min — verbose advice on scoping.
+        let h = soft_deadline_hint(600).expect("10-min bucket");
+        assert!(h.contains("~10 min"));
+        let h2 = soft_deadline_hint(301).expect("just inside 10-min bucket");
+        assert!(h2.contains("~10 min"));
+    }
+
+    #[test]
+    fn soft_deadline_hint_5min_bucket() {
+        let h = soft_deadline_hint(300).expect("5-min boundary");
+        assert!(h.contains("~5 min"));
+        let h2 = soft_deadline_hint(121).expect("just inside 5-min bucket");
+        assert!(h2.contains("~5 min"));
+    }
+
+    #[test]
+    fn soft_deadline_hint_2min_bucket() {
+        let h = soft_deadline_hint(120).expect("2-min boundary");
+        assert!(h.contains("~2 min"));
+        let h2 = soft_deadline_hint(61).expect("just inside 2-min bucket");
+        assert!(h2.contains("~2 min"));
+    }
+
+    #[test]
+    fn soft_deadline_hint_60s_bucket_is_most_urgent() {
+        let h = soft_deadline_hint(60).expect("1-min boundary");
+        assert!(h.contains("~60s"));
+        let h2 = soft_deadline_hint(0).expect("expired (caught by hard guard but we still match)");
+        assert!(h2.contains("~60s"));
+    }
+
+    #[test]
+    fn soft_deadline_input_uses_developer_role() {
+        // Pick a deadline 30s away → soft-prompt fires (60s bucket).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let v = soft_deadline_input(deadline).expect("hint should fire at 30s remaining");
+        assert_eq!(v.get("role").and_then(|x| x.as_str()), Some("developer"));
+        let content = v.get("content").and_then(|x| x.as_str()).unwrap_or("");
+        assert!(content.contains("turn deadline"));
+    }
+
+    #[test]
+    fn soft_deadline_input_returns_none_when_far_from_deadline() {
+        // Deadline 25 min away → no hint.
+        let deadline = Instant::now() + Duration::from_secs(25 * 60);
+        assert!(soft_deadline_input(deadline).is_none());
+    }
 }
