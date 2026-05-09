@@ -127,10 +127,6 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
         });
     }
 
-    // Note: `max_output_tokens` is intentionally NOT serialized — the codex
-    // backend rejects it as "Unsupported parameter". We'll add it back when
-    // the openai_api_key provider lands (platform.openai.com supports it).
-    let _ = req.max_output_tokens;
     body
 }
 
@@ -603,8 +599,7 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
-            max_output_tokens: None,
-            tools: vec![ToolSpec::WebSearch {
+            tools:vec![ToolSpec::WebSearch {
                 external_web_access: true,
             }],
             additional_inputs: Vec::new(),
@@ -632,8 +627,7 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
-            max_output_tokens: None,
-            tools: Vec::new(),
+            tools:Vec::new(),
             additional_inputs: Vec::new(),
             reasoning_effort: None,
             verbosity: None,
@@ -691,8 +685,7 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
-            max_output_tokens: None,
-            tools: vec![ToolSpec::Function {
+            tools:vec![ToolSpec::Function {
                 name: "web_fetch".into(),
                 description: "Fetch a URL.".into(),
                 parameters: serde_json::json!({
@@ -749,8 +742,7 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
-            max_output_tokens: None,
-            tools: Vec::new(),
+            tools:Vec::new(),
             additional_inputs: Vec::new(),
             reasoning_effort: Some(ReasoningEffort::Minimal),
             verbosity: None,
@@ -771,8 +763,7 @@ mod tests {
             }],
             system: None,
             model: "gpt-5".into(),
-            max_output_tokens: None,
-            tools: Vec::new(),
+            tools:Vec::new(),
             additional_inputs: Vec::new(),
             reasoning_effort: Some(ReasoningEffort::Minimal),
             verbosity: None,
@@ -791,8 +782,7 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
-            max_output_tokens: None,
-            tools: Vec::new(),
+            tools:Vec::new(),
             additional_inputs: Vec::new(),
             reasoning_effort: Some(ReasoningEffort::XHigh),
             verbosity: None,
@@ -811,8 +801,7 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
-            max_output_tokens: None,
-            tools: Vec::new(),
+            tools:Vec::new(),
             additional_inputs: Vec::new(),
             reasoning_effort: None,
             verbosity: Some(Verbosity::Low),
@@ -831,8 +820,7 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
-            max_output_tokens: None,
-            tools: Vec::new(),
+            tools:Vec::new(),
             additional_inputs: Vec::new(),
             reasoning_effort: None,
             verbosity: None,
@@ -851,8 +839,7 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
-            max_output_tokens: None,
-            tools: Vec::new(),
+            tools:Vec::new(),
             additional_inputs: Vec::new(),
             reasoning_effort: None,
             verbosity: None,
@@ -871,8 +858,7 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
-            max_output_tokens: None,
-            tools: Vec::new(),
+            tools:Vec::new(),
             additional_inputs: vec![
                 serde_json::json!({
                     "type": "function_call",

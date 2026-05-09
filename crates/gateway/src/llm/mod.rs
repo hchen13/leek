@@ -16,7 +16,6 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub system: Option<String>,
     pub model: String,
-    pub max_output_tokens: Option<u32>,
     pub tools: Vec<ToolSpec>,
     /// Raw input items appended after `messages` — used by the agent loop to
     /// inject prior-turn `function_call` and `function_call_output` items so

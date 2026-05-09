@@ -319,7 +319,6 @@ async fn run_chat(vault_path: &Path, prompt: String, model: String) -> Result<()
         }],
         system: None,
         model,
-        max_output_tokens: Some(2048),
         // Enable codex's built-in web_search so this CLI path doubles as a
         // smoke-test for the tool-on-request wiring (search/open_page events
         // print as `[web_search] ...` lines in stderr).

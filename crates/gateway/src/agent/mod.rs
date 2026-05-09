@@ -250,7 +250,6 @@ pub async fn run_chat_reply(
                 messages: messages.clone(),
                 system: Some(system_prompt.clone()),
                 model: DEFAULT_MODEL.to_string(),
-                max_output_tokens: None,
                 tools: turn_tools,
                 additional_inputs: request_inputs,
                 // Main agent is the synthesizer — give it the largest

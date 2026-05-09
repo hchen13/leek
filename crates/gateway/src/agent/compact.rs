@@ -216,7 +216,6 @@ pub async fn summarize_session(
         }],
         system: Some(COMPACT_SYSTEM_PROMPT.to_string()),
         model: COMPACT_MODEL.to_string(),
-        max_output_tokens: None,
         tools: Vec::new(),
         additional_inputs: Vec::new(),
         // Compaction summary doesn't need depth; per-surface tuning lets

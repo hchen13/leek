@@ -140,7 +140,6 @@ pub async fn decide_route(
         messages,
         system: Some(system_prompt),
         model: ROUTING_MODEL.to_string(),
-        max_output_tokens: None,
         // Routing is a deterministic intent classifier — no tool calls allowed.
         tools: Vec::new(),
         additional_inputs: Vec::new(),
