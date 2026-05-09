@@ -1445,6 +1445,13 @@ fn is_terminal_provider_error(e: &anyhow::Error) -> bool {
         || s.contains(" 403")
         || s.contains("http 401")
         || s.contains("http 403")
+        // R4 fix: real OpenAI billing/quota errors don't always carry
+        // an HTTP code substring. Caught by R4 review — without these,
+        // a user who hits their monthly cap experiences the same 5-min
+        // hang R3 was meant to fix.
+        || s.contains("insufficient_quota")
+        || s.contains("invalid_api_key")
+        || s.contains("billing_hard_limit_reached")
 }
 
 /// Round-1 review fix — shared writer for the per-task observability row.
@@ -2265,5 +2272,17 @@ mod tests {
         assert!(!is_terminal_provider_error(&e2));
         let e3 = anyhow::anyhow!("provider stream idle timeout after 90000ms");
         assert!(!is_terminal_provider_error(&e3));
+    }
+
+    #[test]
+    fn terminal_provider_error_recognizes_billing_classes() {
+        // R4 fix: insufficient_quota / invalid_api_key / billing limit
+        // are auth-equivalent terminal errors.
+        let e1 = anyhow::anyhow!("openai: insufficient_quota — billing");
+        assert!(is_terminal_provider_error(&e1));
+        let e2 = anyhow::anyhow!("openai: invalid_api_key");
+        assert!(is_terminal_provider_error(&e2));
+        let e3 = anyhow::anyhow!("billing_hard_limit_reached");
+        assert!(is_terminal_provider_error(&e3));
     }
 }

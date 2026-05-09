@@ -80,6 +80,13 @@ pub async fn hard_delete(pool: &SqlitePool, user_id: &str, session_id: &str) -> 
 
     // Tables keyed by task_id (no session_id column) — fan out via subquery
     // on `tasks` BEFORE we delete the tasks themselves.
+    //
+    // R4 fix: `task_metrics` (added in M1.1) has a FK to `tasks(user_id, id)`.
+    // Pre-R3 the table was rarely written, so the FK violation on session
+    // delete was a latent bug. R3 made every task lifecycle write a
+    // metrics row, which means *every* M1-era session would now fail to
+    // delete with a SQLite FK constraint error. Add the fan-out delete
+    // before `tasks` is purged.
     for sql in [
         "DELETE FROM task_assignments WHERE user_id = ? AND task_id IN \
          (SELECT id FROM tasks WHERE user_id = ? AND session_id = ?)",
@@ -91,6 +98,8 @@ pub async fn hard_delete(pool: &SqlitePool, user_id: &str, session_id: &str) -> 
          (SELECT d.id FROM deliverables d JOIN tasks t \
           ON d.user_id = t.user_id AND d.task_id = t.id \
           WHERE t.user_id = ? AND t.session_id = ?)",
+        "DELETE FROM task_metrics WHERE user_id = ? AND task_id IN \
+         (SELECT id FROM tasks WHERE user_id = ? AND session_id = ?)",
     ] {
         sqlx::query(sql)
             .bind(user_id)
