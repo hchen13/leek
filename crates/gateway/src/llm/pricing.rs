@@ -213,6 +213,19 @@ mod tests {
     }
 
     #[test]
+    fn context_window_returns_per_model_value() {
+        // R3 QA3 fix: `auto_compact_threshold` reads through this
+        // accessor instead of hardcoding 400K. Spot-check the table.
+        assert_eq!(context_window("gpt-5.5"), 400_000);
+        assert_eq!(context_window("gpt-5"), 400_000);
+        assert_eq!(context_window("gpt-5-mini"), 200_000);
+        assert_eq!(context_window("gpt-4o"), 128_000);
+        assert_eq!(context_window("o3"), 200_000);
+        // Unknown models fall back to the conservative 400K default.
+        assert_eq!(context_window("not-a-model"), 400_000);
+    }
+
+    #[test]
     fn compute_cost_handles_cached_exceeds_total_gracefully() {
         // Vendor over-reports cache reads vs total — saturate to 0.
         let u = Usage {

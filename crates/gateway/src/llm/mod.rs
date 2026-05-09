@@ -220,12 +220,25 @@ impl GuardConfig {
                 }
             }
         });
+        // QA-cycle: doom-loop threshold also overridable so E2E can
+        // trigger it with N=2 (the in-prod default of N=3 is hard to
+        // hit without a really pathological model).
+        let doom_loop_threshold = match std::env::var("LEEK_DOOM_LOOP_THRESHOLD") {
+            Ok(v) => match v.parse::<usize>() {
+                Ok(n) if n >= 2 => Some(n),
+                _ => {
+                    tracing::warn!(raw = %v, "LEEK_DOOM_LOOP_THRESHOLD invalid; using default");
+                    Some(3)
+                }
+            },
+            Err(_) => Some(3),
+        };
         Self {
             turn_wall_clock: Some(Duration::from_secs(30 * 60)),
             idle_timeout: Some(Duration::from_secs(90)),
             max_iterations,
             cost_cap_usd,
-            doom_loop_threshold: Some(3),
+            doom_loop_threshold,
             // M1.7: 90% of the active model's context window — mirrors
             // codex-rs's hardcoded `(context_window * 9) / 10`. The
             // previous 0.95 left only 5% headroom for the compaction-
