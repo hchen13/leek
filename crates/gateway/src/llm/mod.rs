@@ -197,11 +197,34 @@ pub struct GuardConfig {
 
 impl GuardConfig {
     pub fn defaults() -> Self {
+        // QA-cycle env-var overrides for opt-in fields. These are the
+        // *only* way to configure guards short of a UI surface — useful
+        // for E2E tests that need to trigger a guard, and for staging
+        // deployments that want a strict cost ceiling. Parse failures
+        // log a warning and fall through to None.
+        let max_iterations = std::env::var("LEEK_MAX_ITERATIONS")
+            .ok()
+            .and_then(|v| match v.parse::<usize>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => {
+                    tracing::warn!(raw = %v, "LEEK_MAX_ITERATIONS invalid; ignoring");
+                    None
+                }
+            });
+        let cost_cap_usd = std::env::var("LEEK_COST_CAP_USD").ok().and_then(|v| {
+            match v.parse::<f64>() {
+                Ok(n) if n > 0.0 && n.is_finite() => Some(n),
+                _ => {
+                    tracing::warn!(raw = %v, "LEEK_COST_CAP_USD invalid; ignoring");
+                    None
+                }
+            }
+        });
         Self {
             turn_wall_clock: Some(Duration::from_secs(30 * 60)),
             idle_timeout: Some(Duration::from_secs(90)),
-            max_iterations: None,
-            cost_cap_usd: None,
+            max_iterations,
+            cost_cap_usd,
             doom_loop_threshold: Some(3),
             // M1.7: 90% of the active model's context window — mirrors
             // codex-rs's hardcoded `(context_window * 9) / 10`. The
