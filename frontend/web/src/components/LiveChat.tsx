@@ -9,7 +9,7 @@ import { InsightSidebar, type AgentPlanView } from "./BrainWidget";
 import { Rail, TopBar } from "./Workbench";
 import { NavRail } from "../App";
 import { SafeMarkdown } from "./SafeMarkdown";
-import { ArtifactPanel, extractLinkMeta, type ArtifactEventView, type DecisionDraftView } from "./ArtifactCards";
+import { ArtifactPanel, extractLinkMeta, type ArtifactEventView } from "./ArtifactCards";
 import { SessionMenu, type SessionRow } from "./SessionMenu";
 import { CorpusDocModal, type CorpusDoc } from "./CorpusDocModal";
 import type { Scene } from "../scenes";
@@ -80,12 +80,11 @@ interface NarrationStep {
 
 interface ArtifactEvent extends ArtifactEventView {
   id: string;
-  kind: "narration" | "narration_group" | "search" | "tool" | "decision" | "subagent";
+  kind: "narration" | "narration_group" | "search" | "tool";
   narration?: NarrationStep;
   narrations?: NarrationStep[];
   search?: SearchCall;
   tool?: ToolCall;
-  decision?: DecisionDraftPayload;
 }
 
 interface ClarificationOption {
@@ -105,17 +104,10 @@ interface ClarificationPayload {
   questions: ClarificationQuestion[];
 }
 
-interface DecisionDraftPayload extends DecisionDraftView {}
-
-interface BudgetFinalizationInfo {
-  reason: string;
-  plan_summary?: string;
-}
-
 interface LiveMsg {
   /** `compaction_summary` rows are written by /compact and rendered as a
    *  collapsible system card inside the same session. */
-  role: "user" | "agent" | "compaction_summary" | "decision_draft";
+  role: "user" | "agent" | "compaction_summary";
   text: string;
   ts: string;
   streaming?: boolean;
@@ -130,11 +122,6 @@ interface LiveMsg {
    *  status chip to distinguish "done" from "aborted" / other terminations
    *  so the user isn't told a manually-cancelled run completed normally. */
   stop_reason?: string;
-  decision_draft?: DecisionDraftPayload;
-  /** Set when the agent hit a budget cap and entered the recovery
-   *  finalization turn. UI shows a checkpoint banner so the user knows the
-   *  answer is partial-by-design. */
-  budget_finalization?: BudgetFinalizationInfo;
   msg_seq?: number;
   raw_ts?: string;
   hidden?: boolean;
@@ -232,141 +219,6 @@ function CompactingDivider() {
         height: "1px",
         background: "linear-gradient(90deg, rgba(217,119,87,0.4), transparent)",
       }} />
-    </div>
-  );
-}
-
-function BudgetFinalizationBanner(props: { info: BudgetFinalizationInfo }) {
-  const [open, setOpen] = createSignal(false);
-  const label = () => {
-    switch (props.info.reason) {
-      case "max_tool_turns":
-        return "工具调用预算用完 · 进入 checkpoint 答复";
-      case "plan_guard_exhausted":
-        return "计划闸口预算用完 · 进入 checkpoint 答复";
-      default:
-        return `预算限额触发 · ${props.info.reason}`;
-    }
-  };
-  return (
-    <div
-      class="lk-budget-finalization"
-      style={{
-        margin: "0 0 8px",
-        padding: "8px 10px",
-        border: "1px dashed rgba(217,160,87,0.55)",
-        background: "rgba(217,160,87,0.08)",
-        "border-radius": "6px",
-        "font-family": "var(--font-mono)",
-        "font-size": "11px",
-        color: "rgba(217,180,120,0.95)",
-        "line-height": "1.5",
-      }}
-    >
-      <div
-        onClick={() => setOpen((v) => !v)}
-        style={{ cursor: props.info.plan_summary ? "pointer" : "default", display: "flex", "align-items": "center", gap: "8px" }}
-      >
-        <span style={{ "font-weight": 700, "letter-spacing": "0.04em" }}>BUDGET CHECKPOINT</span>
-        <span style={{ flex: 1, color: "var(--ink-2)" }}>{label()}</span>
-        <Show when={props.info.plan_summary}>
-          <span style={{ "font-size": "10px", color: "var(--ink-3)" }}>
-            {open() ? "收起 ▴" : "展开 ▾"}
-          </span>
-        </Show>
-      </div>
-      <Show when={open() && props.info.plan_summary}>
-        <pre
-          style={{
-            margin: "8px 0 0",
-            padding: "8px 10px",
-            background: "rgba(0,0,0,0.18)",
-            "border-radius": "4px",
-            "font-size": "10.5px",
-            color: "var(--ink-2)",
-            "white-space": "pre-wrap",
-            "word-break": "break-word",
-          }}
-        >{props.info.plan_summary}</pre>
-      </Show>
-    </div>
-  );
-}
-
-function DecisionDraftCard(props: { time: string; draft: DecisionDraftPayload }) {
-  // The card used to expose "确认执行 / 拒绝" buttons that POSTed to
-  // /api/v1/deliverables/.../confirm. Per product feedback (2026-05-09):
-  //   - leek does not directly trade, so any "execute" wording is wrong.
-  //   - the downstream effect (mock portfolio? confirm-into-vault?) hasn't
-  //     been designed yet — do not let users click into a half-baked path.
-  // For now, render the draft as a structured archive entry only. The
-  // record_investment_action call already wrote the deliverable to the
-  // vault, so "存档" is accurate even with no UI action.
-  const dirColor = () => props.draft.direction === "long" ? "rgba(100,200,120,0.15)" : "rgba(217,112,112,0.12)";
-  const dirBorder = () => props.draft.direction === "long" ? "rgba(100,200,120,0.4)" : "rgba(217,112,112,0.4)";
-  const dirLabel = () =>
-    props.draft.direction === "long" ? "▲ 加仓 / 持有偏多"
-    : props.draft.direction === "short" ? "▼ 减仓 / 持有偏空"
-    : "◆ 平仓";
-
-  return (
-    <div style={{
-      border: `1px solid ${dirBorder()}`,
-      "border-radius": "8px",
-      padding: "12px 14px",
-      margin: "6px 0",
-      background: dirColor(),
-    }}>
-      <div style={{ display: "flex", "align-items": "center", gap: "10px", "margin-bottom": "8px", "font-family": "var(--font-mono)" }}>
-        <span style={{ "font-size": "12px", "font-weight": 700, color: "var(--ink-0)", "letter-spacing": "0.06em" }}>
-          {dirLabel()} · {props.draft.ticker}
-        </span>
-        <Show when={props.draft.size_pct != null}>
-          <span style={{ "font-size": "11px", color: "var(--ink-2)" }}>{props.draft.size_pct}%</span>
-        </Show>
-        <div style={{ flex: 1 }} />
-        <span style={{ "font-size": "10px", color: "var(--ink-3)" }}>{props.time}</span>
-      </div>
-      <Show when={props.draft.rationale}>
-        <div style={{ "font-size": "13px", color: "var(--ink-0)", "line-height": "1.55", "margin-bottom": "10px" }}>
-          <SafeMarkdown source={props.draft.rationale} />
-        </div>
-      </Show>
-      <Show when={(props.draft.risks?.length ?? 0) > 0}>
-        <div style={{ "font-size": "12.5px", color: "var(--ink-1)", "line-height": "1.5", "margin-bottom": "10px" }}>
-          <div style={{ "font-family": "var(--font-mono)", "font-size": "10.5px", color: "var(--ink-3)", "letter-spacing": "0.06em", "text-transform": "uppercase", "margin-bottom": "4px" }}>风险</div>
-          <ul style={{ margin: 0, "padding-left": "18px" }}>
-            <For each={props.draft.risks}>{(r) => <li><SafeMarkdown source={r} /></li>}</For>
-          </ul>
-        </div>
-      </Show>
-      <Show when={props.draft.invalidation_conditions}>
-        <div style={{ "font-size": "12.5px", color: "var(--ink-1)", "line-height": "1.5", "margin-bottom": "10px" }}>
-          <div style={{ "font-family": "var(--font-mono)", "font-size": "10.5px", color: "var(--ink-3)", "letter-spacing": "0.06em", "text-transform": "uppercase", "margin-bottom": "4px" }}>失效条件</div>
-          <SafeMarkdown source={props.draft.invalidation_conditions!} />
-        </div>
-      </Show>
-      <div style={{ display: "flex", gap: "10px", "flex-wrap": "wrap", "font-size": "11px", color: "var(--ink-3)", "margin-bottom": "8px", "font-family": "var(--font-mono)" }}>
-        <Show when={props.draft.stop_loss != null}>
-          <span>止损 {props.draft.stop_loss}</span>
-        </Show>
-        <Show when={props.draft.target != null}>
-          <span>目标 {props.draft.target}</span>
-        </Show>
-        <Show when={props.draft.horizon_days != null}>
-          <span>周期 {props.draft.horizon_days}d</span>
-        </Show>
-      </div>
-      <div style={{
-        "font-size": "10.5px",
-        color: "var(--ink-3)",
-        "font-family": "var(--font-mono)",
-        "letter-spacing": "0.04em",
-        "padding-top": "6px",
-        "border-top": "1px dashed rgba(255, 255, 255, 0.06)",
-      }}>
-        ✓ 已存档为决策草稿 · 模拟持仓 / 执行联动暂未启用
-      </div>
     </div>
   );
 }
@@ -475,40 +327,6 @@ function upsertSearchEvent(events: ArtifactEvent[] | undefined, search: SearchCa
     }
   }
   out.push({ id, kind: "search", search });
-  return out;
-}
-
-function upsertSubagentEvent(
-  events: ArtifactEvent[] | undefined,
-  payload: Record<string, unknown>,
-): ArtifactEvent[] {
-  const runId = typeof payload.run_id === "string" ? payload.run_id : "";
-  if (!runId) return [...(events ?? [])];
-  const out = [...(events ?? [])];
-  const idx = out.findIndex((event) => event.kind === "subagent" && event.id === `subagent:${runId}`);
-  const extra = (payload.extra && typeof payload.extra === "object")
-    ? (payload.extra as Record<string, unknown>)
-    : {};
-  const view = {
-    run_id: runId,
-    role: typeof payload.role === "string" ? payload.role : "subagent",
-    status: typeof payload.status === "string" ? payload.status : "in_progress",
-    question: typeof payload.question === "string" ? payload.question : "",
-    output_preview: typeof extra.output_preview === "string" ? extra.output_preview : undefined,
-    tokens_used: typeof extra.tokens_used === "number" ? extra.tokens_used : undefined,
-    duration_ms: typeof extra.duration_ms === "number" ? extra.duration_ms : undefined,
-    error: typeof extra.error === "string" ? extra.error : undefined,
-  };
-  if (idx >= 0) {
-    const prev = out[idx].subagent;
-    out[idx] = {
-      id: `subagent:${runId}`,
-      kind: "subagent",
-      subagent: { ...prev, ...view },
-    };
-  } else {
-    out.push({ id: `subagent:${runId}`, kind: "subagent", subagent: view });
-  }
   return out;
 }
 
@@ -1137,82 +955,11 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
                 outTokens: typeof p.output_tokens === "number" ? p.output_tokens : 0,
               };
               break;
-            case "decision_draft_ready": {
-              // Dedup within the session: a critic-driven rewrite causes
-              // record_investment_action to fire multiple times in one
-              // task. Match on task_id when present (post-2026-05-09
-              // backends), otherwise fall back to ticker+direction —
-              // good enough because a session rarely has two distinct
-              // open drafts on the same ticker+direction.
-              const draft = p as DecisionDraftPayload;
-              const matches = (m: LiveMsg) => {
-                if (m.role !== "decision_draft") return false;
-                const d = m.decision_draft;
-                if (!d) return false;
-                if (draft.task_id && d.task_id === draft.task_id) return true;
-                if (!draft.task_id && d.ticker === draft.ticker && d.direction === draft.direction) return true;
-                return false;
-              };
-              const existingIdx = hist.findIndex(matches);
-              const nextRaw = row.ts ?? row.created_at;
-              if (existingIdx >= 0) {
-                hist[existingIdx] = {
-                  ...hist[existingIdx],
-                  decision_draft: draft,
-                  ts: fmtTime(nextRaw),
-                  raw_ts: nextRaw,
-                };
-              } else {
-                hist.push({
-                  role: "decision_draft",
-                  text: "",
-                  ts: fmtTime(nextRaw),
-                  raw_ts: nextRaw,
-                  decision_draft: draft,
-                });
-              }
-              break;
-            }
-            case "subagent_run": {
-              // Attach to the in-progress / most recent agent message in this
-              // session — same heuristic as clarification_requested.
-              let idx = cursor >= 0 && cursor < agentIdxs.length ? agentIdxs[cursor] : -1;
-              if (idx < 0) {
-                for (let i = hist.length - 1; i >= 0; i--) {
-                  if (hist[i].role === "agent") {
-                    idx = i;
-                    break;
-                  }
-                }
-              }
-              if (idx >= 0) {
-                const msg = hist[idx];
-                msg.artifacts = upsertSubagentEvent(msg.artifacts, p);
-              }
-              break;
-            }
-            case "budget_finalization": {
-              // Attach to the agent message currently streaming (or last one).
-              let idx = cursor >= 0 && cursor < agentIdxs.length ? agentIdxs[cursor] : -1;
-              if (idx < 0) {
-                for (let i = hist.length - 1; i >= 0; i--) {
-                  if (hist[i].role === "agent") {
-                    idx = i;
-                    break;
-                  }
-                }
-              }
-              if (idx >= 0) {
-                hist[idx].budget_finalization = {
-                  reason: typeof p.reason === "string" ? p.reason : "budget exhausted",
-                  plan_summary:
-                    typeof p.plan_summary === "string" && p.plan_summary.trim()
-                      ? p.plan_summary
-                      : undefined,
-                };
-              }
-              break;
-            }
+            // Phase 0: decision_draft_ready / subagent_run / budget_finalization
+            // events are no longer emitted by the backend (their owning code
+            // paths were removed). Older sessions in the vault may still
+            // contain these events; we ignore them on replay rather than
+            // resurrect dead UI shapes.
           }
         }
         if (usageSnap) setUsage(usageSnap);
@@ -1501,33 +1248,6 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
       }
     });
 
-    evtSrc.addEventListener("budget_finalization", (e: MessageEvent) => {
-      try {
-        const data = JSON.parse(e.data) as {
-          reason?: string;
-          plan_summary?: string;
-        };
-        emitTick(e, "budget_finalization", data);
-        const info: BudgetFinalizationInfo = {
-          reason: typeof data.reason === "string" ? data.reason : "budget exhausted",
-          plan_summary:
-            typeof data.plan_summary === "string" && data.plan_summary.trim()
-              ? data.plan_summary
-              : undefined,
-        };
-        setMessages((prev) => {
-          const out = [...prev];
-          const last = out[out.length - 1];
-          if (!last || last.role !== "agent") return prev;
-          out[out.length - 1] = { ...last, budget_finalization: info };
-          return out;
-        });
-        setError(null);
-      } catch {
-        // skip malformed
-      }
-    });
-
     evtSrc.addEventListener("llm_usage", (e: MessageEvent) => {
       try {
         const u = JSON.parse(e.data);
@@ -1586,68 +1306,11 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
       emitTick(e, "agent_message_end", data);
     });
 
-    evtSrc.addEventListener("decision_draft_ready", (e: MessageEvent) => {
-      try {
-        const data = JSON.parse(e.data) as DecisionDraftPayload;
-        // Dedup: critic-driven rewrites fire record_investment_action
-        // again. Use task_id when the backend supplies it (post-2026-05-09),
-        // and fall back to ticker+direction so older sessions also collapse
-        // duplicate ACTION cards on reload.
-        setMessages((prev) => {
-          const matches = (m: LiveMsg) => {
-            if (m.role !== "decision_draft") return false;
-            const d = m.decision_draft;
-            if (!d) return false;
-            if (data.task_id && d.task_id === data.task_id) return true;
-            if (!data.task_id && d.ticker === data.ticker && d.direction === data.direction) return true;
-            return false;
-          };
-          for (let i = prev.length - 1; i >= 0; i--) {
-            if (matches(prev[i])) {
-              const out = [...prev];
-              out[i] = { ...prev[i], decision_draft: data, ts: fmtTime() };
-              return out;
-            }
-          }
-          return [
-            ...prev,
-            { role: "decision_draft", text: "", ts: fmtTime(), decision_draft: data },
-          ];
-        });
-        try { emitTick(e, "decision_draft_ready", data); } catch { /* skip */ }
-      } catch { /* skip */ }
-    });
-
-    evtSrc.addEventListener("subagent_run", (e: MessageEvent) => {
-      try {
-        const data = JSON.parse(e.data) as Record<string, unknown>;
-        setMessages((prev) => {
-          const out = [...prev];
-          // Attach to the in-progress agent bubble; if none, the last agent message.
-          let idx = -1;
-          for (let i = out.length - 1; i >= 0; i--) {
-            if (out[i].role === "agent" && out[i].streaming) {
-              idx = i;
-              break;
-            }
-          }
-          if (idx < 0) {
-            for (let i = out.length - 1; i >= 0; i--) {
-              if (out[i].role === "agent") {
-                idx = i;
-                break;
-              }
-            }
-          }
-          if (idx < 0) return prev;
-          out[idx] = { ...out[idx], artifacts: upsertSubagentEvent(out[idx].artifacts, data) };
-          return out;
-        });
-        emitTick(e, "subagent_run", data);
-      } catch {
-        // skip malformed
-      }
-    });
+    // Phase 0: decision_draft_ready / subagent_run / budget_finalization
+    // SSE events are no longer emitted (their backend code paths were
+    // deleted). No live listeners are registered for them; older sessions
+    // in the vault still hold these events but the history-replay branch
+    // also ignores them.
 
     evtSrc.addEventListener("clarification_requested", (e: MessageEvent) => {
       try {
@@ -2022,14 +1685,6 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
   const sessionArtifactEvents = createMemo<ArtifactEvent[]>(() => {
     const out: ArtifactEvent[] = [];
     for (const m of messages()) {
-      if (m.role === "decision_draft" && m.decision_draft) {
-        out.push({
-          id: `decision:${m.decision_draft.deliverable_id}`,
-          kind: "decision",
-          decision: m.decision_draft,
-        });
-        continue;
-      }
       if (m.role !== "agent") continue;
       if (m.artifacts && m.artifacts.length > 0) {
         out.push(...m.artifacts.filter(isCanvasArtifact));
@@ -2133,17 +1788,10 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
                 when={m.role === "agent"}
                 fallback={
                   <Show
-                    when={m.role === "decision_draft" && m.decision_draft != null}
-                    fallback={
-                      <Show
-                        when={m.role === "compaction_summary"}
-                        fallback={<UserMsg time={m.ts}>{m.text}</UserMsg>}
-                      >
-                        <CompactionSummaryCard time={m.ts} markdown={m.text} />
-                      </Show>
-                    }
+                    when={m.role === "compaction_summary"}
+                    fallback={<UserMsg time={m.ts}>{m.text}</UserMsg>}
                   >
-                    <DecisionDraftCard time={m.ts} draft={m.decision_draft!} />
+                    <CompactionSummaryCard time={m.ts} markdown={m.text} />
                   </Show>
                 }
               >
@@ -2162,11 +1810,6 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
                           ? `⏹ aborted · ${m.total_sec}s`
                           : `✓ done · ${m.total_sec}s`}
                     </div>
-                  </Show>
-                  <Show when={m.budget_finalization}>
-                    {(info) => (
-                      <BudgetFinalizationBanner info={info()} />
-                    )}
                   </Show>
                   <Show when={(m.searches?.length ?? 0) + (m.tool_calls?.length ?? 0) + (m.narrations?.length ?? 0) > 0}>
                     <div style={{

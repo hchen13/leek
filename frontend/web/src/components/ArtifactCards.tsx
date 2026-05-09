@@ -39,51 +39,21 @@ export interface NarrationStep {
   seq?: number;
 }
 
-export interface MandateCheckView {
-  fits_mandate: boolean;
-  notes: string;
-}
-
-export interface DecisionDraftView {
-  /** Set by the backend so chat-panel can dedupe drafts within one task —
-   *  critic-driven rewrites cause the same task to record_investment_action
-   *  multiple times. */
-  task_id?: string;
-  deliverable_id: string;
-  ticker: string;
-  direction: string;
-  size_pct?: number;
-  stop_loss?: number;
-  target?: number;
-  horizon_days?: number;
-  rationale: string;
-  risks?: string[];
-  opposing_case?: string;
-  corpus_refs?: string[];
-  mandate_check?: MandateCheckView;
-  invalidation_conditions?: string;
-}
-
-export interface SubagentRunView {
-  run_id: string;
-  role: string;
-  status: "in_progress" | "completed" | "error" | string;
-  question: string;
-  output_preview?: string;
-  tokens_used?: number;
-  duration_ms?: number;
-  error?: string;
-}
+// Phase 0: DecisionDraftView / SubagentRunView / MandateCheckView were
+// the canvas analogues of the deleted record_investment_action /
+// delegate_research backend tools. They have no producers anymore and
+// were removed along with the corresponding card renderers (see the
+// deletions of SubagentArtifact / DecisionArtifact). The kinds
+// "decision" and "subagent" stay out of ArtifactEventView so any
+// stale event payloads don't try to construct unrenderable cards.
 
 export interface ArtifactEventView {
   id: string;
-  kind: "narration" | "narration_group" | "search" | "tool" | "decision" | "subagent";
+  kind: "narration" | "narration_group" | "search" | "tool";
   narration?: NarrationStep;
   narrations?: NarrationStep[];
   search?: SearchCallView;
   tool?: ToolCallView;
-  decision?: DecisionDraftView;
-  subagent?: SubagentRunView;
 }
 
 interface ArtifactCallbacks {
@@ -214,129 +184,7 @@ function ArtifactEventCard(props: { event: ArtifactEventView; callbacks?: Artifa
       return props.event.tool
         ? <ToolArtifact tool={props.event.tool} callbacks={props.callbacks} />
         : null;
-    case "decision":
-      return props.event.decision ? <DecisionArtifact id={props.event.id} draft={props.event.decision} /> : null;
-    case "subagent":
-      return props.event.subagent ? <SubagentArtifact id={props.event.id} run={props.event.subagent} /> : null;
   }
-}
-
-function SubagentArtifact(props: { id: string; run: SubagentRunView }) {
-  const [expanded, setExpanded] = createSignal(false);
-  // Live elapsed counter for the in_progress state. Without it, a
-  // running subagent looks identical to a stalled one — the user can't
-  // tell whether anything is happening. We start the counter the moment
-  // the card mounts (which coincides with the in_progress event for live
-  // sessions; for history replay the card is already completed and the
-  // counter is hidden by the status check).
-  const cardMountedAt = Date.now();
-  const [liveSec, setLiveSec] = createSignal(0);
-  let timer: number | undefined;
-  createEffect(() => {
-    const running = props.run.status === "in_progress";
-    if (running && timer == null) {
-      timer = window.setInterval(() => {
-        setLiveSec(Math.floor((Date.now() - cardMountedAt) / 1000));
-      }, 500);
-    } else if (!running && timer != null) {
-      clearInterval(timer);
-      timer = undefined;
-    }
-  });
-  onCleanup(() => { if (timer != null) clearInterval(timer); });
-
-  const isRunning = () => props.run.status === "in_progress";
-  const statusTone = () =>
-    props.run.status === "completed" ? "#9eb78f" :
-    props.run.status === "error"     ? "#d97070" : "#e8b86c";
-  const statusLabel = () =>
-    props.run.status === "completed" ? "已完成" :
-    props.run.status === "error"     ? "出错" :
-    "运行中";
-  const preview = () => props.run.output_preview ?? "";
-  const hasOutput = () => preview().length > 0 || props.run.error;
-  return (
-    <div
-      data-call-id={props.id}
-      class={`lk-artifact-card is-normal is-subagent${isRunning() ? " is-running" : ""}`}
-      style={{
-        background: isRunning()
-          ? "linear-gradient(180deg, rgba(232,184,108,0.14), rgba(182,154,214,0.05))"
-          : "linear-gradient(180deg, rgba(182,154,214,0.10), rgba(255,255,255,0.02))",
-        border: isRunning()
-          ? "1px solid rgba(232,184,108,0.45)"
-          : "1px solid rgba(182,154,214,0.28)",
-        "border-radius": "8px",
-        padding: "12px 14px",
-      }}
-    >
-      <div style={{ display: "flex", "align-items": "baseline", gap: "10px", "margin-bottom": "6px", "flex-wrap": "wrap" }}>
-        <span style={{
-          "font-family": "var(--font-mono)",
-          "font-size": "10px",
-          color: "#b69ad6",
-          "letter-spacing": "0.06em",
-          "font-weight": 700,
-        }}>
-          子代理 · {subagentRoleLabel(props.run.role)}
-        </span>
-        <span style={{
-          "font-family": "var(--font-mono)",
-          "font-size": "10px",
-          color: statusTone(),
-          "font-weight": 600,
-        }}>
-          <Show when={isRunning()}>
-            <span class="lk-subagent-spinner" style={{ "margin-right": "4px" }}>⏳</span>
-          </Show>
-          {statusLabel()}
-        </span>
-        <Show when={isRunning()}>
-          <span style={{ "font-family": "var(--font-mono)", "font-size": "10px", color: "var(--ink-3)" }}>
-            {liveSec()}s
-          </span>
-        </Show>
-        <Show when={!isRunning() && typeof props.run.duration_ms === "number"}>
-          <span style={{ "font-family": "var(--font-mono)", "font-size": "10px", color: "var(--ink-3)" }}>
-            {Math.max(1, Math.round((props.run.duration_ms ?? 0) / 100) / 10)}s
-          </span>
-        </Show>
-      </div>
-      <div style={{ "font-size": "12px", color: "var(--ink-1)", "margin-bottom": hasOutput() ? "8px" : 0, "line-height": 1.5 }}>
-        {props.run.question}
-      </div>
-      <Show when={props.run.error}>
-        {(err) => (
-          <div style={{
-            color: "#d97070",
-            "font-family": "var(--font-mono)",
-            "font-size": "11px",
-            background: "rgba(217,112,112,0.08)",
-            padding: "6px 8px",
-            "border-radius": "4px",
-          }}>
-            {err()}
-          </div>
-        )}
-      </Show>
-      <Show when={preview()}>
-        <div
-          onClick={() => setExpanded(!expanded())}
-          style={{
-            "font-size": "12.5px",
-            color: "var(--ink-1)",
-            "line-height": 1.55,
-            cursor: "pointer",
-            "max-height": expanded() ? "none" : "9.5em",
-            overflow: "hidden",
-          }}
-          title={expanded() ? "click to collapse" : "click to expand"}
-        >
-          <SafeMarkdown source={preview()} />
-        </div>
-      </Show>
-    </div>
-  );
 }
 
 function NarrationArtifact(props: { id: string; steps: NarrationStep[] }) {
@@ -408,167 +256,6 @@ function NarrationArtifact(props: { id: string; steps: NarrationStep[] }) {
             </div>
           </div>
         )}</For>
-      </div>
-    </div>
-  );
-}
-
-function DecisionArtifact(props: { id: string; draft: DecisionDraftView }) {
-  const directionLabel = () =>
-    props.draft.direction === "long" ? "BUY"
-    : props.draft.direction === "short" ? "SELL"
-    : props.draft.direction === "flat" ? "EXIT"
-    : props.draft.direction.toUpperCase();
-  const directionTone = () =>
-    props.draft.direction === "long" ? "#d97757"
-    : props.draft.direction === "short" ? "#6fb98a"
-    : "#e8b86c";
-  const stat = (label: string, value: string | number | undefined) => (
-    <Show when={value != null && value !== ""}>
-      <div style={{
-        padding: "7px 8px",
-        background: "rgba(255,255,255,0.03)",
-        border: "1px solid rgba(255,255,255,0.08)",
-        "border-radius": "6px",
-        "min-width": 0,
-      }}>
-        <div style={{ "font-family": "var(--font-mono)", "font-size": "9.5px", color: "var(--ink-3)", "margin-bottom": "3px" }}>
-          {label}
-        </div>
-        <div style={{
-          "font-family": "var(--font-mono)",
-          "font-size": "12px",
-          color: "var(--ink-0)",
-          "font-weight": 700,
-          overflow: "hidden",
-          "text-overflow": "ellipsis",
-          "white-space": "nowrap",
-        }}>
-          {value}
-        </div>
-      </div>
-    </Show>
-  );
-
-  return (
-    <div
-      data-call-id={props.id}
-      class="lk-artifact-card is-normal is-action"
-      style={{
-        background: "linear-gradient(180deg, rgba(232,184,108,0.10), rgba(255,255,255,0.02))",
-        border: "1px solid rgba(232,184,108,0.28)",
-        "border-radius": "8px",
-        padding: "14px 15px",
-      }}
-    >
-      <div style={{
-        display: "flex",
-        "align-items": "baseline",
-        gap: "10px",
-        "font-family": "var(--font-mono)",
-        "margin-bottom": "10px",
-      }}>
-        <span style={{ color: directionTone(), "font-size": "12px", "font-weight": 800, "letter-spacing": "0.08em" }}>
-          ACTION · {directionLabel()}
-        </span>
-        <span style={{ color: "var(--ink-2)", "font-size": "12px", "font-weight": 700 }}>
-          {props.draft.ticker}
-        </span>
-      </div>
-      <div style={{
-        display: "grid",
-        "grid-template-columns": "repeat(2, minmax(0, 1fr))",
-        gap: "8px",
-        "margin-bottom": "10px",
-      }}>
-        {stat("Size", props.draft.size_pct != null ? `${props.draft.size_pct}%` : undefined)}
-        {stat("Horizon", props.draft.horizon_days != null ? `${props.draft.horizon_days}d` : undefined)}
-        {stat("Stop", props.draft.stop_loss)}
-        {stat("Target", props.draft.target)}
-      </div>
-      <div style={{
-        color: "var(--ink-1)",
-        "font-size": "12.5px",
-        "line-height": 1.55,
-        "margin-bottom": "10px",
-        // The agent often writes rationale as markdown (bold thesis lines,
-        // bullet sub-claims, inline links). Render it as markdown so users
-        // don't see raw `**` / `##` characters.
-      }}>
-        <SafeMarkdown source={props.draft.rationale} />
-      </div>
-      <Show when={props.draft.risks && props.draft.risks.length > 0}>
-        <DecisionSection title="风险" tone="risk">
-          <ul style={{ margin: 0, "padding-left": "18px", display: "flex", "flex-direction": "column", gap: "3px" }}>
-            <For each={props.draft.risks}>{(risk) => <li><SafeMarkdown source={risk} /></li>}</For>
-          </ul>
-        </DecisionSection>
-      </Show>
-      <Show when={props.draft.opposing_case}>
-        <DecisionSection title="反方观点" tone="bear">
-          <SafeMarkdown source={props.draft.opposing_case!} />
-        </DecisionSection>
-      </Show>
-      <Show when={props.draft.invalidation_conditions}>
-        <DecisionSection title="失效条件" tone="risk">
-          <SafeMarkdown source={props.draft.invalidation_conditions!} />
-        </DecisionSection>
-      </Show>
-      <Show when={props.draft.mandate_check}>
-        {(check) => (
-          <DecisionSection title={`Mandate · ${check().fits_mandate ? "符合" : "需复核"}`} tone={check().fits_mandate ? "ok" : "risk"}>
-            <SafeMarkdown source={check().notes ?? ""} />
-          </DecisionSection>
-        )}
-      </Show>
-      <Show when={props.draft.corpus_refs && props.draft.corpus_refs.length > 0}>
-        <DecisionSection title="Corpus 引用" tone="ref">
-          <div style={{ display: "flex", "flex-wrap": "wrap", gap: "4px" }}>
-            <For each={props.draft.corpus_refs}>
-              {(ref) => (
-                <span style={{
-                  padding: "2px 7px",
-                  border: "1px solid rgba(255,255,255,0.12)",
-                  "border-radius": "4px",
-                  "font-size": "10.5px",
-                  "font-family": "var(--font-mono)",
-                }}>
-                  {ref}
-                </span>
-              )}
-            </For>
-          </div>
-        </DecisionSection>
-      </Show>
-    </div>
-  );
-}
-
-function DecisionSection(props: { title: string; tone: "risk" | "bear" | "ok" | "ref"; children: any }) {
-  const accent = () => ({
-    risk: "#d97070",
-    bear: "#7a9bd6",
-    ok: "#9eb78f",
-    ref: "#c9a76a",
-  })[props.tone];
-  return (
-    <div style={{ "margin-top": "8px" }}>
-      <div style={{
-        "font-family": "var(--font-mono)",
-        "font-size": "9.5px",
-        "letter-spacing": "0.08em",
-        "text-transform": "uppercase",
-        color: accent(),
-        "margin-bottom": "4px",
-      }}>
-        {props.title}
-      </div>
-      <div style={{
-        color: "var(--ink-1)",
-        "font-size": "12px",
-        "line-height": 1.5,
-      }}>
-        {props.children}
       </div>
     </div>
   );
@@ -898,31 +585,13 @@ function ToolArtifact(props: { tool: ToolCallView; callbacks?: ArtifactCallbacks
     case "tradingview_quote": return <MarketQuoteCard {...props} />;
     case "get_candlesticks": return <CandlestickToolCard {...props} />;
     case "tushare_quote": return <TushareCard {...props} />;
-    case "use_skill": return <UseSkillCard {...props} />;
     case "get_company_info": return <CompanyInfoCard {...props} />;
     case "get_financials": return <FinancialsCard {...props} />;
     case "get_capital_flow": return <CapitalFlowCard {...props} />;
-    case "sec_filing_fetch": return <SecFilingCard {...props} />;
-    // `delegate_research` is the agent tool call that spawns a subagent;
-    // the matching `subagent_run` event already renders a richer card
-    // (with role label, status, output preview). Showing both creates
-    // duplicate noise on the canvas, so suppress the tool-call card here.
-    case "delegate_research": return null;
+    // The `use_skill`, `sec_filing_fetch`, and `delegate_research`
+    // backend tools were removed in Phase 0; old session events that
+    // reference them just fall through to GenericToolCard.
     default:              return <GenericToolCard {...props} />;
-  }
-}
-
-/// Subagent role → user-facing label. Roles come from the backend
-/// `delegate_research` tool's hard-coded persona list (fundamental_analyst,
-/// trading_analyst, risk_manager, corpus_guardian — see
-/// `crates/gateway/src/agent/tools/delegate_research.rs::role_instruction`).
-function subagentRoleLabel(role: string): string {
-  switch (role) {
-    case "risk_manager": return "风控代理";
-    case "fundamental_analyst": return "基本面分析";
-    case "trading_analyst": return "交易分析";
-    case "corpus_guardian": return "知识审核";
-    default: return role;
   }
 }
 
@@ -1428,73 +1097,6 @@ function WebFetchCard(props: { tool: ToolCallView }) {
     </div>
   );
 }
-
-/* ---------- use_skill ---------- */
-
-function UseSkillCard(props: { tool: ToolCallView }) {
-  const args = parseArgs(props.tool);
-  const skill = String(args.name ?? args.skill ?? "").replace(/[-_]/g, " ");
-  const body = () => props.tool.output_preview ?? "";
-  const headings = createMemo(() =>
-    body()
-      .split("\n")
-      .map((line) => line.match(/^#{2,3}\s+(.+)$/)?.[1]?.trim())
-      .filter(Boolean)
-      .slice(0, 6) as string[]
-  );
-
-  return (
-    <CardShell
-      status={props.tool.status}
-      badge="skill"
-      detail={skill || undefined}
-      callId={props.tool.call_id}
-      size="compact"
-    >
-      <Show
-        when={headings().length > 0}
-        fallback={
-          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
-            <Show when={props.tool.status === "in_progress"} fallback="Skill loaded.">
-              Loading skill…
-            </Show>
-          </div>
-        }
-      >
-        <div style={{ display: "flex", "flex-direction": "column", gap: "8px" }}>
-          <div style={{
-            "font-size": "13px",
-            color: "var(--ink-0)",
-            "line-height": 1.35,
-            "font-weight": 600,
-          }}>
-            {skill ? skill.replace(/\b\w/g, (m) => m.toUpperCase()) : "Research Skill"}
-          </div>
-          <div style={{
-            display: "flex",
-            "flex-wrap": "wrap",
-            gap: "6px",
-          }}>
-            <For each={headings()}>{(h) => (
-              <span style={{
-                "font-family": "var(--font-mono)",
-                "font-size": "10.5px",
-                color: "var(--ink-2)",
-                padding: "4px 7px",
-                background: "rgba(217,119,87,0.08)",
-                border: "1px solid rgba(217,119,87,0.18)",
-                "border-radius": "999px",
-                "white-space": "nowrap",
-              }}>{h}</span>
-            )}</For>
-          </div>
-        </div>
-      </Show>
-    </CardShell>
-  );
-}
-
-/* ---------- get_company_info ---------- */
 
 interface CompanyInfo {
   title: string;
@@ -3212,66 +2814,6 @@ interface SecFiling {
   description?: string;
 }
 
-function SecFilingCard(props: { tool: ToolCallView }) {
-  const args = parseArgs(props.tool);
-  const ticker = String(args.ticker ?? "").toUpperCase();
-  const preview = props.tool.output_preview ?? "";
-  const parsed = safeParseJson(preview) as
-    | { filings?: SecFiling[]; company_name?: string } | null;
-  const filings: SecFiling[] = parsed?.filings
-    ?? (extractObjectsAfter(preview, "\"filings\"") as SecFiling[]);
-  return (
-    <CardShell
-      status={props.tool.status}
-      badge="sec · edgar"
-      detail={parsed?.company_name ? `${ticker} · ${parsed.company_name}` : ticker}
-      callId={props.tool.call_id}
-      size="normal"
-    >
-      <Show
-        when={filings.length > 0}
-        fallback={
-          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
-            <Show when={props.tool.status === "in_progress"} fallback="No filings.">
-              Fetching filings…
-            </Show>
-          </div>
-        }
-      >
-        <div style={{ display: "flex", "flex-direction": "column", gap: "6px" }}>
-          <For each={filings.slice(0, 5)}>{(f) => (
-            <a
-              href={f.primary_doc_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              onClick={(e) => e.stopPropagation()}
-              style={{
-                display: "flex",
-                gap: "10px",
-                padding: "6px 10px",
-                background: "rgba(255, 255, 255, 0.025)",
-                border: "1px solid var(--line-1)",
-                "border-radius": "6px",
-                "font-family": "var(--font-mono)",
-                "font-size": "11px",
-                color: "var(--ink-1)",
-                "text-decoration": "none",
-              }}
-            >
-              <span style={{ "min-width": "50px", color: "var(--clay-soft)" }}>{f.form}</span>
-              <span style={{ "min-width": "100px", color: "var(--ink-3)" }}>{f.filed}</span>
-              <span style={{ flex: 1, "white-space": "nowrap", overflow: "hidden", "text-overflow": "ellipsis" }}>
-                {f.description || f.primary_doc_url.split("/").slice(-1)[0]}
-              </span>
-            </a>
-          )}</For>
-        </div>
-      </Show>
-    </CardShell>
-  );
-}
-
-/* ---------- generic fallback ---------- */
 
 function GenericToolCard(props: { tool: ToolCallView }) {
   const args = parseArgs(props.tool);
