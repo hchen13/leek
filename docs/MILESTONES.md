@@ -46,7 +46,7 @@ user prompt → minimal tools → answer.
 
 ---
 
-## Milestone 1 — Agent Loop MVP: safety nets
+## Milestone 1 — Agent Loop MVP: safety nets [DONE 2026-05-10]
 
 ### Goal
 
@@ -56,17 +56,33 @@ opt-in (mirroring codex's "trust the provider" philosophy). Build all
 guard mechanisms so they're available; ship them on or off by default
 according to whether they're well-understood guards or aggressive ones.
 
-### Sub-commits
+### Sub-commits (all landed)
 
-| #    | Content                                                                              | Default          | Status  |
-|------|--------------------------------------------------------------------------------------|------------------|---------|
-| M1.1 | `task_metrics` vault table + write hook + `LlmTuning` extended with all guard fields | —                | pending |
-| M1.2 | Idle timeout (watchdog task pattern)                                                 | 90s, on          | pending |
-| M1.3 | Wall-clock ceiling + 10/5/2/1 min staged soft-prompts                                | 30 min, on       | pending |
-| M1.4 | Iteration cap (opt-in) + rename `turn` → `iteration_count`                           | None (off)       | pending |
-| M1.5 | Cost cap USD/turn (opt-in) + per-model price table                                   | None (off)       | pending |
-| M1.6 | Doom-loop detector + `task_metrics.first_triggered_guard`                            | N=3, on          | pending |
-| M1.7 | Auto-compaction parity with codex (95% → 90%)                                        | 90%, on          | pending |
+| #    | Commit    | Content                                                                              | Default          |
+|------|-----------|--------------------------------------------------------------------------------------|------------------|
+| M1.1 | `e4d8401` | `task_metrics` vault table + write hook + `LlmTuning` extended with all guard fields | —                |
+| M1.2 | `4d2d17a` | Idle timeout: GuardConfig-driven + per-task hit budget (3 hits → idle_timeout)       | 90s, on          |
+| M1.3 | `ceb3716` | Wall-clock ceiling + 10/5/2/1 min staged soft-prompts                                | 30 min, on       |
+| M1.4 | `2b7a232` | Iteration cap (opt-in) + rename `turn` → `iteration_count` (SSE dual-key)            | None (off)       |
+| M1.5 | `3f0f46d` | Cost cap USD/turn (opt-in) + per-model price table (`llm/pricing.rs`)                | None (off)       |
+| M1.6 | `59aacf1` | Doom-loop detector + `task_metrics.first_triggered_guard` wired at all 5 trigger sites | N=3, on        |
+| M1.7 | `ef8e5f9` | Auto-compaction parity with codex (95% → 90% via `LlmTuning.guards.auto_compact_threshold`) | 90%, on    |
+
+### Tests
+- 140 unit tests pass (was 115 pre-M1, +25 from M1.1-M1.6)
+- cargo build clean, no dead-code warnings
+- Frontend tsc --noEmit clean (M1.4 SSE field rename uses dual-key fallback)
+
+### Known limitation (deferred)
+- The early `return Err(e)` path after exhausted provider retries
+  (~`agent/mod.rs:520`) doesn't write a `task_metrics` row. Documented
+  in M1.1 / M1.2 / M1.6 commit messages. Folded into the M1 QA cycle
+  if it's exercised in E2E.
+
+### Post-M1 QA cycle (in progress)
+- 5 rounds of: deep code review via opus max-thinking subagent → fix
+  issues → ≥ 3 E2E cases serially via opus xhigh-thinking subagents
+  → fix test issues. Then milestone wrap-up.
 
 ### Design decisions (locked)
 
