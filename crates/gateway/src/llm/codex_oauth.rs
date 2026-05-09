@@ -112,9 +112,38 @@ impl LlmProvider for CodexOauthProvider {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            bail!("codex /responses returned {status}: {body_text}");
+            bail!(
+                "codex /responses returned {status}: {}",
+                redact_bearer(&body_text)
+            );
         }
 
         Ok(openai_responses::parse_sse_stream(resp))
+    }
+}
+
+/// Strip `Bearer <token>` substrings from a string before propagating it into
+/// logs / SSE error events. Defensive: today the upstream doesn't echo the
+/// access token, but if it ever does we don't want it landing in event rows.
+fn redact_bearer(s: &str) -> String {
+    let re = regex::Regex::new(r"(?i)Bearer\s+[A-Za-z0-9._\-]+").unwrap();
+    re.replace_all(s, "Bearer <redacted>").into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_bearer;
+
+    #[test]
+    fn redacts_bearer_token() {
+        let out = redact_bearer("error: invalid Bearer abc.def.ghi-123 returned by foo");
+        assert!(!out.contains("abc.def.ghi-123"));
+        assert!(out.contains("Bearer <redacted>"));
+    }
+
+    #[test]
+    fn passes_through_non_bearer() {
+        let s = "plain error with no secrets";
+        assert_eq!(redact_bearer(s), s);
     }
 }

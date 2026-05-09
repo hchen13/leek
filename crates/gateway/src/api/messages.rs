@@ -86,9 +86,7 @@ pub async fn post_handler(
                 threshold,
                 "auto-compact triggered"
             );
-            api_sessions::start_compaction(&state, &session_id, "auto_pre_turn", None)
-                .await
-                .map_err(AppError)?;
+            api_sessions::start_compaction(&state, &session_id, "auto_pre_turn", None).await?;
             return Ok((
                 StatusCode::ACCEPTED,
                 Json(PostMessageResponse::AutoCompacting {
@@ -153,6 +151,7 @@ pub async fn post_handler(
     let bus = state.event_bus.clone();
     let tools = state.tools.clone();
     let mandate_path = state.mandate_path.clone();
+    let tuning = state.tuning_snapshot();
     let cancel_for_task = cancel.clone();
     let cancel_for_cleanup = cancel.clone();
     let active_replies = state.active_replies.clone();
@@ -168,6 +167,7 @@ pub async fn post_handler(
             cancel_for_task,
             tools,
             mandate_path,
+            tuning,
         )
         .await
         {
@@ -202,6 +202,7 @@ async fn handle_user_message(
     cancel: CancellationToken,
     tools: crate::agent::tools::ToolRegistry,
     mandate_path: Option<std::path::PathBuf>,
+    tuning: crate::llm::LlmTuning,
 ) -> anyhow::Result<()> {
     // P1 simplification: routing layer fires only when there's no in-progress
     // task. With one, attach to it directly (in-thread chat_reply).
@@ -228,13 +229,34 @@ async fn handle_user_message(
             cancel,
             tools,
             mandate_path,
+            tuning,
+            // In-thread follow-up on an already-active task. The agent
+            // should treat this as a continuation, not a fresh research run.
+            true,
         )
         .await;
     }
 
     // No active task — run the routing layer.
     let history = load_history_for_routing(&pool, &user_id, &session_id).await?;
-    let decision = match routing::decide_route(provider.clone(), &history, &user_text).await {
+    let recent_task = vault_tasks::get_latest_for_session(&pool, &user_id, &session_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|row| routing::RecentTaskContext {
+            title: row.title,
+            expected_deliverable: row.expected_deliverable,
+            status: row.status,
+        });
+    let decision = match routing::decide_route(
+        provider.clone(),
+        &history,
+        &user_text,
+        tuning,
+        recent_task.as_ref(),
+    )
+    .await
+    {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(error = %e, "routing failed; falling back to chat_reply");
@@ -249,6 +271,8 @@ async fn handle_user_message(
                 cancel,
                 tools,
                 mandate_path,
+                tuning,
+                false,
             )
             .await;
         }
@@ -320,11 +344,22 @@ async fn handle_user_message(
                 cancel,
                 tools,
                 mandate_path,
+                tuning,
+                false,
             )
             .await
         }
 
         DecisionKind::ChatReply => {
+            // Routing classifies a message as `chat_reply` either because
+            // it's a greeting / standalone definition, OR because the user
+            // is continuing a prior subject in this session even though the
+            // prior task has already been delivered. The latter case is
+            // exactly the "M1.t2 ASIC challenge" shape — we want the
+            // continuation framing + softened tool list to apply there too,
+            // not only to the still-active L222 path. Detect it by the
+            // presence of `recent_task` (the same context routing uses).
+            let is_followup = recent_task.is_some();
             agent::run_chat_reply(
                 pool,
                 user_id,
@@ -335,6 +370,8 @@ async fn handle_user_message(
                 cancel,
                 tools,
                 mandate_path,
+                tuning,
+                is_followup,
             )
             .await
         }

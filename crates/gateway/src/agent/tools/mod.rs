@@ -9,6 +9,7 @@
 //! advertised through `ToolSpec::WebSearch` and execute on OpenAI's side.
 
 pub mod ask_user_question;
+pub mod corpus_read;
 pub mod corpus_search;
 pub mod delegate_research;
 pub mod get_candlesticks;
@@ -21,6 +22,9 @@ pub mod record_investment_action;
 pub mod record_research_note;
 pub mod sec_filing_fetch;
 pub mod tradingview_quote;
+// `tushare_quote` was an unused dead module — `market_quote` (via
+// `tradingview_quote`) is the unified quote tool, and `get_candlesticks`
+// has Tushare integration baked in for OHLC. Removed in 0.5 cleanup.
 pub mod update_plan;
 pub mod use_skill;
 pub mod web_fetch;
@@ -37,6 +41,8 @@ use crate::llm::ToolSpec;
 /// Per-request context injected by the agent loop into every tool call.
 /// Stateless tools (web_fetch, corpus_search, etc.) may ignore it.
 /// Stateful tools (record_investment_action, etc.) need it to write to vault.
+/// `tuning` carries the active per-surface reasoning/verbosity knobs so tools
+/// that spawn LLM calls (delegate_research) match the user's Settings.
 #[derive(Clone)]
 pub struct ToolContext {
     pub pool: sqlx::SqlitePool,
@@ -44,6 +50,7 @@ pub struct ToolContext {
     pub user_id: String,
     pub session_id: String,
     pub task_id: Option<String>,
+    pub tuning: crate::llm::LlmTuning,
 }
 
 #[async_trait]
@@ -171,6 +178,7 @@ mod tests {
             user_id: "test".into(),
             session_id: "sess".into(),
             task_id: None,
+            tuning: crate::llm::LlmTuning::defaults(),
         }
     }
 

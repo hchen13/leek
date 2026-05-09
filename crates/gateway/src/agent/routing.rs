@@ -14,7 +14,7 @@ use crate::llm::{ChatMessage, ChatRequest, LlmEvent, LlmProvider, Role};
 
 const ROUTING_MODEL: &str = "gpt-5.5";
 
-const ROUTING_PROMPT: &str = r#"You are L.E.E.K's routing layer. Your only job: decide whether the latest user message starts a new research task or is just chat. Reply with strict JSON, no preamble, no markdown fences.
+const ROUTING_PROMPT: &str = r#"You are L.E.E.K's routing layer. Your only job: decide whether the latest user message starts a new research task, is a follow-up on the prior task in this session, or is just chat. Reply with strict JSON, no preamble, no markdown fences.
 
 Schema:
 {
@@ -23,30 +23,39 @@ Schema:
   "task_draft": null | {
     "title": "<short>",
     "goal": "<1-2 sentences>",
-    "expected_deliverable": "decision_draft" | "research_brief" | "review" | "comparison" | "morning_brief" | "free_form"
+    "expected_deliverable": "decision_draft" | "research_brief" | "delegated_brief" | "review" | "comparison" | "morning_brief" | "free_form"
   },
   "chat_reply_text": null | "<full reply>",
   "clarification_question": null | "<one short question>"
 }
 
 Decision rules:
-- new_task: user asks for research / decision / comparison / review on a specific subject, ticker, or company.
-- chat_reply: greeting / casual / meta question about LEEK itself / one-shot definition that needs no investigation.
+- new_task: user asks for research / decision / comparison / review on a SUBJECT THE PRIOR TASK DID NOT ALREADY COVER (different ticker, different question class, or a clearly fresh start).
+- chat_reply: greeting / casual / meta question about LEEK itself / one-shot definition that needs no investigation, OR a continuation / challenge / refinement of the prior task in the same session (asking "what if X", "challenge your view", "give a final action boundary", "decompose the bear case", "translate to portfolio guardrails", referencing "你刚才"/"上面"/"那个"/"如果", or otherwise riding on the prior subject). Continuations stay chat_reply — do NOT fork a duplicate task on the same subject just because the user pushed for more depth or asked for a translation step.
 - ambiguous: subject unclear, needs one clarifying question.
 
-expected_deliverable inference:
-- buy/sell/add/trim/stop-loss => decision_draft
-- post-mortem / look back at last decision => review
-- compare / vs => comparison
-- research / look into / 调研 / 研究 => research_brief
+expected_deliverable inference (only used when decision=new_task):
+- User explicitly asks the agent to invoke a specific subagent / delegate ("调用 delegate_research", "让 risk_manager 列三点", "让 X 给我 Y", "use the X subagent to ...") => delegated_brief
+- "buy / sell / add / trim / stop-loss / 加仓 / 减仓 / 平仓 / 出清 / 进场" with a clear capital-commitment ask => decision_draft
+- post-mortem / 复盘 / look back at last decision => review
+- compare / vs / 比较 / 哪个更好 => comparison
+- "research / look into / 调研 / 研究 / analyze / 评估 / 分析 / 估值 / 风险 / 列出 …" => research_brief
 - morning brief / 晨报 => morning_brief
 - otherwise => free_form
+
+decision_draft is RESERVED for explicit capital-commitment asks. "评估能不能加仓" is research_brief, not decision_draft, unless the user has made it clear they want a recordable action recommendation. A risk list, a comparison, a post-mortem, or a "what's the impact on portfolio" question is NEVER decision_draft.
+
+delegated_brief means the user has named a specific worker / subagent and the main agent's job is to dispatch that worker and present its result, NOT to redo the research itself. The main agent should not run plan/critic rigor here — the user wants the named worker's output, not a full audited brief. If the user just asks "what are the risks" without naming a worker, that is research_brief.
 
 Examples:
 - "你好" -> chat_reply, chat_reply_text greets back briefly
 - "什么是经济护城河" -> chat_reply, chat_reply_text gives one-line definition (no investigation)
-- "NVDA 现在能加仓吗？" -> new_task, decision_draft
+- "NVDA 现在能加仓吗？" -> new_task, research_brief (no explicit "buy" — user wants the analysis)
+- "请提交一个 NVDA 加仓 decision draft" -> new_task, decision_draft (explicit ask)
+- "请直接调用 delegate_research，让 risk_manager 用三点列出 NVDA 加仓风险" -> new_task, delegated_brief (named worker, present-its-output ask)
 - "看一下我的持仓" -> ambiguous (re-balance? risk check? performance review?)
+- (after a NVDA analysis just delivered) "如果像 ASIC 这样的竞争呢？" -> chat_reply (challenge to prior task)
+- (after a NVDA analysis just delivered) "假设单票上限 5%，那现在还能加吗？" -> chat_reply (refinement of prior task with new constraint)
 
 Respond with the JSON object only.
 "#;
@@ -77,10 +86,22 @@ pub struct TaskDraft {
     pub expected_deliverable: String,
 }
 
+/// Snapshot of the most recent task in this session, surfaced to the routing
+/// LLM so it can spot follow-up / continuation messages and route them as
+/// chat_reply instead of forking a duplicate task.
+#[derive(Debug, Clone)]
+pub struct RecentTaskContext {
+    pub title: String,
+    pub expected_deliverable: String,
+    pub status: String,
+}
+
 pub async fn decide_route(
     provider: Arc<dyn LlmProvider>,
     history: &[ChatMessage],
     user_text: &str,
+    tuning: crate::llm::LlmTuning,
+    recent_task: Option<&RecentTaskContext>,
 ) -> Result<RouteDecision> {
     // Send the last few turns + the new user message. The new user message is
     // already the last item in `history` (POST handler persists before routing).
@@ -104,15 +125,31 @@ pub async fn decide_route(
         });
     }
 
+    let mut system_prompt = ROUTING_PROMPT.to_string();
+    if let Some(rt) = recent_task {
+        system_prompt.push_str(&format!(
+            "\n\nSESSION CONTEXT — last task in this session: \
+             title=\"{}\", expected_deliverable=\"{}\", status=\"{}\". \
+             If the new user message is a continuation, challenge, refinement, \
+             or translation step on this same subject, prefer chat_reply.\n",
+            rt.title.replace('"', "'"),
+            rt.expected_deliverable,
+            rt.status,
+        ));
+    }
+
     let req = ChatRequest {
         messages,
-        system: Some(ROUTING_PROMPT.to_string()),
+        system: Some(system_prompt),
         model: ROUTING_MODEL.to_string(),
         max_output_tokens: None,
         // Routing is a deterministic intent classifier — no tool calls allowed.
         tools: Vec::new(),
         additional_inputs: Vec::new(),
-        reasoning_effort: None,
+        // Routing is a quick classifier; default Minimal/Low keeps latency
+        // and tokens down. Users can crank it up via Settings.
+        reasoning_effort: Some(tuning.routing.reasoning_effort),
+        verbosity: Some(tuning.routing.verbosity),
     };
 
     let mut stream = provider.chat(req).await.context("routing chat call")?;
@@ -128,10 +165,11 @@ pub async fn decide_route(
 
 fn parse_decision(raw: &str) -> Result<RouteDecision> {
     let stripped = strip_code_fence(raw.trim());
-    let v: serde_json::Value = serde_json::from_str(stripped).with_context(|| {
+    let candidate = extract_json_object(stripped).unwrap_or(stripped);
+    let v: serde_json::Value = serde_json::from_str(candidate).with_context(|| {
         format!(
             "routing LLM returned non-JSON (head): {}",
-            stripped.chars().take(200).collect::<String>()
+            candidate.chars().take(200).collect::<String>()
         )
     })?;
 
@@ -175,6 +213,45 @@ fn parse_decision(raw: &str) -> Result<RouteDecision> {
         chat_reply_text,
         clarification_question,
     })
+}
+
+/// Pull the first balanced `{...}` block out of free-form prose. gpt-5.5 is
+/// instructed to emit JSON only, but occasionally prepends a one-liner like
+/// "Here is the decision:" or appends trailing notes. We salvage the object
+/// instead of failing the route. String literals are honored so a `}` inside
+/// a JSON string doesn't trip the brace counter.
+fn extract_json_object(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_str {
+            match b {
+                b'\\' => escape = true,
+                b'"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn strip_code_fence(s: &str) -> &str {
@@ -230,5 +307,21 @@ mod tests {
     fn rejects_unknown_decision() {
         let raw = r#"{"decision":"maybe","task_draft":null,"chat_reply_text":null,"clarification_question":null}"#;
         assert!(parse_decision(raw).is_err());
+    }
+
+    #[test]
+    fn parses_leading_prose() {
+        let raw = "Sure, here's my decision:\n\n{\"decision\":\"chat_reply\",\"reason\":\"\",\"task_draft\":null,\"chat_reply_text\":\"ok\",\"clarification_question\":null}\n\nLet me know if you need more.";
+        let d = parse_decision(raw).unwrap();
+        assert_eq!(d.kind, DecisionKind::ChatReply);
+        assert_eq!(d.chat_reply_text.unwrap(), "ok");
+    }
+
+    #[test]
+    fn extract_handles_braces_in_strings() {
+        let raw = r#"prefix { "decision":"chat_reply","reason":"has } brace","task_draft":null,"chat_reply_text":"hi","clarification_question":null }"#;
+        let d = parse_decision(raw).unwrap();
+        assert_eq!(d.kind, DecisionKind::ChatReply);
+        assert_eq!(d.reason, "has } brace");
     }
 }

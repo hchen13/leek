@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
@@ -37,7 +37,13 @@ impl ToolHandler for RecordInvestmentActionTool {
                  ('buy', 'build a position', 'close', 'enter', 'exit') rather than language of \
                  reflection ('interesting', 'note', 'agree', 'remember this', 'principle'). \
                  When the intent is to preserve an insight or guideline rather than execute a \
-                 trade, use record_research_note instead."
+                 trade, use record_research_note instead.\n\n\
+                 The structural fields (`risks`, `opposing_case`, `corpus_refs`, \
+                 `mandate_check`, `invalidation_conditions`) are mandatory: a decision without \
+                 a steelmanned bear case, named risks, an explicit invalidation, mandate \
+                 alignment, and corpus grounding is by definition under-researched. If you \
+                 cannot provide all of them honestly, do not record the action — go gather \
+                 more facts first."
                     .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -69,10 +75,47 @@ impl ToolHandler for RecordInvestmentActionTool {
                     },
                     "rationale": {
                         "type": "string",
-                        "description": "Research rationale in markdown"
+                        "description": "Research rationale in markdown (the bull case / why this trade)"
+                    },
+                    "risks": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "Named, concrete risks. Must include at least one. Format each as 'risk: <one-line description>' — no platitudes like 'market conditions might change'."
+                    },
+                    "opposing_case": {
+                        "type": "string",
+                        "description": "The strongest steelmanned bear case (or bull case for shorts). Must engage with the *reasons* a smart investor would take the opposite side, not a strawman."
+                    },
+                    "corpus_refs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Corpus document titles cited in the rationale (e.g. 'Margin of Safety', 'Long-term debt cycle'). Empty array allowed only if the corpus has no relevant page; explicitly state that condition in the rationale."
+                    },
+                    "mandate_check": {
+                        "type": "object",
+                        "properties": {
+                            "fits_mandate": {
+                                "type": "boolean",
+                                "description": "Does this trade respect the user's mandate (risk tolerance, position caps, instrument limits)?"
+                            },
+                            "notes": {
+                                "type": "string",
+                                "description": "Specific mandate clauses that gate this trade. State them, don't summarize."
+                            }
+                        },
+                        "required": ["fits_mandate", "notes"]
+                    },
+                    "invalidation_conditions": {
+                        "type": "string",
+                        "description": "What observation would falsify the thesis and force exit? E.g. 'EPS revisions turn negative for two consecutive quarters' or 'price closes below 50-week MA'. Must be observable and specific."
                     }
                 },
-                "required": ["ticker", "direction", "rationale"]
+                "required": [
+                    "ticker", "direction", "rationale",
+                    "risks", "opposing_case", "corpus_refs",
+                    "mandate_check", "invalidation_conditions"
+                ]
             }),
         }
     }
@@ -106,6 +149,64 @@ impl ToolHandler for RecordInvestmentActionTool {
         let target = args.get("target").and_then(|v| v.as_f64());
         let horizon_days = args.get("horizon_days").and_then(|v| v.as_i64());
 
+        let risks = parse_string_array(&args, "risks")?;
+        if risks.is_empty() {
+            bail!(
+                "validation: 'risks' must contain at least one named, concrete risk. \
+                 Do NOT retry with fabricated platitudes like 'market volatility'. \
+                 If you don't have real risks for this trade, the right move is to \
+                 NOT record the action and explain to the user that this draft cannot \
+                 be submitted without a real risk list."
+            );
+        }
+        let opposing_case = args
+            .get("opposing_case")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing 'opposing_case' argument"))?
+            .trim()
+            .to_string();
+        if opposing_case.is_empty() {
+            bail!(
+                "validation: 'opposing_case' must not be empty — record a steelmanned \
+                 counter-thesis (engage with the reasons a smart investor would take \
+                 the opposite side). Do NOT retry with a strawman or platitude; if you \
+                 cannot supply a real counter-thesis, refuse to record and explain why."
+            );
+        }
+        let corpus_refs = parse_string_array(&args, "corpus_refs")?;
+        let mandate_check = args
+            .get("mandate_check")
+            .ok_or_else(|| anyhow!("missing 'mandate_check' argument"))?
+            .clone();
+        let mandate_obj = mandate_check
+            .as_object()
+            .ok_or_else(|| anyhow!("'mandate_check' must be an object"))?;
+        if mandate_obj.get("fits_mandate").and_then(|v| v.as_bool()).is_none() {
+            bail!("'mandate_check.fits_mandate' must be a boolean");
+        }
+        if mandate_obj
+            .get("notes")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+        {
+            bail!("'mandate_check.notes' must be a non-empty string");
+        }
+        let invalidation_conditions = args
+            .get("invalidation_conditions")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing 'invalidation_conditions' argument"))?
+            .trim()
+            .to_string();
+        if invalidation_conditions.is_empty() {
+            bail!(
+                "validation: 'invalidation_conditions' must not be empty — declare \
+                 an observable falsifier (price level, EPS revision direction, \
+                 regulatory event). Do NOT retry with 'if conditions change' or \
+                 similar non-observable language."
+            );
+        }
+
         let deliverable_id = Uuid::now_v7().to_string();
         let now = Utc::now().to_rfc3339();
 
@@ -117,6 +218,11 @@ impl ToolHandler for RecordInvestmentActionTool {
             "target": target,
             "horizon_days": horizon_days,
             "rationale": rationale,
+            "risks": risks,
+            "opposing_case": opposing_case,
+            "corpus_refs": corpus_refs,
+            "mandate_check": mandate_check,
+            "invalidation_conditions": invalidation_conditions,
             "session_id": ctx.session_id,
         });
 
@@ -137,7 +243,13 @@ impl ToolHandler for RecordInvestmentActionTool {
         .await
         .context("inserting decision draft deliverable")?;
 
+        // The SSE payload mirrors the deliverable so the UI card can show the
+        // structural fields without a second fetch. `task_id` is included so
+        // the chat panel can dedupe: the agent may iterate on a draft within
+        // one task (critic-driven rewrite → record_investment_action again),
+        // and we want to keep only the latest draft visible per task.
         let event_payload = serde_json::json!({
+            "task_id": ctx.task_id,
             "deliverable_id": deliverable_id,
             "ticker": ticker,
             "direction": direction,
@@ -146,6 +258,11 @@ impl ToolHandler for RecordInvestmentActionTool {
             "target": target,
             "horizon_days": horizon_days,
             "rationale": rationale,
+            "risks": risks,
+            "opposing_case": opposing_case,
+            "corpus_refs": corpus_refs,
+            "mandate_check": mandate_check,
+            "invalidation_conditions": invalidation_conditions,
         });
         let ts = Utc::now();
         let evt_seq = vault_events::insert(
@@ -190,6 +307,15 @@ impl ToolHandler for RecordInvestmentActionTool {
         let horizon_row = horizon_days
             .map(|v| format!("| 期限 | {v} 天 |\n"))
             .unwrap_or_default();
+        let risks_row = format!("| 风险 | {} 项 |\n", risks.len());
+        let mandate_fits = mandate_obj
+            .get("fits_mandate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mandate_row = format!(
+            "| Mandate | {} |\n",
+            if mandate_fits { "符合" } else { "需用户复核" }
+        );
 
         let summary = format!(
             "**决策草稿已提交，等待确认**\n\n\
@@ -200,11 +326,32 @@ impl ToolHandler for RecordInvestmentActionTool {
              {size_row}\
              {stop_row}\
              {target_row}\
-             {horizon_row}\n\
+             {horizon_row}\
+             {risks_row}\
+             {mandate_row}\n\
              草稿 ID: `{deliverable_id}`\n\n\
              请在界面中确认或拒绝此决策。"
         );
 
         Ok(summary)
     }
+}
+
+fn parse_string_array(args: &serde_json::Value, key: &str) -> Result<Vec<String>> {
+    let arr = args
+        .get(key)
+        .ok_or_else(|| anyhow!("missing '{key}' argument"))?
+        .as_array()
+        .ok_or_else(|| anyhow!("'{key}' must be an array of strings"))?;
+    arr.iter()
+        .map(|v| {
+            v.as_str()
+                .ok_or_else(|| anyhow!("'{key}' entries must be strings"))
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|r| match r {
+            Ok(s) => !s.is_empty(),
+            Err(_) => true,
+        })
+        .collect()
 }

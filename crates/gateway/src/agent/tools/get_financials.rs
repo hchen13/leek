@@ -1,4 +1,8 @@
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
@@ -11,13 +15,28 @@ use super::ToolHandler;
 
 const TOOL_NAME: &str = "get_financials";
 const TUSHARE_ENDPOINT: &str = "https://api.tushare.pro";
-const FMP_BASE: &str = "https://financialmodelingprep.com/stable";
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_PERIODS: u64 = 4;
 const MAX_PERIODS: u64 = 24;
 
+// SEC EDGAR — free, official, no API key. The companyfacts endpoint returns
+// every us-gaap fact ever filed for a registrant. Requires a UA with a
+// contact email; the parser is finicky so we mirror the format
+// `sec_filing_fetch.rs` already uses.
+const SEC_TICKERS_URL: &str = "https://www.sec.gov/files/company_tickers.json";
+const SEC_COMPANYFACTS_URL: &str = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json";
+const SEC_USER_AGENT: &str = "Leek Research gradschool.hchen13@gmail.com";
+const SEC_TICKER_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 pub struct GetFinancialsTool {
     http: Client,
+    sec_http: Client,
+    sec_ticker_cache: Mutex<Option<SecTickerCache>>,
+}
+
+struct SecTickerCache {
+    map: HashMap<String, u64>,
+    fetched_at: Instant,
 }
 
 impl GetFinancialsTool {
@@ -25,7 +44,16 @@ impl GetFinancialsTool {
         let http = Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .build()?;
-        Ok(Self { http })
+        let sec_ua = std::env::var("LEEK_SEC_USER_AGENT").unwrap_or_else(|_| SEC_USER_AGENT.into());
+        let sec_http = Client::builder()
+            .user_agent(sec_ua)
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .build()?;
+        Ok(Self {
+            http,
+            sec_http,
+            sec_ticker_cache: Mutex::new(None),
+        })
     }
 }
 
@@ -39,16 +67,17 @@ impl ToolHandler for GetFinancialsTool {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
             description: "Fetch financial statements and key ratios for a listed company.\n\
-                Covers A-shares (via Tushare Pro) and US stocks (via FMP).\n\
+                Covers A-shares (via Tushare Pro) and US stocks (via SEC EDGAR companyfacts).\n\
                 - A-share ts_code: \"600519.SH\", \"000001.SZ\"\n\
                 - US ticker: \"AAPL\", \"TSLA\", \"NVDA\"\n\
                 report_type controls what to fetch:\n\
                 - \"income\": income statement (revenue, profit, EPS)\n\
                 - \"balance\": balance sheet (assets, liabilities, equity)\n\
                 - \"cashflow\": cash flow statement\n\
-                - \"ratios\": key financial ratios (ROE, ROA, PE, PB, margins, debt ratio)\n\
+                - \"ratios\": key financial ratios (margins, ROE, ROA, leverage)\n\
                 - \"all\": fetch income + balance sheet + cash flow + ratios\n\
-                Returns markdown tables with the most recent N periods."
+                Returns markdown tables with the most recent N periods (annual 10-K \
+                preferred, falls back to quarterly 10-Q when annual data is sparse)."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -101,7 +130,7 @@ impl ToolHandler for GetFinancialsTool {
 
         match market {
             "a_share" => fetch_a_share(&self.http, &ticker, report_type, periods, cancel).await,
-            "us_stock" => fetch_us_stock(&self.http, &ticker, report_type, periods, cancel).await,
+            "us_stock" => self.fetch_us_stock_via_sec(&ticker, report_type, periods, cancel).await,
             _ => bail!("unknown market: {market}"),
         }
     }
@@ -482,289 +511,507 @@ async fn fetch_ashare_ratios(
     Ok(out)
 }
 
-// ── US stock (FMP) ─────────────────────────────────────────────────────────
+// ── US stock (SEC EDGAR companyfacts) ──────────────────────────────────────
+//
+// Free, official, no API key required. The companyfacts JSON contains every
+// us-gaap fact the registrant has reported, indexed by tag → unit → period.
+// We pick a fallback list per metric (Revenues vs. RevenueFromContract... vs.
+// SalesRevenueNet, etc.), pull annual (10-K, fp=="FY") rows preferentially,
+// and lay them out in the same markdown shape as the old FMP path so the
+// agent's prompts don't need to change.
 
-async fn fetch_us_stock(
-    http: &Client,
-    ticker: &str,
-    report_type: &str,
-    periods: usize,
-    cancel: CancellationToken,
-) -> Result<String> {
-    let key = match std::env::var("FMP_API_KEY") {
-        Ok(k) => k,
-        Err(_) => {
-            return Ok("[get_financials: FMP_API_KEY not set — get a free key at \
-                 https://financialmodelingprep.com/developer/docs to access US stock financials]"
-                .to_string());
-        }
-    };
-
-    let mut parts: Vec<String> = Vec::new();
-
-    match report_type {
-        "income" => {
-            parts.push(fetch_fmp_income(http, ticker, periods, &key, &cancel).await?);
-        }
-        "balance" => {
-            parts.push(fetch_fmp_balance(http, ticker, periods, &key, &cancel).await?);
-        }
-        "cashflow" => {
-            parts.push(fetch_fmp_cashflow(http, ticker, periods, &key, &cancel).await?);
-        }
-        "ratios" => {
-            parts.push(fetch_fmp_ratios(http, ticker, periods, &key, &cancel).await?);
-        }
-        "all" => {
-            parts.push(fetch_fmp_income(http, ticker, periods, &key, &cancel).await?);
-            parts.push(fetch_fmp_balance(http, ticker, periods, &key, &cancel).await?);
-            parts.push(fetch_fmp_cashflow(http, ticker, periods, &key, &cancel).await?);
-            parts.push(fetch_fmp_ratios(http, ticker, periods, &key, &cancel).await?);
-        }
-        _ => bail!("unknown report_type: {report_type}"),
-    }
-
-    Ok(parts.join("\n\n"))
+/// Period identifier we use to align metrics across multiple GAAP tags.
+///
+/// SEC EDGAR's companyfacts payload restates every historical period in
+/// every subsequent 10-K filing, so the same `end` date appears repeatedly
+/// with **different** `fy` labels — e.g. for NVDA, end=2024-01-28 shows up
+/// as `fy=2024` in the FY2024 10-K, `fy=2025` in the FY2025 10-K, and
+/// `fy=2026` in the FY2026 10-K. The `fy` field is therefore "reporting
+/// year of this filing", not the issuer's true fiscal year. If we keyed on
+/// `fy`, we'd produce three rows for the same period.
+///
+/// The end-date+fp pair is the only stable identifier. Dedup happens at
+/// `pick_metric` time: same (end, fp) → keep the value from the most
+/// recently filed entry (which carries any post-split / restatement
+/// adjustments).
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
+struct PeriodKey {
+    end: String, // YYYY-MM-DD; sortable lexically
+    fp: String,  // "FY" / "Q1" / "Q2" ...
 }
 
-async fn fmp_get(
-    http: &Client,
-    url: &str,
-    cancel: &CancellationToken,
-) -> Result<Vec<serde_json::Value>> {
-    let resp = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => bail!("aborted"),
-        r = http.get(url).send() => r?,
-    };
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = tokio::select! {
+impl PeriodKey {
+    fn label(&self) -> String {
+        if self.fp == "FY" {
+            format!("FY ending {}", self.end)
+        } else {
+            format!("{} ending {}", self.fp, self.end)
+        }
+    }
+}
+
+impl GetFinancialsTool {
+    async fn fetch_us_stock_via_sec(
+        &self,
+        ticker: &str,
+        report_type: &str,
+        periods: usize,
+        cancel: CancellationToken,
+    ) -> Result<String> {
+        let cik = self.sec_ticker_to_cik(ticker, &cancel).await?;
+        let facts = self.sec_companyfacts(cik, &cancel).await?;
+        let entity = facts
+            .get("entityName")
+            .and_then(|v| v.as_str())
+            .unwrap_or(ticker)
+            .to_string();
+        let gaap = facts
+            .get("facts")
+            .and_then(|f| f.get("us-gaap"))
+            .ok_or_else(|| anyhow!("companyfacts payload missing facts.us-gaap (entity {entity})"))?;
+
+        let mut parts: Vec<String> = Vec::new();
+        match report_type {
+            "income" => parts.push(format_income(&entity, ticker, gaap, periods)),
+            "balance" => parts.push(format_balance(&entity, ticker, gaap, periods)),
+            "cashflow" => parts.push(format_cashflow(&entity, ticker, gaap, periods)),
+            "ratios" => parts.push(format_ratios(&entity, ticker, gaap, periods)),
+            "all" => {
+                parts.push(format_income(&entity, ticker, gaap, periods));
+                parts.push(format_balance(&entity, ticker, gaap, periods));
+                parts.push(format_cashflow(&entity, ticker, gaap, periods));
+                parts.push(format_ratios(&entity, ticker, gaap, periods));
+            }
+            _ => bail!("unknown report_type: {report_type}"),
+        }
+        Ok(parts.join("\n\n"))
+    }
+
+    async fn sec_ticker_to_cik(&self, ticker: &str, cancel: &CancellationToken) -> Result<u64> {
+        let upper = ticker.to_ascii_uppercase();
+        if let Ok(guard) = self.sec_ticker_cache.lock() {
+            if let Some(cache) = guard.as_ref() {
+                if cache.fetched_at.elapsed() < SEC_TICKER_CACHE_TTL {
+                    if let Some(&cik) = cache.map.get(&upper) {
+                        return Ok(cik);
+                    }
+                }
+            }
+        }
+        let resp = tokio::select! {
             biased;
-            _ = cancel.cancelled() => bail!("aborted"),
-            r = resp.text() => r.unwrap_or_default(),
+            _ = cancel.cancelled() => bail!("aborted during SEC ticker map fetch"),
+            r = self.sec_http.get(SEC_TICKERS_URL).send() => r?,
         };
-        bail!("{}", fmp_http_error(status, &body));
+        if !resp.status().is_success() {
+            bail!(
+                "SEC ticker map returned HTTP {} (UA may need to include a contact email)",
+                resp.status().as_u16()
+            );
+        }
+        let raw: serde_json::Value = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("aborted during SEC ticker map parse"),
+            r = resp.json() => r?,
+        };
+        let mut map: HashMap<String, u64> = HashMap::new();
+        if let Some(obj) = raw.as_object() {
+            for (_idx, entry) in obj.iter() {
+                let Some(t) = entry.get("ticker").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(cik) = entry.get("cik_str").and_then(|v| v.as_u64()) else {
+                    continue;
+                };
+                map.insert(t.to_ascii_uppercase(), cik);
+            }
+        }
+        let resolved = map
+            .get(&upper)
+            .copied()
+            .ok_or_else(|| anyhow!("unknown US ticker `{ticker}` (not in SEC company list)"))?;
+        if let Ok(mut guard) = self.sec_ticker_cache.lock() {
+            *guard = Some(SecTickerCache {
+                map,
+                fetched_at: Instant::now(),
+            });
+        }
+        Ok(resolved)
     }
-    let body: serde_json::Value = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => bail!("aborted"),
-        r = resp.json() => r?,
-    };
-    match body {
-        serde_json::Value::Array(arr) => Ok(arr),
-        other => bail!("FMP unexpected response shape: {}", other),
+
+    async fn sec_companyfacts(
+        &self,
+        cik: u64,
+        cancel: &CancellationToken,
+    ) -> Result<serde_json::Value> {
+        let url = SEC_COMPANYFACTS_URL.replace("{cik}", &format!("{cik:010}"));
+        let resp = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("aborted during SEC companyfacts fetch"),
+            r = self.sec_http.get(&url).send() => r?,
+        };
+        if !resp.status().is_success() {
+            bail!(
+                "SEC companyfacts returned HTTP {} for CIK {cik}",
+                resp.status().as_u16()
+            );
+        }
+        let body: serde_json::Value = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("aborted during SEC companyfacts parse"),
+            r = resp.json() => r?,
+        };
+        Ok(body)
     }
 }
 
-fn fmp_http_error(status: u16, body: &str) -> String {
-    let base = match status {
-        401 | 403 => format!(
-            "FMP HTTP {status}: authentication or endpoint permission denied. Check FMP_API_KEY and the API plan."
-        ),
-        402 => "FMP HTTP 402: API key was loaded, but the current FMP plan/quota does not allow this financial-statement endpoint.".to_string(),
-        429 => "FMP HTTP 429: provider rate limit exceeded. Retry later or lower request frequency.".to_string(),
-        _ => format!("FMP HTTP {status}: provider request failed."),
+/// Pull the latest `n` annual (or fall-back-to-quarterly if annual is sparse)
+/// values for the first GAAP tag in `tags` that exists.
+///
+/// For each (end, fp) pair we keep only the value from the **most recently
+/// filed** entry. This is what eliminates duplicates for issuers that
+/// restate prior periods in every new 10-K (e.g. NVDA reports FY2024 data
+/// inside the FY2024, FY2025, and FY2026 10-Ks; we want the FY2026 10-K's
+/// number because it reflects the 10-for-1 stock split adjustment).
+fn pick_metric(
+    gaap: &serde_json::Value,
+    tags: &[&str],
+    units: &[&str],
+    periods: usize,
+) -> BTreeMap<PeriodKey, f64> {
+    /// Insert / update `(end, fp)` to keep the row with the latest `filed`.
+    fn ingest(
+        arr: &[serde_json::Value],
+        annual_only: bool,
+        out: &mut BTreeMap<PeriodKey, (String /* filed */, f64)>,
+    ) {
+        for entry in arr {
+            let Some(fp) = entry.get("fp").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let is_fy = fp == "FY";
+            if annual_only && !is_fy {
+                continue;
+            }
+            if !annual_only && is_fy {
+                continue;
+            }
+            let Some(end) = entry.get("end").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(val) = entry.get("val").and_then(|v| v.as_f64()) else {
+                continue;
+            };
+            let filed = entry
+                .get("filed")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let key = PeriodKey {
+                end: end.to_string(),
+                fp: fp.to_string(),
+            };
+            match out.get(&key) {
+                Some((existing_filed, _)) if existing_filed.as_str() >= filed.as_str() => {}
+                _ => {
+                    out.insert(key, (filed, val));
+                }
+            }
+        }
+    }
+
+    for tag in tags {
+        let Some(tag_obj) = gaap.get(*tag) else {
+            continue;
+        };
+        let Some(unit_map) = tag_obj.get("units").and_then(|u| u.as_object()) else {
+            continue;
+        };
+        for unit in units {
+            let Some(arr) = unit_map.get(*unit).and_then(|v| v.as_array()) else {
+                continue;
+            };
+            let mut staged: BTreeMap<PeriodKey, (String, f64)> = BTreeMap::new();
+            ingest(arr, true, &mut staged);
+            if staged.len() < periods {
+                ingest(arr, false, &mut staged);
+            }
+            if !staged.is_empty() {
+                return staged.into_iter().map(|(k, (_filed, v))| (k, v)).collect();
+            }
+        }
+    }
+    BTreeMap::new()
+}
+
+fn collect_periods(
+    metric_maps: &[&BTreeMap<PeriodKey, f64>],
+    periods: usize,
+) -> Vec<PeriodKey> {
+    let mut all: HashSet<PeriodKey> = HashSet::new();
+    for m in metric_maps {
+        for k in m.keys() {
+            all.insert(k.clone());
+        }
+    }
+    let mut sorted: Vec<PeriodKey> = all.into_iter().collect();
+    sorted.sort_by(|a, b| b.end.cmp(&a.end)); // most recent first
+    sorted.truncate(periods);
+    // Display oldest → newest so the table reads left-to-right chronologically.
+    sorted.reverse();
+    sorted
+}
+
+fn fmt_money(val: Option<&f64>) -> String {
+    let Some(&v) = val else {
+        return "—".to_string();
     };
-    let detail = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    if detail.is_empty() {
-        base
+    let abs = v.abs();
+    if abs >= 1e9 {
+        format!("{:.2}B", v / 1e9)
+    } else if abs >= 1e6 {
+        format!("{:.2}M", v / 1e6)
+    } else if abs >= 1e3 {
+        format!("{:.2}K", v / 1e3)
     } else {
-        format!(
-            "{base} Provider response: {}",
-            truncate_error_detail(&detail, 180)
-        )
+        format!("{:.2}", v)
     }
 }
 
-fn truncate_error_detail(s: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for ch in s.chars().take(max_chars) {
-        out.push(ch);
+fn fmt_per_share(val: Option<&f64>) -> String {
+    val.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "—".into())
+}
+
+fn fmt_pct_ratio(num: Option<&f64>, den: Option<&f64>) -> String {
+    match (num, den) {
+        (Some(n), Some(d)) if d.abs() > f64::EPSILON => format!("{:.2}%", (n / d) * 100.0),
+        _ => "—".to_string(),
     }
-    if s.chars().count() > max_chars {
-        out.push('…');
+}
+
+fn format_income(
+    entity: &str,
+    ticker: &str,
+    gaap: &serde_json::Value,
+    periods: usize,
+) -> String {
+    let revenue = pick_metric(
+        gaap,
+        &[
+            "Revenues",
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "RevenueFromContractWithCustomerIncludingAssessedTax",
+            "SalesRevenueNet",
+        ],
+        &["USD"],
+        periods,
+    );
+    let gross = pick_metric(gaap, &["GrossProfit"], &["USD"], periods);
+    let opinc = pick_metric(gaap, &["OperatingIncomeLoss"], &["USD"], periods);
+    let netinc = pick_metric(gaap, &["NetIncomeLoss"], &["USD"], periods);
+    let eps = pick_metric(
+        gaap,
+        &["EarningsPerShareDiluted", "EarningsPerShareBasic"],
+        &["USD/shares"],
+        periods,
+    );
+
+    let rows = collect_periods(&[&revenue, &gross, &opinc, &netinc, &eps], periods);
+    if rows.is_empty() {
+        return format!("[get_financials: SEC has no income data for {ticker} ({entity})]");
     }
+    let mut out = format!("## {ticker} ({entity}) · Income Statement (last {periods} periods)\n\n");
+    out.push_str("| Period | Revenue | Gross Profit | Op. Income | Net Income | Diluted EPS |\n");
+    out.push_str("|--------|---------|--------------|------------|------------|-------------|\n");
+    for k in &rows {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            k.label(),
+            fmt_money(revenue.get(k)),
+            fmt_money(gross.get(k)),
+            fmt_money(opinc.get(k)),
+            fmt_money(netinc.get(k)),
+            fmt_per_share(eps.get(k)),
+        ));
+    }
+    out.push_str("\n_Source: SEC EDGAR companyfacts (us-gaap, FY-preferred)_");
     out
 }
 
-fn fmp_str(row: &serde_json::Value, key: &str) -> String {
-    row.get(key)
-        .map(|v| match v {
-            serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Null => String::new(),
-            other => other.to_string(),
-        })
-        .unwrap_or_default()
-}
-
-fn fmt_b(row: &serde_json::Value, key: &str) -> String {
-    row.get(key)
-        .and_then(|v| v.as_f64())
-        .map(|f| {
-            let b = f / 1e9;
-            if b.abs() >= 1.0 {
-                format!("{:.2}B", b)
-            } else {
-                format!("{:.0}M", f / 1e6)
-            }
-        })
-        .unwrap_or_default()
-}
-
-fn fmt_ratio_pct(row: &serde_json::Value, key: &str) -> String {
-    row.get(key)
-        .and_then(|v| v.as_f64())
-        .map(|f| format!("{:.2}%", f * 100.0))
-        .unwrap_or_default()
-}
-
-fn fmt_ratio(row: &serde_json::Value, key: &str) -> String {
-    row.get(key)
-        .and_then(|v| v.as_f64())
-        .map(|f| format!("{:.2}", f))
-        .unwrap_or_default()
-}
-
-async fn fetch_fmp_income(
-    http: &Client,
+fn format_balance(
+    entity: &str,
     ticker: &str,
+    gaap: &serde_json::Value,
     periods: usize,
-    key: &str,
-    cancel: &CancellationToken,
-) -> Result<String> {
-    let url = format!("{FMP_BASE}/income-statement?symbol={ticker}&limit={periods}&apikey={key}");
-    let rows = fmp_get(http, &url, cancel).await?;
-
-    if rows.is_empty() {
-        return Ok(format!("[get_financials: no income data for {ticker}]"));
-    }
-
-    let mut out = format!("## {ticker} · Income Statement (last {periods} periods)\n\n");
-    out.push_str("| Date | Revenue | Gross Profit | Op. Income | Net Income | EPS |\n");
-    out.push_str("|------|---------|-------------|-----------|-----------|-----|\n");
-    for row in &rows {
-        let date = fmp_str(row, "date");
-        let revenue = fmt_b(row, "revenue");
-        let gross = fmt_b(row, "grossProfit");
-        let op_inc = fmt_b(row, "operatingIncome");
-        let net = fmt_b(row, "netIncome");
-        let eps = fmt_ratio(row, "eps");
-        out.push_str(&format!(
-            "| {date} | {revenue} | {gross} | {op_inc} | {net} | {eps} |\n"
-        ));
-    }
-    out.push_str("\n_Source: Financial Modeling Prep (income-statement)_");
-    Ok(out)
-}
-
-async fn fetch_fmp_balance(
-    http: &Client,
-    ticker: &str,
-    periods: usize,
-    key: &str,
-    cancel: &CancellationToken,
-) -> Result<String> {
-    let url =
-        format!("{FMP_BASE}/balance-sheet-statement?symbol={ticker}&limit={periods}&apikey={key}");
-    let rows = fmp_get(http, &url, cancel).await?;
-
-    if rows.is_empty() {
-        return Ok(format!(
-            "[get_financials: no balance sheet data for {ticker}]"
-        ));
-    }
-
-    let mut out = format!("## {ticker} · Balance Sheet (last {periods} periods)\n\n");
-    out.push_str("| Date | Total Assets | Total Liabilities | Stockholders' Equity | Cash |\n");
-    out.push_str("|------|-------------|------------------|---------------------|------|\n");
-    for row in &rows {
-        let date = fmp_str(row, "date");
-        let assets = fmt_b(row, "totalAssets");
-        let liab = fmt_b(row, "totalLiabilities");
-        let equity = fmt_b(row, "totalStockholdersEquity");
-        let cash = fmt_b(row, "cashAndShortTermInvestments");
-        out.push_str(&format!(
-            "| {date} | {assets} | {liab} | {equity} | {cash} |\n"
-        ));
-    }
-    out.push_str("\n_Source: Financial Modeling Prep (balance-sheet-statement)_");
-    Ok(out)
-}
-
-async fn fetch_fmp_cashflow(
-    http: &Client,
-    ticker: &str,
-    periods: usize,
-    key: &str,
-    cancel: &CancellationToken,
-) -> Result<String> {
-    let url =
-        format!("{FMP_BASE}/cash-flow-statement?symbol={ticker}&limit={periods}&apikey={key}");
-    let rows = fmp_get(http, &url, cancel).await?;
-
-    if rows.is_empty() {
-        return Ok(format!("[get_financials: no cashflow data for {ticker}]"));
-    }
-
-    let mut out = format!("## {ticker} · Cash Flow Statement (last {periods} periods)\n\n");
-    out.push_str("| Date | Operating CF | Investing CF | Financing CF | Free CF |\n");
-    out.push_str("|------|-------------|-------------|-------------|--------|\n");
-    for row in &rows {
-        let date = fmp_str(row, "date");
-        let oper = fmt_b(row, "operatingCashFlow");
-        let inv = fmt_b(row, "investingActivitiesCashFlow");
-        let fin = fmt_b(row, "financingActivitiesCashFlow");
-        let free = fmt_b(row, "freeCashFlow");
-        out.push_str(&format!("| {date} | {oper} | {inv} | {fin} | {free} |\n"));
-    }
-    out.push_str("\n_Source: Financial Modeling Prep (cash-flow-statement)_");
-    Ok(out)
-}
-
-async fn fetch_fmp_ratios(
-    http: &Client,
-    ticker: &str,
-    periods: usize,
-    key: &str,
-    cancel: &CancellationToken,
-) -> Result<String> {
-    let url = format!("{FMP_BASE}/ratios?symbol={ticker}&limit={periods}&apikey={key}");
-    let rows = fmp_get(http, &url, cancel).await?;
-    let metrics_url =
-        format!("{FMP_BASE}/key-metrics?symbol={ticker}&limit={periods}&apikey={key}");
-    let metrics = fmp_get(http, &metrics_url, cancel)
-        .await
-        .unwrap_or_default();
-
-    if rows.is_empty() {
-        return Ok(format!("[get_financials: no ratio data for {ticker}]"));
-    }
-
-    let mut out = format!("## {ticker} · Key Ratios (last {periods} periods)\n\n");
-    out.push_str(
-        "| Date | ROE% | ROA% | Gross Margin% | Debt/Equity | Current Ratio | P/E | P/B |\n",
+) -> String {
+    let assets = pick_metric(gaap, &["Assets"], &["USD"], periods);
+    let liab = pick_metric(gaap, &["Liabilities"], &["USD"], periods);
+    let equity = pick_metric(
+        gaap,
+        &[
+            "StockholdersEquity",
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+        ],
+        &["USD"],
+        periods,
     );
-    out.push_str("|------|------|------|--------------|------------|--------------|-----|-----|\n");
-    for row in &rows {
-        let date = fmp_str(row, "date");
-        let metric = metrics
-            .iter()
-            .find(|m| fmp_str(m, "date") == date)
-            .unwrap_or(row);
-        let roe = fmt_ratio_pct(metric, "returnOnEquity");
-        let roa = fmt_ratio_pct(metric, "returnOnAssets");
-        let gpm = fmt_ratio_pct(row, "grossProfitMargin");
-        let d2e = fmt_ratio(row, "debtToEquityRatio");
-        let cr = fmt_ratio(row, "currentRatio");
-        let pe = fmt_ratio(row, "priceToEarningsRatio");
-        let pb = fmt_ratio(row, "priceToBookRatio");
+    let cash = pick_metric(
+        gaap,
+        &[
+            "CashAndCashEquivalentsAtCarryingValue",
+            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        ],
+        &["USD"],
+        periods,
+    );
+    let lt_debt = pick_metric(
+        gaap,
+        &["LongTermDebtNoncurrent", "LongTermDebt"],
+        &["USD"],
+        periods,
+    );
+
+    let rows = collect_periods(&[&assets, &liab, &equity, &cash, &lt_debt], periods);
+    if rows.is_empty() {
+        return format!(
+            "[get_financials: SEC has no balance-sheet data for {ticker} ({entity})]"
+        );
+    }
+    let mut out = format!("## {ticker} ({entity}) · Balance Sheet (last {periods} periods)\n\n");
+    out.push_str("| Period | Total Assets | Total Liab. | Equity | Cash | LT Debt |\n");
+    out.push_str("|--------|--------------|-------------|--------|------|---------|\n");
+    for k in &rows {
         out.push_str(&format!(
-            "| {date} | {roe} | {roa} | {gpm} | {d2e} | {cr} | {pe} | {pb} |\n"
+            "| {} | {} | {} | {} | {} | {} |\n",
+            k.label(),
+            fmt_money(assets.get(k)),
+            fmt_money(liab.get(k)),
+            fmt_money(equity.get(k)),
+            fmt_money(cash.get(k)),
+            fmt_money(lt_debt.get(k)),
         ));
     }
-    out.push_str("\n_Source: Financial Modeling Prep (ratios)_");
-    Ok(out)
+    out.push_str("\n_Source: SEC EDGAR companyfacts (us-gaap, FY-preferred)_");
+    out
+}
+
+fn format_cashflow(
+    entity: &str,
+    ticker: &str,
+    gaap: &serde_json::Value,
+    periods: usize,
+) -> String {
+    let ocf = pick_metric(
+        gaap,
+        &["NetCashProvidedByUsedInOperatingActivities"],
+        &["USD"],
+        periods,
+    );
+    let icf = pick_metric(
+        gaap,
+        &["NetCashProvidedByUsedInInvestingActivities"],
+        &["USD"],
+        periods,
+    );
+    let fcf = pick_metric(
+        gaap,
+        &["NetCashProvidedByUsedInFinancingActivities"],
+        &["USD"],
+        periods,
+    );
+    let capex = pick_metric(
+        gaap,
+        &["PaymentsToAcquirePropertyPlantAndEquipment"],
+        &["USD"],
+        periods,
+    );
+
+    let rows = collect_periods(&[&ocf, &icf, &fcf, &capex], periods);
+    if rows.is_empty() {
+        return format!("[get_financials: SEC has no cash-flow data for {ticker} ({entity})]");
+    }
+    let mut out = format!("## {ticker} ({entity}) · Cash Flow (last {periods} periods)\n\n");
+    out.push_str("| Period | Operating CF | Investing CF | Financing CF | CapEx | FCF (OCF-CapEx) |\n");
+    out.push_str("|--------|--------------|--------------|--------------|-------|-----------------|\n");
+    for k in &rows {
+        let free = match (ocf.get(k), capex.get(k)) {
+            (Some(o), Some(c)) => Some(*o - c.abs()),
+            (Some(o), None) => Some(*o),
+            _ => None,
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            k.label(),
+            fmt_money(ocf.get(k)),
+            fmt_money(icf.get(k)),
+            fmt_money(fcf.get(k)),
+            fmt_money(capex.get(k)),
+            fmt_money(free.as_ref()),
+        ));
+    }
+    out.push_str("\n_Source: SEC EDGAR companyfacts (us-gaap, FY-preferred)_");
+    out
+}
+
+fn format_ratios(
+    entity: &str,
+    ticker: &str,
+    gaap: &serde_json::Value,
+    periods: usize,
+) -> String {
+    let revenue = pick_metric(
+        gaap,
+        &[
+            "Revenues",
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "RevenueFromContractWithCustomerIncludingAssessedTax",
+            "SalesRevenueNet",
+        ],
+        &["USD"],
+        periods,
+    );
+    let gross = pick_metric(gaap, &["GrossProfit"], &["USD"], periods);
+    let opinc = pick_metric(gaap, &["OperatingIncomeLoss"], &["USD"], periods);
+    let netinc = pick_metric(gaap, &["NetIncomeLoss"], &["USD"], periods);
+    let assets = pick_metric(gaap, &["Assets"], &["USD"], periods);
+    let liab = pick_metric(gaap, &["Liabilities"], &["USD"], periods);
+    let equity = pick_metric(
+        gaap,
+        &[
+            "StockholdersEquity",
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+        ],
+        &["USD"],
+        periods,
+    );
+
+    let rows = collect_periods(
+        &[&revenue, &gross, &opinc, &netinc, &assets, &liab, &equity],
+        periods,
+    );
+    if rows.is_empty() {
+        return format!("[get_financials: SEC has no ratio inputs for {ticker} ({entity})]");
+    }
+    let mut out = format!("## {ticker} ({entity}) · Key Ratios (last {periods} periods)\n\n");
+    out.push_str("| Period | Gross Margin | Op. Margin | Net Margin | ROE | ROA | Debt/Equity |\n");
+    out.push_str("|--------|--------------|------------|------------|-----|-----|-------------|\n");
+    for k in &rows {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            k.label(),
+            fmt_pct_ratio(gross.get(k), revenue.get(k)),
+            fmt_pct_ratio(opinc.get(k), revenue.get(k)),
+            fmt_pct_ratio(netinc.get(k), revenue.get(k)),
+            fmt_pct_ratio(netinc.get(k), equity.get(k)),
+            fmt_pct_ratio(netinc.get(k), assets.get(k)),
+            match (liab.get(k), equity.get(k)) {
+                (Some(l), Some(e)) if e.abs() > f64::EPSILON => format!("{:.2}", l / e),
+                _ => "—".to_string(),
+            },
+        ));
+    }
+    out.push_str("\n_Source: SEC EDGAR companyfacts (derived from us-gaap; market multiples like P/E, P/B not provided — combine with `market_quote` and your own EPS/Book inputs)._");
+    out
 }
 
 #[cfg(test)]
@@ -772,10 +1019,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fmp_http_402_mentions_loaded_key_and_plan() {
-        let msg = fmp_http_error(402, "{\"Error Message\":\"Plan limit\"}");
-        assert!(msg.contains("API key was loaded"));
-        assert!(msg.contains("plan/quota"));
-        assert!(msg.contains("Plan limit"));
+    fn pick_metric_prefers_fy_and_falls_back_to_quarterly() {
+        let payload = serde_json::json!({
+            "Revenues": {
+                "units": {
+                    "USD": [
+                        {"end": "2023-01-29", "val": 26974000000_i64, "fy": 2023, "fp": "FY", "filed": "2023-02-24"},
+                        {"end": "2023-04-30", "val": 7192000000_i64, "fy": 2024, "fp": "Q1", "filed": "2023-05-25"},
+                        {"end": "2024-01-28", "val": 60922000000_i64, "fy": 2024, "fp": "FY", "filed": "2024-02-21"},
+                    ]
+                }
+            }
+        });
+        let map = pick_metric(&payload, &["Revenues"], &["USD"], 4);
+        // FY entries alone count as 2; we ask for 4, so the Q1 should be
+        // pulled in too.
+        assert_eq!(map.len(), 3);
+        let labels: Vec<String> = map.keys().map(|k| k.label()).collect();
+        assert!(labels.iter().any(|l| l.contains("2024-01-28")));
+        assert!(labels.iter().any(|l| l.contains("Q1 ending 2023-04-30")));
+    }
+
+    #[test]
+    fn pick_metric_dedups_restated_periods_keeping_latest_filed() {
+        // Same end+FY across three 10-K filings — the issuer restated
+        // historical numbers each time. We must keep only the value from
+        // the most recently filed 10-K (post-split, post-restatement).
+        let payload = serde_json::json!({
+            "EarningsPerShareDiluted": {
+                "units": {
+                    "USD/shares": [
+                        {"end": "2024-01-28", "val": 11.93, "fy": 2024, "fp": "FY", "filed": "2024-02-21"},
+                        {"end": "2024-01-28", "val": 1.19,  "fy": 2025, "fp": "FY", "filed": "2025-02-26"},
+                        {"end": "2024-01-28", "val": 1.19,  "fy": 2026, "fp": "FY", "filed": "2026-02-25"},
+                    ]
+                }
+            }
+        });
+        let map = pick_metric(
+            &payload,
+            &["EarningsPerShareDiluted"],
+            &["USD/shares"],
+            4,
+        );
+        // One row, not three — same (end, fp) collapses.
+        assert_eq!(map.len(), 1);
+        let (_k, v) = map.iter().next().unwrap();
+        // Latest-filed value is 1.19 (post-split adjusted).
+        assert!((v - 1.19).abs() < 1e-9, "expected 1.19, got {v}");
+    }
+
+    #[test]
+    fn pick_metric_fallback_to_secondary_tag() {
+        let payload = serde_json::json!({
+            "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                "units": {
+                    "USD": [
+                        {"end": "2024-12-31", "val": 1000000000_i64, "fy": 2024, "fp": "FY", "filed": "2025-02-15"},
+                    ]
+                }
+            }
+        });
+        let map = pick_metric(
+            &payload,
+            &["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax"],
+            &["USD"],
+            2,
+        );
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn fmt_money_scales_correctly() {
+        assert_eq!(fmt_money(Some(&1_500_000_000.0)), "1.50B");
+        assert_eq!(fmt_money(Some(&12_345_000.0)), "12.35M");
+        assert_eq!(fmt_money(Some(&500.0)), "500.00");
+        assert_eq!(fmt_money(None), "—");
     }
 }

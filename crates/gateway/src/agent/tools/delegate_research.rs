@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::{harness, preview};
 use crate::events::EventEnvelope;
 use crate::llm::{
-    ChatMessage, ChatRequest, LlmEvent, LlmProvider, ReasoningEffort, Role, ToolSpec,
+    ChatMessage, ChatRequest, LlmEvent, LlmProvider, Role, ToolSpec,
 };
 use crate::vault::{events as vault_events, subagents as vault_subagents};
 
@@ -139,7 +139,8 @@ impl ToolHandler for DelegateResearchTool {
             max_output_tokens: Some(2400),
             tools: Vec::new(),
             additional_inputs: Vec::new(),
-            reasoning_effort: Some(ReasoningEffort::High),
+            reasoning_effort: Some(ctx.tuning.subagent.reasoning_effort),
+            verbosity: Some(ctx.tuning.subagent.verbosity),
         };
 
         let mut output = String::new();

@@ -31,8 +31,19 @@ impl ToolHandler for UpdatePlanTool {
             description:
                 "Create or replace the active execution plan for the current research task. \
                 Use this for non-trivial research before doing the work, then update it as items \
-                move from pending to in_progress to completed. The runtime will not accept a final \
-                task answer while the active plan still has pending or in_progress items."
+                move from pending to in_progress to completed. Lifecycle has three states \
+                (pending / in_progress / completed); `completed` is terminal but does not imply \
+                success — pair every completed item with a `resolution` and supporting evidence. \
+                Resolutions: \
+                  `done` (work produced its expected evidence), \
+                  `satisfied_by_proxy` (need met by a different signal than originally planned), \
+                  `blocked` (required input unavailable; tool failure / user forbade source / valid empty), \
+                  `deferred` (meaningful but out of this turn's scope), \
+                  `superseded` (replaced by a later plan revision), \
+                  `insufficient_evidence` (attempted but cannot draw conclusion at current confidence). \
+                The runtime will not accept a final task answer while items are still pending or \
+                in_progress; auditable closure with a non-`done` resolution is a valid finish, \
+                but the final answer must reflect the gap and lower confidence accordingly."
                     .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -57,11 +68,24 @@ impl ToolHandler for UpdatePlanTool {
                                 },
                                 "status": {
                                     "type": "string",
-                                    "enum": ["pending", "in_progress", "completed"]
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Lifecycle state. `completed` requires `resolution`."
+                                },
+                                "resolution": {
+                                    "type": "string",
+                                    "enum": [
+                                        "done",
+                                        "satisfied_by_proxy",
+                                        "blocked",
+                                        "deferred",
+                                        "superseded",
+                                        "insufficient_evidence"
+                                    ],
+                                    "description": "Why the item is closed. Required when status=completed; must be omitted otherwise."
                                 },
                                 "evidence": {
                                     "type": "string",
-                                    "description": "What tool result, source, or finding supports completion"
+                                    "description": "What tool result, source, or finding supports the closure (or, for non-`done` resolutions, *why* the closure)."
                                 }
                             },
                             "required": ["step", "status"]
@@ -89,11 +113,13 @@ impl ToolHandler for UpdatePlanTool {
             let step = required_str(raw, "step")?;
             let status = required_str(raw, "status")?;
             let id = optional_str(raw, "id");
+            let resolution = optional_str(raw, "resolution");
             let evidence = optional_str(raw, "evidence");
             inputs.push(vault_plans::PlanItemInput {
                 id,
                 step,
                 status,
+                resolution,
                 evidence,
             });
         }
@@ -138,12 +164,28 @@ impl ToolHandler for UpdatePlanTool {
             .await;
 
         let open = rows.iter().filter(|row| row.status != "completed").count();
+        let with_caveats = rows
+            .iter()
+            .filter(|row| {
+                row.status == "completed"
+                    && !row
+                        .resolution
+                        .as_deref()
+                        .map(|r| vault_plans::SUCCESSFUL_RESOLUTIONS.contains(&r))
+                        .unwrap_or(false)
+            })
+            .count();
         Ok(serde_json::json!({
             "status": "plan_updated",
             "open_items": open,
+            "items_closed_with_caveats": with_caveats,
             "items": rows.iter().map(plan_item_json).collect::<Vec<_>>(),
             "guidance": if open == 0 {
-                "active plan is complete; final answer may now synthesize the completed work"
+                if with_caveats == 0 {
+                    "active plan is complete; final answer may now synthesize the completed work"
+                } else {
+                    "active plan is closed; final answer must acknowledge the non-`done` resolutions and lower confidence accordingly"
+                }
             } else {
                 "continue executing incomplete plan items; do not provide the final answer yet"
             }
@@ -158,6 +200,7 @@ fn plan_item_json(row: &vault_plans::PlanItemRow) -> serde_json::Value {
         "seq": row.seq,
         "step": row.step,
         "status": row.status,
+        "resolution": row.resolution,
         "evidence": row.evidence,
     })
 }

@@ -289,7 +289,7 @@ export function Composer(props: {
         <span class="kbd">↵</span> send
         <span class="kbd">⇧↵</span> newline
         <span class="kbd">Esc</span> stop
-        <span style={{ "margin-left": "auto" }}>Logic-Enhanced Equity Kernel · v0.4.1</span>
+        <span style={{ "margin-left": "auto" }}>Logic-Enhanced Equity Kernel</span>
       </div>
     </div>
   );

@@ -39,7 +39,16 @@ export interface NarrationStep {
   seq?: number;
 }
 
+export interface MandateCheckView {
+  fits_mandate: boolean;
+  notes: string;
+}
+
 export interface DecisionDraftView {
+  /** Set by the backend so chat-panel can dedupe drafts within one task —
+   *  critic-driven rewrites cause the same task to record_investment_action
+   *  multiple times. */
+  task_id?: string;
   deliverable_id: string;
   ticker: string;
   direction: string;
@@ -48,16 +57,33 @@ export interface DecisionDraftView {
   target?: number;
   horizon_days?: number;
   rationale: string;
+  risks?: string[];
+  opposing_case?: string;
+  corpus_refs?: string[];
+  mandate_check?: MandateCheckView;
+  invalidation_conditions?: string;
+}
+
+export interface SubagentRunView {
+  run_id: string;
+  role: string;
+  status: "in_progress" | "completed" | "error" | string;
+  question: string;
+  output_preview?: string;
+  tokens_used?: number;
+  duration_ms?: number;
+  error?: string;
 }
 
 export interface ArtifactEventView {
   id: string;
-  kind: "narration" | "narration_group" | "search" | "tool" | "decision";
+  kind: "narration" | "narration_group" | "search" | "tool" | "decision" | "subagent";
   narration?: NarrationStep;
   narrations?: NarrationStep[];
   search?: SearchCallView;
   tool?: ToolCallView;
   decision?: DecisionDraftView;
+  subagent?: SubagentRunView;
 }
 
 interface ArtifactCallbacks {
@@ -137,8 +163,30 @@ export function ArtifactPanel(props: {
     return out;
   });
 
+  // Sticky-bottom auto-scroll: when new artifact cards land while the user
+  // is already at (or near) the bottom of the canvas, follow the new card
+  // into view. If the user has scrolled up to read earlier cards, do not
+  // yank them back — that would make the canvas unusable for review.
+  let gridEl: HTMLDivElement | undefined;
+  let wasAtBottom = true;
+  const updateStickiness = () => {
+    if (!gridEl) return;
+    const slack = 80; // px tolerance — user counts as "at bottom" within this band
+    wasAtBottom = gridEl.scrollTop + gridEl.clientHeight + slack >= gridEl.scrollHeight;
+  };
+  createEffect(() => {
+    // Re-run whenever the rendered card list changes.
+    groupedEvents().length;
+    if (gridEl && wasAtBottom) {
+      // Defer to after Solid commits the new DOM.
+      queueMicrotask(() => {
+        if (gridEl) gridEl.scrollTop = gridEl.scrollHeight;
+      });
+    }
+  });
+
   return (
-    <div class="lk-artifact-grid">
+    <div class="lk-artifact-grid" ref={(el) => { gridEl = el; }} onScroll={updateStickiness}>
       <For each={groupedEvents()}>{(event) => (
         <ArtifactEventCard event={event} callbacks={props.callbacks} />
       )}</For>
@@ -168,7 +216,127 @@ function ArtifactEventCard(props: { event: ArtifactEventView; callbacks?: Artifa
         : null;
     case "decision":
       return props.event.decision ? <DecisionArtifact id={props.event.id} draft={props.event.decision} /> : null;
+    case "subagent":
+      return props.event.subagent ? <SubagentArtifact id={props.event.id} run={props.event.subagent} /> : null;
   }
+}
+
+function SubagentArtifact(props: { id: string; run: SubagentRunView }) {
+  const [expanded, setExpanded] = createSignal(false);
+  // Live elapsed counter for the in_progress state. Without it, a
+  // running subagent looks identical to a stalled one — the user can't
+  // tell whether anything is happening. We start the counter the moment
+  // the card mounts (which coincides with the in_progress event for live
+  // sessions; for history replay the card is already completed and the
+  // counter is hidden by the status check).
+  const cardMountedAt = Date.now();
+  const [liveSec, setLiveSec] = createSignal(0);
+  let timer: number | undefined;
+  createEffect(() => {
+    const running = props.run.status === "in_progress";
+    if (running && timer == null) {
+      timer = window.setInterval(() => {
+        setLiveSec(Math.floor((Date.now() - cardMountedAt) / 1000));
+      }, 500);
+    } else if (!running && timer != null) {
+      clearInterval(timer);
+      timer = undefined;
+    }
+  });
+  onCleanup(() => { if (timer != null) clearInterval(timer); });
+
+  const isRunning = () => props.run.status === "in_progress";
+  const statusTone = () =>
+    props.run.status === "completed" ? "#9eb78f" :
+    props.run.status === "error"     ? "#d97070" : "#e8b86c";
+  const statusLabel = () =>
+    props.run.status === "completed" ? "已完成" :
+    props.run.status === "error"     ? "出错" :
+    "运行中";
+  const preview = () => props.run.output_preview ?? "";
+  const hasOutput = () => preview().length > 0 || props.run.error;
+  return (
+    <div
+      data-call-id={props.id}
+      class={`lk-artifact-card is-normal is-subagent${isRunning() ? " is-running" : ""}`}
+      style={{
+        background: isRunning()
+          ? "linear-gradient(180deg, rgba(232,184,108,0.14), rgba(182,154,214,0.05))"
+          : "linear-gradient(180deg, rgba(182,154,214,0.10), rgba(255,255,255,0.02))",
+        border: isRunning()
+          ? "1px solid rgba(232,184,108,0.45)"
+          : "1px solid rgba(182,154,214,0.28)",
+        "border-radius": "8px",
+        padding: "12px 14px",
+      }}
+    >
+      <div style={{ display: "flex", "align-items": "baseline", gap: "10px", "margin-bottom": "6px", "flex-wrap": "wrap" }}>
+        <span style={{
+          "font-family": "var(--font-mono)",
+          "font-size": "10px",
+          color: "#b69ad6",
+          "letter-spacing": "0.06em",
+          "font-weight": 700,
+        }}>
+          子代理 · {subagentRoleLabel(props.run.role)}
+        </span>
+        <span style={{
+          "font-family": "var(--font-mono)",
+          "font-size": "10px",
+          color: statusTone(),
+          "font-weight": 600,
+        }}>
+          <Show when={isRunning()}>
+            <span class="lk-subagent-spinner" style={{ "margin-right": "4px" }}>⏳</span>
+          </Show>
+          {statusLabel()}
+        </span>
+        <Show when={isRunning()}>
+          <span style={{ "font-family": "var(--font-mono)", "font-size": "10px", color: "var(--ink-3)" }}>
+            {liveSec()}s
+          </span>
+        </Show>
+        <Show when={!isRunning() && typeof props.run.duration_ms === "number"}>
+          <span style={{ "font-family": "var(--font-mono)", "font-size": "10px", color: "var(--ink-3)" }}>
+            {Math.max(1, Math.round((props.run.duration_ms ?? 0) / 100) / 10)}s
+          </span>
+        </Show>
+      </div>
+      <div style={{ "font-size": "12px", color: "var(--ink-1)", "margin-bottom": hasOutput() ? "8px" : 0, "line-height": 1.5 }}>
+        {props.run.question}
+      </div>
+      <Show when={props.run.error}>
+        {(err) => (
+          <div style={{
+            color: "#d97070",
+            "font-family": "var(--font-mono)",
+            "font-size": "11px",
+            background: "rgba(217,112,112,0.08)",
+            padding: "6px 8px",
+            "border-radius": "4px",
+          }}>
+            {err()}
+          </div>
+        )}
+      </Show>
+      <Show when={preview()}>
+        <div
+          onClick={() => setExpanded(!expanded())}
+          style={{
+            "font-size": "12.5px",
+            color: "var(--ink-1)",
+            "line-height": 1.55,
+            cursor: "pointer",
+            "max-height": expanded() ? "none" : "9.5em",
+            overflow: "hidden",
+          }}
+          title={expanded() ? "click to collapse" : "click to expand"}
+        >
+          <SafeMarkdown source={preview()} />
+        </div>
+      </Show>
+    </div>
+  );
 }
 
 function NarrationArtifact(props: { id: string; steps: NarrationStep[] }) {
@@ -322,12 +490,85 @@ function DecisionArtifact(props: { id: string; draft: DecisionDraftView }) {
         color: "var(--ink-1)",
         "font-size": "12.5px",
         "line-height": 1.55,
-        display: "-webkit-box",
-        "-webkit-line-clamp": "5",
-        "-webkit-box-orient": "vertical",
-        overflow: "hidden",
+        "margin-bottom": "10px",
+        // The agent often writes rationale as markdown (bold thesis lines,
+        // bullet sub-claims, inline links). Render it as markdown so users
+        // don't see raw `**` / `##` characters.
       }}>
-        {props.draft.rationale}
+        <SafeMarkdown source={props.draft.rationale} />
+      </div>
+      <Show when={props.draft.risks && props.draft.risks.length > 0}>
+        <DecisionSection title="风险" tone="risk">
+          <ul style={{ margin: 0, "padding-left": "18px", display: "flex", "flex-direction": "column", gap: "3px" }}>
+            <For each={props.draft.risks}>{(risk) => <li><SafeMarkdown source={risk} /></li>}</For>
+          </ul>
+        </DecisionSection>
+      </Show>
+      <Show when={props.draft.opposing_case}>
+        <DecisionSection title="反方观点" tone="bear">
+          <SafeMarkdown source={props.draft.opposing_case!} />
+        </DecisionSection>
+      </Show>
+      <Show when={props.draft.invalidation_conditions}>
+        <DecisionSection title="失效条件" tone="risk">
+          <SafeMarkdown source={props.draft.invalidation_conditions!} />
+        </DecisionSection>
+      </Show>
+      <Show when={props.draft.mandate_check}>
+        {(check) => (
+          <DecisionSection title={`Mandate · ${check().fits_mandate ? "符合" : "需复核"}`} tone={check().fits_mandate ? "ok" : "risk"}>
+            <SafeMarkdown source={check().notes ?? ""} />
+          </DecisionSection>
+        )}
+      </Show>
+      <Show when={props.draft.corpus_refs && props.draft.corpus_refs.length > 0}>
+        <DecisionSection title="Corpus 引用" tone="ref">
+          <div style={{ display: "flex", "flex-wrap": "wrap", gap: "4px" }}>
+            <For each={props.draft.corpus_refs}>
+              {(ref) => (
+                <span style={{
+                  padding: "2px 7px",
+                  border: "1px solid rgba(255,255,255,0.12)",
+                  "border-radius": "4px",
+                  "font-size": "10.5px",
+                  "font-family": "var(--font-mono)",
+                }}>
+                  {ref}
+                </span>
+              )}
+            </For>
+          </div>
+        </DecisionSection>
+      </Show>
+    </div>
+  );
+}
+
+function DecisionSection(props: { title: string; tone: "risk" | "bear" | "ok" | "ref"; children: any }) {
+  const accent = () => ({
+    risk: "#d97070",
+    bear: "#7a9bd6",
+    ok: "#9eb78f",
+    ref: "#c9a76a",
+  })[props.tone];
+  return (
+    <div style={{ "margin-top": "8px" }}>
+      <div style={{
+        "font-family": "var(--font-mono)",
+        "font-size": "9.5px",
+        "letter-spacing": "0.08em",
+        "text-transform": "uppercase",
+        color: accent(),
+        "margin-bottom": "4px",
+      }}>
+        {props.title}
+      </div>
+      <div style={{
+        color: "var(--ink-1)",
+        "font-size": "12px",
+        "line-height": 1.5,
+      }}>
+        {props.children}
       </div>
     </div>
   );
@@ -501,6 +742,18 @@ function SearchArtifact(props: { search: SearchCallView }) {
     : props.search.action === "open_page" ? "Opening"
     : "Searching";
   const primaryDetail = () => props.search.detail || props.search.queries?.[0] || "";
+  // The provider sometimes emits a `web_search_call` `output_item.added`
+  // event with `action=unknown` and no metadata (just a status flip), and
+  // its matching `output_item.done` may carry the real action+detail OR
+  // may simply close out without further data. When neither side has any
+  // identifying content, the card is just a placeholder horizontal rule
+  // ("—") on the canvas — visually noisy and tells the user nothing.
+  // Skip rendering in that case.
+  const hasContent = () =>
+    !!primaryDetail()
+    || (props.search.queries?.length ?? 0) > 0
+    || (props.search.sources?.length ?? 0) > 0;
+  if (!hasContent()) return null;
   let host = primaryDetail();
   let isUrl = false;
   try {
@@ -639,6 +892,7 @@ function SearchArtifact(props: { search: SearchCallView }) {
 function ToolArtifact(props: { tool: ToolCallView; callbacks?: ArtifactCallbacks }) {
   switch (props.tool.name) {
     case "corpus_search": return <CorpusSearchCard {...props} />;
+    case "corpus_read":   return <CorpusReadCard {...props} />;
     case "web_fetch":     return <WebFetchCard {...props} />;
     case "market_quote":
     case "tradingview_quote": return <MarketQuoteCard {...props} />;
@@ -649,8 +903,179 @@ function ToolArtifact(props: { tool: ToolCallView; callbacks?: ArtifactCallbacks
     case "get_financials": return <FinancialsCard {...props} />;
     case "get_capital_flow": return <CapitalFlowCard {...props} />;
     case "sec_filing_fetch": return <SecFilingCard {...props} />;
+    // `delegate_research` is the agent tool call that spawns a subagent;
+    // the matching `subagent_run` event already renders a richer card
+    // (with role label, status, output preview). Showing both creates
+    // duplicate noise on the canvas, so suppress the tool-call card here.
+    case "delegate_research": return null;
     default:              return <GenericToolCard {...props} />;
   }
+}
+
+/// Subagent role → user-facing label. Roles come from the backend
+/// `delegate_research` tool's hard-coded persona list (fundamental_analyst,
+/// trading_analyst, risk_manager, corpus_guardian — see
+/// `crates/gateway/src/agent/tools/delegate_research.rs::role_instruction`).
+function subagentRoleLabel(role: string): string {
+  switch (role) {
+    case "risk_manager": return "风控代理";
+    case "fundamental_analyst": return "基本面分析";
+    case "trading_analyst": return "交易分析";
+    case "corpus_guardian": return "知识审核";
+    default: return role;
+  }
+}
+
+function CorpusReadCard(props: { tool: ToolCallView; callbacks?: ArtifactCallbacks }) {
+  const args = parseArgs(props.tool);
+  const id = String(args.id ?? "");
+  const preview = props.tool.output_preview ?? "";
+  const parsed = parseCorpusReadPreview(preview);
+  const title = parsed?.title ?? id;
+  const tierLayer = parsed ? [parsed.tier, parsed.layer].filter(Boolean).join("·") : "";
+  const body = (parsed?.body ?? "").trim();
+  const bodyPreview = () => {
+    if (!body) return "";
+    if (body.length <= 1200) return body;
+    return body.slice(0, 1200).trimEnd() + "…";
+  };
+  return (
+    <CardShell
+      status={props.tool.status}
+      badge="corpus·read"
+      detail={title}
+      callId={props.tool.call_id}
+      size="normal"
+    >
+      <Show
+        when={body.length > 0}
+        fallback={
+          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+            <Show when={props.tool.status === "in_progress"} fallback="No body returned.">
+              Reading the corpus document…
+            </Show>
+          </div>
+        }
+      >
+        <Show when={tierLayer.trim().length > 0}>
+          <div
+            style={{
+              "font-family": "var(--font-mono)",
+              "font-size": "10px",
+              color: "var(--ink-3)",
+              "margin-bottom": "6px",
+            }}
+          >
+            {tierLayer}
+          </div>
+        </Show>
+        <div
+          onClick={(e) => {
+            e.stopPropagation();
+            props.callbacks?.onOpenDoc?.(parsed?.id ?? id, title);
+          }}
+          style={{
+            cursor: "pointer",
+            "font-size": "12px",
+            "line-height": "1.55",
+            color: "var(--ink-1)",
+            "max-height": "260px",
+            overflow: "hidden",
+          }}
+        >
+          <SafeMarkdown source={bodyPreview()} />
+        </div>
+        <Show when={parsed?.truncated}>
+          <div
+            style={{
+              "font-family": "var(--font-mono)",
+              "font-size": "10px",
+              color: "var(--ink-3)",
+              "margin-top": "6px",
+            }}
+          >
+            … truncated, click to open the full document
+          </div>
+        </Show>
+      </Show>
+    </CardShell>
+  );
+}
+
+type CorpusReadPreview = {
+  id?: string;
+  title?: string;
+  tier?: string;
+  layer?: string;
+  body?: string;
+  truncated?: boolean;
+};
+
+function parseCorpusReadPreview(preview: string): CorpusReadPreview | null {
+  const parsed = parseCorpusReadPayload(preview);
+  if (parsed?.body) return parsed;
+
+  // `output_preview` is intentionally capped and often cuts inside the large
+  // JSON string returned by corpus_read. Salvage the body field so the card
+  // can still show the document excerpt instead of a false "No body" state.
+  const body = extractJsonStringField(preview, "body");
+  if (!body) return parsed;
+  return { ...(parsed ?? {}), body, truncated: true };
+}
+
+function parseCorpusReadPayload(s: string | undefined): CorpusReadPreview | null {
+  const parsed = safeParseJson(s);
+  if (isCorpusReadPayload(parsed)) return parsed;
+  if (parsed && typeof parsed === "object" && typeof (parsed as { output?: unknown }).output === "string") {
+    const nested = safeParseJson((parsed as { output: string }).output);
+    if (isCorpusReadPayload(nested)) return nested;
+  }
+  return null;
+}
+
+function isCorpusReadPayload(v: unknown): v is CorpusReadPreview {
+  return !!v && typeof v === "object" && (
+    typeof (v as CorpusReadPreview).body === "string" ||
+    typeof (v as CorpusReadPreview).title === "string" ||
+    typeof (v as CorpusReadPreview).id === "string"
+  );
+}
+
+function extractJsonStringField(source: string | undefined, key: string): string {
+  if (!source) return "";
+  const needle = `"${key}":"`;
+  const start = source.indexOf(needle);
+  if (start < 0) return "";
+
+  let escaped = "";
+  let escaping = false;
+  for (let i = start + needle.length; i < source.length; i++) {
+    const ch = source[i];
+    if (!escaping && ch === "\"") break;
+    escaped += ch;
+    if (escaping) escaping = false;
+    else if (ch === "\\") escaping = true;
+  }
+
+  escaped = escaped.replace(/…$/, "");
+  while (hasOddTrailingBackslashes(escaped)) {
+    escaped = escaped.slice(0, -1);
+  }
+
+  try {
+    return JSON.parse(`"${escaped}"`);
+  } catch {
+    return escaped
+      .replace(/\\n/g, "\n")
+      .replace(/\\"/g, "\"")
+      .replace(/\\\\/g, "\\");
+  }
+}
+
+function hasOddTrailingBackslashes(s: string): boolean {
+  let count = 0;
+  for (let i = s.length - 1; i >= 0 && s[i] === "\\"; i--) count++;
+  return count % 2 === 1;
 }
 
 function safeParseJson(s: string | undefined): unknown {

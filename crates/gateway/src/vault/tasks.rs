@@ -112,6 +112,34 @@ pub async fn get_active_for_session(
     Ok(row)
 }
 
+/// Most recent task in this session regardless of status. Used by the routing
+/// layer to give the LLM continuity context — when a follow-up message arrives
+/// after a delivered task, knowing the prior task's title and deliverable kind
+/// lets the router lean toward `chat_reply` instead of forking a duplicate
+/// task.
+pub async fn get_latest_for_session(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+) -> Result<Option<TaskRow>> {
+    let row = sqlx::query_as::<_, TaskRow>(
+        r#"
+        SELECT id, title, goal, expected_deliverable, status,
+               created_at, started_at, delivered_at
+        FROM tasks
+        WHERE user_id = ? AND session_id = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+    .context("looking up latest task in session")?;
+    Ok(row)
+}
+
 pub async fn mark_delivered(pool: &SqlitePool, user_id: &str, task_id: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(

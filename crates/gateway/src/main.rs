@@ -207,6 +207,25 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
     )?);
     let event_bus = events::EventBus::new();
 
+    match agent::harness::corpus_prompt_status() {
+        agent::harness::CorpusPromptStatus::Loaded { path, bytes } => {
+            tracing::info!(path = %path.display(), bytes, "corpus prompt loaded");
+        }
+        agent::harness::CorpusPromptStatus::Placeholder { path } => {
+            tracing::warn!(
+                path = %path.display(),
+                "corpus prompt is a placeholder — system prompt will run without the \
+                 distilled principles kernel. Run: `leek corpus distill --root ./corpus`"
+            );
+        }
+        agent::harness::CorpusPromptStatus::Missing => {
+            tracing::warn!(
+                "corpus prompt file not found in any candidate path — system prompt will \
+                 run without the distilled principles kernel. Run: `leek corpus distill --root ./corpus`"
+            );
+        }
+    }
+
     let tools = agent::tools::ToolRegistry::builder()
         .register(Arc::new(
             agent::tools::ask_user_question::AskUserQuestionTool::new(),
@@ -218,6 +237,7 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
         .register(Arc::new(
             agent::tools::corpus_search::CorpusSearchTool::new(),
         ))
+        .register(Arc::new(agent::tools::corpus_read::CorpusReadTool::new()))
         .register(Arc::new(
             agent::tools::sec_filing_fetch::SecFilingFetchTool::new()?,
         ))
@@ -260,6 +280,14 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
             .join(format!("{}.md", vault::LOCAL_USER_ID))
     });
 
+    // Initial tuning: load persisted user_settings if any, otherwise defaults.
+    let tuning_initial = vault::user_settings::load_tuning(&vault.pool, vault::LOCAL_USER_ID)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(?err, "failed to load user_settings; using built-in defaults");
+            llm::LlmTuning::defaults()
+        });
+
     let state = api::AppState {
         pool: vault.pool.clone(),
         provider,
@@ -270,6 +298,7 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
         )),
         tools,
         mandate_path,
+        tuning: std::sync::Arc::new(std::sync::RwLock::new(tuning_initial)),
     };
 
     let app = api::router(state);
@@ -304,6 +333,7 @@ async fn run_chat(vault_path: &Path, prompt: String, model: String) -> Result<()
         }],
         additional_inputs: Vec::new(),
         reasoning_effort: None,
+        verbosity: None,
     };
 
     let mut stream = provider.chat(req).await?;

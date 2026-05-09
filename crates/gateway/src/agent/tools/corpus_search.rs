@@ -178,9 +178,9 @@ impl ToolHandler for CorpusSearchTool {
                  lenses; source hits are supporting evidence candidates and should not be \
                  treated as active context unless their snippet directly matters or the user \
                  asks for primary-source grounding. Returns top hits as JSON with id, title, \
-                 tier, layer, usage_role, tags, and a snippet around the first match. Combine \
-                 with web_fetch (using the returned id as a wikilink reference) to read the \
-                 full document if needed."
+                 tier, layer, usage_role, tags, and a 240-char snippet around the first \
+                 match. To read the full body of a hit, call `corpus_read` with the hit's \
+                 `id` — do NOT pass corpus ids to `web_fetch` (they are not URLs)."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -434,6 +434,7 @@ mod tests {
             user_id: "test".into(),
             session_id: "sess".into(),
             task_id: None,
+            tuning: crate::llm::LlmTuning::defaults(),
         }
     }
 

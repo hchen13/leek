@@ -81,6 +81,10 @@ export interface AgentPlanItem {
   seq?: number;
   step: string;
   status: "pending" | "in_progress" | "completed" | string;
+  /** Per design 0012: why a `completed` item is closed.
+   *  done / satisfied_by_proxy / blocked / deferred / superseded /
+   *  insufficient_evidence. NULL on pending / in_progress. */
+  resolution?: string | null;
   evidence?: string | null;
 }
 
@@ -712,9 +716,21 @@ function AgentPlanWidget(props: { plan: AgentPlanView }) {
   const active = createMemo(() =>
     props.plan.items.find((item) => item.status === "in_progress")
   );
+  const closedWithCaveats = createMemo(() =>
+    props.plan.items.filter(
+      (item) =>
+        item.status === "completed" &&
+        item.resolution != null &&
+        item.resolution !== "done" &&
+        item.resolution !== "satisfied_by_proxy",
+    ).length,
+  );
   const meta = createMemo(() => {
     const total = props.plan.items.length;
-    if (completed() === total) return "complete";
+    if (completed() === total) {
+      const cav = closedWithCaveats();
+      return cav > 0 ? `complete · ${cav} closed with caveats` : "complete";
+    }
     if (active()) return "in progress";
     return "pending";
   });
@@ -731,15 +747,26 @@ function AgentPlanWidget(props: { plan: AgentPlanView }) {
         </Show>
         <div class="lk-plan-list">
           <For each={props.plan.items}>{(item) => (
-            <div class={`lk-plan-item is-${item.status}`}>
+            <div class={`lk-plan-item is-${item.status}`} data-resolution={item.resolution ?? ""}>
               <span class="lk-plan-mark" aria-hidden="true" />
               <div class="lk-plan-copy">
                 <div class="lk-plan-step">{item.step}</div>
                 <div class="lk-plan-meta">
                   <span>{item.status.replace("_", " ")}</span>
-                  <Show when={item.evidence}>
-                    <span title={item.evidence ?? ""}>{item.evidence}</span>
+                  <Show when={item.resolution}>
+                    <span
+                      class={`lk-plan-resolution lk-resolution-${item.resolution}`}
+                      title={`resolution: ${item.resolution}`}
+                    >
+                      {item.resolution}
+                    </span>
                   </Show>
+                  {/* `item.evidence` is intentionally hidden from the UI:
+                      the agent writes it for plan_guard/audit (corpus
+                      paths, raw tool ids, internal labels), not for the
+                      end user. Until we have a presentable form for it,
+                      keep it server-side only — full text is still
+                      available via the row tooltip. */}
                 </div>
               </div>
             </div>

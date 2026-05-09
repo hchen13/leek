@@ -7,6 +7,7 @@ pub mod health;
 pub mod messages;
 pub mod portfolio;
 pub mod sessions;
+pub mod settings;
 pub mod static_files;
 pub mod stream;
 pub mod tools;
@@ -24,7 +25,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::agent::tools::ToolRegistry;
 use crate::events::EventBus;
-use crate::llm::LlmProvider;
+use crate::llm::{LlmProvider, LlmTuning};
 
 /// One in-flight per-session piece of work — either a chat reply, a manual
 /// `/compact`, or an auto pre-turn compaction. The `user_cancellable` flag
@@ -57,6 +58,16 @@ pub struct AppState {
     /// Read on every chat turn so edits take effect immediately. `None` only
     /// in degenerate test setups where the path can't be resolved.
     pub mandate_path: Option<std::path::PathBuf>,
+    /// Per-surface reasoning/verbosity knobs. Loaded from `vault.user_settings`
+    /// at startup, hot-swapped when Settings UI PATCHes new values. Each
+    /// agent call reads a snapshot via `tuning_snapshot()`.
+    pub tuning: Arc<std::sync::RwLock<LlmTuning>>,
+}
+
+impl AppState {
+    pub fn tuning_snapshot(&self) -> LlmTuning {
+        *self.tuning.read().expect("tuning lock poisoned")
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -116,33 +127,60 @@ pub fn router(state: AppState) -> Router {
             get(portfolio::get_handler).post(portfolio::post_handler),
         )
         .route("/api/v1/portfolio/history", get(portfolio::history_handler))
+        .route(
+            "/api/v1/settings",
+            get(settings::get_handler).patch(settings::patch_handler),
+        )
         .with_state(state)
         // Anything not matched above falls through to the embedded SPA
         .fallback(static_files::handler)
         .layer(cors)
 }
 
-/// Bridge `anyhow::Error` to a JSON 500 response.
-pub struct AppError(pub anyhow::Error);
+/// Bridge `anyhow::Error` to a JSON response. Defaults to 500; handlers can
+/// surface 400 explicitly via `AppError::bad_request`.
+pub struct AppError {
+    pub status: StatusCode,
+    pub error: anyhow::Error,
+}
+
+impl AppError {
+    pub fn bad_request(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error: anyhow::anyhow!(msg.into()),
+        }
+    }
+}
 
 impl<E> From<E> for AppError
 where
     E: Into<anyhow::Error>,
 {
     fn from(e: E) -> Self {
-        Self(e.into())
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error: e.into(),
+        }
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        tracing::error!(error = %self.0, "request failed");
+        let code = if self.status == StatusCode::BAD_REQUEST {
+            "BAD_REQUEST"
+        } else {
+            "INTERNAL_ERROR"
+        };
+        if self.status == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::error!(error = %self.error, "request failed");
+        }
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            self.status,
             Json(serde_json::json!({
                 "error": {
-                    "code": "INTERNAL_ERROR",
-                    "message": self.0.to_string(),
+                    "code": code,
+                    "message": self.error.to_string(),
                 }
             })),
         )

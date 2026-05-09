@@ -8,9 +8,29 @@ use async_stream::try_stream;
 use futures::{stream::BoxStream, StreamExt};
 use serde::Deserialize;
 
-use super::{ChatRequest, LlmEvent, Role, StopReason, ToolSpec, Usage, WebSearchAction};
-// `ReasoningEffort` is stringified at the call site (`effort.as_str()`),
-// so no direct import here.
+use super::{ChatRequest, LlmEvent, ReasoningEffort, Role, StopReason, ToolSpec, Usage, WebSearchAction};
+
+/// gpt-5.5 currently rejects `reasoning_effort=minimal` at the `/responses`
+/// endpoint with a 400 (`Unsupported value 'minimal' for parameter
+/// 'reasoning.effort'`). Coerce to `low` for any gpt-5.5 model so a stored
+/// user setting or a default that pre-dates the backend tightening doesn't
+/// kill the call. We log once per process when the coercion fires so
+/// operators can see why their saved Minimal isn't taking effect.
+pub(super) fn coerce_effort_for_model(model: &str, effort: ReasoningEffort) -> &'static str {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    if matches!(effort, ReasoningEffort::Minimal) && model.starts_with("gpt-5.5") {
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                model,
+                "reasoning_effort=minimal is not supported by gpt-5.5; coercing to low"
+            );
+        }
+        return "low";
+    }
+    effort.as_str()
+}
 
 pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
     let mut input = Vec::new();
@@ -89,16 +109,20 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
     }
 
     // Verbosity hint: only gpt-5.x (Responses API, codex backend) supports
-    // this field. "low" suppresses padding without changing reasoning budget.
+    // this field. Caller decides per-surface; absence falls back to backend
+    // default.
     if req.model.starts_with("gpt-5") {
-        body["text"] = serde_json::json!({ "verbosity": "low" });
+        if let Some(v) = req.verbosity {
+            body["text"] = serde_json::json!({ "verbosity": v.as_str() });
+        }
     }
 
     // Reasoning effort for gpt-5/gpt-5.5-style models. Omit when caller
     // didn't ask — backend uses the model's default level.
     if let Some(effort) = req.reasoning_effort {
+        let effort_str = coerce_effort_for_model(&req.model, effort);
         body["reasoning"] = serde_json::json!({
-            "effort": effort.as_str(),
+            "effort": effort_str,
             "summary": serde_json::Value::Null,
         });
     }
@@ -585,6 +609,7 @@ mod tests {
             }],
             additional_inputs: Vec::new(),
             reasoning_effort: None,
+            verbosity: None,
         };
         let body = build_request_body(&req);
         let tools = body.get("tools").and_then(|t| t.as_array()).unwrap();
@@ -611,6 +636,7 @@ mod tests {
             tools: Vec::new(),
             additional_inputs: Vec::new(),
             reasoning_effort: None,
+            verbosity: None,
         };
         let body = build_request_body(&req);
         assert!(body.get("tools").is_none());
@@ -677,6 +703,7 @@ mod tests {
             }],
             additional_inputs: Vec::new(),
             reasoning_effort: None,
+            verbosity: None,
         };
         let body = build_request_body(&req);
         let tools = body.get("tools").and_then(|t| t.as_array()).unwrap();
@@ -710,7 +737,10 @@ mod tests {
     }
 
     #[test]
-    fn build_request_body_serializes_reasoning_effort() {
+    fn build_request_body_serializes_reasoning_effort_low_for_minimal_on_gpt55() {
+        // gpt-5.5 rejects `minimal`. The build path coerces to `low` so the
+        // call still goes out instead of returning a 400. Saved-setting
+        // values from older defaults end up here too.
         use super::super::{ChatMessage, ChatRequest, ReasoningEffort, Role};
         let req = ChatRequest {
             messages: vec![ChatMessage {
@@ -723,10 +753,92 @@ mod tests {
             tools: Vec::new(),
             additional_inputs: Vec::new(),
             reasoning_effort: Some(ReasoningEffort::Minimal),
+            verbosity: None,
+        };
+        let body = build_request_body(&req);
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert!(body["reasoning"]["summary"].is_null());
+    }
+
+    #[test]
+    fn build_request_body_keeps_minimal_for_non_gpt55_models() {
+        // Future models that DO accept minimal should still get it.
+        use super::super::{ChatMessage, ChatRequest, ReasoningEffort, Role};
+        let req = ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "ok".into(),
+            }],
+            system: None,
+            model: "gpt-5".into(),
+            max_output_tokens: None,
+            tools: Vec::new(),
+            additional_inputs: Vec::new(),
+            reasoning_effort: Some(ReasoningEffort::Minimal),
+            verbosity: None,
         };
         let body = build_request_body(&req);
         assert_eq!(body["reasoning"]["effort"], "minimal");
-        assert!(body["reasoning"]["summary"].is_null());
+    }
+
+    #[test]
+    fn build_request_body_serializes_xhigh_reasoning_effort() {
+        use super::super::{ChatMessage, ChatRequest, ReasoningEffort, Role};
+        let req = ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "deep analysis".into(),
+            }],
+            system: None,
+            model: "gpt-5.5".into(),
+            max_output_tokens: None,
+            tools: Vec::new(),
+            additional_inputs: Vec::new(),
+            reasoning_effort: Some(ReasoningEffort::XHigh),
+            verbosity: None,
+        };
+        let body = build_request_body(&req);
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn build_request_body_serializes_verbosity_when_present() {
+        use super::super::{ChatMessage, ChatRequest, Role, Verbosity};
+        let req = ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "hi".into(),
+            }],
+            system: None,
+            model: "gpt-5.5".into(),
+            max_output_tokens: None,
+            tools: Vec::new(),
+            additional_inputs: Vec::new(),
+            reasoning_effort: None,
+            verbosity: Some(Verbosity::Low),
+        };
+        let body = build_request_body(&req);
+        assert_eq!(body["text"]["verbosity"], "low");
+    }
+
+    #[test]
+    fn build_request_body_omits_verbosity_when_none() {
+        use super::super::{ChatMessage, ChatRequest, Role};
+        let req = ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "hi".into(),
+            }],
+            system: None,
+            model: "gpt-5.5".into(),
+            max_output_tokens: None,
+            tools: Vec::new(),
+            additional_inputs: Vec::new(),
+            reasoning_effort: None,
+            verbosity: None,
+        };
+        let body = build_request_body(&req);
+        assert!(body.get("text").is_none());
     }
 
     #[test]
@@ -743,6 +855,7 @@ mod tests {
             tools: Vec::new(),
             additional_inputs: Vec::new(),
             reasoning_effort: None,
+            verbosity: None,
         };
         let body = build_request_body(&req);
         assert!(body.get("reasoning").is_none());
@@ -774,6 +887,7 @@ mod tests {
                 }),
             ],
             reasoning_effort: None,
+            verbosity: None,
         };
         let body = build_request_body(&req);
         let input = body["input"].as_array().unwrap();

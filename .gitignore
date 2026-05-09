@@ -54,5 +54,8 @@ mandates/
 
 # Playwright debug artifacts (root-level only — don't catch design assets)
 /.playwright-mcp/
-/*.png
-.claude/worktrees/
+
+# Claude Code / agent harness project-level state (skills, worktrees,
+# settings) — these are dev-time tooling, not part of the leek runtime.
+.claude/
+.agents/

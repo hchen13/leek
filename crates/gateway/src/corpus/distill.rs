@@ -35,10 +35,11 @@ fn strip_frontmatter(text: &str) -> &str {
     if let Some(end) = rest.find("\n---\n") {
         return &rest[end + 5..];
     }
-    if let Some(end) = rest.find("\n---") {
-        // EOF without trailing newline
-        let cut = end + 4;
-        return rest.get(cut..).unwrap_or("");
+    // EOF-without-trailing-newline fallback: only accept when "\n---" is
+    // *exactly* at end of input. `find` matches the first occurrence, which
+    // would otherwise mistake an in-body horizontal rule for the closer.
+    if rest.ends_with("\n---") {
+        return "";
     }
     text
 }

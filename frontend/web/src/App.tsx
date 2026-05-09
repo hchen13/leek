@@ -8,9 +8,10 @@ import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import { LiveChat } from "./components/LiveChat";
 import { Workbench } from "./components/Workbench";
 import { PortfolioPage } from "./components/PortfolioPage";
+import { SettingsPage } from "./components/SettingsPage";
 import { ALL_SCENES, type Scene } from "./scenes";
 
-type Page = "chat" | "portfolio";
+type Page = "chat" | "portfolio" | "settings";
 
 type View =
   | { mode: "live" }
@@ -55,7 +56,14 @@ export function App() {
         >
           <Show
             when={page() === "portfolio"}
-            fallback={<LiveChat onNavigate={setPage} />}
+            fallback={
+              <Show
+                when={page() === "settings"}
+                fallback={<LiveChat onNavigate={setPage} />}
+              >
+                <SettingsWithRail onNavigate={setPage} />
+              </Show>
+            }
           >
             <PortfolioWithRail onNavigate={setPage} />
           </Show>
@@ -76,6 +84,17 @@ function PortfolioWithRail(props: { onNavigate: (p: Page) => void }) {
   );
 }
 
+function SettingsWithRail(props: { onNavigate: (p: Page) => void }) {
+  return (
+    <div class="lk-app" style={{ width: "100%", height: "100%" }}>
+      <NavRail page="settings" onNavigate={props.onNavigate} />
+      <div class="lk-main" style={{ "grid-template-rows": "1fr", "grid-template-columns": "1fr" }}>
+        <SettingsPage />
+      </div>
+    </div>
+  );
+}
+
 export function NavRail(props: { page: Page; onNavigate: (p: Page) => void }) {
   return (
     <aside class="lk-rail">
@@ -83,6 +102,7 @@ export function NavRail(props: { page: Page; onNavigate: (p: Page) => void }) {
       <RailNavBtn label="C" sub="chat" target="chat" active={props.page === "chat"} onNavigate={props.onNavigate} />
       <RailNavBtn label="P" sub="port" target="portfolio" active={props.page === "portfolio"} onNavigate={props.onNavigate} />
       <div class="lk-rail-spacer" />
+      <RailNavBtn label="S" sub="set" target="settings" active={props.page === "settings"} onNavigate={props.onNavigate} />
       <div class="lk-rail-avatar">JC</div>
     </aside>
   );

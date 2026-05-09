@@ -11,9 +11,17 @@ use std::sync::Arc;
 use serde::Serialize;
 use tokio::sync::{broadcast, RwLock};
 
-/// Capacity per-session — if a slow subscriber falls more than this behind,
-/// it gets `Lagged` errors and recovers via Last-Event-ID replay (P2).
-const CHANNEL_CAPACITY: usize = 256;
+/// Per-session SSE broadcast backlog. Long deep-research turns can
+/// produce dozens of events per second (web_search lifecycles + thinking
+/// cards + tool_call lifecycles), and a slow client (DOM reactive
+/// re-renders, throttled tab) is enough to fall behind a 256-slot queue
+/// within seconds → backend drops oldest events → frontend sees stale
+/// state. 8192 buys ~2-3 minutes of headroom even on the worst current
+/// case (S5 hits ~50 events/s peak). Revisit if any single session
+/// genuinely produces >8k events between client polls; the right fix
+/// at that scale is a per-client mpsc with explicit backpressure, not
+/// a bigger broadcast buffer.
+const CHANNEL_CAPACITY: usize = 8192;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EventEnvelope {

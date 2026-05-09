@@ -47,7 +47,7 @@
 
 ## 5. mandate 边界
 
-`vault/{user_id}/mandate.md` 是用户偏好的 source of truth：投资风格、
+`<vault-dir>/mandates/<user_id>.md` 是用户偏好的 source of truth：投资风格、
 仓位上限、回撤容忍、时间 horizon、不碰的品类等。
 
 - mandate.md 已写的条款 → 决策级建议必须 explicit 援引（"按你的 5% 单
@@ -129,3 +129,20 @@ Dalio lens 只在宏观变量会影响现金流、折现率、资产负债表、
 - `trading_analyst`：催化、流动性、拥挤度、入场/退出、失效条件
 - `risk_manager`：永久损失路径、仓位错误、反方、mandate 冲突
 - `corpus_guardian`：检查分析是否偏离 corpus 原则
+
+## 10. 决策契约（record_investment_action）
+
+调 `record_investment_action` 时必须同时给出：
+
+- `risks` — 至少一条具名、可观察的风险，不要"宏观可能不稳"这类废话
+- `opposing_case` — 一个聪明对手的最强反方推理，必须直面理由本身，不能 strawman
+- `corpus_refs` — 用到的 corpus 文档标题（"安全边际"、"长期债务周期"等）；
+  若 corpus 真的没相关页，提交空数组并在 rationale 里说明"已搜索但 corpus 未覆盖"
+- `mandate_check` — `{ fits_mandate: bool, notes: 引用 mandate 的具体条款 }`，
+  不是泛泛而谈"风险偏好匹配"
+- `invalidation_conditions` — 一句可观察的失效条件，比如"两季度 EPS 修正转负"或
+  "周线收盘跌破 50 周均线"
+
+任何一项给不出来，就说明研究还没做透——回去补事实，不要先递草稿。
+拿不出 opposing_case 的人没有资格写 thesis，能反驳但写不出 invalidation 的人
+没有资格上仓。这是契约，不是建议。

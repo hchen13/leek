@@ -17,7 +17,7 @@ use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::llm::{ChatMessage, ChatRequest, LlmEvent, LlmProvider, ReasoningEffort, Role};
+use crate::llm::{ChatMessage, ChatRequest, LlmEvent, LlmProvider, Role};
 use crate::vault::messages::MessageRow;
 
 const COMPACT_MODEL: &str = "gpt-5.5";
@@ -58,9 +58,93 @@ the agent committed to>
 behavioral preferences that surfaced — only if explicit; do not invent>
 ";
 
+/// Compact tool-dialogue line built from a slice of vault.events rows.
+/// Captures kind + ticker / query / tool name + status — enough so the
+/// post-compaction model knows *what was looked up*. Without this, the
+/// summary loses tool context entirely (handoff prose says "已查 corpus"
+/// but the model doesn't see what was found).
+pub fn render_tool_dialogue(events: &[crate::vault::events::EventRow]) -> Option<String> {
+    let mut lines = Vec::new();
+    for row in events {
+        let payload: serde_json::Value = match serde_json::from_str(&row.payload_json) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let line = match row.kind.as_str() {
+            "tool_call" => {
+                let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let status = payload
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let preview = payload
+                    .get("output_preview")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.replace('\n', " ").chars().take(160).collect::<String>())
+                    .unwrap_or_default();
+                Some(format!("- tool[{name}] {status} :: {preview}"))
+            }
+            "web_search_call" => {
+                let action = payload
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let detail = payload
+                    .get("detail")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let queries = payload
+                    .get("queries")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|q| q.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    })
+                    .unwrap_or_default();
+                Some(format!("- search[{action}] {detail} {queries}").trim_end().to_string())
+            }
+            "subagent_run" => {
+                let role = payload
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let status = payload
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let question = payload
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.chars().take(120).collect::<String>())
+                    .unwrap_or_default();
+                Some(format!("- subagent[{role}] {status} :: {question}"))
+            }
+            "decision_draft_ready" => {
+                let ticker = payload.get("ticker").and_then(|v| v.as_str()).unwrap_or("?");
+                let direction = payload
+                    .get("direction")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                Some(format!("- decision_draft[{ticker} {direction}] (pending user)"))
+            }
+            _ => None,
+        };
+        if let Some(l) = line {
+            lines.push(l);
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
 /// Render a vault message list into a plain transcript suitable for LLM
 /// consumption. user/agent text rows only — tool rows live in the events
-/// table and aren't surfaced in P1.
+/// table and are folded back in via `render_tool_dialogue`.
 fn render_transcript(history: &[MessageRow]) -> String {
     let mut out = String::new();
     for row in history {
@@ -99,6 +183,8 @@ pub async fn summarize_session(
     history: &[MessageRow],
     focus: Option<&str>,
     cancel: CancellationToken,
+    tuning: crate::llm::LlmTuning,
+    tool_dialogue: Option<&str>,
 ) -> Result<String> {
     if history.is_empty() {
         return Err(anyhow!("compact: refusing to summarize empty history"));
@@ -109,6 +195,13 @@ pub async fn summarize_session(
         "Below is the transcript from one leek session. Produce the structured \
          summary as instructed.\n\n{transcript}"
     );
+    if let Some(td) = tool_dialogue {
+        if !td.trim().is_empty() {
+            user_msg.push_str(&format!(
+                "\n--- TOOL DIALOGUE (chronological, what the agent looked up) ---\n{td}\n"
+            ));
+        }
+    }
     if let Some(f) = focus {
         user_msg.push_str(&format!(
             "\n--- FOCUS ---\nPay special attention to: {f}\nCover other \
@@ -126,10 +219,10 @@ pub async fn summarize_session(
         max_output_tokens: None,
         tools: Vec::new(),
         additional_inputs: Vec::new(),
-        // gpt-5.5 doesn't accept `minimal`; `low` is the lightest level it
-        // supports and is enough for a structured summary without burning
-        // thinking tokens.
-        reasoning_effort: Some(ReasoningEffort::Minimal),
+        // Compaction summary doesn't need depth; per-surface tuning lets
+        // power users override.
+        reasoning_effort: Some(tuning.compaction.reasoning_effort),
+        verbosity: Some(tuning.compaction.verbosity),
     };
 
     let mut stream = provider.chat(req).await.context("compact: chat call")?;

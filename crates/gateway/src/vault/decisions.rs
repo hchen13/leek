@@ -131,6 +131,30 @@ pub async fn confirm_deliverable(
     let stop_loss = payload["stop_loss"].as_f64();
     let target = payload["target"].as_f64();
     let horizon_days = payload["horizon_days"].as_i64();
+
+    // Structural fields landed in 0008. Older drafts (pre-migration) may
+    // not carry them; we tolerate missing fields and write NULL so historical
+    // data still confirms cleanly. The tool itself requires them going forward.
+    let risks_json = payload
+        .get("risks")
+        .map(|v| v.to_string())
+        .filter(|s| s != "null");
+    let opposing_case_md = payload
+        .get("opposing_case")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let invalidation_conditions_md = payload
+        .get("invalidation_conditions")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let corpus_refs_json = payload
+        .get("corpus_refs")
+        .map(|v| v.to_string())
+        .filter(|s| s != "null");
+    let mandate_check_json = payload
+        .get("mandate_check")
+        .map(|v| v.to_string())
+        .filter(|s| s != "null");
     let session_id = if let Some(session_id) = payload.get("session_id").and_then(|v| v.as_str()) {
         session_id.to_string()
     } else if let Some(task_id) = row.task_id.as_deref() {
@@ -174,8 +198,11 @@ pub async fn confirm_deliverable(
         r#"
         INSERT INTO decisions
           (user_id, id, deliverable_id, task_id, session_id, ticker, direction,
-           size_pct, stop_loss, target, horizon_days, rationale_md, status, confirmed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+           size_pct, stop_loss, target, horizon_days, rationale_md,
+           risks_json, opposing_case_md, invalidation_conditions_md,
+           corpus_refs_json, mandate_check_json,
+           status, confirmed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
         "#,
     )
     .bind(user_id)
@@ -190,6 +217,11 @@ pub async fn confirm_deliverable(
     .bind(target)
     .bind(horizon_days)
     .bind(&rationale_md)
+    .bind(&risks_json)
+    .bind(&opposing_case_md)
+    .bind(&invalidation_conditions_md)
+    .bind(&corpus_refs_json)
+    .bind(&mandate_check_json)
     .bind(&now)
     .execute(&mut *tx)
     .await

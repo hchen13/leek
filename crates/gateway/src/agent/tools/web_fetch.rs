@@ -41,7 +41,11 @@ const DEFAULT_MAX_CHARS: usize = 50_000;
 const HARD_CAP_MAX_CHARS: usize = 100_000;
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const CACHE_CAPACITY: usize = 64;
-const USER_AGENT: &str = "leek/0.1 (+https://github.com/hchen13/leek; investment-research agent)";
+// SEC EDGAR's UA parser is finicky: it 403s anything with parens,
+// version markers, or URLs and only accepts a plain "Name email@domain"
+// shape. `sec_filing_fetch.rs` proved this format works against SEC, so
+// we mirror it here verbatim. Other hosts accept any reasonable UA.
+const USER_AGENT: &str = "Leek Research gradschool.hchen13@gmail.com";
 
 /// Below this many chars Tier 1 readability output is considered "too thin"
 /// (likely SPA / JS-heavy / paywall) — trigger Tier 2 Jina Reader fallback.
@@ -205,9 +209,25 @@ impl ToolHandler for WebFetchTool {
             .map(|n| (n as usize).min(HARD_CAP_MAX_CHARS))
             .unwrap_or(DEFAULT_MAX_CHARS);
 
+        // Reject corpus wikilink-style ids early — they are local doc paths,
+        // not URLs. Models sometimes reach for web_fetch after corpus_search
+        // returns hits because they conflate the two tools. The right fix is
+        // a structured validation error pointing them at corpus_read; making
+        // them learn from a 400 from upstream would be both slower and more
+        // ambiguous.
+        if looks_like_corpus_id(&url_str) {
+            bail!(
+                "`{url_str}` looks like a corpus document id, not a URL. \
+                 Call `corpus_read` with `id={url_str}` to read the full body. \
+                 web_fetch is for absolute http(s) URLs only."
+            );
+        }
+
+        // Honor the caller's scheme. Reqwest follows http→https 301/302
+        // redirects automatically, so the previous silent upgrade was both
+        // unnecessary and broke http-only docs sites.
         let parsed = parse_and_validate_url(&url_str)?;
-        let upgraded = upgrade_to_https(parsed);
-        let final_url = upgraded.to_string();
+        let final_url = parsed.to_string();
 
         if let Some(cached) = self.cache_get(&final_url) {
             return Ok(truncate_markdown(&cached, max_chars));
@@ -236,7 +256,7 @@ impl ToolHandler for WebFetchTool {
                 .unwrap_or("(missing Location header)")
                 .to_string();
             // Resolve relative redirects against the requested URL.
-            let resolved = upgraded
+            let resolved = parsed
                 .join(&location)
                 .map(|u| u.to_string())
                 .unwrap_or(location);
@@ -350,6 +370,20 @@ impl ToolHandler for WebFetchTool {
     }
 }
 
+/// True when `s` is recognizably a local LEEK corpus id (wikilink form)
+/// rather than an absolute URL. Used to short-circuit web_fetch with a
+/// pointer at corpus_read instead of a remote 400.
+fn looks_like_corpus_id(s: &str) -> bool {
+    let t = s.trim().trim_start_matches('/');
+    if t.starts_with("http://") || t.starts_with("https://") {
+        return false;
+    }
+    t.starts_with("wikis/")
+        || t.starts_with("sources/")
+        || t.starts_with("corpus/wikis/")
+        || t.starts_with("corpus/sources/")
+}
+
 fn parse_and_validate_url(s: &str) -> Result<Url> {
     let url = Url::parse(s).map_err(|e| anyhow!("invalid URL: {e}"))?;
     match url.scheme() {
@@ -407,15 +441,6 @@ fn check_ipv4(ip: Ipv4Addr) -> Result<()> {
         bail!("CGNAT address {ip} (cloud metadata) blocked");
     }
     Ok(())
-}
-
-fn upgrade_to_https(mut url: Url) -> Url {
-    if url.scheme() == "http" {
-        // url crate's set_scheme returns Err if the scheme is incompatible,
-        // but http→https is allowed.
-        let _ = url.set_scheme("https");
-    }
-    url
 }
 
 fn same_origin_modulo_www(a: &Url, b: &Url) -> bool {
@@ -530,6 +555,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn detects_corpus_ids_for_friendly_validation() {
+        assert!(looks_like_corpus_id(
+            "wikis/principles/concepts/margin-of-safety"
+        ));
+        assert!(looks_like_corpus_id("sources/buffett/letters/2018"));
+        assert!(looks_like_corpus_id("/wikis/foo"));
+        assert!(looks_like_corpus_id(
+            "corpus/wikis/principles/concepts/x"
+        ));
+        assert!(!looks_like_corpus_id("https://example.com/"));
+        assert!(!looks_like_corpus_id("http://example.com/wikis/x"));
+    }
+
+    #[test]
     fn rejects_localhost() {
         assert!(parse_and_validate_url("http://localhost/").is_err());
         assert!(parse_and_validate_url("http://machine.local/").is_err());
@@ -579,10 +618,9 @@ mod tests {
     }
 
     #[test]
-    fn upgrades_http_to_https() {
+    fn keeps_http_scheme() {
         let parsed = parse_and_validate_url("http://example.com/x").unwrap();
-        let up = upgrade_to_https(parsed);
-        assert_eq!(up.scheme(), "https");
+        assert_eq!(parsed.scheme(), "http");
     }
 
     #[test]

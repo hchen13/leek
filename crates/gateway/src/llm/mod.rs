@@ -25,13 +25,20 @@ pub struct ChatRequest {
     /// codex-rs/protocol/src/models.rs ResponseItem).
     pub additional_inputs: Vec<serde_json::Value>,
     /// Reasoning effort for models that support it (gpt-5/gpt-5.5/...).
-    /// `None` means use the model's backend default. Compaction passes
-    /// `Some(Minimal)` so summaries don't burn thinking tokens.
+    /// `None` means use the model's backend default. Each surface sets its
+    /// own default in the agent layer (main = XHigh, routing/compact/subagent
+    /// = Minimal); a per-user override comes from `vault.user_settings`.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Output verbosity hint the codex backend respects via `text.verbosity`.
+    /// `None` falls back to backend default. The agent defaults to `Low`
+    /// across all surfaces so terse output is the norm; users can crank it
+    /// up per surface in Settings.
+    pub verbosity: Option<Verbosity>,
 }
 
-/// Mirrors codex-rs `ReasoningEffort`. We omit XHigh / None — leek only
-/// needs the four levels users would actually pick.
+/// Mirrors codex-rs `ReasoningEffort`. `XHigh` is the highest tier the codex
+/// backend exposes — main agent runs there by default so the synthesizer
+/// gets the largest thinking budget.
 #[derive(Debug, Clone, Copy)]
 pub enum ReasoningEffort {
     Minimal,
@@ -41,6 +48,7 @@ pub enum ReasoningEffort {
     Medium,
     #[allow(dead_code)]
     High,
+    XHigh,
 }
 
 impl ReasoningEffort {
@@ -50,7 +58,96 @@ impl ReasoningEffort {
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
         }
+    }
+
+    pub fn from_str_ci(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" | "x-high" | "extra-high" => Some(Self::XHigh),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Verbosity {
+    Low,
+    #[allow(dead_code)]
+    Medium,
+    #[allow(dead_code)]
+    High,
+}
+
+impl Verbosity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verbosity::Low => "low",
+            Verbosity::Medium => "medium",
+            Verbosity::High => "high",
+        }
+    }
+
+    pub fn from_str_ci(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+}
+
+/// Per-surface reasoning + verbosity knobs. Agent surfaces (main, routing,
+/// compaction, subagent) each carry their own pair so users can tune each
+/// independently from the Settings page. The defaults are the load-bearing
+/// product decision: main agent gets the biggest reasoning budget because
+/// it's the one synthesizing the answer; helpers stay cheap.
+#[derive(Debug, Clone, Copy)]
+pub struct SurfaceTuning {
+    pub reasoning_effort: ReasoningEffort,
+    pub verbosity: Verbosity,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LlmTuning {
+    pub main: SurfaceTuning,
+    pub routing: SurfaceTuning,
+    pub compaction: SurfaceTuning,
+    pub subagent: SurfaceTuning,
+}
+
+impl LlmTuning {
+    pub fn defaults() -> Self {
+        // gpt-5.5 currently rejects `reasoning_effort=minimal` outright, which
+        // would have broken routing / compaction / critic / subagent if any
+        // of them silently inherited a Minimal default. Default the helpers
+        // to Low so the cheap surfaces still cost little but never trip the
+        // backend's input validation. `build_request_body` further coerces
+        // Minimal → Low for any saved-setting that escaped this default.
+        let cheap = SurfaceTuning {
+            reasoning_effort: ReasoningEffort::Low,
+            verbosity: Verbosity::Low,
+        };
+        Self {
+            main: SurfaceTuning {
+                reasoning_effort: ReasoningEffort::XHigh,
+                verbosity: Verbosity::Low,
+            },
+            routing: cheap,
+            compaction: cheap,
+            subagent: cheap,
+        }
+    }
+}
+
+impl Default for LlmTuning {
+    fn default() -> Self {
+        Self::defaults()
     }
 }
 

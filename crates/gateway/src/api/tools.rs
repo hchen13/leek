@@ -52,6 +52,7 @@ pub async fn candlesticks_handler(
         user_id: state.user_id.clone(),
         session_id: "__card__".to_string(),
         task_id: None,
+        tuning: state.tuning_snapshot(),
     };
     let output = state
         .tools
@@ -83,6 +84,7 @@ pub async fn financials_handler(
         user_id: state.user_id.clone(),
         session_id: "__card__".to_string(),
         task_id: None,
+        tuning: state.tuning_snapshot(),
     };
     let output = state
         .tools
@@ -119,6 +121,7 @@ pub async fn quote_handler(
         user_id: state.user_id.clone(),
         session_id: "__card__".to_string(),
         task_id: None,
+        tuning: state.tuning_snapshot(),
     };
     let output = state
         .tools

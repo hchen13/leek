@@ -165,9 +165,7 @@ pub async fn compact_handler(
         .trigger
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| "manual".to_string());
-    start_compaction(&state, &session_id, &trigger, body.focus.as_deref())
-        .await
-        .map_err(AppError)?;
+    start_compaction(&state, &session_id, &trigger, body.focus.as_deref()).await?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -224,6 +222,7 @@ pub async fn start_compaction(
     let trigger_for_task = trigger.to_string();
     let cancel_for_task = cancel.clone();
     let cancel_for_cleanup = cancel.clone();
+    let tuning = state.tuning_snapshot();
 
     tokio::spawn(async move {
         let outcome = run_compaction(
@@ -234,6 +233,7 @@ pub async fn start_compaction(
             focus_owned.as_deref(),
             &trigger_for_task,
             cancel_for_task,
+            tuning,
         )
         .await;
 
@@ -282,6 +282,7 @@ struct CompactionReport {
     messages_retained: i64,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_compaction(
     pool: sqlx::SqlitePool,
     user_id: String,
@@ -290,6 +291,7 @@ async fn run_compaction(
     focus: Option<&str>,
     trigger: &str,
     cancel: CancellationToken,
+    tuning: crate::llm::LlmTuning,
 ) -> anyhow::Result<CompactionReport> {
     // Load only the messages that will go into the transcript: everything
     // after the last compaction_summary (or the full history on first compact).
@@ -310,7 +312,30 @@ async fn run_compaction(
     }
     let messages_removed = history.len() as i64;
 
-    let summary = agent::compact::summarize_session(provider, history, focus, cancel).await?;
+    // Pull tool dialogue in the same range so the summarizer can reference
+    // *what was looked up*, not just the user/agent prose. Without this the
+    // post-compaction model sees "已查 corpus" but no traces of the actual
+    // findings, which is one of the contributors to shallow follow-up turns.
+    let first_seq = history.first().map(|r| r.seq).unwrap_or(0);
+    let session_events =
+        crate::vault::events::list_for_session(&pool, &user_id, &source_session, None, Some(2000))
+            .await
+            .unwrap_or_default();
+    let scoped_events: Vec<_> = session_events
+        .into_iter()
+        .filter(|row| row.seq >= first_seq)
+        .collect();
+    let tool_dialogue = agent::compact::render_tool_dialogue(&scoped_events);
+
+    let summary = agent::compact::summarize_session(
+        provider,
+        history,
+        focus,
+        cancel,
+        tuning,
+        tool_dialogue.as_deref(),
+    )
+    .await?;
 
     // Write the summary into the same session as a compaction_summary message.
     vault_messages::insert(

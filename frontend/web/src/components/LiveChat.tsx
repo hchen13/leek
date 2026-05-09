@@ -80,7 +80,7 @@ interface NarrationStep {
 
 interface ArtifactEvent extends ArtifactEventView {
   id: string;
-  kind: "narration" | "narration_group" | "search" | "tool" | "decision";
+  kind: "narration" | "narration_group" | "search" | "tool" | "decision" | "subagent";
   narration?: NarrationStep;
   narrations?: NarrationStep[];
   search?: SearchCall;
@@ -107,6 +107,11 @@ interface ClarificationPayload {
 
 interface DecisionDraftPayload extends DecisionDraftView {}
 
+interface BudgetFinalizationInfo {
+  reason: string;
+  plan_summary?: string;
+}
+
 interface LiveMsg {
   /** `compaction_summary` rows are written by /compact and rendered as a
    *  collapsible system card inside the same session. */
@@ -121,7 +126,15 @@ interface LiveMsg {
   clarification?: ClarificationPayload;
   /** Final elapsed seconds for the agent reply, frozen at message_end. */
   total_sec?: number;
+  /** Captured from agent_message_end's `stop_reason`. Used by the row's
+   *  status chip to distinguish "done" from "aborted" / other terminations
+   *  so the user isn't told a manually-cancelled run completed normally. */
+  stop_reason?: string;
   decision_draft?: DecisionDraftPayload;
+  /** Set when the agent hit a budget cap and entered the recovery
+   *  finalization turn. UI shows a checkpoint banner so the user knows the
+   *  answer is partial-by-design. */
+  budget_finalization?: BudgetFinalizationInfo;
   msg_seq?: number;
   raw_ts?: string;
   hidden?: boolean;
@@ -223,22 +236,78 @@ function CompactingDivider() {
   );
 }
 
-function DecisionDraftCard(props: { time: string; draft: DecisionDraftPayload }) {
-  const [status, setStatus] = createSignal<"pending" | "confirmed" | "rejected">("pending");
-  const [busy, setBusy] = createSignal(false);
-
-  async function act(action: "confirm" | "reject") {
-    setBusy(true);
-    try {
-      const r = await fetch(`/api/v1/deliverables/${props.draft.deliverable_id}/${action}`, { method: "POST" });
-      if (r.ok) setStatus(action === "confirm" ? "confirmed" : "rejected");
-    } finally {
-      setBusy(false);
+function BudgetFinalizationBanner(props: { info: BudgetFinalizationInfo }) {
+  const [open, setOpen] = createSignal(false);
+  const label = () => {
+    switch (props.info.reason) {
+      case "max_tool_turns":
+        return "工具调用预算用完 · 进入 checkpoint 答复";
+      case "plan_guard_exhausted":
+        return "计划闸口预算用完 · 进入 checkpoint 答复";
+      default:
+        return `预算限额触发 · ${props.info.reason}`;
     }
-  }
+  };
+  return (
+    <div
+      class="lk-budget-finalization"
+      style={{
+        margin: "0 0 8px",
+        padding: "8px 10px",
+        border: "1px dashed rgba(217,160,87,0.55)",
+        background: "rgba(217,160,87,0.08)",
+        "border-radius": "6px",
+        "font-family": "var(--font-mono)",
+        "font-size": "11px",
+        color: "rgba(217,180,120,0.95)",
+        "line-height": "1.5",
+      }}
+    >
+      <div
+        onClick={() => setOpen((v) => !v)}
+        style={{ cursor: props.info.plan_summary ? "pointer" : "default", display: "flex", "align-items": "center", gap: "8px" }}
+      >
+        <span style={{ "font-weight": 700, "letter-spacing": "0.04em" }}>BUDGET CHECKPOINT</span>
+        <span style={{ flex: 1, color: "var(--ink-2)" }}>{label()}</span>
+        <Show when={props.info.plan_summary}>
+          <span style={{ "font-size": "10px", color: "var(--ink-3)" }}>
+            {open() ? "收起 ▴" : "展开 ▾"}
+          </span>
+        </Show>
+      </div>
+      <Show when={open() && props.info.plan_summary}>
+        <pre
+          style={{
+            margin: "8px 0 0",
+            padding: "8px 10px",
+            background: "rgba(0,0,0,0.18)",
+            "border-radius": "4px",
+            "font-size": "10.5px",
+            color: "var(--ink-2)",
+            "white-space": "pre-wrap",
+            "word-break": "break-word",
+          }}
+        >{props.info.plan_summary}</pre>
+      </Show>
+    </div>
+  );
+}
 
+function DecisionDraftCard(props: { time: string; draft: DecisionDraftPayload }) {
+  // The card used to expose "确认执行 / 拒绝" buttons that POSTed to
+  // /api/v1/deliverables/.../confirm. Per product feedback (2026-05-09):
+  //   - leek does not directly trade, so any "execute" wording is wrong.
+  //   - the downstream effect (mock portfolio? confirm-into-vault?) hasn't
+  //     been designed yet — do not let users click into a half-baked path.
+  // For now, render the draft as a structured archive entry only. The
+  // record_investment_action call already wrote the deliverable to the
+  // vault, so "存档" is accurate even with no UI action.
   const dirColor = () => props.draft.direction === "long" ? "rgba(100,200,120,0.15)" : "rgba(217,112,112,0.12)";
   const dirBorder = () => props.draft.direction === "long" ? "rgba(100,200,120,0.4)" : "rgba(217,112,112,0.4)";
+  const dirLabel = () =>
+    props.draft.direction === "long" ? "▲ 加仓 / 持有偏多"
+    : props.draft.direction === "short" ? "▼ 减仓 / 持有偏空"
+    : "◆ 平仓";
 
   return (
     <div style={{
@@ -247,11 +316,10 @@ function DecisionDraftCard(props: { time: string; draft: DecisionDraftPayload })
       padding: "12px 14px",
       margin: "6px 0",
       background: dirColor(),
-      "font-family": "var(--font-mono)",
     }}>
-      <div style={{ display: "flex", "align-items": "center", gap: "10px", "margin-bottom": "8px" }}>
-        <span style={{ "font-size": "12px", "font-weight": 700, color: "var(--ink-0)", "text-transform": "uppercase", "letter-spacing": "0.06em" }}>
-          {props.draft.direction === "long" ? "▲ 买入" : props.draft.direction === "short" ? "▼ 卖出" : "◆ 平仓"} · {props.draft.ticker}
+      <div style={{ display: "flex", "align-items": "center", gap: "10px", "margin-bottom": "8px", "font-family": "var(--font-mono)" }}>
+        <span style={{ "font-size": "12px", "font-weight": 700, color: "var(--ink-0)", "letter-spacing": "0.06em" }}>
+          {dirLabel()} · {props.draft.ticker}
         </span>
         <Show when={props.draft.size_pct != null}>
           <span style={{ "font-size": "11px", color: "var(--ink-2)" }}>{props.draft.size_pct}%</span>
@@ -259,67 +327,46 @@ function DecisionDraftCard(props: { time: string; draft: DecisionDraftPayload })
         <div style={{ flex: 1 }} />
         <span style={{ "font-size": "10px", color: "var(--ink-3)" }}>{props.time}</span>
       </div>
-      <div style={{ "font-size": "12px", color: "var(--ink-1)", "line-height": "1.5", "margin-bottom": "10px" }}>
-        {props.draft.rationale}
-      </div>
-      <div style={{ display: "flex", gap: "6px", "font-size": "11px", color: "var(--ink-3)", "margin-bottom": "10px" }}>
+      <Show when={props.draft.rationale}>
+        <div style={{ "font-size": "13px", color: "var(--ink-0)", "line-height": "1.55", "margin-bottom": "10px" }}>
+          <SafeMarkdown source={props.draft.rationale} />
+        </div>
+      </Show>
+      <Show when={(props.draft.risks?.length ?? 0) > 0}>
+        <div style={{ "font-size": "12.5px", color: "var(--ink-1)", "line-height": "1.5", "margin-bottom": "10px" }}>
+          <div style={{ "font-family": "var(--font-mono)", "font-size": "10.5px", color: "var(--ink-3)", "letter-spacing": "0.06em", "text-transform": "uppercase", "margin-bottom": "4px" }}>风险</div>
+          <ul style={{ margin: 0, "padding-left": "18px" }}>
+            <For each={props.draft.risks}>{(r) => <li><SafeMarkdown source={r} /></li>}</For>
+          </ul>
+        </div>
+      </Show>
+      <Show when={props.draft.invalidation_conditions}>
+        <div style={{ "font-size": "12.5px", color: "var(--ink-1)", "line-height": "1.5", "margin-bottom": "10px" }}>
+          <div style={{ "font-family": "var(--font-mono)", "font-size": "10.5px", color: "var(--ink-3)", "letter-spacing": "0.06em", "text-transform": "uppercase", "margin-bottom": "4px" }}>失效条件</div>
+          <SafeMarkdown source={props.draft.invalidation_conditions!} />
+        </div>
+      </Show>
+      <div style={{ display: "flex", gap: "10px", "flex-wrap": "wrap", "font-size": "11px", color: "var(--ink-3)", "margin-bottom": "8px", "font-family": "var(--font-mono)" }}>
         <Show when={props.draft.stop_loss != null}>
           <span>止损 {props.draft.stop_loss}</span>
         </Show>
         <Show when={props.draft.target != null}>
-          <span>· 目标 {props.draft.target}</span>
+          <span>目标 {props.draft.target}</span>
         </Show>
         <Show when={props.draft.horizon_days != null}>
-          <span>· 周期 {props.draft.horizon_days}d</span>
+          <span>周期 {props.draft.horizon_days}d</span>
         </Show>
       </div>
-      <Show
-        when={status() === "pending"}
-        fallback={
-          <div style={{
-            "font-size": "11px",
-            color: status() === "confirmed" ? "rgba(100,200,120,0.9)" : "rgba(217,112,112,0.9)",
-            "font-weight": 600,
-            "text-transform": "uppercase",
-            "letter-spacing": "0.06em",
-          }}>
-            {status() === "confirmed" ? "✓ 已确认" : "✗ 已拒绝"}
-          </div>
-        }
-      >
-        <div style={{ display: "flex", gap: "8px" }}>
-          <button
-            onClick={() => void act("confirm")}
-            disabled={busy()}
-            style={{
-              background: "rgba(100,200,120,0.25)",
-              border: "1px solid rgba(100,200,120,0.5)",
-              color: "rgba(100,220,120,1)",
-              "font-family": "var(--font-mono)",
-              "font-size": "11px",
-              "font-weight": 600,
-              padding: "4px 14px",
-              "border-radius": "5px",
-              cursor: busy() ? "wait" : "pointer",
-              "letter-spacing": "0.04em",
-            }}
-          >确认执行</button>
-          <button
-            onClick={() => void act("reject")}
-            disabled={busy()}
-            style={{
-              background: "transparent",
-              border: "1px solid var(--line-2)",
-              color: "var(--ink-2)",
-              "font-family": "var(--font-mono)",
-              "font-size": "11px",
-              padding: "4px 14px",
-              "border-radius": "5px",
-              cursor: busy() ? "wait" : "pointer",
-            }}
-          >拒绝</button>
-        </div>
-      </Show>
+      <div style={{
+        "font-size": "10.5px",
+        color: "var(--ink-3)",
+        "font-family": "var(--font-mono)",
+        "letter-spacing": "0.04em",
+        "padding-top": "6px",
+        "border-top": "1px dashed rgba(255, 255, 255, 0.06)",
+      }}>
+        ✓ 已存档为决策草稿 · 模拟持仓 / 执行联动暂未启用
+      </div>
     </div>
   );
 }
@@ -431,6 +478,40 @@ function upsertSearchEvent(events: ArtifactEvent[] | undefined, search: SearchCa
   return out;
 }
 
+function upsertSubagentEvent(
+  events: ArtifactEvent[] | undefined,
+  payload: Record<string, unknown>,
+): ArtifactEvent[] {
+  const runId = typeof payload.run_id === "string" ? payload.run_id : "";
+  if (!runId) return [...(events ?? [])];
+  const out = [...(events ?? [])];
+  const idx = out.findIndex((event) => event.kind === "subagent" && event.id === `subagent:${runId}`);
+  const extra = (payload.extra && typeof payload.extra === "object")
+    ? (payload.extra as Record<string, unknown>)
+    : {};
+  const view = {
+    run_id: runId,
+    role: typeof payload.role === "string" ? payload.role : "subagent",
+    status: typeof payload.status === "string" ? payload.status : "in_progress",
+    question: typeof payload.question === "string" ? payload.question : "",
+    output_preview: typeof extra.output_preview === "string" ? extra.output_preview : undefined,
+    tokens_used: typeof extra.tokens_used === "number" ? extra.tokens_used : undefined,
+    duration_ms: typeof extra.duration_ms === "number" ? extra.duration_ms : undefined,
+    error: typeof extra.error === "string" ? extra.error : undefined,
+  };
+  if (idx >= 0) {
+    const prev = out[idx].subagent;
+    out[idx] = {
+      id: `subagent:${runId}`,
+      kind: "subagent",
+      subagent: { ...prev, ...view },
+    };
+  } else {
+    out.push({ id: `subagent:${runId}`, kind: "subagent", subagent: view });
+  }
+  return out;
+}
+
 function appendNarrationEvent(
   events: ArtifactEvent[] | undefined,
   narration: NarrationStep,
@@ -470,9 +551,10 @@ function isSearchActionNarration(text: string): boolean {
 }
 
 function isFatalStopReason(stopReason: string | undefined): boolean {
-  return stopReason === "max_tool_turns" ||
-    stopReason === "plan_guard_exhausted" ||
-    stopReason === "user_aborted";
+  // After 0012: max_tool_turns / plan_guard_exhausted are recovery
+  // boundaries that produce a budget_finalization checkpoint answer, not
+  // fatal failures. They surface as `budget_finalization:<reason>` here.
+  return stopReason === "user_aborted";
 }
 
 function mergeArtifactEvents(to: ArtifactEvent[] | undefined, from: ArtifactEvent[] | undefined): ArtifactEvent[] {
@@ -536,6 +618,10 @@ function parsePlanPayload(p: any): AgentPlanView | null {
       seq: typeof item.seq === "number" ? item.seq : undefined,
       step: String(item.step ?? "").trim(),
       status: String(item.status ?? "pending"),
+      resolution:
+        typeof item.resolution === "string" && item.resolution.trim()
+          ? item.resolution.trim()
+          : null,
       evidence: typeof item.evidence === "string" && item.evidence.trim() ? item.evidence.trim() : null,
     }))
     .filter((item: any) => item.step);
@@ -559,10 +645,51 @@ function ClarificationRequestCard(props: {
         question: props.payload.question,
         options: [],
       }];
+  const optionsQuestions = () => questions().filter((q) => q.options.length > 0);
+  // When the agent asks two-or-more options-bearing questions in a single
+  // clarification (e.g. R7.S4: "allow risks?" + "matches mandate?"), each
+  // standalone click used to fire its own send() — the second one raced
+  // the first and the backend silently dropped it, leaving the chat panel
+  // with a phantom user/agent bubble pair. With multiple questions we now
+  // collect all selections locally and submit them in one user_message.
+  const isBatch = () => optionsQuestions().length > 1;
+
+  const [selected, setSelected] = createSignal<Record<string, number>>({});
+  const [submitted, setSubmitted] = createSignal(false);
 
   function answerText(question: ClarificationQuestion, option: ClarificationOption) {
     return `关于“${question.question}”，我的选择是：${option.label}。${option.description}`;
   }
+
+  function handleOptionClick(q: ClarificationQuestion, optIdx: number) {
+    if (submitted()) return;
+    const o = q.options[optIdx];
+    if (!o) return;
+    if (isBatch()) {
+      setSelected((prev) => ({ ...prev, [q.id]: optIdx }));
+    } else {
+      setSubmitted(true);
+      props.onPick(answerText(q, o));
+    }
+  }
+
+  function handleSubmit() {
+    if (submitted()) return;
+    const sel = selected();
+    const parts: string[] = [];
+    for (const q of optionsQuestions()) {
+      const i = sel[q.id];
+      if (i == null) return;
+      parts.push(answerText(q, q.options[i]));
+    }
+    if (parts.length === 0) return;
+    setSubmitted(true);
+    props.onPick(parts.join("\n\n"));
+  }
+
+  const allAnswered = () =>
+    optionsQuestions().every((q) => selected()[q.id] != null);
+  const answeredCount = () => Object.keys(selected()).length;
 
   return (
     <div class="lk-clarify live">
@@ -576,20 +703,38 @@ function ClarificationRequestCard(props: {
             fallback={<div class="lk-clarify-free">直接在输入框回复也可以。</div>}
           >
             <div class="lk-clarify-opts column">
-              <For each={q.options}>{(o) => (
-                <button
-                  type="button"
-                  class="lk-clarify-option"
-                  onClick={() => props.onPick(answerText(q, o))}
-                >
-                  <span>{o.label}</span>
-                  <em>{o.description}</em>
-                </button>
-              )}</For>
+              <For each={q.options}>{(o, i) => {
+                const isPicked = () => isBatch() && selected()[q.id] === i();
+                return (
+                  <button
+                    type="button"
+                    class={`lk-clarify-option${isPicked() ? " is-selected" : ""}`}
+                    disabled={submitted()}
+                    onClick={() => handleOptionClick(q, i())}
+                  >
+                    <span>{o.label}</span>
+                    <em>{o.description}</em>
+                  </button>
+                );
+              }}</For>
             </div>
           </Show>
         </div>
       )}</For>
+      <Show when={isBatch()}>
+        <div class="lk-clarify-submit-row">
+          <button
+            type="button"
+            class="lk-clarify-submit"
+            disabled={!allAnswered() || submitted()}
+            onClick={handleSubmit}
+          >
+            {submitted()
+              ? "已提交"
+              : `提交答复 (${answeredCount()}/${optionsQuestions().length})`}
+          </button>
+        </div>
+      </Show>
     </div>
   );
 }
@@ -616,7 +761,7 @@ interface LiveTick {
   ts: string;
 }
 
-export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => void } = {}) {
+export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "settings") => void } = {}) {
   const [sessionId, setSessionId] = createSignal<string>(readSessionFromLocation());
   const [sessions, setSessions] = createSignal<SessionRow[]>([]);
   const [messages, setMessages] = createSignal<LiveMsg[]>([]);
@@ -677,7 +822,6 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
   });
 
   let evtSrc: EventSource | undefined;
-  let agentBuffer = "";
   let chatScrollEl: HTMLDivElement | undefined;
   let agentStartTs = 0;
   let elapsedTimer: number | undefined;
@@ -735,6 +879,14 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     const seq = parseInt(e.lastEventId, 10);
     if (!Number.isFinite(seq)) return;
     setLiveTick({ seq, kind, payload, ts: new Date().toISOString() });
+    // If a transient "provider error … 后重试" banner is up and any non-
+    // retry event lands, the stream is producing again — clear the banner
+    // so the user knows recovery succeeded. Retry banners that are still
+    // accurate (back-to-back retries) get re-set by the next provider_retry
+    // handler.
+    if (kind !== "provider_retry" && kind !== "stream_lag") {
+      setError((prev) => (prev && prev.startsWith("provider error") ? null : prev));
+    }
   }
 
   // Auto-scroll to bottom whenever messages change (length OR last text changes
@@ -750,26 +902,23 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     }
   });
 
-  function appendDelta(text: string) {
-    agentBuffer += text;
-    setMessages((prev) => {
-      const out = [...prev];
-      const last = out[out.length - 1];
-      if (last && last.role === "agent" && last.streaming) {
-        out[out.length - 1] = { ...last, text: agentBuffer };
-      }
-      return out;
-    });
-  }
-
   async function connect(id: string) {
     // 1. Load message + event history. Messages give us the chat backbone
     //    (text, role, ts); events give us the tool_call / web_search /
     //    narration trail we want to keep visible across reloads.
     setMessages([]);
     setUsage(null);
+    setError(null);
     setPending(false);
+    setConnected(false);
+    setLiveTick(null);
     setAgentPlan(null);
+    agentStartTs = 0;
+    if (elapsedTimer) {
+      clearInterval(elapsedTimer);
+      elapsedTimer = undefined;
+    }
+    setElapsedSec(0);
 
     let hist: LiveMsg[] = [];
     try {
@@ -837,6 +986,10 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
                 text: "",
                 ts: fmtTime(row.ts ?? row.created_at),
                 raw_ts: row.ts ?? row.created_at,
+                streaming: true,  // cleared by agent_message_end below; if no
+                                  // end event exists yet, the agent is still
+                                  // running and live SSE delta handlers need
+                                  // this flag to write into the bubble.
                 searches: [],
                 tool_calls: [],
                 narrations: [],
@@ -844,10 +997,38 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
               });
               agentIdxs.push(hist.length - 1);
               break;
+            case "agent_message_delta":
+              // Final answer for the turn (single payload, see backend
+              // `agent/mod.rs` — only emitted once per turn, after final_text
+              // is set). Replay it so reloads of completed sessions show
+              // the full body, not just the summary chip.
+              if (cursor >= 0 && cursor < agentIdxs.length) {
+                const idx = agentIdxs[cursor];
+                if (typeof p.text === "string") hist[idx].text = p.text;
+              }
+              break;
             case "agent_message_end":
               if (cursor >= 0 && cursor < agentIdxs.length) {
                 const currentIdx = agentIdxs[cursor];
-                if (typeof lastSec === "number") hist[currentIdx].total_sec = lastSec;
+                hist[currentIdx].streaming = false;
+                // Compute elapsed seconds from start→end timestamps so the
+                // status chip ("✓ done · Ns" / "⏹ aborted · Ns") renders
+                // after page reload (the live elapsed timer doesn't run
+                // during history replay). Falls back to whatever earlier
+                // logic set on this row.
+                const startTs = hist[currentIdx].raw_ts;
+                const endTs = row.ts ?? row.created_at;
+                if (startTs && endTs) {
+                  const ms = new Date(endTs).getTime() - new Date(startTs).getTime();
+                  if (Number.isFinite(ms) && ms >= 0) {
+                    hist[currentIdx].total_sec = Math.round(ms / 1000);
+                  }
+                } else if (typeof lastSec === "number") {
+                  hist[currentIdx].total_sec = lastSec;
+                }
+                if (typeof p.stop_reason === "string") {
+                  hist[currentIdx].stop_reason = p.stop_reason;
+                }
                 if (typeof p.message_seq === "number") {
                   const targetIdx = hist.findIndex((m) => m.role === "agent" && m.msg_seq === p.message_seq);
                   if (targetIdx >= 0 && targetIdx !== currentIdx) mergeAgentActivity(currentIdx, targetIdx);
@@ -916,6 +1097,20 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
                 msg.artifacts = appendNarrationEvent(msg.artifacts, step, `narration:${row.seq ?? row.id ?? ns.length}:${ns.length}`);
               }
               break;
+            case "agent_thinking_card":
+              // Treated identically to narration on the canvas — the only
+              // semantic difference is provenance (model-streamed mid-turn
+              // text vs. agent-loop-emitted explanation). Both render as
+              // narration cards in the artifacts strip.
+              if (cursor >= 0 && cursor < agentIdxs.length) {
+                const msg = hist[agentIdxs[cursor]];
+                const step = { turn: typeof p.turn === "number" ? p.turn : 0, text: String(p.text ?? "") };
+                const ns = appendNarrationStep(msg.narrations, step);
+                if (ns.length === (msg.narrations?.length ?? 0)) break;
+                msg.narrations = ns;
+                msg.artifacts = appendNarrationEvent(msg.artifacts, step, `thinking:${row.seq ?? row.id ?? ns.length}:${ns.length}`);
+              }
+              break;
             case "clarification_requested": {
               const clarification = parseClarificationPayload(p);
               if (!clarification) break;
@@ -942,15 +1137,82 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
                 outTokens: typeof p.output_tokens === "number" ? p.output_tokens : 0,
               };
               break;
-            case "decision_draft_ready":
-              hist.push({
-                role: "decision_draft",
-                text: "",
-                ts: fmtTime(row.ts ?? row.created_at),
-                raw_ts: row.ts ?? row.created_at,
-                decision_draft: p as DecisionDraftPayload,
-              });
+            case "decision_draft_ready": {
+              // Dedup within the session: a critic-driven rewrite causes
+              // record_investment_action to fire multiple times in one
+              // task. Match on task_id when present (post-2026-05-09
+              // backends), otherwise fall back to ticker+direction —
+              // good enough because a session rarely has two distinct
+              // open drafts on the same ticker+direction.
+              const draft = p as DecisionDraftPayload;
+              const matches = (m: LiveMsg) => {
+                if (m.role !== "decision_draft") return false;
+                const d = m.decision_draft;
+                if (!d) return false;
+                if (draft.task_id && d.task_id === draft.task_id) return true;
+                if (!draft.task_id && d.ticker === draft.ticker && d.direction === draft.direction) return true;
+                return false;
+              };
+              const existingIdx = hist.findIndex(matches);
+              const nextRaw = row.ts ?? row.created_at;
+              if (existingIdx >= 0) {
+                hist[existingIdx] = {
+                  ...hist[existingIdx],
+                  decision_draft: draft,
+                  ts: fmtTime(nextRaw),
+                  raw_ts: nextRaw,
+                };
+              } else {
+                hist.push({
+                  role: "decision_draft",
+                  text: "",
+                  ts: fmtTime(nextRaw),
+                  raw_ts: nextRaw,
+                  decision_draft: draft,
+                });
+              }
               break;
+            }
+            case "subagent_run": {
+              // Attach to the in-progress / most recent agent message in this
+              // session — same heuristic as clarification_requested.
+              let idx = cursor >= 0 && cursor < agentIdxs.length ? agentIdxs[cursor] : -1;
+              if (idx < 0) {
+                for (let i = hist.length - 1; i >= 0; i--) {
+                  if (hist[i].role === "agent") {
+                    idx = i;
+                    break;
+                  }
+                }
+              }
+              if (idx >= 0) {
+                const msg = hist[idx];
+                msg.artifacts = upsertSubagentEvent(msg.artifacts, p);
+              }
+              break;
+            }
+            case "budget_finalization": {
+              // Attach to the agent message currently streaming (or last one).
+              let idx = cursor >= 0 && cursor < agentIdxs.length ? agentIdxs[cursor] : -1;
+              if (idx < 0) {
+                for (let i = hist.length - 1; i >= 0; i--) {
+                  if (hist[i].role === "agent") {
+                    idx = i;
+                    break;
+                  }
+                }
+              }
+              if (idx >= 0) {
+                hist[idx].budget_finalization = {
+                  reason: typeof p.reason === "string" ? p.reason : "budget exhausted",
+                  plan_summary:
+                    typeof p.plan_summary === "string" && p.plan_summary.trim()
+                      ? p.plan_summary
+                      : undefined,
+                };
+              }
+              break;
+            }
           }
         }
         if (usageSnap) setUsage(usageSnap);
@@ -988,14 +1250,63 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
       setError("stream reconnecting…");
     };
 
-    // Server echoes user_message — we already added it optimistically on send,
-    // so we dedupe in the chat view but still forward to EventsPanel.
+    // Backend emits `stream_lag` when this client fell behind the broadcast
+    // channel capacity. Treat it as a soft warning + nudge the user that
+    // some events may be missing from the canvas (vault.events still has
+    // them — page reload guarantees full state).
+    evtSrc.addEventListener("stream_lag", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data) as { missed?: number; last_seq?: number };
+        const missed = typeof data.missed === "number" ? data.missed : 0;
+        setError(`stream lag — ${missed} events skipped, refresh to backfill`);
+        emitTick(e, "stream_lag", data);
+      } catch {
+        // skip malformed
+      }
+    });
+
+    // The backend echoes every user_message it persisted. There are two ways
+    // a user_message can land:
+    //   (a) this client's `send()` optimistically inserted a user bubble
+    //       before the POST returned — we just need to tag it with the seq;
+    //   (b) the message came from somewhere else (curl, recovery replay,
+    //       another client) — there is no optimistic bubble, so we must
+    //       insert one or the chat panel will look like the agent is
+    //       answering nothing.
     evtSrc.addEventListener("user_message", (e: MessageEvent) => {
-      try { emitTick(e, "user_message", JSON.parse(e.data)); } catch { /* skip */ }
+      try {
+        const data = JSON.parse(e.data) as { text?: string; seq?: number };
+        emitTick(e, "user_message", data);
+        const text = String(data.text ?? "");
+        const seq = typeof data.seq === "number" ? data.seq : undefined;
+        setMessages((prev) => {
+          // `send()` optimistically inserts BOTH a user bubble and a
+          // streaming agent placeholder, so the chat array can already
+          // contain a trailing agent row when this echo lands. Walk back
+          // through the whole array to find the optimistic user bubble
+          // (a `user` row whose text matches AND has no `msg_seq` yet —
+          // that's the unmistakable signature of an un-acked optimistic
+          // insert; anything older is from a prior turn and was already
+          // tagged).
+          for (let i = prev.length - 1; i >= 0; i--) {
+            const m = prev[i];
+            if (m.role === "user" && m.text === text && m.msg_seq === undefined) {
+              const out = [...prev];
+              out[i] = { ...m, msg_seq: seq };
+              return out;
+            }
+          }
+          // No optimistic match — message originated elsewhere (API,
+          // recovery replay, parallel client). Append so the chat panel
+          // mirrors what the backend persisted.
+          return [...prev, { role: "user", text, ts: fmtTime(), msg_seq: seq }];
+        });
+      } catch {
+        // skip malformed
+      }
     });
 
     evtSrc.addEventListener("agent_message_start", (e: MessageEvent) => {
-      agentBuffer = "";
       setPending(true);
       // send() already inserted a streaming placeholder when the user hit
       // Enter (so "thinking · Ns" appears instantly). If we got here on a
@@ -1097,26 +1408,59 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
       }
     });
 
+    // The chat-panel main bubble only receives a single `agent_message_delta`
+    // at the end of the turn now (the backend buffers intermediate message
+    // text and ships only `final_text` here). We therefore *replace* the
+    // bubble's text rather than append, and we no longer track an
+    // accumulator buffer for delta chunks.
     evtSrc.addEventListener("agent_message_delta", (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data);
-        if (typeof data.text === "string") appendDelta(data.text);
+        if (typeof data.text === "string") {
+          setMessages((prev) => {
+            const out = [...prev];
+            const last = out[out.length - 1];
+            if (!last || last.role !== "agent" || !last.streaming) return prev;
+            out[out.length - 1] = { ...last, text: data.text };
+            return out;
+          });
+        }
         emitTick(e, "agent_message_delta", data);
       } catch {
         // skip malformed
       }
     });
 
-    evtSrc.addEventListener("agent_message_reset", (e: MessageEvent) => {
-      agentBuffer = "";
-      setMessages((prev) => {
-        const out = [...prev];
-        const last = out[out.length - 1];
-        if (!last || last.role !== "agent" || !last.streaming) return prev;
-        out[out.length - 1] = { ...last, text: "" };
-        return out;
-      });
-      try { emitTick(e, "agent_message_reset", JSON.parse(e.data)); } catch { /* skip */ }
+    // Intermediate message text the model produces between tool calls
+    // arrives here as a thinking-card event. We render it the same way as
+    // narrations: append to the narrations strip *and* drop a card on the
+    // canvas. Unlike the old `agent_message_reset`, no chat-panel state is
+    // wiped — the chat panel stays empty until the final answer arrives.
+    evtSrc.addEventListener("agent_thinking_card", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        emitTick(e, "agent_thinking_card", data);
+        const step: NarrationStep = {
+          turn: typeof data.turn === "number" ? data.turn : 0,
+          text: String(data.text ?? ""),
+        };
+        setMessages((prev) => {
+          const out = [...prev];
+          const last = out[out.length - 1];
+          if (!last || last.role !== "agent" || !last.streaming) return prev;
+          const narrations = appendNarrationStep(last.narrations, step);
+          if (narrations.length === (last.narrations?.length ?? 0)) return prev;
+          const eventId = `thinking:${e.lastEventId || Date.now()}:${narrations.length}`;
+          out[out.length - 1] = {
+            ...last,
+            narrations,
+            artifacts: appendNarrationEvent(last.artifacts, step, eventId),
+          };
+          return out;
+        });
+      } catch {
+        // skip malformed
+      }
     });
 
     evtSrc.addEventListener("agent_narration", (e: MessageEvent) => {
@@ -1152,6 +1496,33 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
         emitTick(e, "plan_updated", data);
         const nextPlan = parsePlanPayload(data);
         if (nextPlan) setAgentPlan(nextPlan);
+      } catch {
+        // skip malformed
+      }
+    });
+
+    evtSrc.addEventListener("budget_finalization", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data) as {
+          reason?: string;
+          plan_summary?: string;
+        };
+        emitTick(e, "budget_finalization", data);
+        const info: BudgetFinalizationInfo = {
+          reason: typeof data.reason === "string" ? data.reason : "budget exhausted",
+          plan_summary:
+            typeof data.plan_summary === "string" && data.plan_summary.trim()
+              ? data.plan_summary
+              : undefined,
+        };
+        setMessages((prev) => {
+          const out = [...prev];
+          const last = out[out.length - 1];
+          if (!last || last.role !== "agent") return prev;
+          out[out.length - 1] = { ...last, budget_finalization: info };
+          return out;
+        });
+        setError(null);
       } catch {
         // skip malformed
       }
@@ -1200,7 +1571,14 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
         if (last && last.role === "agent") {
           // Freeze final elapsed time on the message itself so it stays
           // visible after streaming ends (the live signal resets to 0).
-          out[out.length - 1] = { ...last, streaming: false, total_sec: finalSec };
+          // Also stamp the stop_reason so the status chip can show
+          // "aborted" instead of "done" when the user cancelled.
+          out[out.length - 1] = {
+            ...last,
+            streaming: false,
+            total_sec: finalSec,
+            stop_reason: typeof data.stop_reason === "string" ? data.stop_reason : undefined,
+          };
         }
         return out;
       });
@@ -1211,12 +1589,64 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     evtSrc.addEventListener("decision_draft_ready", (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data) as DecisionDraftPayload;
-        setMessages((prev) => [
-          ...prev,
-          { role: "decision_draft", text: "", ts: fmtTime(), decision_draft: data },
-        ]);
+        // Dedup: critic-driven rewrites fire record_investment_action
+        // again. Use task_id when the backend supplies it (post-2026-05-09),
+        // and fall back to ticker+direction so older sessions also collapse
+        // duplicate ACTION cards on reload.
+        setMessages((prev) => {
+          const matches = (m: LiveMsg) => {
+            if (m.role !== "decision_draft") return false;
+            const d = m.decision_draft;
+            if (!d) return false;
+            if (data.task_id && d.task_id === data.task_id) return true;
+            if (!data.task_id && d.ticker === data.ticker && d.direction === data.direction) return true;
+            return false;
+          };
+          for (let i = prev.length - 1; i >= 0; i--) {
+            if (matches(prev[i])) {
+              const out = [...prev];
+              out[i] = { ...prev[i], decision_draft: data, ts: fmtTime() };
+              return out;
+            }
+          }
+          return [
+            ...prev,
+            { role: "decision_draft", text: "", ts: fmtTime(), decision_draft: data },
+          ];
+        });
         try { emitTick(e, "decision_draft_ready", data); } catch { /* skip */ }
       } catch { /* skip */ }
+    });
+
+    evtSrc.addEventListener("subagent_run", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data) as Record<string, unknown>;
+        setMessages((prev) => {
+          const out = [...prev];
+          // Attach to the in-progress agent bubble; if none, the last agent message.
+          let idx = -1;
+          for (let i = out.length - 1; i >= 0; i--) {
+            if (out[i].role === "agent" && out[i].streaming) {
+              idx = i;
+              break;
+            }
+          }
+          if (idx < 0) {
+            for (let i = out.length - 1; i >= 0; i--) {
+              if (out[i].role === "agent") {
+                idx = i;
+                break;
+              }
+            }
+          }
+          if (idx < 0) return prev;
+          out[idx] = { ...out[idx], artifacts: upsertSubagentEvent(out[idx].artifacts, data) };
+          return out;
+        });
+        emitTick(e, "subagent_run", data);
+      } catch {
+        // skip malformed
+      }
     });
 
     evtSrc.addEventListener("clarification_requested", (e: MessageEvent) => {
@@ -1722,14 +2152,21 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
                     <div style={{
                       "font-family": "var(--font-mono)",
                       "font-size": "10.5px",
-                      color: "var(--ink-3)",
+                      color: m.stop_reason === "user_aborted" ? "var(--down)" : "var(--ink-3)",
                       "margin-bottom": "6px",
                       opacity: m.streaming ? 1 : 0.55,
                     }}>
                       {m.streaming
                         ? `▸ thinking · ${elapsedSec()}s`
-                        : `✓ done · ${m.total_sec}s`}
+                        : m.stop_reason === "user_aborted"
+                          ? `⏹ aborted · ${m.total_sec}s`
+                          : `✓ done · ${m.total_sec}s`}
                     </div>
+                  </Show>
+                  <Show when={m.budget_finalization}>
+                    {(info) => (
+                      <BudgetFinalizationBanner info={info()} />
+                    )}
                   </Show>
                   <Show when={(m.searches?.length ?? 0) + (m.tool_calls?.length ?? 0) + (m.narrations?.length ?? 0) > 0}>
                     <div style={{

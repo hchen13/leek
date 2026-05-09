@@ -14,6 +14,7 @@ pub mod sessions;
 pub mod subagents;
 pub mod tasks;
 pub mod tool_runs;
+pub mod user_settings;
 
 use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};

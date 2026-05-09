@@ -48,11 +48,13 @@ impl ToolHandler for UseSkillTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
-            description: "Load the full step-by-step workflow for a named research skill. \
-                Call this as your FIRST action when the task matches a skill. \
-                Skills are loaded from harness/skills at runtime; edits to SKILL.md \
-                take effect on the next call without restarting the service. \
-                Returns the complete checklist you must follow."
+            description: "Load a portable research methodology by name. Skills describe how to \
+                think about a class of problem (what evidence matters, how to reason under \
+                uncertainty, what a useful deliverable contains); they are not runtime \
+                checklists and do not seed the active plan. Skills are loaded from \
+                harness/skills at runtime; edits to SKILL.md take effect on the next call \
+                without restarting the service. The agent decides how the methodology maps \
+                onto available tools and how to shape the active plan."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -341,6 +343,35 @@ mod tests {
             .unwrap();
         assert!(doc.body.starts_with('#'));
         assert!(!doc.body.contains("name: equity-valuation"));
+    }
+
+    #[test]
+    fn equity_skill_is_portable_methodology() {
+        // Skill body must not name Leek runtime tools — that mapping belongs in
+        // the harness, not in portable methodology. If you add new Leek tools,
+        // do NOT push their names back into the skill body.
+        let doc = load_skill_catalog(&resolve_skills_root())
+            .unwrap()
+            .skills
+            .remove("equity-valuation")
+            .unwrap();
+        for forbidden in [
+            "update_plan",
+            "corpus_search",
+            "web_search",
+            "web_fetch",
+            "market_quote",
+            "get_financials",
+            "get_candlesticks",
+            "get_capital_flow",
+            "get_company_info",
+            "sec_filing_fetch",
+        ] {
+            assert!(
+                !doc.body.contains(forbidden),
+                "equity-valuation skill must not name Leek tool `{forbidden}`; runtime mapping belongs in the harness"
+            );
+        }
     }
 
     #[test]

@@ -152,6 +152,7 @@ mod tests {
             user_id: vault::LOCAL_USER_ID.to_string(),
             session_id: "s".to_string(),
             task_id: Some("t".to_string()),
+            tuning: crate::llm::LlmTuning::defaults(),
         }
     }
 

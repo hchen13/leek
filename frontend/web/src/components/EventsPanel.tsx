@@ -18,7 +18,8 @@ const KIND_FILTERS: { id: string; label: string; predicate: (k: string) => boole
   { id: "agent",   label: "agent",   predicate: (k) => k.startsWith("agent_message_") },
   { id: "tool",    label: "tool",    predicate: (k) => k === "tool_call" || k === "web_search_call" },
   { id: "user",    label: "user",    predicate: (k) => k === "user_message" },
-  { id: "task",    label: "task",    predicate: (k) => k.startsWith("task_") || k === "plan_updated" || k === "deliverable_ready" || k === "clarification_requested" },
+  { id: "task",    label: "task",    predicate: (k) => k.startsWith("task_") || k === "plan_updated" || k === "deliverable_ready" || k === "decision_draft_ready" || k === "clarification_requested" || k === "budget_finalization" },
+  { id: "subagent",label: "subagent",predicate: (k) => k === "subagent_run" },
   { id: "usage",   label: "usage",   predicate: (k) => k === "llm_usage" },
   { id: "error",   label: "error",   predicate: (k) => k === "error" },
 ];
@@ -56,9 +57,16 @@ function summarize(kind: string, payload: unknown): string {
     case "plan_updated":
       return `${Array.isArray(p.items) ? p.items.length : 0} items ${p.explanation ?? ""}`.trim();
     case "deliverable_ready":
-      return `kind=${p.kind ?? ""} id=${p.deliverable_id ?? ""}`;
+    case "decision_draft_ready":
+      return `${p.ticker ?? p.kind ?? ""} ${p.direction ?? ""}`.trim();
+    case "subagent_run":
+      return `${p.role ?? ""} · ${p.status ?? ""} ${p.question ? "— " + (p.question as string).slice(0, 70) : ""}`.trim();
     case "clarification_requested":
       return (p.question as string)?.slice(0, 100) ?? "";
+    case "budget_finalization":
+      return `${p.reason ?? "budget exhausted"} · ${
+        Array.isArray(p.closed_items) ? `${(p.closed_items as unknown[]).length} closed` : ""
+      }`.trim();
     case "error":
       return ((p.message as string) ?? "").slice(0, 120);
     default:
@@ -70,7 +78,9 @@ function kindColor(kind: string): string {
   if (kind.startsWith("agent_message_")) return "#9eb78f";
   if (kind === "tool_call" || kind === "web_search_call") return "#d9a76c";
   if (kind === "user_message") return "#a89e8c";
-  if (kind.startsWith("task_") || kind === "plan_updated" || kind === "deliverable_ready") return "#c990d0";
+  if (kind.startsWith("task_") || kind === "plan_updated" || kind === "deliverable_ready" || kind === "decision_draft_ready") return "#c990d0";
+  if (kind === "budget_finalization") return "#d9a76c";
+  if (kind === "subagent_run") return "#b69ad6";
   if (kind === "llm_usage") return "#7d99b3";
   if (kind === "error") return "#d97070";
   return "#a89e8c";

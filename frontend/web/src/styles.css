@@ -102,7 +102,7 @@
   --r-4: 14px;
   --r-5: 20px;
 
-  --lk-insight-width: 372px;
+  --lk-insight-width: 280px;
 }
 
 /* ---------- base ---------- */
@@ -347,10 +347,10 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
 .lk-md h1, .lk-md h2, .lk-md h3, .lk-md h4 {
   margin: 12px 0 6px; line-height: 1.3; font-weight: 600;
 }
-.lk-md h1 { font-size: 17px; }
-.lk-md h2 { font-size: 15px; }
-.lk-md h3 { font-size: 13.5px; color: var(--clay-soft); }
-.lk-md h4 { font-size: 13px; color: var(--ink-1); }
+.lk-md h1 { font-size: 18.5px; }
+.lk-md h2 { font-size: 16.5px; }
+.lk-md h3 { font-size: 15px; color: var(--clay-soft); }
+.lk-md h4 { font-size: 14px; color: var(--ink-1); }
 .lk-md strong { color: var(--ink-0); font-weight: 600; }
 .lk-md em { font-style: italic; color: var(--ink-1); }
 .lk-md a { color: var(--clay-soft); text-decoration: underline; text-decoration-color: rgba(217, 119, 87, 0.4); }
@@ -370,12 +370,12 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
   margin: 8px 0;
   overflow-x: auto;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--ink-1);
 }
 .lk-md code {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   background: var(--bg-3);
   border: 1px solid var(--line-1);
   border-radius: 4px;
@@ -398,7 +398,7 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
 .lk-md table {
   border-collapse: collapse;
   margin: 8px 0;
-  font-size: 12px;
+  font-size: 13px;
   font-family: var(--font-mono);
 }
 .lk-md th, .lk-md td {
@@ -431,7 +431,11 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
 .lk-msg-head[data-who="agent"] .who { color: var(--clay-soft); }
 .lk-msg-head[data-who="system"] .who { color: var(--amber); }
 .lk-msg-body {
-  font-size: 13px;
+  /* Main reading surface — bumped from 13px so prose, lists and tables
+     are comfortable for sustained reads. Headings (.lk-md h1..h4) and
+     inline metadata stay on their own scale so the visual hierarchy
+     between "main answer" and "tool/canvas/status chrome" is preserved. */
+  font-size: 14.5px;
   line-height: 1.55;
   color: var(--ink-0);
   text-wrap: pretty;
@@ -449,7 +453,7 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
 }
 .lk-msg-body code, .lk-msg-body kbd {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   background: var(--bg-3);
   border: 1px solid var(--line-1);
   border-radius: 4px;
@@ -519,6 +523,39 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
 .lk-clarify-option:hover {
   border-color: rgba(217, 119, 87, 0.38);
   background: rgba(217, 119, 87, 0.06);
+}
+.lk-clarify-option.is-selected {
+  border-color: rgba(232, 184, 108, 0.55);
+  background: rgba(232, 184, 108, 0.16);
+}
+.lk-clarify-option:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.lk-clarify-submit-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+.lk-clarify-submit {
+  appearance: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 6px 16px;
+  border-radius: 5px;
+  background: rgba(217, 119, 87, 0.20);
+  border: 1px solid rgba(217, 119, 87, 0.50);
+  color: var(--clay-soft);
+  cursor: pointer;
+}
+.lk-clarify-submit:hover:not(:disabled) {
+  background: rgba(217, 119, 87, 0.30);
+}
+.lk-clarify-submit:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 .lk-clarify-option span {
   color: var(--ink-0);
@@ -793,6 +830,24 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
   max-width: 320px;
 }
 
+/* SUBAGENT card running-state pulse + spinner so users can tell
+   a long-delegated task is still alive on the canvas. */
+.lk-artifact-card.is-subagent.is-running {
+  animation: lk-subagent-pulse 1.6s ease-in-out infinite;
+}
+@keyframes lk-subagent-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(232, 184, 108, 0.0); }
+  50%      { box-shadow: 0 0 0 4px rgba(232, 184, 108, 0.10); }
+}
+.lk-subagent-spinner {
+  display: inline-block;
+  animation: lk-subagent-spin 1.8s linear infinite;
+}
+@keyframes lk-subagent-spin {
+  0%   { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
 /* ---------- canvas artifact grid ---------- */
 .lk-artifact-grid {
   position: absolute;
@@ -867,9 +922,11 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
 .lk-brain-widget {
   position: relative;
   width: 100%;
-  max-height: min(500px, 58vh);
-  min-height: 240px;
-  flex: 0 1 auto;
+  /* Square: corpus brain is a visualization, not a list, so it reads best
+     1:1. Height tracks width so the widget rescales cleanly when the
+     sidebar width changes. */
+  aspect-ratio: 1 / 1;
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   background: rgba(33, 29, 25, 0.84);
@@ -928,8 +985,12 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
 .lk-brain-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 99px; }
 .lk-brain-map-wrap {
   position: relative;
-  min-height: 320px;
-  flex: 1 1 360px;
+  /* Was `min-height: 320px; flex: 1 1 360px` — that forced the inner map
+     taller than the widget itself once we made the widget square at the
+     280px sidebar width, clipping the bottom. Now the wrap simply fills
+     whatever space the parent gives it. */
+  min-height: 0;
+  flex: 1 1 0;
   border: 1px solid rgba(255, 240, 220, 0.07);
   border-radius: 7px;
   overflow: hidden;
@@ -1232,6 +1293,33 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
 }
 .lk-plan-item.is-completed .lk-plan-meta span:first-child {
   color: var(--up-soft);
+}
+
+/* Resolution badge — added in design 0012. `done` and `satisfied_by_proxy`
+   are treated as success closures; everything else is a caveat closure
+   the final answer is supposed to acknowledge. */
+.lk-plan-resolution {
+  display: inline-block;
+  padding: 0 5px;
+  border-radius: 8px;
+  border: 1px solid currentColor;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+  opacity: 0.85;
+}
+.lk-resolution-done,
+.lk-resolution-satisfied_by_proxy {
+  color: var(--up-soft);
+}
+.lk-resolution-blocked,
+.lk-resolution-insufficient_evidence {
+  color: rgba(217, 112, 112, 0.85);
+}
+.lk-resolution-deferred,
+.lk-resolution-superseded {
+  color: rgba(217, 167, 108, 0.9);
 }
 
 /* ---------- panels (composable) ---------- */
