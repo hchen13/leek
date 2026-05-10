@@ -26,7 +26,7 @@
 
 ## Phase 0 — Rebuild simplification [DONE]
 
-Atomic 6-commit collapse from the over-engineered prototype. End state:
+Atomic 7-commit collapse from the over-engineered prototype. End state:
 user prompt → minimal tools → answer.
 
 | Commit | Range |
@@ -37,12 +37,30 @@ user prompt → minimal tools → answer.
 | 0d | skill mechanism corrected — frontmatter progressive disclosure (use_skill restored as the lazy-load tool) |
 | 0e | tool naming neutrality — no upstream provider names in LLM-visible strings |
 | 0f | drop dead `ChatRequest.max_output_tokens` field — align with codex (trust provider default) |
+| 0g | **remove deliverable kinds** + scrub tool-usage prose from system prompt (post-M1-QA cleanup; user manual-test caught a "当前计划还没完成" UX bug traced to stale deliverable taxonomy) |
 
 ### Tools surviving Phase 0 (11 total)
 - **generic**: `ask_user_question`, `web_fetch`, `update_plan`, `use_skill`
 - **corpus**: `corpus_search`, `corpus_read`
 - **market**: `market_quote`, `get_candlesticks`
 - **A-share**: `get_financials`, `get_company_info`, `get_capital_flow`
+
+### Phase 0g notable design choices
+- **No deliverable taxonomy.** Routing classifies user prompts only as
+  `new_task` / `chat_reply` / `ambiguous` — no `research_brief` /
+  `review` / `comparison` / `morning_brief` / `free_form` framing. The
+  legacy `tasks.expected_deliverable` column stays NOT NULL for
+  backwards compat, hardcoded to `'free_form'` at the INSERT site;
+  M2-era schema migration can drop it.
+- **No tool-usage prose in system prompt.** The model picks tools
+  based on the task and each tool's own `description` field (sent over
+  the API tools array). harness.rs has a flat "Available tools"
+  roster (name + first 160 chars of description) for orienting context
+  only. No prose like "use X for Y" anywhere.
+- **plan_guard is case-B-only.** It intervenes only when a plan exists
+  with open items and the LLM tries to ship a final answer. The
+  prior "no plan + heavy deliverable → catch-and-re-prompt" branch
+  is gone (it was the source of the "当前计划还没完成" UX bug).
 
 ---
 
