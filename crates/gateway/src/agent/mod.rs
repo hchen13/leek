@@ -61,7 +61,6 @@ const MAX_PLAN_GUARD_REWRITES: usize = 3;
 #[derive(Debug, Clone)]
 pub struct TaskBinding {
     pub task_id: String,
-    pub expected_deliverable: String,
 }
 
 struct PendingCall {
@@ -158,14 +157,6 @@ pub async fn run_chat_reply(
     let charter_text = vault::charters::get_active_text(&pool, &user_id)
         .await
         .unwrap_or(None);
-    let system_prompt = harness::build_system_prompt(
-        &handoff_summaries,
-        mandate_text.as_deref(),
-        charter_text.as_deref(),
-        task.as_ref().map(|t| t.expected_deliverable.as_str()),
-        is_followup,
-    );
-
     let ctx = ToolContext {
         pool: pool.clone(),
         event_bus: event_bus.clone(),
@@ -188,29 +179,12 @@ pub async fn run_chat_reply(
             external_web_access: true,
         }]
     };
-    // Follow-up continuation must not spawn a fresh research apparatus.
-    // `update_plan` / `delegate_research` / `record_investment_action` are
-    // start-of-task / end-of-task tools — exposing them on a continuation
-    // tells the agent it should re-plan or hand work to a subagent, which
-    // is exactly the over-reach we saw in R2.M1.t2 (32 tool calls on a
-    // single follow-up). We hide them entirely; the agent can still query
-    // the corpus, run market quotes, and re-fetch web pages if the user
-    // explicitly asks for new evidence.
-    let followup_excluded_tools: &[&str] = &[
-        "update_plan",
-        "delegate_research",
-        "record_investment_action",
-        // R2 fix: when `task = None` (chat-only follow-up), the lifecycle
-        // endpoint can't persist `awaiting_user` state — there's no task
-        // row to attach to. The model would call ask_user_question, the
-        // ClarificationCard would render on UI, but the backend would
-        // silently drop the lifecycle update; the next user POST has no
-        // way to know "we're waiting on a clarification". Excluding the
-        // tool in followup mode forces the model to answer with what
-        // it has from the prior turn instead of starting a new
-        // research arc that could need disambiguation.
-        "ask_user_question",
-    ];
+    // Follow-up continuation hides tools that would re-fork research:
+    // `update_plan` (re-plan), `ask_user_question` (would create an
+    // un-recoverable awaiting_user half-state on chat-only continuations
+    // since there's no task row to attach to). The user can still get
+    // fresh evidence via corpus / market_quote / web_fetch / etc.
+    let followup_excluded_tools: &[&str] = &["update_plan", "ask_user_question"];
     tool_specs.extend(tools.specs().into_iter().filter(|spec| {
         if !is_followup {
             return true;
@@ -220,6 +194,29 @@ pub async fn run_chat_reply(
             _ => true,
         }
     }));
+
+    // M1-MVP: extract (name, description) from tool_specs (after the
+    // followup-exclusion filter) for the system-prompt's "Available
+    // tools" roster. Only Function variants carry per-tool descriptions;
+    // the WebSearch variant is OpenAI's built-in and surfaces via the
+    // API tools array directly.
+    let tools_for_prompt: Vec<(String, String)> = tool_specs
+        .iter()
+        .filter_map(|spec| match spec {
+            ToolSpec::Function {
+                name, description, ..
+            } => Some((name.clone(), description.clone())),
+            ToolSpec::WebSearch { .. } => None,
+        })
+        .collect();
+
+    let system_prompt = harness::build_system_prompt(
+        &handoff_summaries,
+        mandate_text.as_deref(),
+        charter_text.as_deref(),
+        &tools_for_prompt,
+        is_followup,
+    );
 
     publish_and_persist(
         &pool,
@@ -1210,11 +1207,16 @@ pub async fn run_chat_reply(
             .await?;
         } else {
             if has_content {
+                // M1-MVP: deliverable kind hardcoded to "free_form" — the
+                // routing-driven taxonomy was removed in phase-0g; the
+                // legacy NOT NULL column stays populated for backwards
+                // compat. Frontend doesn't read this field.
+                let deliverable_kind = "free_form";
                 let deliverable_id = vault_tasks::write_deliverable(
                     &pool,
                     &user_id,
                     &t.task_id,
-                    &t.expected_deliverable,
+                    deliverable_kind,
                     &final_text,
                 )
                 .await?;
@@ -1228,7 +1230,7 @@ pub async fn run_chat_reply(
                     serde_json::json!({
                         "deliverable_id": deliverable_id,
                         "task_id": t.task_id,
-                        "kind": t.expected_deliverable,
+                        "kind": deliverable_kind,
                     }),
                 )
                 .await?;
@@ -1597,43 +1599,27 @@ fn detect_doom_loop(
     window.iter().all(|c| c == first)
 }
 
-/// Whether the given expected_deliverable kind warrants the rigor of an
-/// active plan + plan_guard. Lightweight kinds (delegated_brief —
-/// "dispatch a named worker and show its output"; free_form, morning_brief)
-/// should ship in 1-2 turns without being forced into the plan/critic
-/// loop. Heavy kinds (decision_draft, research_brief, review, comparison)
-/// keep the guard.
-fn plan_required_for_deliverable(kind: &str) -> bool {
-    matches!(
-        kind,
-        "decision_draft" | "research_brief" | "review" | "comparison"
-    )
-}
-
 async fn plan_guard(
     pool: &SqlitePool,
     user_id: &str,
     session_id: &str,
     task: Option<&TaskBinding>,
 ) -> Result<Option<PlanGuard>> {
+    // M1-MVP plan_guard: only intervene when the model has *already*
+    // committed to a plan and is now trying to ship a final answer with
+    // open items. The phase-0g cleanup removed the deliverable-kind
+    // taxonomy and with it the "no plan + heavy deliverable → catch-and-
+    // re-prompt" branch — that branch was over-eager and surfaced a
+    // user-visible "当前计划还没完成" narration on simple tool-invocation
+    // prompts that routing had mis-classified as research_brief.
+    //
+    // The model is free to answer in one shot if the task didn't warrant
+    // a plan. If it self-organizes a plan via `update_plan`, plan_guard
+    // holds it accountable to that plan.
     let task_id = task.map(|t| t.task_id.as_str());
     let items = vault_plans::list_current(pool, user_id, session_id, task_id).await?;
     if items.is_empty() {
-        // Only heavy deliverables require an active plan up-front. A task
-        // typed as `delegated_brief` / `free_form` / `morning_brief` is
-        // expected to ship without scaffolding — forcing a plan there is
-        // what made S5 ("调用 delegate_research 列三点风险") expand into
-        // a full research run.
-        let needs_plan = task
-            .map(|t| plan_required_for_deliverable(&t.expected_deliverable))
-            .unwrap_or(false);
-        if !needs_plan {
-            return Ok(None);
-        }
-        return Ok(task.map(|_| PlanGuard {
-            reason: "还没有为这个研究任务创建 active plan".to_string(),
-            items,
-        }));
+        return Ok(None);
     }
     // An item is "open" if it's still pending / in_progress, OR it is
     // completed but malformed (no resolution attached, or non-`superseded`
@@ -1933,7 +1919,6 @@ mod tests {
     fn task() -> TaskBinding {
         TaskBinding {
             task_id: "task-1".to_string(),
-            expected_deliverable: "decision_draft".to_string(),
         }
     }
 
@@ -1973,14 +1958,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_guard_requires_plan_for_task() {
+    async fn plan_guard_returns_none_when_no_plan_exists_for_task() {
+        // M1-MVP: plan_guard no longer requires a plan up-front based on
+        // deliverable kind (the kind taxonomy was removed in phase-0g).
+        // A task with no plan items is acceptable — the model can answer
+        // in one shot if the task didn't warrant planning.
         let pool = plan_pool().await;
         let binding = task();
-        let guard = plan_guard(&pool, "u", "s", Some(&binding))
+        assert!(plan_guard(&pool, "u", "s", Some(&binding))
             .await
             .unwrap()
-            .unwrap();
-        assert!(guard.reason.contains("还没有"));
+            .is_none());
     }
 
     #[tokio::test]

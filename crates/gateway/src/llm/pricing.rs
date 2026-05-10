@@ -34,11 +34,11 @@ pub struct ModelPrice {
     pub cached_input_per_million: Option<f64>,
     /// Effective context window in tokens. Used by the auto-compactor
     /// to derive the absolute trigger from `tuning.guards.auto_compact_threshold`
-    /// (a fraction). When a model isn't in the table, callers should
-    /// fall back to a conservative default (see `MAIN_CONTEXT_WINDOW_TOKENS`
-    /// in api/messages.rs) — guessing wrong here means we either
-    /// over-trigger compaction (cheap) or under-trigger and overflow
-    /// the window (catastrophic).
+    /// (a fraction). Prefer the `context_window` accessor below over
+    /// reading this field directly — it encapsulates the fallback for
+    /// unknown models, where guessing wrong means we either over-trigger
+    /// compaction (cheap) or under-trigger and overflow the window
+    /// (catastrophic).
     pub context_window_tokens: i64,
 }
 

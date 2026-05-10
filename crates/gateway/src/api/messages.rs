@@ -253,7 +253,6 @@ async fn handle_user_message(
             vault_tasks::mark_in_progress(&pool, &user_id, &task.id).await?;
             Some(TaskBinding {
                 task_id: task.id,
-                expected_deliverable: task.expected_deliverable,
             })
         } else {
             None
@@ -284,7 +283,6 @@ async fn handle_user_message(
         .flatten()
         .map(|row| routing::RecentTaskContext {
             title: row.title,
-            expected_deliverable: row.expected_deliverable,
             status: row.status,
         });
     let decision = match routing::decide_route(
@@ -329,7 +327,6 @@ async fn handle_user_message(
                 vault_tasks::NewTask {
                     title: &draft.title,
                     goal: &draft.goal,
-                    expected_deliverable: &draft.expected_deliverable,
                     source: "user",
                     constraints_json: None,
                     context_refs_json: None,
@@ -351,7 +348,6 @@ async fn handle_user_message(
                     "task_id": task_id,
                     "title": draft.title,
                     "goal": draft.goal,
-                    "expected_deliverable": draft.expected_deliverable,
                     "reason": decision.reason,
                 }),
             )
@@ -376,10 +372,7 @@ async fn handle_user_message(
                 session_id,
                 provider,
                 event_bus,
-                Some(TaskBinding {
-                    task_id,
-                    expected_deliverable: draft.expected_deliverable,
-                }),
+                Some(TaskBinding { task_id }),
                 cancel,
                 tools,
                 mandate_path,

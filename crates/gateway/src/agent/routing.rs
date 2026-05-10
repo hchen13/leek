@@ -22,8 +22,7 @@ Schema:
   "reason": "<short>",
   "task_draft": null | {
     "title": "<short>",
-    "goal": "<1-2 sentences>",
-    "expected_deliverable": "research_brief" | "review" | "comparison" | "morning_brief" | "free_form"
+    "goal": "<1-2 sentences>"
   },
   "chat_reply_text": null | "<full reply>",
   "clarification_question": null | "<one short question>"
@@ -31,29 +30,17 @@ Schema:
 
 Decision rules:
 - new_task: user asks for research / comparison / review on a SUBJECT THE PRIOR TASK DID NOT ALREADY COVER (different ticker, different question class, or a clearly fresh start).
-- chat_reply: greeting / casual / meta question about LEEK itself / one-shot definition that needs no investigation, OR a continuation / challenge / refinement of the prior task in the same session (asking "what if X", "challenge your view", "give a final action boundary", "decompose the bear case", "translate to portfolio guardrails", referencing "你刚才"/"上面"/"那个"/"如果", or otherwise riding on the prior subject). Continuations stay chat_reply — do NOT fork a duplicate task on the same subject just because the user pushed for more depth or asked for a translation step.
+- chat_reply: greeting / casual / meta question about LEEK itself / one-shot definition / explicit single-tool invocation ("用 X 工具查 Y" / "use the X tool to look up Y") / a continuation / challenge / refinement of the prior task in the same session (asking "what if X", "challenge your view", "give a final action boundary", "decompose the bear case", "translate to portfolio guardrails", referencing "你刚才"/"上面"/"那个"/"如果", or otherwise riding on the prior subject). Continuations stay chat_reply — do NOT fork a duplicate task on the same subject just because the user pushed for more depth or asked for a translation step.
 - ambiguous: subject unclear, needs one clarifying question.
-
-expected_deliverable inference (only used when decision=new_task):
-- post-mortem / 复盘 / look back at last decision => review
-- compare / vs / 比较 / 哪个更好 => comparison
-- "research / look into / 调研 / 研究 / analyze / 评估 / 分析 / 估值 / 风险 / 列出 …" => research_brief
-- morning brief / 晨报 => morning_brief
-- otherwise => free_form
 
 Examples:
 - "你好" -> chat_reply, chat_reply_text greets back briefly
 - "什么是经济护城河" -> chat_reply, chat_reply_text gives one-line definition (no investigation)
-- "NVDA 现在能加仓吗？" -> new_task, research_brief
+- "你使用行情报价工具查一下水晶光电" -> chat_reply (explicit single-tool invocation; main loop will run the tool and reply)
+- "NVDA 现在能加仓吗？" -> new_task
 - "看一下我的持仓" -> ambiguous (re-balance? risk check? performance review?)
 - (after a NVDA analysis just delivered) "如果像 ASIC 这样的竞争呢？" -> chat_reply (challenge to prior task)
 - (after a NVDA analysis just delivered) "假设单票上限 5%，那现在还能加吗？" -> chat_reply (refinement of prior task with new constraint)
-
-Note: `decision_draft` and `delegated_brief` deliverable kinds were
-removed in the rebuild slice — the underlying tools (record_investment_action,
-delegate_research) are gone. If the user explicitly asks for either,
-classify as `research_brief` (or `chat_reply` for follow-ups) and let
-the main agent answer in prose.
 
 Respond with the JSON object only.
 "#;
@@ -81,7 +68,6 @@ pub enum DecisionKind {
 pub struct TaskDraft {
     pub title: String,
     pub goal: String,
-    pub expected_deliverable: String,
 }
 
 /// Snapshot of the most recent task in this session, surfaced to the routing
@@ -90,7 +76,6 @@ pub struct TaskDraft {
 #[derive(Debug, Clone)]
 pub struct RecentTaskContext {
     pub title: String,
-    pub expected_deliverable: String,
     pub status: String,
 }
 
@@ -127,11 +112,10 @@ pub async fn decide_route(
     if let Some(rt) = recent_task {
         system_prompt.push_str(&format!(
             "\n\nSESSION CONTEXT — last task in this session: \
-             title=\"{}\", expected_deliverable=\"{}\", status=\"{}\". \
+             title=\"{}\", status=\"{}\". \
              If the new user message is a continuation, challenge, refinement, \
              or translation step on this same subject, prefer chat_reply.\n",
             rt.title.replace('"', "'"),
-            rt.expected_deliverable,
             rt.status,
         ));
     }
@@ -193,7 +177,6 @@ fn parse_decision(raw: &str) -> Result<RouteDecision> {
         Some(TaskDraft {
             title: obj.get("title")?.as_str()?.to_string(),
             goal: obj.get("goal")?.as_str()?.to_string(),
-            expected_deliverable: obj.get("expected_deliverable")?.as_str()?.to_string(),
         })
     });
     let chat_reply_text = v
@@ -269,12 +252,12 @@ mod tests {
 
     #[test]
     fn parses_new_task() {
-        let raw = r#"{"decision":"new_task","reason":"NVDA review","task_draft":{"title":"NVDA 加仓评估","goal":"...","expected_deliverable":"decision_draft"},"chat_reply_text":null,"clarification_question":null}"#;
+        let raw = r#"{"decision":"new_task","reason":"NVDA review","task_draft":{"title":"NVDA 加仓评估","goal":"..."},"chat_reply_text":null,"clarification_question":null}"#;
         let d = parse_decision(raw).unwrap();
         assert_eq!(d.kind, DecisionKind::NewTask);
         let draft = d.task_draft.unwrap();
-        assert_eq!(draft.expected_deliverable, "decision_draft");
         assert_eq!(draft.title, "NVDA 加仓评估");
+        assert_eq!(draft.goal, "...");
     }
 
     #[test]

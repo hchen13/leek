@@ -14,7 +14,6 @@ use uuid::Uuid;
 pub struct NewTask<'a> {
     pub title: &'a str,
     pub goal: &'a str,
-    pub expected_deliverable: &'a str,
     pub source: &'a str, // "user" / "cron" / "agent_proposed"
     pub constraints_json: Option<&'a str>,
     pub context_refs_json: Option<&'a str>,
@@ -44,13 +43,19 @@ pub async fn insert_in_progress(
 
     let mut tx = pool.begin().await?;
 
+    // M1-MVP: `expected_deliverable` is hardcoded to 'free_form' at the
+    // INSERT site so the legacy NOT NULL column stays populated for
+    // backwards compat. The deliverable-kind taxonomy was removed in
+    // phase-0g — routing no longer classifies, agent loop no longer
+    // reads it. Drop the column itself in M2 when a wider task-schema
+    // refactor lands.
     sqlx::query(
         r#"
         INSERT INTO tasks
           (user_id, id, session_id, title, goal, constraints_json,
            expected_deliverable, priority, context_refs_json, source,
            status, created_at, started_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'normal', ?, ?, 'in_progress', ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, 'free_form', 'normal', ?, ?, 'in_progress', ?, ?)
         "#,
     )
     .bind(user_id)
@@ -59,7 +64,6 @@ pub async fn insert_in_progress(
     .bind(new_task.title)
     .bind(new_task.goal)
     .bind(new_task.constraints_json)
-    .bind(new_task.expected_deliverable)
     .bind(new_task.context_refs_json)
     .bind(new_task.source)
     .bind(&now)
