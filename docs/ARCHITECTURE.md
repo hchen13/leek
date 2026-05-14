@@ -122,8 +122,10 @@ System prompt 组装顺序（每节都可选）。**顺序原则：越普适、�
    定位信息，模型实际选工具是从 API `tools` 数组拿，不是从这个
    列表。工具集变化时才变。
 4. **Skill 索引**——每个 skill 一行：`name — frontmatter
-   description`。body 通过 `use_skill` 懒加载。skill 集合变化时
-   才变。
+   description`。body 通过 `use_skill` 懒加载。索引来源三层：内置
+   `harness/skills/` + 用户全局 `~/.leek/skills/` + 项目级
+   `<project>/.leek/skills/`（第三方 skill 通过界面安装到用户全局
+   路径）。skill 集合变化时才变。
 5. **用户 mandate**——用户的投资 profile。每个用户不一样、且
    用户编辑后会变，所以放最后；前面 1–4 的 cache 命中不受 mandate
    差异影响。
@@ -147,28 +149,65 @@ loop 实例（跑同样的 loop 代码——同样的安全网，同样的 metri
 loop 代码是统一的，**专业化只来自 system prompt + 工具子集**——
 没有第二份"subagent loop 实现"。
 
-具体怎么*提供* system prompt + 工具子集（**这层还在调研**）：
-当前提议是 skill 机制——`harness/skills/<name>/SKILL.md` 的 body
-作为 system prompt，frontmatter 的 `allowed_tools` 作为工具子集。
-但这是不是最佳形式取决于 CC 和 codex 是怎么做的（见 §11 + 进行
-中的调研）。可能保留也可能换。无论怎样，上面的抽象层不变。
+具体怎么*提供* system prompt + 工具子集（**调研后 lock**）：
+照搬 CC——subagent 是磁盘上的 markdown 文件，**frontmatter 定义
+配置 + body 是 system prompt 原文**。详细文件格式见下面的 4.2.1。
 
-通信方式**一次性**：父级传入 prompt，subagent 返回一个 text
-block。v0 不做流式回传（之后觉得有用再加）。
+**关键：与 skill 严格分离。** skill 是注入主 agent system prompt
+索引的"上下文展开式"内容（每个 skill 一行 description 进索引，
+body 通过 `use_skill` 懒加载到当前 loop）；agent 是被 `task()`
+spawn 出去带独立 loop 的子 agent，主 agent 不会把它当 skill 索引、
+不能 `use_skill` 调用。两者目录分开（`harness/skills/` vs
+`harness/agents/`）、文件名不同（`SKILL.md` vs `AGENT.md`）、
+frontmatter 里 description 的写法也不一样：
 
-初始 subagent 形态——边搭边补：
+- skill 的 description 是"该 skill 包含什么知识/指南"——决定要不要
+  expand 到当前上下文
+- agent 的 description 是"该 agent 能做什么委派工作"——决定要不要
+  spawn 一个子 loop
 
-- **`corpus-expert`**——system prompt 是"你深谙 corpus，用户问
-  一个 corpus 相关的问题，给出有原文引证的综合回答"。工具子集：
-  `corpus_search`、`corpus_read`。对标：CC 的 `claude-code-guide`。
-- **`market-data-fetcher`**——对一组 ticker 并行查询。工具子集：
-  market / fundamentals 类工具。
-- **`planner`**——多步研究的任务分解。工具子集：最小（不做数据
-  查询）——只产出 plan，不执行。
+如果混在一起，subagent 会被主 agent 当成 skill 引用，造成调用方式
+混乱。两者必须分开维护。
 
-新的 subagent 通过 skill 机制添加：把 `harness/skills/<name>/SKILL.md`
-写好就行，等 skill 机制落地（M2.5）后即可。上面三个硬编码的 subagent
-只作为引导，skill 机制就位后第一时间替换为 skill 发现的版本。
+#### 4.2.1 AGENT.md 文件格式
+
+```yaml
+---
+description: <一句话描述这个 agent 能做什么委派工作>
+allowed_tools: [...]      # 可选；不给等于全工具集
+model: <override>         # 可选；codex OAuth 单 model 时无视
+---
+
+<markdown body — 直接作为 subagent 的 system prompt>
+```
+
+发现路径（三层，越靠后优先级越高）：
+
+- 内置（leek 自带，跟随 repo 走）：`harness/agents/<name>/AGENT.md`
+- 用户全局：`~/.leek/agents/<name>/AGENT.md`
+- 项目级：`<project>/.leek/agents/<name>/AGENT.md`
+
+同名冲突时优先级"项目 > 用户 > 内置"。所有层都进 agent 注册表。
+第三方 agent 通过界面安装到用户全局路径。
+
+通信方式**一次性**：父级通过 `task(agent_name, input)` 工具传入
+prompt，subagent 返回一个 text block。v0 不做流式回传（之后觉得
+有用再加）。
+
+#### 4.2.2 leek 自带的初始 subagent（rebuild-clean 阶段三个）
+
+每个是一个 AGENT.md 文件，跟随 repo 走：
+
+- **`corpus-expert`**——`harness/agents/corpus-expert/AGENT.md`。
+  body 是"你深谙 corpus，用户问一个 corpus 相关的问题，给出有原文
+  引证的综合回答"。`allowed_tools`：`corpus_search`、`corpus_read`。
+  对标 CC 的 `claude-code-guide`。
+- **`market-data-fetcher`**——`harness/agents/market-data-fetcher/AGENT.md`。
+  对一组 ticker 并行查询。`allowed_tools`：market / fundamentals
+  类工具。
+- **`planner`**——`harness/agents/planner/AGENT.md`。多步研究的任务
+  分解。`allowed_tools`：最小（不做数据查询）——只产出 plan，
+  不执行。
 
 ### 4.3 为什么投资领域天然适合 subagent
 
@@ -279,15 +318,19 @@ M0 故意不引入的表：
 
 ## 9. Skill / Hook / Plugin
 
-照搬 CC 的约定，做最小调整。
+照搬 CC 的约定，做最小调整。**Agent 跟 skill 并行但分开**（见 §4.2
+为什么）；下面只说 skill，agent 的对等结构在 §4.2.1。
 
-**Skill**（`harness/skills/<name>/SKILL.md`）：
+**Skill**（`<dir>/<name>/SKILL.md`）：
 
 - Frontmatter：`name`、`description`、可选 `allowed_tools`、`model`
 - Body：自由 markdown，通过 `use_skill(name)` 懒加载
-- 发现路径：`harness/skills/`（自带）+ 用户目录
-  （`~/.leek/skills/`）+ 项目目录
-  （`<project>/.leek/skills/`）
+- 发现路径（三层，越靠后优先级越高）：
+  - 内置（leek 自带，跟随 repo 走）：`harness/skills/`
+  - 用户全局（第三方 skill 通过界面安装到这里）：`~/.leek/skills/`
+  - 项目级（项目 repo 自带的 skill）：`<project>/.leek/skills/`
+- 三层都进 skill 索引（写进主 agent 的 system prompt §4.1 第 4 节）。
+  同名冲突优先级"项目 > 用户 > 内置"。
 - 通过 `notify` 监听做热加载
 
 **Hook** 事件（对齐 CC）：
@@ -398,13 +441,17 @@ Hook 执行：shell 命令，捕获 stdout / exit code，可配置超时。
   两个都做？
 
 ### Subagent（M2.7）
-- 工具名字：`task`（CC）vs `delegate`（研究风味）vs
-  `spawn_subagent`（描述性）。默认 `task`。
+- ~~工具名字~~：locked 为 `task`（对齐 CC）。
+- ~~配置机制~~：locked 为 AGENT.md（frontmatter + body，与 skill
+  分开维护），见 §4.2.1。
 - 事件流：v0 一次性结果给父级 vs 实时流式。先一次性；什么时候
   流式才值得复杂度？
-- subagent 在 vault 里怎么算：在父级 session 下开自己的 task_id
-  还是开自己的 session_id？默认：父级 session 下开自己的 turn，
-  不开 session 实体。
+- subagent 在 vault 里怎么算：在父级 session 下开自己的 turn 行
+  （父级 turn 的 child），还是单独的 session？默认前者，但跨 turn
+  的可观测性 UI 怎么做还没定。
+- 自定义 agent 的热加载：复用 `notify` 监听 `~/.leek/agents/` 和
+  `<project>/.leek/agents/`，启动延后到第一次有用户写自定义 agent
+  时再做。
 
 ### Skill / Hook / Plugin（M2.5）
 - Plugin 沙箱——v0 punt 到"只信本地安装"，第一次有人想要远程

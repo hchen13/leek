@@ -285,25 +285,28 @@ prompt、工具子集的子 agent loop。投资领域真的吃这个（多 ticke
 ### Scope
 
 - 一个 `task` 工具（CC 约定）给主 agent 调用
-- subagent 在自己的 loop 里跑：自己的 system prompt（通常 skill
-  body）、自己的工具子集、自己的消息历史
+- subagent 在自己的 loop 里跑：自己的 system prompt（来自
+  `AGENT.md` body）、自己的工具子集（来自 `AGENT.md` frontmatter
+  的 `allowed_tools`）、自己的消息历史
 - **subagent loop 复用所有 M1 guard**（cost cap / wall-clock /
   idle / iteration / doom-loop / turn_metrics）
 - 结果作为单个 text block 返回给父级（v0 不流式）
-- skill 驱动的 persona 绑定：`task(skill="corpus-expert",
-  input="...")` 把 skill body 当成 subagent 的 system prompt，
-  工具子集限制为 skill 的 `allowed_tools`
+- **AGENT.md 驱动的 persona 绑定**（agent 跟 skill 严格分开维护，
+  见 `ARCHITECTURE.md §4.2`）：`task(agent_name="corpus-expert",
+  input="...")` 加载 `harness/agents/<name>/AGENT.md`，body 作为
+  subagent 的 system prompt，frontmatter `allowed_tools` 作为工具
+  子集。
 - 嵌套：subagent 可以 spawn subagent，默认 depth 上限 2（主 →
   子 → 孙就停）
 
 ### Sub-commits（计划）
 
-| #       | 标题                                                                    |
-|---------|-------------------------------------------------------------------------|
-| M2.7.1  | `task` 工具 + subagent loop spawn                                       |
-| M2.7.2  | Skill 驱动的 persona 绑定                                                |
-| M2.7.3  | Depth 上限 + per-subagent turn_metrics 行（parent_turn_id 链接）          |
-| M2.7.4  | 前三个 subagent skill：`corpus-expert`、`market-data-fetcher`、`planner` |
+| #       | 标题                                                                          |
+|---------|-------------------------------------------------------------------------------|
+| M2.7.1  | `task` 工具 + subagent loop spawn                                             |
+| M2.7.2  | AGENT.md loader + frontmatter 解析（三层路径发现）                              |
+| M2.7.3  | Depth 上限 + per-subagent turn_metrics 行（parent_turn_id 链接）                |
+| M2.7.4  | 前三个内置 AGENT.md：`corpus-expert`、`market-data-fetcher`、`planner`          |
 
 ### Design decisions（locked）
 
@@ -436,3 +439,32 @@ Task 形态——有 eval case 端到端跑通：
   subagent 也能证明 loop 通；(b) M2.7 合理依赖 M2.5 的 skill
   机制做 persona 绑定。架构上从第一天起就是多 agent 概念，但
   spawn 机制在 M2.7 才到位。
+
+### 2026-05-11 — Subagent 配置机制：AGENT.md（与 skill 分开维护）
+- 调研 CC（`~/research/repos/claude-code-sourcemap/restored-src/`）+
+  codex（`~/research/repos/codex/codex-rs/`）的 subagent 实现，
+  确认两边都是"同一份 loop 代码 + 不同 system prompt + 不同工具
+  子集"的抽象层。
+- 关键发现：codex 的 `laplace` / `fermat` / `lagrange` / `russell`
+  **不是 subagent 标识**，是 spawn 时从 101 个科学家名字池里随机
+  挑一个当 display name（证据：`codex-rs/core/src/agent/agent_names.txt`）。
+  codex 的 subagent 真正概念叫 `role`（`core/src/agent/role.rs`），
+  内置 default / explorer / worker / awaiter。
+- CC 的 subagent 跟 leek 之前提议的"skill body 当 subagent system
+  prompt"格式上完全兼容——CC 的自定义 agent 就是 YAML frontmatter
+  + markdown body。
+- 决定：照搬 CC 的文件格式（AGENT.md = frontmatter + body），
+  但与 skill **严格分开维护**：
+  - 内置 agent：`harness/agents/<name>/AGENT.md`
+  - 用户全局：`~/.leek/agents/<name>/AGENT.md`
+  - 项目级：`<project>/.leek/agents/<name>/AGENT.md`
+  - 三层都进 agent 注册表，同名优先级"项目 > 用户 > 内置"
+- 为什么分开（用户决策）：skill 是注入主 agent system prompt 的
+  上下文展开式内容（`use_skill` 注入到当前 loop），agent 是被
+  `task()` spawn 出去带独立 loop 的子 agent。混在一起会让 subagent
+  被主 agent 误当 skill，调用方式混乱。两者 frontmatter 里
+  description 的写法也不一样（skill 是"包含什么知识"，agent 是
+  "能做什么委派工作"）。
+- 同时 lock skill 的三层路径模型：内置 `harness/skills/` + 用户
+  全局 `~/.leek/skills/`（第三方 skill 通过界面安装到这里）+
+  项目级 `<project>/.leek/skills/`。
