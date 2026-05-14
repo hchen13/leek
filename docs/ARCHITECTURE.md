@@ -39,19 +39,24 @@ agent loop 原语。我们采纳它们。
 
 下面这些在过去版本的 leek 里有，rebuild-clean 里**故意没有**：
 
-- **不做 routing 层。**每条用户消息直接进 main loop。不会有一个
+- **不做 routing 层。** 每条用户消息直接进 main loop。不会有一个
   上游 LLM 把消息分类成 `new_task` / `chat_reply` / `ambiguous`。
   是否调用工具由模型自己决定。
-- **不做 deliverable 分类。**没有 `research_brief` / `comparison`
+- **不做 deliverable 分类。** 没有 `research_brief` / `comparison`
   / `morning_brief` / `free_form` 这种分类。用户问什么，模型就
   产出什么形态的回答。
-- **vault 里不存 `task` 实体。**会话就是消息序列。会话和消息之间
+- **vault 里不存 `task` 实体。** 会话就是消息序列。会话和消息之间
   不再有一个 LLM 分类出来的"task"记录。
-- **不做 `plan_guard` 强制。**模型想用 `update_plan` 就用，觉得
+- **不做 `plan_guard` 强制。** 模型想用 `update_plan` 就用，觉得
   答案 ready 了就交付。不会出现"plan 没走完不准交付"的拦截。
-- **不做 4-persona subagent。**只有**一个通用的** subagent 机制。
-  专业化来自 skill 的 body，而不是硬编码的 persona。
-- **不抽象 LLM provider。**今天访问模型只有一条路径：codex pro
+- **不把 subagent 写成硬编码的 Rust persona 类。** 多个专业化子
+  agent（`corpus-expert` / `planner` / `market-data-fetcher` 等）
+  是想要的；但它们的 system prompt 和工具子集通过**外部配置**
+  （skill 文件之类）提供，而不是 Rust 里的 hardcoded persona 类。
+  前一版 leek 的 4-persona 是 Rust 写死的代码路径——那才是要删
+  的对象，不是"多个 subagent"本身。具体怎么配置 subagent 还在
+  调研（CC vs codex 的做法对比），见 §4.2。
+- **不抽象 LLM provider。** 今天访问模型只有一条路径：codex pro
   via OAuth。代码直接连这条路径。等真有第二个具体 provider 带着
   真实契约出现时再抽象——不要提前。
 - **vault 里不把 charters / decisions / portfolio / holdings
@@ -104,17 +109,24 @@ agent loop 原语。我们采纳它们。
 
 跑在用户的 session 里，每个活跃 session 一个。
 
-System prompt 组装顺序（每节都可选）：
+System prompt 组装顺序（每节都可选）。**顺序原则：越普适、越稳定
+的内容越靠前**——这样 KV cache 的 prefix 能命中得更深，跨 session、
+跨用户都能复用。从最稳到最易变：
 
-1. **身份描述（identity）**——leek 自己的短描述。稳定文本。
-2. **用户 mandate**——用户的投资 profile。如果有，原文注入。
-3. **Corpus orientation**——少量从 corpus 里挑出的"始终适用"的
-   片段（原则、定义）。长文走工具按需加载，不进 prompt。
-4. **Skill 索引**——每个 skill 一行：`name — frontmatter
-   description`。body 通过 `use_skill` 懒加载。
-5. **可用工具列表**——名字 + 第一行描述，从工具注册表取。仅作
+1. **身份描述（identity）**——leek 自己的短描述。所有用户、所有
+   session 都一样。最稳定，放最前。
+2. **Corpus orientation**——少量从 corpus 里挑出的"始终适用"的
+   片段（原则、定义）。corpus 更新时才会变，频率低。长文走工具
+   按需加载，不进 prompt。
+3. **可用工具列表**——名字 + 第一行描述，从工具注册表取。仅作
    定位信息，模型实际选工具是从 API `tools` 数组拿，不是从这个
-   列表。
+   列表。工具集变化时才变。
+4. **Skill 索引**——每个 skill 一行：`name — frontmatter
+   description`。body 通过 `use_skill` 懒加载。skill 集合变化时
+   才变。
+5. **用户 mandate**——用户的投资 profile。每个用户不一样、且
+   用户编辑后会变，所以放最后；前面 1–4 的 cache 命中不受 mandate
+   差异影响。
 
 明确**不进** system prompt 的内容：
 
@@ -129,13 +141,17 @@ System prompt 组装顺序（每节都可选）：
 由主 agent（或另一个 subagent，最多 depth=2）通过 `task` 工具
 spawn——沿用 CC 的命名约定。
 
-每个 subagent 拿到：
+抽象层定义（**这层是 locked 的**）：每个 subagent 拿到自己的
+system prompt + 自己的工具子集 + 自己的 context window + 自己的
+loop 实例（跑同样的 loop 代码——同样的安全网，同样的 metrics）。
+loop 代码是统一的，**专业化只来自 system prompt + 工具子集**——
+没有第二份"subagent loop 实现"。
 
-- 自己的 system prompt（通常是某个 skill 的 body）
-- 自己的工具子集（通常是该 skill 的 `allowed_tools`）
-- 自己的 context window（全新，不继承父级的）
-- 自己的 loop 实例，跑同样的 loop 代码——同样的安全网，同样的
-  metrics
+具体怎么*提供* system prompt + 工具子集（**这层还在调研**）：
+当前提议是 skill 机制——`harness/skills/<name>/SKILL.md` 的 body
+作为 system prompt，frontmatter 的 `allowed_tools` 作为工具子集。
+但这是不是最佳形式取决于 CC 和 codex 是怎么做的（见 §11 + 进行
+中的调研）。可能保留也可能换。无论怎样，上面的抽象层不变。
 
 通信方式**一次性**：父级传入 prompt，subagent 返回一个 text
 block。v0 不做流式回传（之后觉得有用再加）。
@@ -230,7 +246,8 @@ M0 故意不引入的表：
 
 - **持久化**：`user_settings.mandate_text`——一段 markdown，
   用户可编辑，在 vault 里有版本记录。
-- **注入**：原文写进主 agent 的 system prompt（§4.1 第 2 节）。
+- **注入**：原文写进主 agent 的 system prompt（§4.1 第 5 节，
+  最靠后以避免污染前面 1–4 的 KV cache prefix）。
 - **收集**：通过 onboarding skill（`harness/skills/mandate/`）
   ——首次 session 时跑，问 4–6 个问题，把结果写下来。之后可以
   在 settings 里编辑。
