@@ -27,11 +27,16 @@ L.E.E.K 是一个**面向投资研究领域的专用 AI agent**。
 - 一份精心维护的投研 **corpus**（markdown 知识库，注入主 agent 的
   system prompt，也可以通过工具查询）
 - 一组**领域工具**（行情/财务/资金流/资讯查询）
-- **用户 mandate**——用户的持仓、风险偏好、风格、时间维度——
-  收集一次后跨 session 持久化
 
 除此之外都跟业内已经收敛的 agent harness 模式一致。我们不发明
 agent loop 原语。我们采纳它们。
+
+> **关于 memory / 用户 mandate**：harness 里的"用户 mandate"
+> （持仓 / 风格 / 风险偏好 / 跨 session 持久化的语义状态）本质上
+> 是 memory 的一个特例。memory 是一个**独立的设计课题**——分层
+> （项目级 / 用户级 / session 级）、编辑 UX、冲突解决，CC / codex
+> 的最佳实践还在演进中。M0–M4 不做这一层，等 leek 跑起来、看到
+> 真实使用模式之后再单独研究。详见决策日志 2026-05-11。
 
 ---
 
@@ -59,10 +64,9 @@ agent loop 原语。我们采纳它们。
 - **不抽象 LLM provider。** 今天访问模型只有一条路径：codex pro
   via OAuth。代码直接连这条路径。等真有第二个具体 provider 带着
   真实契约出现时再抽象——不要提前。
-- **vault 里不把 charters / decisions / portfolio / holdings
-  做成一等实体**（至少在 M0–M1 阶段）。用户 mandate 就是一段
-  注入 system prompt 的文本。等哪个 milestone 真需要时再升级
-  为结构化字段。
+- **vault 里不存任何用户特定的语义数据**（charters / decisions /
+  portfolio / holdings / mandate / memory 等等）。这些归到独立的
+  memory 课题里，M0–M4 不碰。
 
 这些决定都不是随便做的。每一项都试过、观察到延迟/bug 面/认知
 负担超过其价值，然后被移除。
@@ -126,9 +130,9 @@ System prompt 组装顺序（每节都可选）。**顺序原则：越普适、�
    `harness/skills/` + 用户全局 `~/.leek/skills/` + 项目级
    `<project>/.leek/skills/`（第三方 skill 通过界面安装到用户全局
    路径）。skill 集合变化时才变。
-5. **用户 mandate**——用户的投资 profile。每个用户不一样、且
-   用户编辑后会变，所以放最后；前面 1–4 的 cache 命中不受 mandate
-   差异影响。
+
+未来加 memory / 用户 mandate 层时会插在第 4 之后（最易变、最不
+通用），不影响前面 1–4 的 cache prefix。
 
 明确**不进** system prompt 的内容：
 
@@ -270,30 +274,29 @@ M0 故意不引入的表：
 
 ---
 
-## 7. 用户 mandate
+## 7. 用户 mandate / memory（已移除，推迟）
 
-"用户想从这个 agent 那里得到什么"的投资域版本。它能涵盖比如：
+原本这一节设计了一个简陋的 mandate 注入机制（`user_settings.mandate_text`
+markdown blob，原文进 system prompt，onboarding skill 收集）。
+**2026-05-11 整节移除。**
 
-- **持仓**（ticker、规模、成本）
-- **风险偏好**（明确陈述的）
-- **风格偏好**（成长 / 价值 / GARP / 事件驱动 / 等）
-- **时间维度**（日内 / 持仓 / 长期）
-- **实际交易的市场和币种**
-- **硬约束**（"不做杠杆产品"、"不做加密"等）
+理由：在 harness 里，"用户 mandate"本质上是 **memory 的一个特例**
+——持仓 / 风格 / 风险偏好 / 跨 session 持久化的语义状态。memory
+是一个**独立的设计课题**：
 
-计划怎么处理（细节待 refine，见 Open Questions）：
+- 要做分层（项目级 / 用户级 / session 级，类似 CC 的 CLAUDE.md
+  + project memory + user memory）
+- 要有编辑 UX、冲突解决、版本管理
+- CC / codex 的最佳实践都还在演进中
 
-- **持久化**：`user_settings.mandate_text`——一段 markdown，
-  用户可编辑，在 vault 里有版本记录。
-- **注入**：原文写进主 agent 的 system prompt（§4.1 第 5 节，
-  最靠后以避免污染前面 1–4 的 KV cache prefix）。
-- **收集**：通过 onboarding skill（`harness/skills/mandate/`）
-  ——首次 session 时跑，问 4–6 个问题，把结果写下来。之后可以
-  在 settings 里编辑。
-- **subagent 可见性**：subagent **不**自动继承 mandate。如果某个
-  subagent 需要，父级在 task prompt 里传相关切片。
+在 leek 还没跑起来、没有真实使用数据的情况下硬塞一个 mandate 实现，
+大概率又是一个 deterministic-systems 包袱（"这个用户用 leek 时
+是 X 风格，所以一定要这样回答"——把模型应该自由决定的事情写死）。
 
-**这部分是整个设计里我们最不确定的部分**（见 §11）。
+**什么时候回来**：M3 A 股 MVP 跑起来之后，看实际研究 session 里
+出现什么用户特定的痛点，再回到这个课题——届时调研当时的 CC / codex
+memory 实现作为参考。可能成为 leek 的一个独立 milestone（暂称
+"M5 — memory"）。
 
 ---
 
@@ -424,15 +427,6 @@ Hook 执行：shell 命令，捕获 stdout / exit code，可配置超时。
 ## 11. 待定的 Open Questions
 
 不会阻塞重建启动。先记下来，等对应 milestone 启动时再敲定。
-
-### 用户 mandate（M2）
-- **Onboarding UX**：skill 驱动问答 vs settings 表单 vs 两者都做？
-- **可变性**：聊天里改（`/edit-mandate`）vs settings 页面改 vs
-  两个都给？
-- **mandate 长度上限**：长到 2K tokens 会吃掉每个 system prompt。
-  硬限长？还是 save 时跑一遍 summarization？
-- **subagent 的 mandate 可见性**：subagent 什么时候看到 mandate？
-  始终？skill 显式 opt-in？主 agent 按 task 决定？
 
 ### Corpus（M2）
 - Embedding vs lexical 检索——lexical 跑 v0，但召回降到什么水平

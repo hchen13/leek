@@ -180,22 +180,23 @@
 
 ---
 
-## M2 — Corpus + Mandate
+## M2 — Corpus
 
 ### 目标
 
-把让 leek 区别于通用 agent 的两块内容搞起来：投资 **corpus** 和
-每用户的 **mandate**。两个都通过主 agent 的 system prompt 和工具
-对外暴露。
+把让 leek 区别于通用 agent 的核心内容搞起来：投资 **corpus**。
+通过主 agent 的 system prompt 默认注入 + 工具按需检索两条路径
+暴露。
+
+> **注**：之前 M2 还包括"用户 mandate"，2026-05-11 整个移除，
+> 推迟到 leek 跑起来之后的独立 memory 课题（详见 ARCHITECTURE
+> §7 + 本文件 decision log）。
 
 ### Scope
 
 - Corpus loader：从一个根目录读 markdown，做 lexical（BM25）检索
 - 工具：`corpus_search(query)`、`corpus_read(id)`
 - 默认 corpus 注入到主 agent 的 system prompt（目标 < 800 tokens）
-- 用户 mandate：`user_settings.mandate_text`，写进 system prompt
-- Mandate 收集 UX（onboarding 流） + 编辑 UX（settings 页面或者
-  聊天里的 slash 命令——见 Open questions）
 
 ### Sub-commits（计划）
 
@@ -204,9 +205,6 @@
 | M2.1 | Corpus loader + BM25 索引，内存中                   |
 | M2.2 | `corpus_search` + `corpus_read` 工具                |
 | M2.3 | 系统 prompt 默认注入精选 corpus 片段                |
-| M2.4 | `user_settings.mandate_text` + 原文注入             |
-| M2.5 | Mandate 编辑 UX（settings）                         |
-| M2.6 | Mandate 收集 onboarding（首次 session 流）          |
 
 ### Design decisions（locked）
 
@@ -214,16 +212,9 @@
   编辑还要重算。先 punt，等 lexical 召回有可测量的不足再上。
 - **Corpus 用 git 版本管理。** 通过编辑 markdown 文件作者化。
   应用内编辑器是后续 affordance。
-- **Mandate 是一段 markdown，不是结构化字段。** 我们不知道哪些
-  字段重要，先看 LLM 在自由 text 上怎么用，等明显的模式浮出来
-  再结构化。
 
 ### Open questions
 
-- Mandate 长度上限——长到超过 2K tokens 时怎么办？硬限长还是
-  save 时跑 summarization？
-- Mandate 编辑 UX surface：聊天里的 slash 命令 vs settings 页面
-  vs 两个都给？
 - Corpus 更新 reload——v0 启动时加载就够，但什么时候开始想做热
   加载？
 
@@ -264,9 +255,6 @@ M2.5 **不**是发明的地方——抄约定，做最小适配。
 
 ### Open questions
 
-- Mandate 机制在这个模型下放哪？很可能变成一个默认安装的 skill
-  （`harness/skills/mandate/`），加一个 `SessionStart` hook 把
-  mandate-text 注入 system prompt。M2.5 commit 时定。
 - Plugin 沙箱——第一版不做；只信本地安装。
 - Skill 的 model override 跟 codex OAuth 组合时怎么解（CC 每个
   skill 可换 model；codex pro 就一个 model）。
@@ -327,8 +315,6 @@ prompt、工具子集的子 agent loop。投资领域真的吃这个（多 ticke
 
 - 事件流：实时流给父级 vs 一次性 batch。默认 batch；第一次有用
   户可感知的延迟抱怨时再回头看。
-- Subagent 的 mandate 可见性——见 `ARCHITECTURE.md §7` open
-  questions。
 
 ---
 
@@ -468,3 +454,28 @@ Task 形态——有 eval case 端到端跑通：
 - 同时 lock skill 的三层路径模型：内置 `harness/skills/` + 用户
   全局 `~/.leek/skills/`（第三方 skill 通过界面安装到这里）+
   项目级 `<project>/.leek/skills/`。
+
+### 2026-05-11 — 用户 mandate 整个移除，推迟到 memory 课题
+- 用户拍板：之前 M2 设计的"用户 mandate"（一段 markdown 注入
+  system prompt、user_settings 持久化、onboarding skill 收集）
+  **整个移除**。
+- 理由：harness 里的"用户 mandate"本质上是 **memory** 的一个特例
+  ——持仓 / 风格 / 风险偏好 / 跨 session 持久化的语义状态。memory
+  是一个独立的设计课题：要分层（项目级 / 用户级 / session 级，
+  类似 CC 的 CLAUDE.md + project memory + user memory）、要有
+  编辑 UX / 冲突解决 / 版本管理。CC / codex 的最佳实践还在演进
+  中，硬塞一个半成品 mandate 就是又埋一个 deterministic-systems
+  包袱。
+- 合理时机：M3 A 股 MVP 跑起来之后看真实痛点，再回到这个课题，
+  作为独立 milestone（暂称 M5）。届时会重新调研当时的 CC / codex
+  memory 实现作为参考。
+- 影响：
+  - ARCHITECTURE.md §1（差异化清单只剩 corpus + 领域工具）
+  - ARCHITECTURE.md §2（vault 不存任何用户特定语义数据）
+  - ARCHITECTURE.md §4.1（system prompt 顺序从 5 项缩到 4 项）
+  - ARCHITECTURE.md §7（替换为"已移除"存根）
+  - ARCHITECTURE.md §11（删除"用户 mandate (M2)" open questions）
+  - MILESTONES.md M2（"Corpus + Mandate" → "Corpus"，删 M2.4/5/6
+    三个 sub-commit）
+  - MILESTONES.md M2.5（删 mandate-as-skill open question）
+  - MILESTONES.md M2.7（删 subagent mandate 可见性 open question）
