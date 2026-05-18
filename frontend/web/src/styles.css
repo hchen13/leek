@@ -127,6 +127,10 @@ h2 {
   align-self: flex-start;
   background: #1d2530;
 }
+.msg.pending {
+  opacity: 0.72;
+  border: 1px dashed #3a4656;
+}
 .msg .role {
   font-size: 10px;
   text-transform: uppercase;

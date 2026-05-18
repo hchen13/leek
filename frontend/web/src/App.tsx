@@ -1,9 +1,10 @@
-// L.E.E.K — M0 verification harness.
+// L.E.E.K — M1 verification harness.
 //
-// Deliberately minimal: session list/create, message list, a composer, and a
-// raw SSE event log. No later-milestone product surfaces —
-// those belong to later milestones. This page exists only to prove the
-// gateway's HTTP + SSE plumbing from a browser.
+// A minimal chat page for exercising the gateway from a browser: session
+// list/create, message list, a composer, a live SSE feed. M1 runs a real
+// agent turn — assistant text streams into a pending bubble; tool calls and
+// per-turn metrics land in the event log. No later-milestone product
+// surfaces — this page exists only to verify the gateway end to end.
 
 import { createSignal, For, onCleanup, Show } from "solid-js";
 
@@ -14,13 +15,31 @@ type Session = {
   last_active_at: string;
 };
 type Message = { seq: number; role: string; content: string; created_at: string };
-type EventRow = { seq: number; kind: string; payload: unknown; created_at: string };
+type EventRow = {
+  seq: number;
+  kind: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+// Lifecycle events shown in the right-hand log. `assistant_delta` is handled
+// separately — it streams into the pending bubble instead of flooding the log.
+const LOG_KINDS = [
+  "message_created",
+  "tool_call",
+  "tool_result",
+  "assistant_done",
+  "turn_metrics_recorded",
+  "error",
+];
+const ALL_KINDS = ["assistant_delta", ...LOG_KINDS];
 
 export default function App() {
   const [sessions, setSessions] = createSignal<Session[]>([]);
   const [current, setCurrent] = createSignal<string | null>(null);
   const [messages, setMessages] = createSignal<Message[]>([]);
   const [events, setEvents] = createSignal<EventRow[]>([]);
+  const [streaming, setStreaming] = createSignal("");
   const [draft, setDraft] = createSignal("");
 
   let stream: EventSource | undefined;
@@ -40,14 +59,22 @@ export default function App() {
   const openSession = (id: string) => {
     setCurrent(id);
     setEvents([]);
+    setStreaming("");
     void loadMessages(id);
     stream?.close();
     stream = new EventSource(`/stream/sessions/${id}/events`);
-    for (const kind of ["message_created", "assistant_delta", "assistant_done"]) {
+    for (const kind of ALL_KINDS) {
       stream.addEventListener(kind, (ev) => {
         const row = JSON.parse((ev as MessageEvent).data) as EventRow;
+        if (row.kind === "assistant_delta") {
+          setStreaming((prev) => prev + String(row.payload?.text ?? ""));
+          return;
+        }
         setEvents((prev) => [...prev, row]);
-        if (row.kind === "message_created") void loadMessages(id);
+        if (row.kind === "message_created") {
+          if (row.payload?.role === "assistant") setStreaming("");
+          void loadMessages(id);
+        }
       });
     }
   };
@@ -82,7 +109,9 @@ export default function App() {
     <div class="app">
       <aside class="sidebar">
         <header>
-          <h1>L.E.E.K <span>· M0 harness</span></h1>
+          <h1>
+            L.E.E.K <span>· M1 harness</span>
+          </h1>
         </header>
         <button class="new" onClick={() => void newSession()}>
           + New session
@@ -116,6 +145,12 @@ export default function App() {
                 </div>
               )}
             </For>
+            <Show when={streaming()}>
+              <div class="msg assistant pending">
+                <span class="role">assistant · streaming</span>
+                <p>{streaming()}</p>
+              </div>
+            </Show>
           </section>
           <form
             class="composer"
@@ -126,7 +161,7 @@ export default function App() {
           >
             <textarea
               rows={2}
-              placeholder="Message — M0 replies with Echo:"
+              placeholder="Message — M1 runs a real agent turn (watch the SSE log)"
               value={draft()}
               onInput={(e) => setDraft(e.currentTarget.value)}
             />

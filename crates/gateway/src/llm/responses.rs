@@ -1,0 +1,443 @@
+//! OpenAI Responses API — request-body builder and SSE stream parser.
+//!
+//! The codex backend (`chatgpt.com/backend-api/codex/responses`) speaks the
+//! OpenAI Responses API. This module turns a `ChatRequest` into the request
+//! JSON and turns the streamed `text/event-stream` response into a flow of
+//! normalized `LlmEvent`s.
+
+use anyhow::{anyhow, Context, Result};
+use async_stream::try_stream;
+use futures::stream::BoxStream;
+use futures::StreamExt;
+use serde::Deserialize;
+
+use super::{ChatRequest, LlmEvent, StopReason, Usage};
+
+/// Build the Responses API request body for `req`.
+///
+/// Notable choices:
+/// - `store: false` — the codex backend disallows server-side response
+///   storage anyway, and leek keeps its own history in `vault.messages`.
+/// - no `max_output_tokens` — codex-rs's request struct has no such field;
+///   the provider's per-model default is trusted (ARCHITECTURE §12.3,
+///   MILESTONES decision 2026-05-09).
+pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
+    let input: Vec<serde_json::Value> = req
+        .messages
+        .iter()
+        .map(|m| serde_json::json!({ "role": m.role.as_str(), "content": m.content }))
+        .collect();
+
+    let mut body = serde_json::json!({
+        "model": req.model,
+        "stream": true,
+        "instructions": req.system,
+        "input": input,
+        "store": false,
+    });
+
+    if !req.tools.is_empty() {
+        let tools: Vec<serde_json::Value> = req
+            .tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                    "strict": false,
+                })
+            })
+            .collect();
+        body["tools"] = serde_json::Value::Array(tools);
+    }
+
+    // Raw input items appended after the conversation — the agent loop's
+    // re-injected function_call / function_call_output pairs and any
+    // per-iteration developer hint.
+    if !req.additional_inputs.is_empty() {
+        if let Some(arr) = body["input"].as_array_mut() {
+            arr.extend(req.additional_inputs.iter().cloned());
+        }
+    }
+
+    if let Some(effort) = &req.reasoning_effort {
+        body["reasoning"] =
+            serde_json::json!({ "effort": effort, "summary": serde_json::Value::Null });
+    }
+    if let Some(verbosity) = &req.verbosity {
+        body["text"] = serde_json::json!({ "verbosity": verbosity });
+    }
+
+    body
+}
+
+/// Parse a Responses API SSE stream into a flow of `LlmEvent`s.
+pub fn parse_sse_stream(resp: reqwest::Response) -> BoxStream<'static, Result<LlmEvent>> {
+    let mut bytes = resp.bytes_stream();
+
+    Box::pin(try_stream! {
+        // Buffer at the byte level: the backend can split a multi-byte UTF-8
+        // character (CJK text) across two HTTP chunks, so decoding chunks
+        // individually blows up at the boundary. The `\n\n` event delimiter
+        // is pure ASCII, so scanning raw bytes is safe; we only decode UTF-8
+        // once a whole event has been extracted.
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = bytes.next().await {
+            let chunk = chunk.context("reading SSE chunk")?;
+            buf.extend_from_slice(&chunk);
+
+            while let Some(b) = find_event_boundary(&buf) {
+                let raw: Vec<u8> = buf.drain(..b.next_start).collect();
+                let event = std::str::from_utf8(&raw[..b.event_end])
+                    .context("non-UTF-8 in SSE event")?;
+                for evt in parse_one_event(event)? {
+                    yield evt;
+                }
+            }
+        }
+
+        // Flush a trailing event with no closing blank line.
+        if !buf.is_empty() {
+            if let Ok(trailing) = std::str::from_utf8(&buf) {
+                if !trailing.trim().is_empty() {
+                    for evt in parse_one_event(trailing)? {
+                        yield evt;
+                    }
+                }
+            }
+        }
+    })
+}
+
+struct Boundary {
+    event_end: usize,
+    next_start: usize,
+}
+
+fn find_event_boundary(buf: &[u8]) -> Option<Boundary> {
+    if let Some(i) = buf.windows(2).position(|w| w == b"\n\n") {
+        return Some(Boundary {
+            event_end: i,
+            next_start: i + 2,
+        });
+    }
+    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some(Boundary {
+            event_end: i,
+            next_start: i + 4,
+        });
+    }
+    None
+}
+
+#[derive(Deserialize)]
+struct DataEnvelope {
+    #[serde(rename = "type")]
+    type_: Option<String>,
+    #[serde(default)]
+    delta: Option<String>,
+    #[serde(default)]
+    response: Option<ResponseObject>,
+    #[serde(default)]
+    item: Option<ItemObject>,
+}
+
+#[derive(Deserialize)]
+struct ItemObject {
+    #[serde(rename = "type", default)]
+    type_: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    /// Wire form is a JSON string (codex-rs `ResponseItem`).
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResponseObject {
+    #[serde(default)]
+    usage: Option<UsageRaw>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UsageRaw {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+    #[serde(default)]
+    input_tokens_details: Option<TokenDetailsRaw>,
+}
+
+#[derive(Deserialize)]
+struct TokenDetailsRaw {
+    #[serde(default)]
+    cached_tokens: u32,
+}
+
+/// Parse one raw SSE event block into zero or more `LlmEvent`s. Any
+/// recognized-but-untranslated event yields a single `Ping` so the loop's
+/// idle timer sees the model is still working.
+fn parse_one_event(raw: &str) -> Result<Vec<LlmEvent>> {
+    // Concatenate `data:` lines per the SSE spec; ignore `event:` / `id:`.
+    let mut data = String::new();
+    for line in raw.lines() {
+        if let Some(payload) = line.trim_end().strip_prefix("data:") {
+            let payload = payload.strip_prefix(' ').unwrap_or(payload);
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(payload);
+        }
+    }
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(Vec::new());
+    }
+
+    let env: DataEnvelope = serde_json::from_str(&data)
+        .with_context(|| format!("parsing SSE data as JSON: {}", truncate(&data, 200)))?;
+
+    match env.type_.as_deref() {
+        Some("response.output_text.delta") => {
+            let text = env
+                .delta
+                .ok_or_else(|| anyhow!("output_text.delta missing 'delta'"))?;
+            Ok(vec![LlmEvent::TextDelta { text }])
+        }
+        // Function-call items: arguments are accumulated server-side and
+        // delivered complete on `output_item.done`. The `added` event has
+        // empty arguments — skip it (→ Ping) to avoid a partial dispatch.
+        Some("response.output_item.done") => {
+            let Some(item) = env.item else {
+                return Ok(vec![LlmEvent::Ping]);
+            };
+            if item.type_.as_deref() == Some("function_call") {
+                let call_id = item
+                    .call_id
+                    .ok_or_else(|| anyhow!("function_call done missing 'call_id'"))?;
+                let name = item
+                    .name
+                    .ok_or_else(|| anyhow!("function_call done missing 'name'"))?;
+                Ok(vec![LlmEvent::FunctionCall {
+                    call_id,
+                    name,
+                    arguments: item.arguments.unwrap_or_default(),
+                }])
+            } else {
+                Ok(vec![LlmEvent::Ping])
+            }
+        }
+        Some("response.completed") => {
+            let response = env
+                .response
+                .ok_or_else(|| anyhow!("response.completed missing 'response'"))?;
+            let usage = response.usage.unwrap_or(UsageRaw {
+                input_tokens: 0,
+                output_tokens: 0,
+                input_tokens_details: None,
+            });
+            let cache_read = usage
+                .input_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens)
+                .unwrap_or(0);
+            let stop = match response.status.as_deref() {
+                Some("incomplete") => StopReason::MaxTokens,
+                _ => StopReason::EndTurn,
+            };
+            Ok(vec![
+                LlmEvent::Usage(Usage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_read_tokens: cache_read,
+                }),
+                LlmEvent::MessageEnd { stop_reason: stop },
+            ])
+        }
+        Some("response.failed") | Some("response.error") | Some("error") => Err(anyhow!(
+            "provider returned an error event: {}",
+            truncate(&data, 400)
+        )),
+        // Everything else (lifecycle, reasoning summary, argument deltas):
+        // recognized, no content — a heartbeat for the idle timer.
+        Some(_) | None => Ok(vec![LlmEvent::Ping]),
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::{ChatMessage, Role, ToolSpec};
+
+    fn req() -> ChatRequest {
+        ChatRequest {
+            model: "gpt-5.5".into(),
+            system: "sys".into(),
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "hi".into(),
+            }],
+            tools: Vec::new(),
+            additional_inputs: Vec::new(),
+            reasoning_effort: None,
+            verbosity: None,
+        }
+    }
+
+    #[test]
+    fn body_has_no_max_output_tokens() {
+        let body = build_request_body(&req());
+        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["instructions"], "sys");
+    }
+
+    #[test]
+    fn body_serializes_function_tool() {
+        let mut r = req();
+        r.tools = vec![ToolSpec {
+            name: "echo".into(),
+            description: "Echo text.".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }];
+        let body = build_request_body(&r);
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "echo");
+    }
+
+    #[test]
+    fn body_appends_additional_inputs() {
+        let mut r = req();
+        r.additional_inputs = vec![
+            serde_json::json!({ "type": "function_call", "call_id": "c1", "name": "echo", "arguments": "{}" }),
+            serde_json::json!({ "type": "function_call_output", "call_id": "c1", "output": "ok" }),
+        ];
+        let body = build_request_body(&r);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[2]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn body_emits_reasoning_and_verbosity() {
+        let mut r = req();
+        r.reasoning_effort = Some("xhigh".into());
+        r.verbosity = Some("low".into());
+        let body = build_request_body(&r);
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert!(body["reasoning"]["summary"].is_null());
+        assert_eq!(body["text"]["verbosity"], "low");
+    }
+
+    #[test]
+    fn parses_text_delta() {
+        let raw = "event: response.output_text.delta\n\
+                   data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}";
+        match &parse_one_event(raw).unwrap()[..] {
+            [LlmEvent::TextDelta { text }] => assert_eq!(text, "Hi"),
+            other => panic!("expected TextDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_completed_with_usage() {
+        let raw = "data: {\"type\":\"response.completed\",\"response\":{\
+                   \"status\":\"completed\",\"usage\":{\"input_tokens\":10,\
+                   \"output_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":3}}}}";
+        let evts = parse_one_event(raw).unwrap();
+        assert_eq!(evts.len(), 2);
+        match &evts[0] {
+            LlmEvent::Usage(u) => {
+                assert_eq!(u.input_tokens, 10);
+                assert_eq!(u.output_tokens, 5);
+                assert_eq!(u.cache_read_tokens, 3);
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        assert!(matches!(
+            evts[1],
+            LlmEvent::MessageEnd {
+                stop_reason: StopReason::EndTurn
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_function_call_done() {
+        let raw = "data: {\"type\":\"response.output_item.done\",\"item\":{\
+                   \"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"echo\",\
+                   \"arguments\":\"{\\\"text\\\":\\\"x\\\"}\"}}";
+        match &parse_one_event(raw).unwrap()[..] {
+            [LlmEvent::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            }] => {
+                assert_eq!(call_id, "call_1");
+                assert_eq!(name, "echo");
+                assert_eq!(arguments, "{\"text\":\"x\"}");
+            }
+            other => panic!("expected FunctionCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_event_is_ping() {
+        let raw = "data: {\"type\":\"response.in_progress\"}";
+        assert!(matches!(
+            parse_one_event(raw).unwrap()[..],
+            [LlmEvent::Ping]
+        ));
+    }
+
+    #[test]
+    fn done_marker_yields_nothing() {
+        assert!(parse_one_event("data: [DONE]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_event_is_error() {
+        let raw = "data: {\"type\":\"response.failed\",\"error\":{}}";
+        assert!(parse_one_event(raw).is_err());
+    }
+
+    #[test]
+    fn event_boundary_survives_split_multibyte() {
+        // "data: 中文\n\nrest" — boundary is found even with 3-byte CJK.
+        let buf = b"data: \xe4\xb8\xad\xe6\x96\x87\n\nrest";
+        let b = find_event_boundary(buf).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&buf[..b.event_end]).unwrap(),
+            "data: 中文"
+        );
+        assert_eq!(&buf[b.next_start..], b"rest");
+    }
+
+    #[test]
+    fn event_boundary_none_for_partial_multibyte() {
+        // Chunk ends mid-character — no boundary yet.
+        assert!(find_event_boundary(b"data: hi\xe4\xb8").is_none());
+    }
+}

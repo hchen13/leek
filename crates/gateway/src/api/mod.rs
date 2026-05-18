@@ -11,12 +11,49 @@ use axum::routing::{get, patch};
 use axum::{Json, Router};
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::agent::GuardConfig;
 use crate::bus::EventBus;
+use crate::llm::codex::CodexClient;
+use crate::vault::events::Event;
 
+/// Shared, cheaply-cloneable handles for request handlers and agent turns.
 #[derive(Clone)]
 pub struct AppState {
     pub pool: sqlx::SqlitePool,
     pub bus: EventBus,
+    /// The codex backend client (model access).
+    pub codex: CodexClient,
+    /// HTTP client for client-side tools (the `web_fetch` tool).
+    pub http: reqwest::Client,
+    /// Agent-loop safety nets, resolved once at startup.
+    pub guards: GuardConfig,
+}
+
+impl AppState {
+    /// Persist an event to the durable log, then fan it out to live SSE
+    /// subscribers. Use for meaningful, replayable lifecycle events.
+    pub async fn emit(&self, session_id: &str, kind: &str, payload: serde_json::Value) {
+        match crate::vault::events::insert(&self.pool, session_id, kind, &payload).await {
+            Ok(event) => self.bus.publish(session_id, event).await,
+            Err(e) => {
+                tracing::error!(error = %e, session_id, kind, "failed to persist event");
+            }
+        }
+    }
+
+    /// Fan an event out to live subscribers WITHOUT persisting it. For
+    /// high-frequency ephemeral events (assistant token deltas): the durable
+    /// record of a turn is its `messages` row, not every streamed token.
+    /// `seq = -1` marks the event as not coming from the durable log.
+    pub async fn emit_ephemeral(&self, session_id: &str, kind: &str, payload: serde_json::Value) {
+        let event = Event {
+            seq: -1,
+            kind: kind.to_string(),
+            payload,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        self.bus.publish(session_id, event).await;
+    }
 }
 
 pub fn router(state: AppState) -> Router {

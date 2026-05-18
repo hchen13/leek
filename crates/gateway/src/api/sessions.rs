@@ -53,10 +53,7 @@ pub async fn rename(
 }
 
 /// `DELETE /api/v1/sessions/{id}`
-pub async fn remove(
-    State(st): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<StatusCode> {
+pub async fn remove(State(st): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     if sessions::delete(&st.pool, &id).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {

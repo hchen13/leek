@@ -2,7 +2,7 @@
   "name": "leek-web",
   "version": "0.1.0",
   "private": true,
-  "description": "L.E.E.K web — M0 verification harness (SolidJS + Vite)",
+  "description": "L.E.E.K web — M1 verification harness (SolidJS + Vite)",
   "type": "module",
   "scripts": {
     "dev": "vite",

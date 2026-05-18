@@ -44,6 +44,15 @@ frontend active tree 全部清底重写。旧代码通过 git history 查询，
 老的 milestone 完成标记（M1 DONE 等）有意被重置——*实现*它们的
 *代码*不再继承。它们*验证过的原则*仍然 locked。
 
+当前 `rebuild-clean` 实现状态：
+
+- **M0 completed（2026-05-18）**：runtime / migration / frontend
+  active tree 已 clean-room 重写，HTTP + SQLite + SSE echo 骨架可跑。
+- **M1 completed（2026-05-18）**：echo worker 已替换为真实主 agent
+  loop；Codex OAuth、Responses streaming、工具循环、turn_metrics 和
+  M1 guard set 已接入。M1 没有接 corpus / skill / subagent / domain
+  tools。
+
 ---
 
 ## M0 — Clean-room skeleton（清底骨架）
@@ -196,8 +205,9 @@ SSE 闭环，不是复活旧应用。
 
 - per-model 的 wall-clock 默认值？（目前全局 30 分钟。reasoning
   模型也许要更长。）推到第一次真有人抱怨再说。
-- Cost cap 怎么处理多档价格（input vs cached input vs reasoning
-  vs output）——具体 schema 在 M1.6 commit message 里定。
+- Cost cap 多档价格初版已在 M1 落地为 `input / cached input /
+  output` 三档估算；codex backend 没有公开价格面，后续以真实账单或
+  vendor 价格更新 `pricing.rs`。
 
 ---
 
@@ -448,6 +458,20 @@ Task 形态——有 eval case 端到端跑通：
 - M1 开始再按需从 git history 摘取 OAuth / Responses parsing 等
   具体片段，摘取时必须删除旧 `LlmProvider`、routing、compaction、
   subagent surface 和 M0 不需要的 schema。
+
+### 2026-05-18 — M1 clean-room agent loop 落地
+- M1 在 clean-room runtime 上重新实现，没有继承旧 `LlmProvider`
+  trait、routing、task/deliverable、plan_guard 或旧 compaction
+  subsystem。
+- 落地范围：Codex OAuth、Responses streaming、主 agent loop、
+  `echo` + `web_fetch` 工具注册、`turn_metrics`、M1 guard set、
+  SSE 事件扩展和前端 harness 的流式气泡。
+- `auto-compaction` 在 M1 只做 90% 阈值检测 + 诊断性停止；不做
+  摘要压缩后继续。真正 summarize-and-continue 等后续有真实压力再
+  设计。
+- `web_fetch` 是 M1 的通用验证工具，不是领域工具。它只允许
+  HTTP(S)，并阻断 localhost / private IP literal 这类本机和内网
+  入口；更完整的 DNS rebinding 防护等到多用户或远程部署前再补。
 
 ### 2026-05-11 — 不抽象 LLM provider
 - 当前只有一条路径：codex pro OAuth → Responses API。用户没有

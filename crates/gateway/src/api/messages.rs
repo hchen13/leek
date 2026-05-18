@@ -1,4 +1,5 @@
-//! Message endpoints. `post` runs the M0 echo worker.
+//! Message endpoints. `post` persists the user message and spawns an
+//! agent turn (M0's echo worker is gone — M1 runs the real loop).
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -6,7 +7,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use super::{ApiResult, AppState};
-use crate::vault::{events, messages, sessions};
+use crate::vault::{messages, sessions};
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -33,9 +34,11 @@ pub struct PostBody {
 
 /// `POST /api/v1/sessions/{id}/messages`
 ///
-/// Persists the user message, then runs the M0 echo worker: a fixed
-/// `Echo: <text>` assistant reply. Every step also lands as a row in `events`
-/// and is fanned out over SSE.
+/// Persists the user message, then spawns the agent turn in the background
+/// and returns `202 Accepted` immediately. A real turn runs for seconds to
+/// minutes, so the response carries only the `turn_id`; the client watches
+/// the SSE stream (`assistant_delta`, `tool_call`, `tool_result`,
+/// `assistant_done`, `turn_metrics_recorded`) for the turn's progress.
 pub async fn post(
     State(st): State<AppState>,
     Path(session_id): Path<String>,
@@ -43,10 +46,8 @@ pub async fn post(
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     sessions::ensure(&st.pool, &session_id).await?;
 
-    // User message.
     let user = messages::insert(&st.pool, &session_id, "user", &body.content).await?;
-    emit(
-        &st,
+    st.emit(
         &session_id,
         "message_created",
         serde_json::json!({
@@ -56,57 +57,17 @@ pub async fn post(
             "created_at": user.created_at,
         }),
     )
-    .await?;
+    .await;
 
-    // Echo worker — M0's stand-in for the agent loop.
-    let reply = format!("Echo: {}", body.content);
-    emit(
-        &st,
-        &session_id,
-        "assistant_delta",
-        serde_json::json!({ "text": reply }),
-    )
-    .await?;
-    let assistant = messages::insert(&st.pool, &session_id, "assistant", &reply).await?;
-    emit(
-        &st,
-        &session_id,
-        "message_created",
-        serde_json::json!({
-            "seq": assistant.seq,
-            "role": "assistant",
-            "content": assistant.content,
-            "created_at": assistant.created_at,
-        }),
-    )
-    .await?;
-    emit(
-        &st,
-        &session_id,
-        "assistant_done",
-        serde_json::json!({ "message_seq": assistant.seq }),
-    )
-    .await?;
-
-    sessions::touch(&st.pool, &session_id).await?;
+    let turn_id = format!("turn-{}", uuid::Uuid::new_v4().simple());
+    tokio::spawn(crate::agent::run_turn(
+        st.clone(),
+        session_id.clone(),
+        turn_id.clone(),
+    ));
 
     Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "user_seq": user.seq,
-            "assistant_seq": assistant.seq,
-        })),
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "turn_id": turn_id, "user_seq": user.seq })),
     ))
-}
-
-/// Persist an event, then fan it out to live SSE subscribers.
-async fn emit(
-    st: &AppState,
-    session_id: &str,
-    kind: &str,
-    payload: serde_json::Value,
-) -> ApiResult<()> {
-    let event = events::insert(&st.pool, session_id, kind, &payload).await?;
-    st.bus.publish(session_id, event).await;
-    Ok(())
 }

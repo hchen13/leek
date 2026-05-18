@@ -1,8 +1,13 @@
-//! SQLite vault — open + migrate. M0 schema: users / sessions / messages / events.
+//! SQLite vault — open + migrate.
+//!
+//! M0 schema: users / sessions / messages / events.
+//! M1 adds: turn_metrics (per-turn observability) + codex_auth (OAuth tokens).
 
+pub mod auth_tokens;
 pub mod events;
 pub mod messages;
 pub mod sessions;
+pub mod turn_metrics;
 
 use std::path::Path;
 use std::str::FromStr;
