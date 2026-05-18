@@ -50,8 +50,9 @@ frontend active tree 全部清底重写。旧代码通过 git history 查询，
   active tree 已 clean-room 重写，HTTP + SQLite + SSE echo 骨架可跑。
 - **M1 completed（2026-05-18）**：echo worker 已替换为真实主 agent
   loop；Codex OAuth、Responses streaming、工具循环、turn_metrics 和
-  M1 guard set 已接入。M1 没有接 corpus / skill / subagent / domain
-  tools。
+  M1 guard set 已接入。注意：M1.8 落地的是 context-limit guard
+  （到阈值停止并给诊断），不是摘要压缩后继续工作的完整 auto-compaction。
+  M1 没有接 corpus / skill / subagent / domain tools。
 
 ---
 
@@ -146,7 +147,7 @@ SSE 闭环，不是复活旧应用。
 | M1.5 | Iteration cap                                               | None，opt-in    |
 | M1.6 | Cost cap + per-model 价格表                                 | None，opt-in    |
 | M1.7 | Doom-loop detector + first_triggered_guard 接线             | N=3，默认开      |
-| M1.8 | Auto-compaction                                             | 90%，默认开      |
+| M1.8 | Context-limit guard（auto-compact threshold only）           | 90%，默认开      |
 
 ### Design decisions（locked — 从老 rebuild 继承）
 
@@ -173,8 +174,10 @@ SSE 闭环，不是复活旧应用。
   hermes / openclaw 都没有等价物。同样的 `(tool_name, args)`
   连续 ≥ 3 次时触发。
 
-- **Auto-compaction 90%** — 对齐 codex 的硬编码
-  `(context_window * 9) / 10`。
+- **Context-limit guard 90%** — 对齐 codex 的硬编码
+  `(context_window * 9) / 10` 作为阈值。M1 只保证到阈值时不继续把
+  context 撑爆：停止 turn、持久化诊断消息和 metrics。真正的
+  summarize-and-continue auto-compaction 不算 M1 已完成内容。
 
 - **Soft-prompt 时间提示是 leek 自创** — 阶段化 10/5/2/1 分钟
   阈值，按 LLM block 注入（不是按 turn）。剩余 > 10 分钟时不
@@ -413,7 +416,7 @@ Task 形态——有 eval case 端到端跑通：
   hermes-agent（无）、openclaw（只 idle）。
 
 ### 2026-05-09 — Guard 的 opt-in vs 默认开
-- 默认开：idle timeout、wall-clock、doom-loop、auto-compaction、
+- 默认开：idle timeout、wall-clock、doom-loop、context-limit guard、
   可观测性（`turn_metrics`）。
 - Opt-in：iteration cap、cost cap。
 - 对齐 codex，除了 leek 自创的 guard（doom-loop、soft 时间提示）
@@ -466,9 +469,9 @@ Task 形态——有 eval case 端到端跑通：
 - 落地范围：Codex OAuth、Responses streaming、主 agent loop、
   `echo` + `web_fetch` 工具注册、`turn_metrics`、M1 guard set、
   SSE 事件扩展和前端 harness 的流式气泡。
-- `auto-compaction` 在 M1 只做 90% 阈值检测 + 诊断性停止；不做
-  摘要压缩后继续。真正 summarize-and-continue 等后续有真实压力再
-  设计。
+- M1.8 的名称修正为 `context-limit guard`：它只做 90% 阈值检测
+  + 诊断性停止；不做摘要压缩后继续。真正 summarize-and-continue
+  不能算 M1 done，后续要作为独立 milestone/commit 设计和验收。
 - `web_fetch` 是 M1 的通用验证工具，不是领域工具。它只允许
   HTTP(S)，并阻断 localhost / private IP literal 这类本机和内网
   入口；更完整的 DNS rebinding 防护等到多用户或远程部署前再补。

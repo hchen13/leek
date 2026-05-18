@@ -257,7 +257,7 @@ corpus-expert，主 agent 再据此 `update_plan`。
 | Iteration cap       | None，opt-in            | per-turn          | codex / CC 都不强制。给高级用户用；默认不开。                                         |
 | Cost cap            | None，opt-in            | per-turn          | 用 per-model 价格表算的美元上限。                                                     |
 | Doom-loop detector  | N=3，默认开             | per-turn          | 同样的 `(tool_name, args)` 连续 ≥ N 次 → 中止。                                       |
-| Auto-compaction     | 90%，默认开             | per-session       | 对齐 codex。                                                                          |
+| Context-limit guard | 90%，默认开             | per-turn          | M1 先诊断性停止；真正摘要压缩后继续是后续独立能力。                                  |
 | Per-turn metrics    | 默认开                  | per-turn          | 每个 turn 一行：stop_reason、tokens、cost、first_triggered_guard、iteration。         |
 
 Subagent 的 loop **全部**复用这些。一个挂掉的 subagent 不能污染
