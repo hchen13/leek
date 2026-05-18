@@ -100,8 +100,8 @@ agent loop 原语。我们采纳它们。
   `LlmProvider` trait，不做 `OpenAIClient` / `AnthropicClient`
   这种并行类层级。就一个具体 client。
 - **单 vault**：每个用户一份 SQLite 文件。M0 表：`users`、
-  `sessions`、`messages`、`user_settings`。其它表只能通过明确的
-  milestone 引入，迁移文件要在 commit 时被审查。
+  `sessions`、`messages`、`events`。其它表只能通过明确的 milestone
+  引入，迁移文件要在 commit 时被审查。
 - **SSE 做流式**：模型输出、工具事件、计划更新走同一条 SSE 通道。
 
 ---
@@ -274,18 +274,22 @@ Subagent 的 loop **全部**复用这些。一个挂掉的 subagent 不能污染
 每用户一份 SQLite。M0 schema：
 
 ```sql
-users(id, oauth_subject, created_at)
+users(id, created_at)
 sessions(id, user_id, title, created_at, last_active_at)
-messages(seq, session_id, user_id, role, content, created_at, ...)
-user_settings(user_id, ...)
+messages(session_id, seq, role, content, created_at)
+events(session_id, seq, kind, payload, created_at)
 turn_metrics(turn_id, session_id, ...)   -- M1 引入
 ```
 
+M0 是单用户本地骨架：`messages` / `events` 不重复存 `user_id`，
+归属从 `sessions.user_id` 派生。OAuth 相关字段等 M1 接入 codex
+OAuth 时随 token 存储一起引入。
+
 M0 故意不引入的表：
 `tasks`、`deliverables`、`charters`、`decisions`、`plans`、
-`holdings`、`provider_configs`、`compactions`、`tool_runs`、
-`subagents`（subagent spawn 不需要单独的表——`turn_metrics`
-带 `parent_turn_id` 字段就够）。
+`holdings`、`user_settings`、`provider_configs`、`compactions`、
+`tool_runs`、`subagents`（subagent spawn 不需要单独的表——
+`turn_metrics` 带 `parent_turn_id` 字段就够）。
 
 每张新加入的表都必须在 migration 文件头部说明**为什么现在加**。
 没写出理由的 migration 在 code review 阶段就该被拒。
@@ -367,78 +371,63 @@ Hook 执行：shell 命令，捕获 stdout / exit code，可配置超时。
 
 ---
 
-## 10. 老 `rebuild` 分支上什么留什么删
+## 10. Clean-room rebuild 边界
 
-这是清理 commit 要用的字面映射表。"留下"的门槛：MVP 直接需要它。
-其它一概砍。
+M0 不再做"旧实现里哪些文件留下来改"的清理题，而是做 clean-room
+runtime。原因：partial-retain 会把旧 schema、旧事件、旧 endpoint、
+旧 UI 和旧 mental model 一起带进新系统，制造"能编译但方向已偏"
+的假象。
 
-### 留下（可能会有重构）
+### Active tree 保留
 
-- `crates/gateway/src/main.rs`——入口
-- `crates/gateway/src/auth/`——OAuth 登录
-- `crates/gateway/src/llm/codex_oauth.rs`——OAuth 流
-- `crates/gateway/src/llm/openai_responses.rs`——Responses API client
-- `crates/gateway/src/llm/pricing.rs`——per-model 价格表（cost cap 用）
-- `crates/gateway/src/events/`——SSE 基础设施
-- `crates/gateway/src/api/sessions.rs`——session CRUD（会简化）
-- `crates/gateway/src/api/messages.rs`——message POST + stream
-- `crates/gateway/src/api/static_files.rs`——前端静态文件
-- `crates/gateway/src/api/health.rs`——健康检查
-- `crates/gateway/src/vault/mod.rs`、`sessions.rs`、`messages.rs`、
-  `user_settings.rs`
-- `crates/gateway/src/corpus/`——corpus loader（会简化）
-- `crates/gateway/migrations/0001_initial.sql`——user / session /
-  message schema
-- `crates/gateway/migrations/0007_user_settings.sql`——user settings
-- `frontend/web/`——整个前端目录，API 契约会调整
-- `harness/skills/`——自带 skill（agent 重建过程中重写 body）
+只保留不会参与 runtime 控制流的设计和内容资产：
+
+- `AGENTS.md`
+- `docs/ARCHITECTURE.md`
+- `docs/MILESTONES.md`
+- `design/decisions/` 中仍然 locked 的决策记录
 - `harness/identity.md`、`harness/discipline.md`、
-  `harness/corpus_orientation.md`——system prompt 片段
-- `corpus/`——corpus 内容（目前是空占位）
+  `harness/corpus_orientation.md`
+- `harness/skills/`
+- `corpus/`
+- workspace / package manifest 中 M0 真正需要的最小部分
 
-### 删（DELETE）
+### Active tree 清底
 
-- `crates/gateway/src/agent/mod.rs`（2276 行）——重写，做小
-- `crates/gateway/src/agent/harness.rs`——system prompt 构造重写
-- `crates/gateway/src/agent/routing.rs`——routing 层，整个删除
-- `crates/gateway/src/agent/compact.rs`——auto-compact，M1 时折进
-  新 loop
-- `crates/gateway/src/agent/tools/`——保留*工具定义*但 registry
-  plumbing 重做
-- `crates/gateway/src/api/charter.rs`
-- `crates/gateway/src/api/corpus.rs`（如不再用专门 API 就删）
-- `crates/gateway/src/api/deliverables.rs`
-- `crates/gateway/src/api/portfolio.rs`
-- `crates/gateway/src/api/tools.rs`（legacy）
-- `crates/gateway/src/api/stream.rs`（与 events/ 冗余则删）
-- `crates/gateway/src/vault/charters.rs`
-- `crates/gateway/src/vault/compactions.rs`
-- `crates/gateway/src/vault/decisions.rs`
-- `crates/gateway/src/vault/holdings.rs`
-- `crates/gateway/src/vault/plans.rs`
-- `crates/gateway/src/vault/provider_configs.rs`
-- `crates/gateway/src/vault/subagents.rs`
-- `crates/gateway/src/vault/task_metrics.rs`——M1 时重命名为
-  `turn_metrics.rs`
-- `crates/gateway/src/vault/tasks.rs`
-- `crates/gateway/src/vault/tool_runs.rs`
-- `crates/gateway/migrations/0002_compaction.sql`
-- `crates/gateway/migrations/0003_decisions.sql`
-- `crates/gateway/migrations/0004_charters.sql`
-- `crates/gateway/migrations/0005_in_place_compaction.sql`
-- `crates/gateway/migrations/0006_agent_plan_items.sql`
-- `crates/gateway/migrations/0008_decision_structure.sql`
-- `crates/gateway/migrations/0009_plan_resolution.sql`
-- `crates/gateway/migrations/0010_task_metrics.sql`——M1 时重命名 + 重塑
+这些路径不作为 M0 的继承基础；需要时从 git history 精确查阅：
 
-### 前端 reshape（M0）
+- `crates/gateway/src/`
+- `crates/gateway/migrations/`
+- `frontend/web/src/`
+- `README.md` 里的旧 quickstart / roadmap 叙述
 
-- 删掉绑定到已删除后端实体的卡片/面板（charter 面板、decision
-  draft 卡片、portfolio 面板、deliverable artifact、task 状态指
-  示器）。
-- 保留：chat composer、消息列表、SSE 流接线、corpus 浏览、plan
-  视图。
-- API 契约对齐到新 gateway。细节在 M0 里定。
+M0 可以重新创建同名目录和文件，但内容必须按新 milestone 从零写。
+禁止把旧 runtime 整目录搬进 `tmp/legacy` 或其它可被误读为状态源的
+位置。参考旧代码时使用：
+
+```bash
+git show <old-rev>:<path>
+git grep <symbol> <old-rev>
+```
+
+摘回来的片段必须通过当前架构重审。比如 M1 需要 codex OAuth 时，
+可以查旧 `codex_oauth.rs` 的 token refresh 细节，但不能顺手带回
+`LlmProvider` trait、routing surface、compaction surface 或
+`provider_configs` M0 schema。
+
+### M0 前端边界
+
+M0 默认无产品前端。若为了验收要浏览器端验证，只允许一个极简 chat
+harness：
+
+- session list / create
+- message list
+- message composer
+- SSE event log
+
+不能带 portfolio、decision draft、plan、canvas fixture、corpus
+browser、settings、compaction、tool cards。那些属于后续 milestone，
+从旧前端摘取时也要逐组件重审。
 
 ---
 

@@ -26,52 +26,67 @@
 
 ---
 
-## 状态标识（2026-05-11）
+## 状态标识（2026-05-18）
 
 老的 `rebuild` 分支完成了 M1 + Phase 0g 清理，之后被诊断为携带
 了过多的确定性系统脚手架（routing 层、deliverable 分类、plan_guard），
-在预算内无法挽救。**决定：删掉 agent 后端，在 `rebuild-clean` 上
-重启。** 前端代码保留。Locked 设计决策保留（它们是研究背书过的，
-独立于实现它们的那些差劲代码）。详见 "Decision log" → 2026-05-11 条目。
+在预算内无法挽救。2026-05-11 的方案是删掉 agent 后端、保留前端
+和部分基础设施，在 `rebuild-clean` 上重启。
+
+2026-05-18 复盘后进一步收紧：**partial-retain 风险仍然太高**。
+旧 runtime 能编译、旧前端能 typecheck，但 migration、API、事件模型、
+README 和 UI 仍会把 `tasks` / `deliverables` / `mandate` /
+`portfolio` / `compaction` 等旧概念带回 active path。M0 改为
+**clean-room rebuild**：只保留设计资产和内容资产；runtime、migration、
+frontend active tree 全部清底重写。旧代码通过 git history 查询，
+不放进编译路径、路由路径、migration 路径或前端入口。
 
 老的 milestone 完成标记（M1 DONE 等）有意被重置——*实现*它们的
-*代码*正在被删除。它们*验证过的原则*仍然 locked。
+*代码*不再继承。它们*验证过的原则*仍然 locked。
 
 ---
 
-## M0 — Clean skeleton（干净骨架）
+## M0 — Clean-room skeleton（清底骨架）
 
 ### 目标
 
-立起最小端到端可用的纵切片，用来证明 plumbing 通了：用户能登录、
-开 session、发消息、通过 SSE 收到响应。**这个阶段没有 agent loop。
-没有工具。没有 LLM 调用。** "响应"是服务端 echo 回来。我们要证明
-的是前后端接通。
+立起最小端到端可用的纵切片，用来证明 plumbing 通了：能开 session、
+发消息、通过 SSE 收到响应。**这个阶段没有 agent loop，没有工具，
+没有 LLM 调用，没有 OAuth 登录要求，没有前端产品壳。** "响应"是
+服务端 echo 回来。M0 证明的是全新 runtime 的最小 HTTP / SQLite /
+SSE 闭环，不是复活旧应用。
 
 ### Scope
 
-- 分支手术：删除老的 agent / routing / deliverable / charter /
-  decision / plan / portfolio / holdings / subagents / task_metrics
-  / tool_runs / compaction 代码路径。字面清单见 `ARCHITECTURE.md
-  §10`。
-- Migration 合并：把老的 10 份 migration 合成一份新的
-  `0001_initial.sql`，覆盖 M0 的 schema（`users`、`sessions`、
-  `messages`、`user_settings`）。
-- 前端 reshape：删掉绑定到已删除后端实体的卡片/面板（charter、
-  decision draft、portfolio、deliverable artifact、task 状态）。
-  保留 chat composer、消息列表、SSE 接线、corpus 浏览、plan 视图
-  （plan 视图 M1 之前先休眠，这没问题）。
-- 验证：发一条消息，看它持久化，看到 SSE echo 响应回来。没有
-  agent，没有 LLM。
+- Runtime 清底：`crates/gateway/src/` 不继承旧 active code。重建
+  一个最小 Rust binary：CLI 参数、Axum server、SQLite open/migrate、
+  health、session CRUD、message POST/list、SSE stream、echo worker。
+  旧 OAuth / LLM / corpus / event / static file 代码一律暂不接回。
+- Migration 清底：删除老的 0001–0010；新建唯一
+  `0001_initial.sql`，只覆盖 M0 schema：`users`、`sessions`、
+  `messages`、`events`。如果 M0 没有实际字段使用，连
+  `user_settings` 也不要加。
+- Frontend 清底：`frontend/web/src/` 不继承旧 active UI。M0 可以
+  没有前端；如果要验证浏览器端，只写一个极简 chat harness，不能
+  带 portfolio、decision、plan、corpus、compaction、settings、
+  canvas fixture 等旧产品壳。
+- Legacy quarantine：旧代码不搬到 `tmp/legacy`，避免制造第二份
+  状态源。需要参考时用 `git show <old-rev>:<path>` 或
+  `git grep <symbol> <old-rev>` 精确摘取，再按新架构重写。
+- 验证：用 curl 或极简前端发一条消息，看 user message 和 echo
+  assistant message 都持久化，SSE 收到 `message_created` /
+  `assistant_delta` / `assistant_done` 等最小事件。没有 agent，
+  没有 LLM。
 
 ### Sub-commits（计划）
 
-| #    | 标题               | Scope                                                                                              |
-|------|--------------------|----------------------------------------------------------------------------------------------------|
-| M0.1 | 删除老后端          | 移除全部 `crates/gateway/src/agent/`、被删除的 vault 模块、被删除的 API 路由                         |
-| M0.2 | Migration 重置      | 把 migrations 0001–0010 合并成一份新的 `0001_initial.sql`                                            |
-| M0.3 | Echo loop          | 服务端桩：POST 消息 → SSE 事件 echo 响应 → DB 持久化                                                 |
-| M0.4 | 前端 reshape       | 移除已删除实体相关的面板；验证端到端 echo 通                                                          |
+| #    | 标题                    | Scope                                                                                 |
+|------|-------------------------|---------------------------------------------------------------------------------------|
+| M0.1 | Runtime wipe            | 清空旧 active runtime；只留下最小 crate/module 骨架和必要依赖                           |
+| M0.2 | Vault schema v1         | 单一 `0001_initial.sql`：users / sessions / messages / events                           |
+| M0.3 | HTTP + SSE echo         | Session CRUD；POST 消息；后台 echo assistant；事件持久化 + SSE fan-out                  |
+| M0.4 | Verification harness    | curl 脚本或极简前端；证明消息持久化、事件流、重启后 list 可恢复                         |
+| M0.5 | Docs sync               | README / ARCHITECTURE / MILESTONES 同步为 clean-room 状态，删掉旧 quickstart 误导         |
 
 ### Design decisions（locked）
 
@@ -80,11 +95,17 @@
 - **M0 用 echo，不调 LLM**。把 plumbing 和 agent 逻辑分开能让 M0
   小、让 M1 端到端地拿到模型集成的所有权。
 - **不存 `tasks` 表。**会话就是消息序列。见 `ARCHITECTURE.md §6`。
+- **M0 不保留旧前端作为产品基础。**旧 UI 的视觉和组件可以之后从
+  git history 摘取，但 M0 active frontend 只能服务 echo 验证。
+- **M0 不保留 OAuth / LLM client。**M1 从 git history 精确摘取
+  codex OAuth / Responses parsing 的有效片段，摘取时必须删掉
+  `LlmProvider` trait 和 routing/compaction/subagent surface 残留。
 
 ### Open questions
 
-- 开发机上现存的 vault DB——丢掉还是写个一次性 migrator？默认：
-  丢掉（我们还没有生产用户）。
+- 开发机上现存的 vault DB 默认丢掉；M0 不写 migrator。
+- M0 是否需要前端：默认不需要。若为了人工验收写极简前端，它必须
+  独立于旧产品 UI，且不能扩大 M0 scope。
 
 ---
 
@@ -412,7 +433,21 @@ Task 形态——有 eval case 端到端跑通：
   M1–M4 保留）。
 - 删除的（字面清单）：见 `ARCHITECTURE.md §10`。
 - 新增的：`M0 — Clean skeleton`（在重新实现 M1 之前，把分支手术
-  本身做成一个显式 milestone）。
+  本身做成一个显式 milestone）。此条里的 partial-retain 执行方式
+  已被 2026-05-18 的 clean-room 决策替代。
+
+### 2026-05-18 — M0 从 partial-retain 改成 clean-room rebuild
+- 用户担心"删一部分留一部分"的重构成本和方向风险太高：旧代码能
+  编译、旧前端能 typecheck，但 schema/API/UI/文档仍会继续携带旧
+  mental model。
+- 决定：M0 不再保留旧 runtime / migration / frontend active tree。
+  只保留设计资产和内容资产。旧实现作为参考留在 git history 里，
+  不复制到 `tmp/legacy`，避免出现第二份状态源。
+- M0 端态收缩为：最小 Rust server + SQLite v1 schema + session /
+  message API + SSE echo + curl/极简前端验证。
+- M1 开始再按需从 git history 摘取 OAuth / Responses parsing 等
+  具体片段，摘取时必须删除旧 `LlmProvider`、routing、compaction、
+  subagent surface 和 M0 不需要的 schema。
 
 ### 2026-05-11 — 不抽象 LLM provider
 - 当前只有一条路径：codex pro OAuth → Responses API。用户没有
