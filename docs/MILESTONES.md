@@ -50,11 +50,15 @@ frontend active tree 全部清底重写。旧代码通过 git history 查询，
 
 - **M0 completed（2026-05-18）**：runtime / migration / frontend
   active tree 已 clean-room 重写，HTTP + SQLite + SSE echo 骨架可跑。
-- **M1 completed（2026-05-18）**：echo worker 已替换为真实主 agent
+- **M1 core completed（2026-05-18）**：echo worker 已替换为真实主 agent
   loop；Codex OAuth、Responses streaming、工具循环、turn_metrics 和
-  M1 guard set 已接入。注意：M1.8 落地的是 context-limit guard
-  （到阈值停止并给诊断），不是摘要压缩后继续工作的完整 auto-compaction。
+  大部分 M1 guard set 已接入。注意：M1.8 auto-compaction 尚未完成；
+  当前代码只有 context-limit fallback（到阈值停止并给诊断），不能算
+  auto-compaction。
   M1 没有接 corpus / skill / subagent / domain tools。
+- **M1.8 pending（2026-05-19）**：实现真正 auto-compaction：到
+  90% context window 时摘要压缩旧上下文并继续同一个 turn；停止只作为
+  compaction 失败兜底。
 - **M1.9 pending（2026-05-19）**：锁定 workbench UX / event contract：
   chat 只放最终回复，canvas 放 note/tool/search/corpus/subagent 过程
   artifact，tool result 拆成 `model_output / display_payload /
@@ -153,7 +157,7 @@ SSE 闭环，不是复活旧应用。
 | M1.5 | Iteration cap                                               | None，opt-in    |
 | M1.6 | Cost cap + per-model 价格表                                 | None，opt-in    |
 | M1.7 | Doom-loop detector + first_triggered_guard 接线             | N=3，默认开      |
-| M1.8 | Context-limit guard（auto-compact threshold only）           | 90%，默认开      |
+| M1.8 | Auto-compaction（summarize and continue）                    | 90%，默认开      |
 
 ### Design decisions（locked — 从老 rebuild 继承）
 
@@ -180,10 +184,10 @@ SSE 闭环，不是复活旧应用。
   hermes / openclaw 都没有等价物。同样的 `(tool_name, args)`
   连续 ≥ 3 次时触发。
 
-- **Context-limit guard 90%** — 对齐 codex 的硬编码
-  `(context_window * 9) / 10` 作为阈值。M1 只保证到阈值时不继续把
-  context 撑爆：停止 turn、持久化诊断消息和 metrics。真正的
-  summarize-and-continue auto-compaction 不算 M1 已完成内容。
+- **Auto-compaction 90%** — 对齐 codex 的硬编码
+  `(context_window * 9) / 10` 作为阈值。到阈值时必须摘要压缩旧上下文
+  并继续同一个 turn。`context_limit` 停止只能作为 compaction 不可用、
+  压缩失败或压缩结果不可信时的兜底，不能替代 auto-compaction。
 
 - **Soft-prompt 时间提示是 leek 自创** — 阶段化 10/5/2/1 分钟
   阈值，按 LLM block 注入（不是按 turn）。剩余 > 10 分钟时不
@@ -217,6 +221,45 @@ SSE 闭环，不是复活旧应用。
 - Cost cap 多档价格初版已在 M1 落地为 `input / cached input /
   output` 三档估算；codex backend 没有公开价格面，后续以真实账单或
   vendor 价格更新 `pricing.rs`。
+
+---
+
+## M1.8 — Auto-compaction：摘要压缩后继续
+
+### 目标
+
+把当前 stop-only 的 context-limit fallback 升级为真正 auto-compaction：
+当上下文接近窗口上限时，系统自动生成可追溯摘要，替换长历史，然后继续
+同一个 turn。用户的问题没有完成时，默认应该继续工作，而不是让用户新开
+session。
+
+### Scope
+
+- 触发阈值：默认 90% context window。
+- 压缩对象：长 session history、早期 assistant 文本、早期 tool 结果、
+  已完成分支；当前用户问题、最近消息、正在进行的 tool call / tool
+  result 不得丢。
+- 摘要必须保留：
+  - 当前目标和用户约束
+  - 已确认事实和关键证据
+  - tool 结果摘要及 provenance / event refs
+  - corpus / web source 引用
+  - 未完成分支和下一步意图
+  - 已触发 guard / 错误状态
+- 压缩结果作为特殊上下文块进入后续 model input；同一个 turn 继续跑。
+- 写入可观测事件：`compaction_started`、`compaction_completed`、
+  `compaction_failed`。
+- metrics 记录 compaction 次数、压缩前后 token 估算、失败原因。
+- `context_limit` stop 只保留为 fallback：compaction 不可用、失败、
+  或摘要不满足保真要求时才触发。
+
+### 验收
+
+- 构造长 session 触发阈值后，turn 不停止，而是 compaction 后继续。
+- 压缩后模型仍能引用压缩前的关键约束、证据和 tool 结果。
+- compaction 事件可在 SSE / event history 中观察。
+- 如果 compaction 失败，系统给出清楚的 `context_limit` 诊断消息，
+  不静默失败。
 
 ---
 
@@ -461,7 +504,7 @@ Task 形态——有 eval case 端到端跑通：
   hermes-agent（无）、openclaw（只 idle）。
 
 ### 2026-05-09 — Guard 的 opt-in vs 默认开
-- 默认开：idle timeout、wall-clock、doom-loop、context-limit guard、
+- 默认开：idle timeout、wall-clock、doom-loop、auto-compaction、
   可观测性（`turn_metrics`）。
 - Opt-in：iteration cap、cost cap。
 - 对齐 codex，除了 leek 自创的 guard（doom-loop、soft 时间提示）
@@ -514,12 +557,21 @@ Task 形态——有 eval case 端到端跑通：
 - 落地范围：Codex OAuth、Responses streaming、主 agent loop、
   `echo` + `web_fetch` 工具注册、`turn_metrics`、M1 guard set、
   SSE 事件扩展和前端 harness 的流式气泡。
-- M1.8 的名称修正为 `context-limit guard`：它只做 90% 阈值检测
-  + 诊断性停止；不做摘要压缩后继续。真正 summarize-and-continue
-  不能算 M1 done，后续要作为独立 milestone/commit 设计和验收。
+- 这一版只落地了 `context_limit` stop fallback，没有完成真正
+  auto-compaction。2026-05-19 已修正口径：fallback 不能算 M1.8 done。
 - `web_fetch` 是 M1 的通用验证工具，不是领域工具。它只允许
   HTTP(S)，并阻断 localhost / private IP literal 这类本机和内网
   入口；更完整的 DNS rebinding 防护等到多用户或远程部署前再补。
+
+### 2026-05-19 — Auto-compaction 口径纠正
+- 用户纠正：context-limit stop-only 不是合理产品目标。codex /
+  Claude Code 类 agent 在上下文接近上限时应当自动压缩并继续工作；
+  事情没做完时，默认应该继续，而不是停下来要求用户精简或新开 session。
+- 决定：M1.8 恢复为真正 auto-compaction（summarize-and-continue）。
+  当前代码里的 `context_limit` 停止只保留为 fallback，不能算 M1.8
+  完成。
+- 影响：M1 改成 “core completed；M1.8 pending”。M1.9 workbench
+  event contract 仍然保留，但应排在 M1.8 full auto-compaction 之后。
 
 ### 2026-05-11 — 不抽象 LLM provider
 - 当前只有一条路径：codex pro OAuth → Responses API。用户没有

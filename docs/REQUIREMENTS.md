@@ -22,8 +22,8 @@
 - **turn**：一次用户输入到一次最终 assistant 回复。
 - **iteration**：一个 turn 内的一次模型调用。
 - **canvas artifact**：由事件流驱动的可视化过程卡片，如 note、tool、search、corpus、subagent。
-- **context-limit guard**：上下文接近窗口上限时停止 turn，并给出可见诊断。
-- **full auto-compaction**：上下文接近窗口上限时，先生成可追溯摘要替换长历史，然后继续同一个 turn。M1 没有实现 full auto-compaction。
+- **auto-compaction**：上下文接近窗口上限时，先生成可追溯摘要替换长历史，然后继续同一个 turn。
+- **context-limit fallback**：auto-compaction 不可用或失败时才停止 turn，并给出可见诊断。它是兜底，不是目标行为。
 
 ---
 
@@ -469,7 +469,7 @@ source page 可以在 modal 或引用列表中打开，但不进入 Corpus Brain
 - idle timeout：90 秒。
 - wall-clock 上限：30 分钟。
 - doom-loop detector：连续相同 tool+args 达到阈值时停止。
-- context-limit guard：90% context window。
+- auto-compaction threshold：90% context window。
 - per-turn metrics：默认开启。
 
 Opt-in guard：
@@ -486,14 +486,14 @@ wall-clock 软提示：
 
 Guard 触发时不能静默失败，必须产出可见停止原因和已有部分结果。
 
-#### Context-limit guard vs full auto-compaction
+#### Auto-compaction 与 context-limit fallback
 
-二者不是同一个完成度：
+正常目标是 auto-compaction，不是停下来让用户重开 session。
 
-- **context-limit guard**：检测到上下文接近窗口上限时，停止当前 turn，持久化已有文本、停止原因和 metrics，提示用户精简或新开 session。它的价值是避免继续撞上下文窗口。
-- **full auto-compaction**：检测到上下文接近窗口上限时，先把长历史压缩成一个可追溯摘要，保留目标、约束、关键证据、工具结果、未完成分支和 provenance，然后用摘要替换长历史，继续同一个 turn。
+- **auto-compaction**：检测到上下文接近窗口上限时，先把长历史压缩成一个可追溯摘要，保留目标、约束、关键证据、工具结果、未完成分支和 provenance，然后用摘要替换长历史，继续同一个 turn。
+- **context-limit fallback**：只有当 auto-compaction 尚不可用、压缩失败、或压缩结果无法满足保真要求时，才停止当前 turn，持久化已有文本、停止原因和 metrics，并提示用户精简或新开 session。
 
-当前 M1 只要求 context-limit guard。full auto-compaction 需要独立设计和验收，不算 M1 完成内容。
+当前代码只有 context-limit fallback，还没有完成 auto-compaction。按产品需求，M1.8 不能算完成，必须补到“压缩后继续”。
 
 ### 7.2 Observability
 
@@ -615,6 +615,7 @@ Guard 触发时不能静默失败，必须产出可见停止原因和已有部�
 - `echo` / `web_fetch`。
 - turn_metrics。
 - guard set。
+- auto-compaction。
 - chat 流式最终回复。
 
 验收：
@@ -624,9 +625,10 @@ Guard 触发时不能静默失败，必须产出可见停止原因和已有部�
 - 工具结果进入下一轮模型输入。
 - 最终回复在 chat 中流式出现。
 - guard 触发时有停止说明。
-- context-limit guard 到阈值时诊断性停止；不要求摘要压缩后继续。
+- auto-compaction 到阈值时生成可追溯摘要并继续同一个 turn。
+- context-limit fallback 只在 auto-compaction 失败或不可用时触发。
 
-当前实现状态：M1 已完成。它是后端 agent loop MVP，不包含完整 workbench canvas UX，也不包含 provider-side `web_search`。
+当前实现状态：M1 主 loop 已完成；M1.8 auto-compaction 尚未完成，当前代码只有 context-limit fallback。M1 也不包含完整 workbench canvas UX 或 provider-side `web_search`。
 
 ### M1.9 — Workbench Event Contract
 

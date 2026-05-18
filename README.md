@@ -32,8 +32,9 @@ What works today:
 - **Tools** — `echo` (deterministic, proves the function-call loop) and
   `web_fetch` (fetch a URL as text). Domain tools are M3.
 - **Guards** — idle timeout, wall-clock ceiling with staged soft-prompts,
-  iteration cap, cost cap, doom-loop detector, and a context-limit threshold
-  guard. Observability guards are on by default; hard caps are opt-in.
+  iteration cap, cost cap, doom-loop detector, and a context-limit fallback.
+  Full auto-compaction is the intended M1.8 behavior and is still pending.
+  Observability guards are on by default; hard caps are opt-in.
 - **Per-turn metrics** — every turn writes a `turn_metrics` row (stop reason,
   iterations, tokens, cost, triggering guard) and emits a
   `turn_metrics_recorded` event.
@@ -96,7 +97,7 @@ Until a settings UI exists, guards are tuned by environment variable
 | `LEEK_MAX_ITERATIONS` | off | Cap LLM iterations per turn (opt-in) |
 | `LEEK_COST_CAP_USD` | off | Cap estimated USD cost per turn (opt-in) |
 | `LEEK_DOOM_LOOP_THRESHOLD` | `3` | Abort after N identical `(tool, args)` calls in a row |
-| `LEEK_AUTO_COMPACT_THRESHOLD` | `0.90` | Stop with a diagnostic when context reaches this fraction of the window |
+| `LEEK_AUTO_COMPACT_THRESHOLD` | `0.90` | Current fallback stops with diagnostics at this threshold; intended behavior is summarize-and-continue |
 
 ### Repository layout
 
@@ -137,8 +138,9 @@ corpus、skill、委派子 agent —— 那些是后续 milestone。
 - **工具** —— `echo`（确定性，验证 function-call 循环）和 `web_fetch`
   （把 URL 抓成文本）。领域工具在 M3。
 - **Guards** —— idle timeout、wall-clock 上限（带阶段化软提示）、迭代
-  上限、成本上限、doom-loop 检测、context-limit 阈值 guard。可观测性
-  guard 默认开，硬上限 opt-in。
+  上限、成本上限、doom-loop 检测、context-limit fallback。真正
+  auto-compaction 是 M1.8 的目标行为，目前仍待补。可观测性 guard
+  默认开，硬上限 opt-in。
 - **Per-turn metrics** —— 每个 turn 写一行 `turn_metrics`（停止原因、
   迭代数、token、成本、触发的 guard），并发一个 `turn_metrics_recorded`
   事件。
@@ -200,7 +202,7 @@ SSE 事件类型：`message_created`、`assistant_delta`、`tool_call`、
 | `LEEK_MAX_ITERATIONS` | 关 | 每 turn 的 LLM 迭代上限（opt-in） |
 | `LEEK_COST_CAP_USD` | 关 | 每 turn 估算美元成本上限（opt-in） |
 | `LEEK_DOOM_LOOP_THRESHOLD` | `3` | 连续 N 次相同 `(tool, args)` 调用即中止 |
-| `LEEK_AUTO_COMPACT_THRESHOLD` | `0.90` | 上下文达到窗口此比例时诊断性停止 turn |
+| `LEEK_AUTO_COMPACT_THRESHOLD` | `0.90` | 当前 fallback 会在此阈值诊断性停止；目标行为是摘要压缩后继续 |
 
 ### 仓库结构
 

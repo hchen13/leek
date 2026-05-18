@@ -35,8 +35,9 @@ const MODEL: &str = "gpt-5.5";
 const REASONING_EFFORT: &str = "xhigh";
 const VERBOSITY: &str = "low";
 
-/// Recent messages of history sent as context. The context-limit guard covers
-/// the case where even this is too large.
+/// Recent messages of history sent as context. Until M1.8 full
+/// auto-compaction lands, the context-limit fallback covers the case where
+/// even this is too large.
 const HISTORY_LIMIT: i64 = 400;
 
 /// Run one agent turn to completion. Spawned fire-and-forget by the message
@@ -128,9 +129,9 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
             break 'turn;
         }
         if compact_trigger > 0 && last_input_tokens >= compact_trigger {
-            // M1 context-limit guard: detect the 90% threshold and stop the turn
-            // with a clear diagnostic. Summarize-and-continue compaction is a
-            // later milestone (see docs / the M1 report).
+            // Temporary M1 fallback: detect the 90% threshold and stop the
+            // turn with a clear diagnostic. This is not full auto-compaction;
+            // M1.8 must summarize-and-continue instead.
             stop_reason = "context_limit".into();
             first_guard.get_or_insert("context_limit");
             break 'turn;
@@ -414,9 +415,7 @@ fn stop_note(stop_reason: &str) -> Option<&'static str> {
         "max_iterations" => Some("达到迭代次数上限（iteration cap），提前结束。"),
         "cost_cap_exceeded" => Some("达到本回合成本上限（cost cap），提前结束。"),
         "doom_loop" => Some("检测到工具调用陷入循环（doom-loop），本回合中止。"),
-        "context_limit" => {
-            Some("上下文接近窗口上限（context-limit guard），本回合提前结束；建议精简会话或新开 session。")
-        }
+        "context_limit" => Some("上下文接近窗口上限；自动压缩尚未完成，本回合提前结束。"),
         _ => Some("本回合提前结束。"),
     }
 }
