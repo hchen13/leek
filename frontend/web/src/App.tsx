@@ -1,172 +1,155 @@
-// L.E.E.K shell — defaults to the LIVE workbench (real session). URL hash
-// `#demo:<scene>` (e.g. `#demo:deep`) renders the fixture variant instead,
-// kept around as a visual reference / dev preview, NOT as a parallel page.
-// The 5 scenes are forms of the same UI under different session states;
-// the LIVE workbench evolves through them based on real data.
+// L.E.E.K — M0 verification harness.
+//
+// Deliberately minimal: session list/create, message list, a composer, and a
+// raw SSE event log. No later-milestone product surfaces —
+// those belong to later milestones. This page exists only to prove the
+// gateway's HTTP + SSE plumbing from a browser.
 
-import { Show, createSignal, onCleanup, onMount } from "solid-js";
-import { LiveChat } from "./components/LiveChat";
-import { Workbench } from "./components/Workbench";
-import { PortfolioPage } from "./components/PortfolioPage";
-import { SettingsPage } from "./components/SettingsPage";
-import { ALL_SCENES, type Scene } from "./scenes";
+import { createSignal, For, onCleanup, Show } from "solid-js";
 
-type Page = "chat" | "portfolio" | "settings";
+type Session = {
+  id: string;
+  title: string | null;
+  created_at: string;
+  last_active_at: string;
+};
+type Message = { seq: number; role: string; content: string; created_at: string };
+type EventRow = { seq: number; kind: string; payload: unknown; created_at: string };
 
-type View =
-  | { mode: "live" }
-  | { mode: "demo"; scene: Scene };
+export default function App() {
+  const [sessions, setSessions] = createSignal<Session[]>([]);
+  const [current, setCurrent] = createSignal<string | null>(null);
+  const [messages, setMessages] = createSignal<Message[]>([]);
+  const [events, setEvents] = createSignal<EventRow[]>([]);
+  const [draft, setDraft] = createSignal("");
 
-function readViewFromHash(): View {
-  const h = window.location.hash.replace(/^#/, "");
-  if (h.startsWith("demo:")) {
-    const s = h.slice(5);
-    if ((ALL_SCENES as string[]).includes(s)) {
-      return { mode: "demo", scene: s as Scene };
+  let stream: EventSource | undefined;
+
+  const loadSessions = async () => {
+    const res = await fetch("/api/v1/sessions");
+    const body = await res.json();
+    setSessions(body.items ?? []);
+  };
+
+  const loadMessages = async (id: string) => {
+    const res = await fetch(`/api/v1/sessions/${id}/messages`);
+    const body = await res.json();
+    setMessages(body.items ?? []);
+  };
+
+  const openSession = (id: string) => {
+    setCurrent(id);
+    setEvents([]);
+    void loadMessages(id);
+    stream?.close();
+    stream = new EventSource(`/stream/sessions/${id}/events`);
+    for (const kind of ["message_created", "assistant_delta", "assistant_done"]) {
+      stream.addEventListener(kind, (ev) => {
+        const row = JSON.parse((ev as MessageEvent).data) as EventRow;
+        setEvents((prev) => [...prev, row]);
+        if (row.kind === "message_created") void loadMessages(id);
+      });
     }
-  }
-  return { mode: "live" };
-}
+  };
 
-export function App() {
-  const [view, setView] = createSignal<View>(readViewFromHash());
-  const [page, setPage] = createSignal<Page>("chat");
+  const newSession = async () => {
+    const res = await fetch("/api/v1/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "New session" }),
+    });
+    const session = (await res.json()) as Session;
+    await loadSessions();
+    openSession(session.id);
+  };
 
-  onMount(() => {
-    const handler = () => setView(readViewFromHash());
-    window.addEventListener("hashchange", handler);
-    onCleanup(() => window.removeEventListener("hashchange", handler));
-  });
+  const send = async () => {
+    const id = current();
+    const text = draft().trim();
+    if (!id || !text) return;
+    setDraft("");
+    await fetch(`/api/v1/sessions/${id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content: text }),
+    });
+  };
+
+  onCleanup(() => stream?.close());
+  void loadSessions();
 
   return (
-    <div style={{
-      width: "100vw",
-      height: "100vh",
-      display: "flex",
-      "flex-direction": "column",
-      background: "var(--bg-0)",
-    }}>
-      <Show when={view().mode === "demo"}>
-        <DemoBanner scene={(view() as { mode: "demo"; scene: Scene }).scene} />
-      </Show>
-      <div style={{ flex: 1, overflow: "hidden" }}>
-        <Show
-          when={view().mode === "live"}
-          fallback={<Workbench scene={(view() as { mode: "demo"; scene: Scene }).scene} />}
-        >
-          <Show
-            when={page() === "portfolio"}
-            fallback={
-              <Show
-                when={page() === "settings"}
-                fallback={<LiveChat onNavigate={setPage} />}
+    <div class="app">
+      <aside class="sidebar">
+        <header>
+          <h1>L.E.E.K <span>· M0 harness</span></h1>
+        </header>
+        <button class="new" onClick={() => void newSession()}>
+          + New session
+        </button>
+        <ul class="sessions">
+          <For each={sessions()} fallback={<li class="muted">no sessions yet</li>}>
+            {(s) => (
+              <li
+                classList={{ session: true, active: s.id === current() }}
+                onClick={() => openSession(s.id)}
               >
-                <SettingsWithRail onNavigate={setPage} />
-              </Show>
-            }
+                <span class="title">{s.title ?? "(untitled)"}</span>
+                <span class="id">{s.id}</span>
+              </li>
+            )}
+          </For>
+        </ul>
+      </aside>
+
+      <main class="main">
+        <Show
+          when={current()}
+          fallback={<div class="empty">Pick or create a session.</div>}
+        >
+          <section class="messages">
+            <For each={messages()} fallback={<p class="muted">no messages yet</p>}>
+              {(m) => (
+                <div classList={{ msg: true, [m.role]: true }}>
+                  <span class="role">{m.role}</span>
+                  <p>{m.content}</p>
+                </div>
+              )}
+            </For>
+          </section>
+          <form
+            class="composer"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void send();
+            }}
           >
-            <PortfolioWithRail onNavigate={setPage} />
-          </Show>
+            <textarea
+              rows={2}
+              placeholder="Message — M0 replies with Echo:"
+              value={draft()}
+              onInput={(e) => setDraft(e.currentTarget.value)}
+            />
+            <button type="submit">Send</button>
+          </form>
         </Show>
-      </div>
-    </div>
-  );
-}
+      </main>
 
-function PortfolioWithRail(props: { onNavigate: (p: Page) => void }) {
-  return (
-    <div class="lk-app" style={{ width: "100%", height: "100%" }}>
-      <NavRail page="portfolio" onNavigate={props.onNavigate} />
-      <div class="lk-main" style={{ "grid-template-rows": "1fr", "grid-template-columns": "1fr" }}>
-        <PortfolioPage />
-      </div>
-    </div>
-  );
-}
-
-function SettingsWithRail(props: { onNavigate: (p: Page) => void }) {
-  return (
-    <div class="lk-app" style={{ width: "100%", height: "100%" }}>
-      <NavRail page="settings" onNavigate={props.onNavigate} />
-      <div class="lk-main" style={{ "grid-template-rows": "1fr", "grid-template-columns": "1fr" }}>
-        <SettingsPage />
-      </div>
-    </div>
-  );
-}
-
-export function NavRail(props: { page: Page; onNavigate: (p: Page) => void }) {
-  return (
-    <aside class="lk-rail">
-      <div class="lk-rail-logo">L</div>
-      <RailNavBtn label="C" sub="chat" target="chat" active={props.page === "chat"} onNavigate={props.onNavigate} />
-      <RailNavBtn label="P" sub="port" target="portfolio" active={props.page === "portfolio"} onNavigate={props.onNavigate} />
-      <div class="lk-rail-spacer" />
-      <RailNavBtn label="S" sub="set" target="settings" active={props.page === "settings"} onNavigate={props.onNavigate} />
-      <div class="lk-rail-avatar">JC</div>
-    </aside>
-  );
-}
-
-function RailNavBtn(props: {
-  label: string;
-  sub: string;
-  target: Page;
-  active: boolean;
-  onNavigate: (p: Page) => void;
-}) {
-  return (
-    <button
-      class="lk-rail-btn"
-      data-active={props.active}
-      onClick={() => props.onNavigate(props.target)}
-      title={props.target}
-      style={{
-        display: "flex",
-        "flex-direction": "column",
-        "align-items": "center",
-        "justify-content": "center",
-        gap: "2px",
-        height: "44px",
-        width: "36px",
-      }}
-    >
-      <span style={{
-        "font-family": "var(--font-stencil)",
-        "font-size": "13px",
-        "font-weight": "700",
-        "line-height": "1",
-        color: props.active ? "var(--clay-soft)" : "var(--ink-2)",
-      }}>{props.label}</span>
-      <span style={{
-        "font-family": "var(--font-mono)",
-        "font-size": "8px",
-        color: props.active ? "var(--clay-soft)" : "var(--ink-3)",
-        "letter-spacing": "0.04em",
-        "text-transform": "uppercase",
-      }}>{props.sub}</span>
-    </button>
-  );
-}
-
-function DemoBanner(props: { scene: Scene }) {
-  return (
-    <div style={{
-      display: "flex",
-      "align-items": "center",
-      gap: "12px",
-      padding: "6px 14px",
-      background: "rgba(217, 119, 87, 0.08)",
-      "border-bottom": "1px solid rgba(217, 119, 87, 0.2)",
-      "font-family": "var(--font-mono)",
-      "font-size": "11px",
-      color: "var(--ink-2)",
-    }}>
-      <span><b>DEMO</b> · {props.scene}</span>
-      <span style={{ color: "var(--ink-3)" }}>fixture data, not live session</span>
-      <span style={{ "margin-left": "auto" }}>
-        <a href="#" style={{ color: "var(--ink-2)" }}>← back to LIVE</a>
-      </span>
+      <aside class="events">
+        <header>
+          <h2>SSE events</h2>
+        </header>
+        <ul>
+          <For each={events()} fallback={<li class="muted">stream idle</li>}>
+            {(ev) => (
+              <li>
+                <span class="kind">{ev.kind}</span>
+                <code>{JSON.stringify(ev.payload)}</code>
+              </li>
+            )}
+          </For>
+        </ul>
+      </aside>
     </div>
   );
 }

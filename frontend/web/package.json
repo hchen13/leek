@@ -2,7 +2,7 @@
   "name": "leek-web",
   "version": "0.1.0",
   "private": true,
-  "description": "L.E.E.K Web (SolidJS + Vite)",
+  "description": "L.E.E.K web — M0 verification harness (SolidJS + Vite)",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,11 +11,6 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@types/dompurify": "^3.0.5",
-    "@types/markdown-it": "^14.1.2",
-    "dompurify": "^3.4.2",
-    "lightweight-charts": "^5.2.0",
-    "markdown-it": "^14.1.1",
     "solid-js": "^1.9.3"
   },
   "devDependencies": {
