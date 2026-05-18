@@ -2,9 +2,11 @@
 
 > **rebuild-clean 分支的端态规格说明。**
 >
-> 配套文档：`docs/MILESTONES.md`。MILESTONES 告诉你*什么时候发布什么*；
-> 本文档告诉你*全部里程碑落地后系统长什么样*。两份保持同步——本文档
-> 里某个架构决策有变动时，找到对应的 milestone 一起更新。
+> 配套文档：`docs/REQUIREMENTS.md` 与 `docs/MILESTONES.md`。
+> REQUIREMENTS 告诉你产品 / UX / 验收边界；MILESTONES 告诉你
+> *什么时候发布什么*；本文档告诉你*全部里程碑落地后系统长什么样*。
+> 三份保持同步——本文档里某个架构决策有变动时，找到对应的需求和
+> milestone 一起更新。
 >
 > 最近修订：2026-05-11，rebuild-clean 重置时。
 

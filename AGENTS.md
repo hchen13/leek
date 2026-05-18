@@ -15,9 +15,12 @@ corpus-grounded investment agents: the durable work is in loop control, tool
 surfaces, state, evidence, provenance, plan semantics, budgets, recovery, and
 human confirmation boundaries.
 
-Implementation state should be read from the code. Focused design specs
-and decision records under [`design/`](design/) explain durable architecture
-choices; historical notes are context only and are never state authority.
+Implementation state should be read from the code. Product and UX boundaries
+are locked in [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md). End-state
+architecture is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and
+milestone order / completion state is in [`docs/MILESTONES.md`](docs/MILESTONES.md).
+The old [`design/`](design/) tree is historical reference only unless a current
+docs file explicitly re-adopts a detail from it.
 
 ## Relationship to `finance-giant/` and the corpus
 
@@ -43,20 +46,29 @@ The two projects are **deliberately separate repos sitting side-by-side** at `~/
 When opening a new agent session in this project, do this in order:
 
 1. Read this file (`AGENTS.md`).
-2. Read the current code paths relevant to the task. Use focused files under [`design/decisions/`](design/decisions/) and [`design/p1-spec/`](design/p1-spec/) only as needed; do not treat historical notes as state authority.
-3. If `~/playground/finance-giant/corpus/` exists locally, glance at `finance-giant/corpus/AGENTS.md` to understand the corpus shape; otherwise the GitHub repo is `hchen13/the-corpus`.
-4. Reference repos used as architecture sources may be at `~/research/repos/` (`dexter`, `warp`, `FinceptTerminal`, `hermes-agent`); clone if needed when the discussion calls for them.
-5. For agent-loop, plan, tool, subagent, skill, budget, context, or reliability work, read [`.agents/skills/harness-engineering/SKILL.md`](.agents/skills/harness-engineering/SKILL.md) before proposing changes.
-6. Resume from the current task request and current code state.
+2. Read [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md), then the current code paths relevant to the task.
+3. Use [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for architectural principles and [`docs/MILESTONES.md`](docs/MILESTONES.md) for phase boundaries.
+4. Treat `design/` as archive material. Do not follow old task / deliverable / mandate / portfolio / `LlmProvider` / Reasoning DAG specs unless the current docs explicitly say to reintroduce that idea.
+5. If `~/playground/finance-giant/corpus/` exists locally, glance at `finance-giant/corpus/AGENTS.md` to understand the corpus shape; otherwise the GitHub repo is `hchen13/the-corpus`.
+6. Reference repos used as architecture sources may be at `~/research/repos/` (`dexter`, `warp`, `FinceptTerminal`, `hermes-agent`); clone if needed when the discussion calls for them.
+7. For agent-loop, plan, tool, subagent, skill, budget, context, or reliability work, read [`.agents/skills/harness-engineering/SKILL.md`](.agents/skills/harness-engineering/SKILL.md) before proposing changes.
+8. Resume from the current task request and current code state.
 
 ## Working conventions
 
-- All design / discussion artifacts go under `design/`.
-- Durable decision records go under `design/decisions/`.
-- Focused implementation specs go under `design/p1-spec/` or the nearest relevant design subdirectory.
+- Current product, UX, architecture, and milestone artifacts go under `docs/`.
+- The existing `design/` tree is historical archive material. Do not add new authoritative specs there.
 - Scratch / temporary files go under `tmp/` (gitignored).
 - **Browser/Playwright 截图必须保存到 `tmp/`，严禁落到项目根目录。** 测试结束后 `tmp/` 内容可直接清空，不需逐一确认。
 
 ## Authoritative documents
 
-This file plus the focused design specs / decision records under `design/` are authoritative for L.E.E.K. The corpus has its own authority (`finance-giant/corpus/AGENTS.md`) — when the two disagree about *the corpus*, that file wins; about *the agent*, this project wins.
+Authority order for L.E.E.K itself:
+
+1. Current code.
+2. [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md) for product / UX / acceptance requirements.
+3. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for architecture.
+4. [`docs/MILESTONES.md`](docs/MILESTONES.md) for phase order and completion state.
+5. `design/` only as non-authoritative historical reference.
+
+The corpus has its own authority (`finance-giant/corpus/AGENTS.md`) — when the two disagree about *the corpus*, that file wins; about *the agent*, this project wins.

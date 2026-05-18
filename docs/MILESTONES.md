@@ -2,8 +2,9 @@
 
 > **rebuild-clean 分支的目标和顺序的源头依据。**
 >
-> 配套文档：`docs/ARCHITECTURE.md`。ARCHITECTURE 告诉你端态形状；
-> 本文档告诉你到达端态的顺序。
+> 配套文档：`docs/REQUIREMENTS.md` 与 `docs/ARCHITECTURE.md`。
+> REQUIREMENTS 告诉你产品 / UX / 验收边界；ARCHITECTURE 告诉你
+> 端态形状；本文档告诉你到达端态的顺序。
 >
 > 每完成一个 milestone 就更新本文档。在 M4 落地之前，产生这些
 > milestone 的对话上下文会被压缩很多次——这份文件存在的意义就
@@ -22,6 +23,7 @@
 - "Open questions" 是已延后但有跟踪的。在对应 sub-commit 之前
   必须敲定；不要让它烂掉。
 - 横向原则放在 `ARCHITECTURE.md §12`。
+- 产品 / UX 边界放在 `REQUIREMENTS.md`；本文只描述阶段切分。
 - 文末的 Decision log 记录的是 locked 决策*为什么*被 lock。
 
 ---
@@ -53,6 +55,10 @@ frontend active tree 全部清底重写。旧代码通过 git history 查询，
   M1 guard set 已接入。注意：M1.8 落地的是 context-limit guard
   （到阈值停止并给诊断），不是摘要压缩后继续工作的完整 auto-compaction。
   M1 没有接 corpus / skill / subagent / domain tools。
+- **M1.9 pending（2026-05-19）**：锁定 workbench UX / event contract：
+  chat 只放最终回复，canvas 放 note/tool/search/corpus/subagent 过程
+  artifact，tool result 拆成 `model_output / display_payload /
+  debug_payload`。
 
 ---
 
@@ -211,6 +217,45 @@ SSE 闭环，不是复活旧应用。
 - Cost cap 多档价格初版已在 M1 落地为 `input / cached input /
   output` 三档估算；codex backend 没有公开价格面，后续以真实账单或
   vendor 价格更新 `pricing.rs`。
+
+---
+
+## M1.9 — Workbench Event Contract：前端/UX 契约
+
+### 目标
+
+把 M1 的后端 loop 事件升级成前端 workbench 可以稳定消费的事件契约。
+这是 M2 前的收口 milestone：不接 corpus、不做领域工具，先把 chat /
+canvas / right rail 的边界锁死。
+
+### Scope
+
+- `docs/REQUIREMENTS.md` 成为产品 / UX / 验收边界源头。
+- `AGENTS.md` 改为优先读 REQUIREMENTS / ARCHITECTURE / MILESTONES；
+  `design/` 明确降级为历史参考。
+- 事件语义拆分：
+  - chat：用户消息、最终 assistant 回复、运行中工具摘要。
+  - canvas：Note Trace、tool card、provider-side search card、
+    corpus card、subagent card。
+  - right rail：Corpus Brain、Plan / TODO。
+- tool contract 拆分为 `model_output / display_payload /
+  debug_payload`。前端不得从 `model_output` 文本解析业务数据。
+- tool UI metadata 与 LLM-facing tool spec 分离。
+- `update_plan` 作为展示工具接入：更新 Plan / TODO，不进入 canvas
+  tool card，也不是 gate。
+- provider-side `web_search` 若当前 Codex backend 可用，则接入并
+  映射为 search artifact；不可用时保留契约，不伪造功能。
+
+### 验收
+
+- 旧 `design/` 里的 task / deliverable / mandate / portfolio /
+  `LlmProvider` / Reasoning DAG 不能再被新 session 当作当前权威。
+- Chat 中只显示用户消息、assistant 最终回复和工具摘要；Note Trace
+  不进入 chat 正文。
+- Canvas 按 turn 分段展示过程 artifact；最终回复不生成 canvas card。
+- 失败工具在 chat 摘要可见；canvas 可以默认隐藏失败卡，但必须能
+  展开查看。
+- Plan / TODO 只在存在 plan 时显示；plan 不阻止 assistant 回复。
 
 ---
 
