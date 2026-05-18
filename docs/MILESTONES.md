@@ -267,8 +267,8 @@ M2.5 **不**是发明的地方——抄约定，做最小适配。
 
 一个通用机制，用来 spawn 一个有自己 context window、system
 prompt、工具子集的子 agent loop。投资领域真的吃这个（多 ticker
-并行扫描、corpus-expert 委派、planner 隔离）。topology 的理由
-见 `ARCHITECTURE.md §4.2-4.3`。
+并行扫描、corpus-expert 委派、把重活赶进独立 context）。topology
+的理由见 `ARCHITECTURE.md §4.2-4.3`。
 
 ### Scope
 
@@ -294,7 +294,7 @@ prompt、工具子集的子 agent loop。投资领域真的吃这个（多 ticke
 | M2.7.1  | `task` 工具 + subagent loop spawn                                             |
 | M2.7.2  | AGENT.md loader + frontmatter 解析（三层路径发现）                              |
 | M2.7.3  | Depth 上限 + per-subagent turn_metrics 行（parent_turn_id 链接）                |
-| M2.7.4  | 前三个内置 AGENT.md：`corpus-expert`、`market-data-fetcher`、`planner`          |
+| M2.7.4  | 内置 AGENT.md：`general-purpose`（基线）+ `corpus-expert`（领域 subagent 等 M3） |
 
 ### Design decisions（locked）
 
@@ -342,7 +342,8 @@ Task 形态——有 eval case 端到端跑通：
    （`market-data-fetcher`）取数据，主 agent 综合。< 2 分钟 wall-
    clock。
 2. **深度复盘** — 完整个股 review。多个 subagent 并行（数据获取
-   + corpus expert + planner）。5–15 分钟 wall-clock 典型。
+   + corpus-expert）。主 agent 自己用 `update_plan` 组织步骤。
+   5–15 分钟 wall-clock 典型。
 3. **对比** — N 个 ticker。N 个并行 `market-data-fetcher` subagent，
    主 agent 综合。
 
@@ -479,3 +480,27 @@ Task 形态——有 eval case 端到端跑通：
     三个 sub-commit）
   - MILESTONES.md M2.5（删 mandate-as-skill open question）
   - MILESTONES.md M2.7（删 subagent mandate 可见性 open question）
+
+### 2026-05-18 — 内置 subagent roster 调整：去 planner、加 general-purpose
+- 用户反馈两点。
+- 去 `planner`：计划是主 agent 用 `update_plan` 工具就地做的事，
+  不是委派出去的事。单独 spawn 一个"只产出 plan 不执行"的 subagent
+  只是多一个来回 + 一次 context 交接，没有收益。若做计划本身需要
+  调研，那部分调研委派给 general-purpose / corpus-expert 即可。
+- 加 `general-purpose`：这是 subagent 机制的"无专业化"基线形态
+  ——全工具集、通用 worker system prompt、`task()` 不指定 agent
+  时的默认。CC 也有这个内置。其它专业 subagent 本质上就是
+  general-purpose + 受限 prompt + 工具子集。架构上必须有。
+- `market-data-fetcher` 从"rebuild-clean 初始三个"里挪走：它依赖
+  M3 的领域工具，归 M3。ARCHITECTURE §4.2.2 不再把它列为近期内置。
+- 影响：
+  - ARCHITECTURE.md §4.2.2（改写：general-purpose 基线 +
+    corpus-expert 专业化 + 领域 subagent 留到 M3；显式写明不做
+    planner）
+  - MILESTONES.md M2.7.4（内置 AGENT.md 改为 general-purpose +
+    corpus-expert）
+  - MILESTONES.md M3 深度复盘 task 形态（去掉 planner subagent，
+    改为主 agent 自己 update_plan）
+- 顺带确认：ARCHITECTURE.md 不规划具体的金融投研工具清单（只有
+  §1 一句品类级描述）。具体工具名（`market_quote` 等）只在
+  MILESTONES M3。

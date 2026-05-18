@@ -55,12 +55,11 @@ agent loop 原语。我们采纳它们。
 - **不做 `plan_guard` 强制。** 模型想用 `update_plan` 就用，觉得
   答案 ready 了就交付。不会出现"plan 没走完不准交付"的拦截。
 - **不把 subagent 写成硬编码的 Rust persona 类。** 多个专业化子
-  agent（`corpus-expert` / `planner` / `market-data-fetcher` 等）
-  是想要的；但它们的 system prompt 和工具子集通过**外部配置**
-  （skill 文件之类）提供，而不是 Rust 里的 hardcoded persona 类。
-  前一版 leek 的 4-persona 是 Rust 写死的代码路径——那才是要删
-  的对象，不是"多个 subagent"本身。具体怎么配置 subagent 还在
-  调研（CC vs codex 的做法对比），见 §4.2。
+  agent（`corpus-expert`、未来的领域取数 subagent 等）是想要的；
+  但它们的 system prompt 和工具子集通过**外部配置**（AGENT.md
+  文件）提供，而不是 Rust 里的 hardcoded persona 类。前一版 leek
+  的 4-persona 是 Rust 写死的代码路径——那才是要删的对象，不是
+  "多个 subagent"本身。配置机制见 §4.2。
 - **不抽象 LLM provider。** 今天访问模型只有一条路径：codex pro
   via OAuth。代码直接连这条路径。等真有第二个具体 provider 带着
   真实契约出现时再抽象——不要提前。
@@ -198,20 +197,39 @@ model: <override>         # 可选；codex OAuth 单 model 时无视
 prompt，subagent 返回一个 text block。v0 不做流式回传（之后觉得
 有用再加）。
 
-#### 4.2.2 leek 自带的初始 subagent（rebuild-clean 阶段三个）
+#### 4.2.2 内置 subagent
 
-每个是一个 AGENT.md 文件，跟随 repo 走：
+leek 自带的 subagent 分两类，每个都是一个 AGENT.md 文件，跟随
+repo 走。
+
+**`general-purpose`（基线——架构上必须有）**
+
+- `harness/agents/general-purpose/AGENT.md`
+- system prompt 通用："你是被委派的 worker，完成给定的子任务，
+  把结果汇总成一个 text block 返回"
+- `allowed_tools`：全集
+- 用途：主 agent 把一段自包含的多步工作委派出去——subagent 在
+  自己的 context window 里跑完、返回 digest，主 agent 的 context
+  保持干净。`task()` 不指定 agent 时默认就是它。
+- 它是 subagent 机制的"无专业化"基线形态：其它专业 subagent
+  本质上就是 general-purpose + 受限 system prompt + 工具子集。
+
+**专业化 subagent（随依赖落地逐个加）**
 
 - **`corpus-expert`**——`harness/agents/corpus-expert/AGENT.md`。
   body 是"你深谙 corpus，用户问一个 corpus 相关的问题，给出有原文
   引证的综合回答"。`allowed_tools`：`corpus_search`、`corpus_read`。
-  对标 CC 的 `claude-code-guide`。
-- **`market-data-fetcher`**——`harness/agents/market-data-fetcher/AGENT.md`。
-  对一组 ticker 并行查询。`allowed_tools`：market / fundamentals
-  类工具。
-- **`planner`**——`harness/agents/planner/AGENT.md`。多步研究的任务
-  分解。`allowed_tools`：最小（不做数据查询）——只产出 plan，
-  不执行。
+  对标 CC 的 `claude-code-guide`。依赖 corpus 工具（M2），M2.7
+  起可用。
+- 领域 subagent（例：并行查行情/财务的取数 subagent）——依赖
+  M3 的领域工具。具体有哪些、各自的工具子集，等 M3 规划领域工具
+  时一起定，本文档不提前写死。
+
+**不做 `planner` subagent。** 计划是主 agent 用 `update_plan` 工具
+就地做的事，不是委派出去的事。单独 spawn 一个"只产出 plan 不执行"
+的 subagent 只是多一个来回 + 一次 context 交接，没有收益。如果
+做计划本身需要先调研，那部分调研可以委派给 general-purpose /
+corpus-expert，主 agent 再据此 `update_plan`。
 
 ### 4.3 为什么投资领域天然适合 subagent
 
