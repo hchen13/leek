@@ -52,17 +52,16 @@ frontend active tree 全部清底重写。旧代码通过 git history 查询，
   active tree 已 clean-room 重写，HTTP + SQLite + SSE echo 骨架可跑。
 - **M1 core completed（2026-05-18）**：echo worker 已替换为真实主 agent
   loop；Codex OAuth、Responses streaming、工具循环、turn_metrics 和
-  大部分 M1 guard set 已接入。注意：M1.8 auto-compaction 尚未完成；
-  当前代码只有 context-limit fallback（到阈值停止并给诊断），不能算
-  auto-compaction。
-  M1 没有接 corpus / skill / subagent / domain tools。
-- **M1.8 pending（2026-05-19）**：实现真正 auto-compaction：到
-  90% context window 时摘要压缩旧上下文并继续同一个 turn；停止只作为
-  compaction 失败兜底。
-- **M1.9 pending（2026-05-19）**：锁定 workbench UX / event contract：
-  chat 只放最终回复，canvas 放 note/tool/search/corpus/subagent 过程
-  artifact，tool result 拆成 `model_output / display_payload /
-  debug_payload`。
+  大部分 M1 guard set 已接入。M1 没有接 corpus / skill / subagent /
+  domain tools。
+- **M1 未完成项 — auto-compaction（M1.8 子提交）**：上下文到 90%
+  context window 时摘要压缩旧上下文并继续同一个 turn。当前代码用的是
+  一个 `context_limit` 停止分支（开发中被擅自加入的工程护栏，见
+  decision log 2026-05-19 第二条），必须被 auto-compaction 替换。
+  M1 在此之前不算完成。
+- **M1.9 pending**：锁定 workbench UX / event contract：chat 只放
+  最终回复，canvas 放 note/tool/search/corpus/subagent 过程 artifact，
+  tool result 拆成 `model_output / display_payload / debug_payload`。
 
 ---
 
@@ -185,9 +184,9 @@ SSE 闭环，不是复活旧应用。
   连续 ≥ 3 次时触发。
 
 - **Auto-compaction 90%** — 对齐 codex 的硬编码
-  `(context_window * 9) / 10` 作为阈值。到阈值时必须摘要压缩旧上下文
-  并继续同一个 turn。`context_limit` 停止只能作为 compaction 不可用、
-  压缩失败或压缩结果不可信时的兜底，不能替代 auto-compaction。
+  `(context_window * 9) / 10` 作为阈值。到阈值时摘要压缩旧上下文
+  并继续同一个 turn。这是上下文接近上限时的**唯一**设计行为；不设计
+  “压缩失败就停 turn”的护栏分支（见 decision log 2026-05-19 第二条）。
 
 - **Soft-prompt 时间提示是 leek 自创** — 阶段化 10/5/2/1 分钟
   阈值，按 LLM block 注入（不是按 turn）。剩余 > 10 分钟时不
@@ -224,14 +223,19 @@ SSE 闭环，不是复活旧应用。
 
 ---
 
-## M1.8 — Auto-compaction：摘要压缩后继续
+## M1.8 — Auto-compaction（M1 的收尾子提交）
+
+> 这是 M1 的最后一个子提交（见 M1 sub-commit 表 M1.8 行），**不是
+> 独立 milestone**。M1 在 auto-compaction 落地前不算完成。
 
 ### 目标
 
-把当前 stop-only 的 context-limit fallback 升级为真正 auto-compaction：
-当上下文接近窗口上限时，系统自动生成可追溯摘要，替换长历史，然后继续
-同一个 turn。用户的问题没有完成时，默认应该继续工作，而不是让用户新开
-session。
+上下文接近窗口上限时，系统自动生成可追溯摘要，替换长历史，然后继续
+同一个 turn。用户的问题没做完时默认继续工作，不让用户新开 session。
+
+当前代码里有一个 `context_limit` 停止分支（到阈值结束 turn + 给诊断），
+是开发中被擅自加入的工程护栏，不是产品设计。M1.8 用 auto-compaction
+**替换**它，不是在它旁边并存。
 
 ### Scope
 
@@ -247,19 +251,19 @@ session。
   - 未完成分支和下一步意图
   - 已触发 guard / 错误状态
 - 压缩结果作为特殊上下文块进入后续 model input；同一个 turn 继续跑。
-- 写入可观测事件：`compaction_started`、`compaction_completed`、
-  `compaction_failed`。
-- metrics 记录 compaction 次数、压缩前后 token 估算、失败原因。
-- `context_limit` stop 只保留为 fallback：compaction 不可用、失败、
-  或摘要不满足保真要求时才触发。
+- 写入可观测事件：`compaction_started`、`compaction_completed`。
+- metrics 记录 compaction 次数、压缩前后 token 估算。
+- 移除现有的 `context_limit` 停止分支。不设计“压缩失败就停 turn”的
+  护栏：压缩是一次模型调用，失败就走通用 `error` 事件路径，跟任何
+  模型调用失败一样，不需要专门的停止状态。
 
 ### 验收
 
 - 构造长 session 触发阈值后，turn 不停止，而是 compaction 后继续。
 - 压缩后模型仍能引用压缩前的关键约束、证据和 tool 结果。
 - compaction 事件可在 SSE / event history 中观察。
-- 如果 compaction 失败，系统给出清楚的 `context_limit` 诊断消息，
-  不静默失败。
+- 旧的 `context_limit` 停止分支已从代码中移除，不与 auto-compaction
+  并存。
 
 ---
 
@@ -288,6 +292,22 @@ canvas / right rail 的边界锁死。
   tool card，也不是 gate。
 - provider-side `web_search` 若当前 Codex backend 可用，则接入并
   映射为 search artifact；不可用时保留契约，不伪造功能。
+
+### Sub-commits（计划）
+
+| #      | 标题                                                                                       |
+|--------|--------------------------------------------------------------------------------------------|
+| M1.9.1 | 事件语义拆分（chat / canvas / right-rail）+ `note_trace` 事件                              |
+| M1.9.2 | tool 生命周期事件统一（start / completion / error）+ `canvas_artifact` envelope             |
+| M1.9.3 | tool 三分契约 `model_output / display_payload / debug_payload` + tool UI metadata registry  |
+| M1.9.4 | provider-side `web_search` 接入 + search 事件映射（Codex backend 可用时）                    |
+| M1.9.5 | `update_plan` 工具 + `plan_updated` 事件                                                   |
+| M1.9.6 | 前端：chat 工具摘要（运行中逐条显示，完成后聚合，可跳转 canvas）                             |
+| M1.9.7 | 前端：基础 canvas（turn 分段，note / tool / web_fetch / search cards）+ Plan / TODO widget   |
+
+> M1.9.1–M1.9.5 是后端事件契约；M1.9.6–M1.9.7 是前端 workbench。
+> Scope 第 1–2 项（REQUIREMENTS 成为权威源、AGENTS.md 重指向）是文档
+> 工作，已随 `REQUIREMENTS.md` / `AGENTS.md` 落地，不再单列 sub-commit。
 
 ### 验收
 
@@ -339,6 +359,43 @@ canvas / right rail 的边界锁死。
 
 - Corpus 更新 reload——v0 启动时加载就够，但什么时候开始想做热
   加载？
+
+---
+
+## M2.1 — Corpus Brain UI
+
+### 目标
+
+让用户看到 corpus 如何参与 agent 的工作，而不是只把 corpus 当文件
+列表。右上角常驻 Corpus Brain 显示全 wiki graph，并叠加 agent 实际
+使用 corpus 时的激活状态。
+
+### Scope
+
+- Corpus Brain 渲染全 wiki graph（只覆盖 wiki pages，不含 sources）。
+- session activation overlay：当前 session 触发过的 wiki 节点叠加
+  激活态。
+- live activation：当前 turn / 当前工具触发的节点用更强或更短暂的
+  激活表现。
+- 历史 activation 弱化保留。
+
+### Sub-commits（计划）
+
+| #      | 标题                                                    |
+|--------|---------------------------------------------------------|
+| M2.1.1 | wiki graph 数据 + Corpus Brain 图谱渲染                 |
+| M2.1.2 | session / turn / live activation overlay + 历史弱化      |
+
+### 验收
+
+- Corpus Brain 显示全 wiki graph。
+- agent 使用 corpus（`corpus_search` / `corpus_read`）时对应节点激活。
+- 历史激活以弱化态保留，当前 turn 激活更突出。
+
+### 依赖
+
+- 依赖 M2（corpus registry + 工具）。
+- 依赖 M1.9（canvas / 事件契约——corpus 工具的 artifact 事件）。
 
 ---
 
@@ -460,14 +517,15 @@ prompt、工具子集的子 agent loop。投资领域真的吃这个（多 ticke
 
 Task 形态——有 eval case 端到端跑通：
 
-1. **快速扫描** — "X 现在能不能交易 / 值不值得看？"一个 subagent
-   （`market-data-fetcher`）取数据，主 agent 综合。< 2 分钟 wall-
-   clock。
-2. **深度复盘** — 完整个股 review。多个 subagent 并行（数据获取
+1. **快速扫描** — "X 现在能不能交易 / 值不值得看？"一个领域取数
+   subagent 取数据，主 agent 综合。< 2 分钟 wall-clock。
+2. **深度复盘** — 完整个股 review。多个 subagent 并行（领域取数
    + corpus-expert）。主 agent 自己用 `update_plan` 组织步骤。
    5–15 分钟 wall-clock 典型。
-3. **对比** — N 个 ticker。N 个并行 `market-data-fetcher` subagent，
-   主 agent 综合。
+3. **对比** — N 个 ticker。N 个并行领域取数 subagent，主 agent 综合。
+
+> 领域取数 subagent 的具体名字和工具子集 M3 启动时定（见
+> `ARCHITECTURE.md §4.2.2`：不提前写死）。
 
 ### Open questions
 
@@ -568,10 +626,13 @@ Task 形态——有 eval case 端到端跑通：
   Claude Code 类 agent 在上下文接近上限时应当自动压缩并继续工作；
   事情没做完时，默认应该继续，而不是停下来要求用户精简或新开 session。
 - 决定：M1.8 恢复为真正 auto-compaction（summarize-and-continue）。
-  当前代码里的 `context_limit` 停止只保留为 fallback，不能算 M1.8
+  当前代码里的 `context_limit` 停止暂留为 fallback，不能算 M1.8
   完成。
 - 影响：M1 改成 “core completed；M1.8 pending”。M1.9 workbench
   event contract 仍然保留，但应排在 M1.8 full auto-compaction 之后。
+- **后续修订（同日，见下方“context-limit fallback 整个移除”条）**：
+  此条里“`context_limit` 暂留为 fallback”已被推翻——fallback 概念
+  整个删除，不与 auto-compaction 并存。
 
 ### 2026-05-11 — 不抽象 LLM provider
 - 当前只有一条路径：codex pro OAuth → Responses API。用户没有
@@ -663,3 +724,42 @@ Task 形态——有 eval case 端到端跑通：
 - 顺带确认：ARCHITECTURE.md 不规划具体的金融投研工具清单（只有
   §1 一句品类级描述）。具体工具名（`market_quote` 等）只在
   MILESTONES M3。
+
+### 2026-05-19 — context-limit fallback 整个移除：codex 擅自加的工程护栏
+- 用户指出：当前代码里的 `context_limit` 停止分支（上下文到阈值就
+  结束 turn + 给诊断）**不是产品设计**，是 codex 在用户不知情时
+  擅自加入的工程护栏。用户原本的设计只有 auto-compaction，没有这种
+  停 turn 的兜底。
+- 背景：这次 rebuild 的根本原因之一，就是 codex 在旧版本开发时擅自
+  加了大量工程护栏。确定性护栏在 non-deterministic 的 agentic system
+  里不解决问题，只会让 agent 行为机械化、抹掉 LLM 的优势。
+- 决定：`context-limit fallback` 概念整个移除。上下文接近窗口上限时
+  的**唯一**设计行为是 auto-compaction（摘要压缩后继续同一个 turn）。
+  不设计“压缩失败就停 turn”的护栏分支——压缩是一次模型调用，失败
+  就走通用 `error` 错误路径，不需要专门的 `context_limit` 停止状态。
+- M1 收尾要求：当前代码的 `context_limit` 分支必须被 auto-compaction
+  **替换**，不是并存。M1 在此之前不算完成。
+- 影响：
+  - REQUIREMENTS §0（删 `context-limit fallback` 术语）、§7.1
+    （章节改为纯 Auto-compaction）、§9 M1 验收 + 实现状态
+  - ARCHITECTURE §5（guard 表 Auto-compaction 行去掉兜底措辞）
+  - MILESTONES 状态标识、M1 “Auto-compaction 90%” locked 决策、
+    M1.8 子提交章节
+- 同类审查：`doom-loop detector` 在 ARCHITECTURE §12.7 原则下是
+  同类嫌疑最大的 guard（leek 自创、codex / CC 都没有、默认开）。
+  已 surface 给用户。**用户 2026-05-19 决定：doom-loop 保持当前
+  设计（默认开、N=3）不动**；idle timeout / wall-clock 一并保留
+  现状。`context-limit fallback` 的移除不波及其它 guard。
+
+### 2026-05-19 — leek 维护独立的 codex OAuth 凭证（auth login，不 import）
+- 用户决定：leek 必须用自己的 `auth login`（device-authorization
+  flow）走一遍 OAuth，拿到并维护**自己独立**的 token set，不要用
+  `auth import` 去复制 codex CLI 的 `~/.codex/auth.json`。
+- 理由：codex OAuth 的 refresh token 是 single-holder。`auth import`
+  会让 leek 和 codex CLI 共享同一个 refresh token——谁先 refresh
+  就 rotate 掉它，另一方失效后无法再 refresh。各自独立登录、各自
+  维护，就没有互相踩踏。
+- 影响：leek vault 的 `auth_tokens` 存的是 leek 自己登录得到的
+  token，与 codex CLI 完全隔离。验收 / 部署一律用 `auth login`。
+- 待决（独立小任务）：代码里的 `auth import` 子命令现在是个 footgun，
+  建议删除，只留 `auth login`。本次未动。

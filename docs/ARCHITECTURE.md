@@ -8,7 +8,7 @@
 > 三份保持同步——本文档里某个架构决策有变动时，找到对应的需求和
 > milestone 一起更新。
 >
-> 最近修订：2026-05-11，rebuild-clean 重置时。
+> 最近修订：2026-05-19。
 
 ---
 
@@ -259,7 +259,7 @@ corpus-expert，主 agent 再据此 `update_plan`。
 | Iteration cap       | None，opt-in            | per-turn          | codex / CC 都不强制。给高级用户用；默认不开。                                         |
 | Cost cap            | None，opt-in            | per-turn          | 用 per-model 价格表算的美元上限。                                                     |
 | Doom-loop detector  | N=3，默认开             | per-turn          | 同样的 `(tool_name, args)` 连续 ≥ N 次 → 中止。                                       |
-| Auto-compaction     | 90%，默认开             | per-turn/session  | 到阈值时摘要压缩旧上下文并继续；`context_limit` 停止只作为 compaction 失败兜底。       |
+| Auto-compaction     | 90%，默认开             | per-turn/session  | 到阈值时摘要压缩旧上下文并继续。这是上下文接近上限时的唯一设计行为；不做停 turn 的护栏。 |
 | Per-turn metrics    | 默认开                  | per-turn          | 每个 turn 一行：stop_reason、tokens、cost、first_triggered_guard、iteration。         |
 
 Subagent 的 loop **全部**复用这些。一个挂掉的 subagent 不能污染
@@ -385,9 +385,10 @@ runtime。原因：partial-retain 会把旧 schema、旧事件、旧 endpoint、
 只保留不会参与 runtime 控制流的设计和内容资产：
 
 - `AGENTS.md`
-- `docs/ARCHITECTURE.md`
-- `docs/MILESTONES.md`
-- `design/decisions/` 中仍然 locked 的决策记录
+- `docs/REQUIREMENTS.md`、`docs/ARCHITECTURE.md`、`docs/MILESTONES.md`
+- `design/` 整体只作为历史参考保留（**不是**当前权威——参见
+  `REQUIREMENTS.md §0`；locked 决策的现行记录在 `MILESTONES.md`
+  decision log）
 - `harness/identity.md`、`harness/discipline.md`、
   `harness/corpus_orientation.md`
 - `harness/skills/`
