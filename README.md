@@ -84,9 +84,12 @@ curl -X POST localhost:8964/api/v1/sessions/<id>/messages -H 'content-type: appl
 | GET | `/api/v1/sessions/{id}/events?since=&limit=` | Durable event history |
 | GET | `/stream/sessions/{id}/events` | Live SSE event stream |
 
-SSE event kinds: `message_created`, `assistant_delta`, `tool_call`,
-`tool_result`, `compaction_started`, `compaction_completed`,
-`assistant_done`, `turn_metrics_recorded`, `error`.
+SSE event kinds (M1.9 workbench contract — each payload carries its
+`surface`: `chat` / `canvas` / `right_rail` / `lifecycle`):
+`message_created`, `assistant_delta`, `note_trace`, `tool_lifecycle`,
+`search_lifecycle`, `plan_updated`, `compaction_started`,
+`compaction_completed`, `assistant_done`, `turn_metrics_recorded`,
+`error`.
 
 ### Guard configuration
 
@@ -102,6 +105,7 @@ Until a settings UI exists, guards are tuned by environment variable
 | `LEEK_DOOM_LOOP_THRESHOLD` | `3` | Abort after N identical `(tool, args)` calls in a row |
 | `LEEK_AUTO_COMPACT_THRESHOLD` | `0.90` | Fraction of the context window at which a turn auto-compacts — summarize early context and continue |
 | `LEEK_CONTEXT_WINDOW` | per-model | Override the context window the auto-compaction trigger is sized against, in tokens (mainly for tests — a small window trips compaction within a few turns) |
+| `LEEK_WEB_SEARCH` | off | Offer the provider-side `web_search` tool (opt-in; the codex backend gates web search behind its own config) |
 
 ### Repository layout
 
@@ -192,8 +196,10 @@ curl -X POST localhost:8964/api/v1/sessions/<id>/messages -H 'content-type: appl
 | GET | `/api/v1/sessions/{id}/events?since=&limit=` | 事件历史 |
 | GET | `/stream/sessions/{id}/events` | SSE 实时事件流 |
 
-SSE 事件类型：`message_created`、`assistant_delta`、`tool_call`、
-`tool_result`、`compaction_started`、`compaction_completed`、
+SSE 事件类型（M1.9 workbench 契约——每个 payload 带 `surface`：
+`chat` / `canvas` / `right_rail` / `lifecycle`）：`message_created`、
+`assistant_delta`、`note_trace`、`tool_lifecycle`、`search_lifecycle`、
+`plan_updated`、`compaction_started`、`compaction_completed`、
 `assistant_done`、`turn_metrics_recorded`、`error`。
 
 ### Guard 配置
@@ -209,6 +215,7 @@ SSE 事件类型：`message_created`、`assistant_delta`、`tool_call`、
 | `LEEK_DOOM_LOOP_THRESHOLD` | `3` | 连续 N 次相同 `(tool, args)` 调用即中止 |
 | `LEEK_AUTO_COMPACT_THRESHOLD` | `0.90` | 上下文用量达到窗口的此比例时 turn 自动压缩——摘要早期上下文后继续 |
 | `LEEK_CONTEXT_WINDOW` | per-model | 覆盖 auto-compaction 触发线所用的 context window（token 数；主要用于测试——小窗口几个 turn 就触发压缩） |
+| `LEEK_WEB_SEARCH` | 关 | 是否提供 provider-side `web_search` 工具（opt-in；codex backend 自身把 web search gate 在其配置后） |
 
 ### 仓库结构
 

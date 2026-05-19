@@ -59,9 +59,18 @@ frontend active tree 全部清底重写。旧代码通过 git history 查询，
   subagent / domain tools——那些是后续 milestone。
   验收：PM 代码审查 + `cargo test` 50/50 + 浏览器 E2E（compaction
   触发 / tool 折叠 / 压缩后继续 / 召回 全部 live 验证）。
-- **M1.9 pending**：锁定 workbench UX / event contract：chat 只放
-  最终回复，canvas 放 note/tool/search/corpus/subagent 过程 artifact，
-  tool result 拆成 `model_output / display_payload / debug_payload`。
+- **M1.9 part 1 completed（2026-05-19，M1.9.1–M1.9.5）**：后端 workbench
+  事件契约落地——`agent/events.rs` surface 分类（chat/canvas/right_rail/
+  lifecycle）+ `CanvasArtifact` 统一信封；`note_trace`、`tool_lifecycle`
+  （start/completion/error）、`search_lifecycle`、`plan_updated` 事件；
+  tool 三分契约 `model_output / display_payload / debug_payload` + `ToolUi`
+  注册表与 `ToolSpec` 分离；`update_plan` 工具；provider-side `web_search`
+  （`LEEK_WEB_SEARCH` opt-in，已实测经 codex backend 可用）。
+  验收：PM 代码审查 + `cargo test` 68/68 + 浏览器 E2E（6 类事件 + 4 个
+  surface 全部 live 验证）。
+- **M1.9 part 2 pending（M1.9.6–M1.9.7）**：前端 workbench——chat 工具
+  摘要（运行中逐条 + 完成聚合）、基础 canvas（turn 分段，note/tool/
+  web_fetch/search cards）+ Plan / TODO widget。
 
 ---
 
@@ -308,6 +317,10 @@ canvas / right rail 的边界锁死。
 > M1.9.1–M1.9.5 是后端事件契约；M1.9.6–M1.9.7 是前端 workbench。
 > Scope 第 1–2 项（REQUIREMENTS 成为权威源、AGENTS.md 重指向）是文档
 > 工作，已随 `REQUIREMENTS.md` / `AGENTS.md` 落地，不再单列 sub-commit。
+>
+> **状态（2026-05-19）**：M1.9.1–M1.9.5（后端事件契约）已完成并验收，
+> 单个 commit `2a5dde1`（5 个 sub-commit 互相耦合、无法干净切分）。
+> M1.9.6–M1.9.7（前端 workbench）待派。
 
 ### 验收
 
