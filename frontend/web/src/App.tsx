@@ -1,52 +1,44 @@
-// L.E.E.K — M1 verification harness.
+// L.E.E.K — the research workbench (M1.9.6 / M1.9.7).
 //
-// A minimal chat page for exercising the gateway from a browser: session
-// list/create, message list, a composer, a live SSE feed. M1 runs a real
-// agent turn — assistant text streams into a pending bubble; tool calls and
-// per-turn metrics land in the event log. No later-milestone product
-// surfaces — this page exists only to verify the gateway end to end.
+// A chat-led research workbench: a session list, the Chat column, the
+// Canvas execution trace, and a floating Plan / TODO widget. The gateway
+// streams the M1.9 event contract over SSE; `store.ts` routes each event to
+// its panel by the event's `surface`. This shell owns sessions, the message
+// list, the SSE wiring, and the cross-panel "focus a canvas card" action.
 
 import { createSignal, For, onCleanup, Show } from "solid-js";
 
-type Session = {
-  id: string;
-  title: string | null;
-  created_at: string;
-  last_active_at: string;
-};
-type Message = { seq: number; role: string; content: string; created_at: string };
-type EventRow = {
-  seq: number;
-  kind: string;
-  payload: Record<string, unknown>;
-  created_at: string;
-};
+import { Canvas } from "./Canvas";
+import { Chat } from "./Chat";
+import { PlanWidget } from "./PlanWidget";
+import { createWorkbench } from "./store";
+import type { EventRow, Message, Session } from "./types";
 
-// Workbench events shown in the right-hand log (M1.9 event contract; each
-// payload carries its `surface`). `assistant_delta` is handled separately —
-// it streams into the pending bubble instead of flooding the log.
-const LOG_KINDS = [
+// SSE event kinds to subscribe to — a subscription detail only. Which panel
+// an event lands in is decided by its `surface`, never by this list.
+const EVENT_KINDS = [
   "message_created",
+  "assistant_delta",
   "note_trace",
   "tool_lifecycle",
   "search_lifecycle",
   "plan_updated",
-  "compaction_started",
-  "compaction_completed",
   "assistant_done",
   "turn_metrics_recorded",
+  "compaction_started",
+  "compaction_completed",
   "error",
 ];
-const ALL_KINDS = ["assistant_delta", ...LOG_KINDS];
 
 export default function App() {
   const [sessions, setSessions] = createSignal<Session[]>([]);
   const [current, setCurrent] = createSignal<string | null>(null);
   const [messages, setMessages] = createSignal<Message[]>([]);
-  const [events, setEvents] = createSignal<EventRow[]>([]);
-  const [streaming, setStreaming] = createSignal("");
-  const [draft, setDraft] = createSignal("");
+  const [sending, setSending] = createSignal(false);
+  const [showFailed, setShowFailed] = createSignal(false);
+  const [highlight, setHighlight] = createSignal<string | null>(null);
 
+  const wb = createWorkbench();
   let stream: EventSource | undefined;
 
   const loadSessions = async () => {
@@ -58,27 +50,55 @@ export default function App() {
   const loadMessages = async (id: string) => {
     const res = await fetch(`/api/v1/sessions/${id}/messages`);
     const body = await res.json();
-    setMessages(body.items ?? []);
+    if (current() === id) setMessages(body.items ?? []);
   };
 
-  const openSession = (id: string) => {
+  /** Apply one event — from history replay or the live stream. Persisted
+   *  events carry a unique `seq`; `seen` drops any duplicate. */
+  const applyOne = (row: EventRow, seen: Set<number>, id: string) => {
+    if (typeof row.seq === "number" && row.seq >= 0) {
+      if (seen.has(row.seq)) return;
+      seen.add(row.seq);
+    }
+    wb.applyEvent(row);
+    if (row.kind === "message_created") {
+      void loadMessages(id);
+      if (row.payload?.role === "assistant") setSending(false);
+    }
+  };
+
+  const openSession = async (id: string) => {
     setCurrent(id);
-    setEvents([]);
-    setStreaming("");
-    void loadMessages(id);
     stream?.close();
-    stream = new EventSource(`/stream/sessions/${id}/events`);
-    for (const kind of ALL_KINDS) {
-      stream.addEventListener(kind, (ev) => {
-        const row = JSON.parse((ev as MessageEvent).data) as EventRow;
-        if (row.kind === "assistant_delta") {
-          setStreaming((prev) => prev + String(row.payload?.text ?? ""));
-          return;
-        }
-        setEvents((prev) => [...prev, row]);
-        if (row.kind === "message_created") {
-          if (row.payload?.role === "assistant") setStreaming("");
-          void loadMessages(id);
+    stream = undefined;
+    wb.reset();
+    setMessages([]);
+    setSending(false);
+    setShowFailed(false);
+    setHighlight(null);
+
+    const seen = new Set<number>();
+    await loadMessages(id);
+
+    // Replay durable event history so past turns' canvas is rebuilt.
+    try {
+      const res = await fetch(`/api/v1/sessions/${id}/events?limit=1000`);
+      const body = await res.json();
+      for (const row of (body.items ?? []) as EventRow[]) applyOne(row, seen, id);
+    } catch {
+      // A missing history endpoint is non-fatal — the live stream still runs.
+    }
+    if (current() !== id) return; // the user switched sessions mid-load
+
+    const es = new EventSource(`/stream/sessions/${id}/events`);
+    stream = es;
+    for (const kind of EVENT_KINDS) {
+      es.addEventListener(kind, (ev) => {
+        if (current() !== id) return;
+        try {
+          applyOne(JSON.parse((ev as MessageEvent).data) as EventRow, seen, id);
+        } catch {
+          // ignore a malformed frame
         }
       });
     }
@@ -88,23 +108,36 @@ export default function App() {
     const res = await fetch("/api/v1/sessions", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ title: "New session" }),
+      body: JSON.stringify({ title: "新会话" }),
     });
     const session = (await res.json()) as Session;
     await loadSessions();
-    openSession(session.id);
+    void openSession(session.id);
   };
 
-  const send = async () => {
+  const send = async (text: string) => {
     const id = current();
-    const text = draft().trim();
-    if (!id || !text) return;
-    setDraft("");
+    if (!id) return;
+    setSending(true);
     await fetch(`/api/v1/sessions/${id}/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ content: text }),
     });
+    void loadMessages(id);
+  };
+
+  /** Scroll to and flash a canvas card — the chat tool summary's click
+   *  target. A failed card is hidden by default, so reveal it first. */
+  const focusCard = (artifactId: string, isError: boolean) => {
+    if (isError) setShowFailed(true);
+    setHighlight(artifactId);
+    requestAnimationFrame(() => {
+      document
+        .getElementById(`card-${artifactId}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+    window.setTimeout(() => setHighlight((h) => (h === artifactId ? null : h)), 2200);
   };
 
   onCleanup(() => stream?.close());
@@ -115,20 +148,20 @@ export default function App() {
       <aside class="sidebar">
         <header>
           <h1>
-            L.E.E.K <span>· M1 harness</span>
+            L.E.E.K <span>· workbench</span>
           </h1>
         </header>
         <button class="new" onClick={() => void newSession()}>
-          + New session
+          + 新会话
         </button>
         <ul class="sessions">
-          <For each={sessions()} fallback={<li class="muted">no sessions yet</li>}>
+          <For each={sessions()} fallback={<li class="muted">还没有会话</li>}>
             {(s) => (
               <li
                 classList={{ session: true, active: s.id === current() }}
-                onClick={() => openSession(s.id)}
+                onClick={() => void openSession(s.id)}
               >
-                <span class="title">{s.title ?? "(untitled)"}</span>
+                <span class="title">{s.title ?? "(未命名)"}</span>
                 <span class="id">{s.id}</span>
               </li>
             )}
@@ -136,60 +169,30 @@ export default function App() {
         </ul>
       </aside>
 
-      <main class="main">
+      <main class="workbench">
         <Show
           when={current()}
-          fallback={<div class="empty">Pick or create a session.</div>}
+          fallback={<div class="empty-main">选择左侧的会话，或新建一个。</div>}
         >
-          <section class="messages">
-            <For each={messages()} fallback={<p class="muted">no messages yet</p>}>
-              {(m) => (
-                <div classList={{ msg: true, [m.role]: true }}>
-                  <span class="role">{m.role}</span>
-                  <p>{m.content}</p>
-                </div>
-              )}
-            </For>
-            <Show when={streaming()}>
-              <div class="msg assistant pending">
-                <span class="role">assistant · streaming</span>
-                <p>{streaming()}</p>
-              </div>
-            </Show>
-          </section>
-          <form
-            class="composer"
-            onSubmit={(e) => {
-              e.preventDefault();
-              void send();
-            }}
-          >
-            <textarea
-              rows={2}
-              placeholder="Message — M1 runs a real agent turn (watch the SSE log)"
-              value={draft()}
-              onInput={(e) => setDraft(e.currentTarget.value)}
-            />
-            <button type="submit">Send</button>
-          </form>
+          <Chat
+            messages={messages}
+            turns={() => wb.state.turns}
+            streaming={() => wb.state.streaming}
+            noted={() => wb.state.noted}
+            sending={sending}
+            send={(t) => void send(t)}
+            focusCard={focusCard}
+          />
+          <Canvas
+            turns={() => wb.state.turns}
+            messages={messages}
+            showFailed={showFailed}
+            setShowFailed={setShowFailed}
+            highlight={highlight}
+          />
+          <PlanWidget plan={() => wb.state.plan} />
         </Show>
       </main>
-
-      <aside class="events">
-        <header>
-          <h2>SSE events</h2>
-        </header>
-        <ul>
-          <For each={events()} fallback={<li class="muted">stream idle</li>}>
-            {(ev) => (
-              <li>
-                <span class="kind">{ev.kind}</span>
-                <code>{JSON.stringify(ev.payload)}</code>
-              </li>
-            )}
-          </For>
-        </ul>
-      </aside>
     </div>
   );
 }
