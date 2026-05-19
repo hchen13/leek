@@ -763,3 +763,29 @@ Task 形态——有 eval case 端到端跑通：
   token，与 codex CLI 完全隔离。验收 / 部署一律用 `auth login`。
 - 待决（独立小任务）：代码里的 `auth import` 子命令现在是个 footgun，
   建议删除，只留 `auth login`。本次未动。
+
+### 2026-05-19 — codex context window 调查 + leek 窗口/阈值 override 设计
+- 调查：codex 的 per-model metadata 来自后端 `/models` endpoint，
+  缓存在 `~/.codex/models_cache.json`。gpt-5.5 的实际值：
+  `context_window=272000`、`max_context_window=272000`、
+  `effective_context_window_percent=95`、`auto_compact_token_limit=None`。
+- 结论：**gpt-5.5 经 codex 的 raw context window = 272K**。leek
+  `pricing.rs` 里硬编码的 400K 是 leek 侧的错误猜测。
+- codex 的窗口模型（源码 `protocol/src/openai_models.rs`、
+  `core/src/session/turn_context.rs`）：可用输入窗口 = raw ×
+  `effective_context_window_percent`(95%) ≈ 258.4K；auto-compact
+  触发点 = `(context_window × 9)/10` = raw × 90% ≈ 244.8K。
+  gpt-5.5 的 `max_context_window` 也是 272K → codex 不允许把
+  gpt-5.5 override 到 272K 以上（对比 gpt-5.4 的 max 是 1M）。
+- leek 设计决策（用户 2026-05-19 拍板）：
+  - context window 默认对齐 codex：gpt-5.5 = **272K**（`pricing.rs`
+    的 400K 要改成 272K——独立小任务，M1.8 完成后派）。
+  - context window 可 env override：`LEEK_CONTEXT_WINDOW`（含在
+    M1.8 spec scope #8）。对 gpt-5.5 实际只用于往下调（测试）。
+  - compaction 阈值默认 0.90（已对齐 codex 的 ×9/10），可 env
+    override：`LEEK_AUTO_COMPACT_THRESHOLD`（已存在）。
+  - **不**采用 codex 的 `effective_context_window_percent`(95%)
+    ——leek 在 90% 就 compact，比 95% 可用上限更早，95% 不会成为
+    约束，加它是过度工程。
+- 影响：ARCHITECTURE §5（新增 context window / 阈值可配置说明）、
+  REQUIREMENTS §7.1（Auto-compaction 小节加配置说明）。

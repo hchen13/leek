@@ -269,6 +269,17 @@ Subagent 的 loop **全部**复用这些。一个挂掉的 subagent 不能污染
 *iteration* = 一个 turn 内的一次 LLM 调用。metrics 表按 turn
 而不是 iteration 记录。
 
+**Context window 与 compaction 阈值都可配置，默认对齐 codex。**
+gpt-5.5 经 codex 后端的 raw context window 是 **272K**（codex
+`/models` 的实际值，见 decision log 2026-05-19；leek 早先硬编码的
+400K 是错的猜测）。auto-compaction 触发点 = context window × 阈值
+（默认 0.90）= 244.8K，与 codex 一致。两个量都能用 env 覆盖——
+`LEEK_CONTEXT_WINDOW` 和 `LEEK_AUTO_COMPACT_THRESHOLD`（测试 compaction
+时把窗口设小，几个 tool-heavy turn 就能触发）。leek **不**采用 codex
+的 `effective_context_window_percent`（95%）——90% 的 compaction 比那条
+可用上限更早触发，95% 不会成为约束。codex 对 gpt-5.5 的 `max_context_window`
+也是 272K，所以窗口 override 实际只能往下调（往上后端会拒）。
+
 ---
 
 ## 6. 存储（vault）
