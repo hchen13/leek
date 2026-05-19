@@ -15,8 +15,11 @@
 //!   - `max_iterations`      — iteration cap reached (opt-in guard)
 //!   - `cost_cap_exceeded`   — USD cost cap reached (opt-in guard)
 //!   - `doom_loop`           — same (tool, args) called N times in a row
-//!   - `context_limit`       — context window near full (auto-compaction)
 //!   - `fatal_error`         — provider / internal failure; see `fatal_error`
+//!
+//! Auto-compaction is deliberately absent from this list: reaching the
+//! context-window threshold folds the context and *continues* the turn
+//! (REQUIREMENTS §7.1), so it is a `compaction_count`, not a `stop_reason`.
 
 use anyhow::{Context, Result};
 use sqlx::SqlitePool;
@@ -33,6 +36,8 @@ pub struct NewTurnMetrics<'a> {
     pub iteration_count: i64,
     pub tool_call_count: i64,
     pub tool_error_count: i64,
+    /// Times auto-compaction folded the context during the turn.
+    pub compaction_count: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cost_usd: f64,
@@ -46,10 +51,10 @@ pub async fn insert(pool: &SqlitePool, m: &NewTurnMetrics<'_>) -> Result<()> {
     sqlx::query(
         "INSERT INTO turn_metrics \
            (turn_id, session_id, model, started_at, ended_at, wall_clock_ms, \
-            iteration_count, tool_call_count, tool_error_count, \
+            iteration_count, tool_call_count, tool_error_count, compaction_count, \
             input_tokens, output_tokens, cost_usd, \
             stop_reason, first_triggered_guard, fatal_error) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(m.turn_id)
     .bind(m.session_id)
@@ -60,6 +65,7 @@ pub async fn insert(pool: &SqlitePool, m: &NewTurnMetrics<'_>) -> Result<()> {
     .bind(m.iteration_count)
     .bind(m.tool_call_count)
     .bind(m.tool_error_count)
+    .bind(m.compaction_count)
     .bind(m.input_tokens)
     .bind(m.output_tokens)
     .bind(m.cost_usd)

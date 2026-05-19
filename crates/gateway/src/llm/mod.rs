@@ -39,6 +39,9 @@ pub struct ChatMessage {
 pub enum Role {
     User,
     Assistant,
+    /// Harness-injected context — neither a user nor a model utterance.
+    /// Used for the auto-compaction summary block (see `agent::compaction`).
+    Developer,
 }
 
 impl Role {
@@ -46,6 +49,7 @@ impl Role {
         match self {
             Role::User => "user",
             Role::Assistant => "assistant",
+            Role::Developer => "developer",
         }
     }
 }

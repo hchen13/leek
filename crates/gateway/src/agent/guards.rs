@@ -29,6 +29,11 @@ pub struct GuardConfig {
     pub cost_cap_usd: Option<f64>,
     pub doom_loop_threshold: Option<usize>,
     pub auto_compact_threshold: f32,
+    /// Override for the model context window the auto-compaction trigger is
+    /// sized against, in tokens. `None` → use the per-model `pricing` table.
+    /// Set via `LEEK_CONTEXT_WINDOW`, mainly so a test can force a small
+    /// window and trip compaction within a few turns.
+    pub context_window: Option<i64>,
 }
 
 impl GuardConfig {
@@ -41,6 +46,7 @@ impl GuardConfig {
             cost_cap_usd: opt_f64_env("LEEK_COST_CAP_USD"),
             doom_loop_threshold: doom_threshold_env(),
             auto_compact_threshold: f32_env("LEEK_AUTO_COMPACT_THRESHOLD", 0.90),
+            context_window: opt_usize_env("LEEK_CONTEXT_WINDOW").map(|n| n as i64),
         }
     }
 }
@@ -193,5 +199,20 @@ mod tests {
     fn doom_loop_ignores_overflowed_window() {
         let w = window(&[("e", "{}"), ("e", "{}"), ("e", "{}"), ("e", "{}")]);
         assert!(!detect_doom_loop(&w, 3));
+    }
+
+    #[test]
+    fn context_window_override_reads_env() {
+        std::env::remove_var("LEEK_CONTEXT_WINDOW");
+        assert_eq!(GuardConfig::from_env().context_window, None);
+
+        std::env::set_var("LEEK_CONTEXT_WINDOW", "16000");
+        assert_eq!(GuardConfig::from_env().context_window, Some(16_000));
+
+        // Invalid values fall back to None, like the other opt-in env caps.
+        std::env::set_var("LEEK_CONTEXT_WINDOW", "not-a-number");
+        assert_eq!(GuardConfig::from_env().context_window, None);
+
+        std::env::remove_var("LEEK_CONTEXT_WINDOW");
     }
 }

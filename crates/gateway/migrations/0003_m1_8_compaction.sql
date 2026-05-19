@@ -1,0 +1,25 @@
+-- L.E.E.K vault — M1.8 schema delta (auto-compaction).
+--
+-- M1.8 completes M1 by replacing the interim `context_limit` stop branch
+-- with real auto-compaction (REQUIREMENTS §7.1, MILESTONES M1.8): near the
+-- context-window limit, a turn folds its early context into a traceable
+-- summary and *continues*, instead of stopping with a diagnostic.
+--
+-- One column is added, justified per ARCHITECTURE §6 ("每张新增表/字段都必须
+-- 说明为什么当前阶段必须加入"):
+--
+--   turn_metrics.compaction_count — how many times auto-compaction ran
+--   during the turn. It is a per-turn count, a sibling of the existing
+--   iteration_count / tool_call_count / tool_error_count: M1.8 is the first
+--   milestone in which a turn can compact at all, so the metric lands now.
+--   Per-compaction before/after token estimates are carried on the
+--   `compaction_completed` event (a turn may compact more than once), not
+--   in this aggregate row.
+--
+-- Note: migration 0002's `stop_reason` comment still lists `context_limit`.
+-- That file is immutable once applied (sqlx checksums it). The authoritative
+-- stop_reason vocabulary is vault/turn_metrics.rs, which drops `context_limit`
+-- in M1.8 — auto-compaction continues the turn rather than ending it, so it
+-- is never a stop_reason.
+
+ALTER TABLE turn_metrics ADD COLUMN compaction_count INTEGER NOT NULL DEFAULT 0;

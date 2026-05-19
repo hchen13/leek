@@ -10,7 +10,12 @@
 //! Every guard is a *recovery* boundary (ch.8): it ends the turn with a
 //! persisted, user-visible partial result and a `turn_metrics` row, never an
 //! empty silent failure.
+//!
+//! Auto-compaction is the one boundary that recovers by *continuing*: near
+//! the context-window limit it folds the early context into a summary and
+//! runs on, instead of stopping (see `compaction`; REQUIREMENTS §7.1).
 
+mod compaction;
 mod guards;
 mod prompt;
 mod tools;
@@ -35,9 +40,9 @@ const MODEL: &str = "gpt-5.5";
 const REASONING_EFFORT: &str = "xhigh";
 const VERBOSITY: &str = "low";
 
-/// Recent messages of history sent as context. Until M1.8 full
-/// auto-compaction lands, the context-limit fallback covers the case where
-/// even this is too large.
+/// Cap on session history loaded as a turn's starting context. A turn whose
+/// context still outgrows the model window is handled by auto-compaction
+/// (see `compaction`), which folds the early context and continues.
 const HISTORY_LIMIT: i64 = 400;
 
 /// Run one agent turn to completion. Spawned fire-and-forget by the message
@@ -66,7 +71,7 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
     // ── context ─────────────────────────────────────────────────────────
     // Full session history (the just-posted user message is already in it).
     let history = messages::list(&st.pool, session_id, None, HISTORY_LIMIT).await?;
-    let chat_messages: Vec<ChatMessage> = history
+    let mut chat_messages: Vec<ChatMessage> = history
         .iter()
         .filter_map(|m| {
             let role = match m.role.as_str() {
@@ -83,8 +88,13 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
 
     let tool_specs = tools::specs();
     let system = prompt::build_system_prompt(&tool_specs);
-    let compact_trigger =
-        (guards.auto_compact_threshold as f64 * pricing::context_window(MODEL) as f64) as u32;
+    // Auto-compaction trigger: a fraction of the context window. The window
+    // is `LEEK_CONTEXT_WINDOW` if set (a small value trips compaction within
+    // a few turns — handy for tests), else the per-model `pricing` value.
+    let context_window = guards
+        .context_window
+        .unwrap_or_else(|| pricing::context_window(MODEL));
+    let compact_trigger = (guards.auto_compact_threshold as f64 * context_window as f64) as u32;
 
     // ── turn state ──────────────────────────────────────────────────────
     // Prior-iteration function_call / function_call_output items, re-sent so
@@ -100,6 +110,10 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
     let mut last_input_tokens: u32 = 0;
     // Sliding window of recent (tool, args) calls for the doom-loop detector.
     let mut doom_window: VecDeque<(String, String)> = VecDeque::new();
+    // Auto-compaction state: the running summary of context folded away,
+    // and how many times that has happened this turn.
+    let mut compaction_summary: Option<String> = None;
+    let mut compaction_count: usize = 0;
 
     // Assigned by every `break 'turn` arm — declared uninitialized so the
     // compiler rejects any future exit path that forgets to set it.
@@ -128,13 +142,49 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
             first_guard.get_or_insert("cost_cap_exceeded");
             break 'turn;
         }
-        if compact_trigger > 0 && last_input_tokens >= compact_trigger {
-            // Temporary M1 fallback: detect the 90% threshold and stop the
-            // turn with a clear diagnostic. This is not full auto-compaction;
-            // M1.8 must summarize-and-continue instead.
-            stop_reason = "context_limit".into();
-            first_guard.get_or_insert("context_limit");
-            break 'turn;
+        // ── auto-compaction ─────────────────────────────────────────────
+        // Near the context-window limit, fold the early context into a
+        // traceable summary and continue this turn — there is no
+        // context-limit stop (REQUIREMENTS §7.1, MILESTONES M1.8). The
+        // provider's measured `input_tokens` is the accurate trigger; until
+        // the first iteration reports one, an estimate stands in so an
+        // already-oversized history still compacts before its first call.
+        if compact_trigger > 0 {
+            let ctx_tokens = if last_input_tokens > 0 {
+                last_input_tokens
+            } else {
+                compaction::estimate_context_tokens(
+                    &system,
+                    compaction_summary.as_deref(),
+                    &chat_messages,
+                    &additional_inputs,
+                )
+            };
+            if ctx_tokens >= compact_trigger {
+                match compaction::compact(
+                    st,
+                    session_id,
+                    turn_id,
+                    &system,
+                    &mut compaction_summary,
+                    &mut chat_messages,
+                    &mut additional_inputs,
+                    ctx_tokens,
+                )
+                .await
+                {
+                    Ok(compaction::Compacted::Done { tokens_after }) => {
+                        compaction_count += 1;
+                        last_input_tokens = tokens_after;
+                    }
+                    Ok(compaction::Compacted::Skipped) => {}
+                    Err(e) => {
+                        fatal_error = Some(e.to_string());
+                        stop_reason = "fatal_error".into();
+                        break 'turn;
+                    }
+                }
+            }
         }
 
         iteration_count += 1;
@@ -151,10 +201,18 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
             }
         }
 
+        // Prepend the auto-compaction summary (if any) as a developer-role
+        // context block, ahead of the kept recent messages.
+        let mut iter_messages: Vec<ChatMessage> = Vec::with_capacity(chat_messages.len() + 1);
+        if let Some(summary) = &compaction_summary {
+            iter_messages.push(compaction::summary_message(summary));
+        }
+        iter_messages.extend(chat_messages.iter().cloned());
+
         let req = ChatRequest {
             model: MODEL.to_string(),
             system: system.clone(),
-            messages: chat_messages.clone(),
+            messages: iter_messages,
             tools: tool_specs.clone(),
             additional_inputs: iter_inputs,
             reasoning_effort: Some(REASONING_EFFORT.to_string()),
@@ -327,6 +385,7 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
             iteration_count: iteration_count as i64,
             tool_call_count: tool_call_count as i64,
             tool_error_count: tool_error_count as i64,
+            compaction_count: compaction_count as i64,
             input_tokens: input_tokens as i64,
             output_tokens: output_tokens as i64,
             cost_usd,
@@ -347,6 +406,7 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
             "iteration_count": iteration_count,
             "tool_call_count": tool_call_count,
             "tool_error_count": tool_error_count,
+            "compaction_count": compaction_count,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cost_usd": cost_usd,
@@ -415,7 +475,6 @@ fn stop_note(stop_reason: &str) -> Option<&'static str> {
         "max_iterations" => Some("达到迭代次数上限（iteration cap），提前结束。"),
         "cost_cap_exceeded" => Some("达到本回合成本上限（cost cap），提前结束。"),
         "doom_loop" => Some("检测到工具调用陷入循环（doom-loop），本回合中止。"),
-        "context_limit" => Some("上下文接近窗口上限；自动压缩尚未完成，本回合提前结束。"),
         _ => Some("本回合提前结束。"),
     }
 }

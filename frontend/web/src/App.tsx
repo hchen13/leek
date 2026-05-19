@@ -28,6 +28,8 @@ const LOG_KINDS = [
   "message_created",
   "tool_call",
   "tool_result",
+  "compaction_started",
+  "compaction_completed",
   "assistant_done",
   "turn_metrics_recorded",
   "error",
