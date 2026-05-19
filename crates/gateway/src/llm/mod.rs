@@ -102,15 +102,11 @@ pub enum LlmEvent {
         /// The search query — reported once the provider has it (on
         /// completion); `None` while the search is still starting.
         query: Option<String>,
-    },
-    /// A source surfaced by the provider-side web search — one `url_citation`
-    /// annotation on the model's answer text (M1.9.4, REQUIREMENTS §4.3). The
-    /// loop collects these and attaches them to the iteration's search card;
-    /// they are display-only and never re-injected into the model context.
-    WebSearchSource {
-        url: String,
-        /// The page title, when the provider supplies one.
-        title: Option<String>,
+        /// Resolved source URLs for this search, parsed from the backend's
+        /// `web_search_call.action.sources` (REQUIREMENTS §4.3, MILESTONES
+        /// decision 2026-05-19). Empty on the `Start` frame; populated on
+        /// `Completed` — the request opts in to this data via `include`.
+        sources: Vec<String>,
     },
 }
 

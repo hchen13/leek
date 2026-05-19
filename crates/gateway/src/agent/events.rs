@@ -177,9 +177,9 @@ impl CanvasArtifact {
 
     /// A provider-side web-search artifact (REQUIREMENTS §4.3). One card per
     /// search call; the call id is both the artifact id and the identity.
-    /// `sources` are the `url_citation` results — empty on the `Start` frame
-    /// and the bare `Completion` frame, populated on the enriched completion
-    /// frame the loop emits once the answer's citations are in.
+    /// `sources` come from the backend's `web_search_call.action.sources`
+    /// (MILESTONES decision 2026-05-19) — empty on the `Start` frame, and
+    /// carrying the search's resolved sources on the `Completion` frame.
     pub fn search(
         turn_id: &str,
         iteration: usize,

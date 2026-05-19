@@ -55,6 +55,11 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
     // keeps it opt-in (see `ChatRequest.web_search`).
     if req.web_search {
         tools.push(serde_json::json!({ "type": "web_search" }));
+        // Opt in to per-search source data: the backend then attaches each
+        // search's resolved sources to its `web_search_call.action.sources`
+        // (MILESTONES decision 2026-05-19). Without this `include` the search
+        // card stays sourceless — codex does not surface them otherwise.
+        body["include"] = serde_json::json!(["web_search_call.action.sources"]);
     }
     if !tools.is_empty() {
         body["tools"] = serde_json::Value::Array(tools);
@@ -149,10 +154,6 @@ struct DataEnvelope {
     response: Option<ResponseObject>,
     #[serde(default)]
     item: Option<ItemObject>,
-    /// `response.output_text.annotation.added` carries a single annotation —
-    /// for web search, a `url_citation` (M1.9.4).
-    #[serde(default)]
-    annotation: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -169,13 +170,9 @@ struct ItemObject {
     /// `web_search_call` items carry their id in `id`, not `call_id`.
     #[serde(default)]
     id: Option<String>,
-    /// `web_search_call` action — `{type:"search", query, queries}`.
+    /// `web_search_call` action — `{type:"search", query, queries, sources}`.
     #[serde(default)]
     action: Option<serde_json::Value>,
-    /// A `message` item's content parts — each `output_text` part may carry
-    /// `url_citation` annotations once a provider web search has run.
-    #[serde(default)]
-    content: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -234,7 +231,7 @@ fn parse_one_event(raw: &str) -> Result<Vec<LlmEvent>> {
         // Function-call items: arguments are accumulated server-side and
         // delivered complete on `output_item.done`. A `web_search_call`
         // item is a provider-side search (M1.9.4) — `.done` completes it
-        // with the query in `action`.
+        // with the query and resolved sources in `action`.
         Some("response.output_item.done") => {
             let Some(item) = env.item else {
                 return Ok(vec![LlmEvent::Ping]);
@@ -254,17 +251,9 @@ fn parse_one_event(raw: &str) -> Result<Vec<LlmEvent>> {
                     }])
                 }
                 Some("web_search_call") => Ok(web_search_event(&item, WebSearchPhase::Completed)),
-                // A completed assistant message — its text already streamed;
-                // harvest any `url_citation` annotations a provider web
-                // search attached (M1.9.4).
-                Some("message") => {
-                    let cites = message_citations(item.content.as_ref());
-                    Ok(if cites.is_empty() {
-                        vec![LlmEvent::Ping]
-                    } else {
-                        cites
-                    })
-                }
+                // A completed assistant message — its text has already
+                // streamed as deltas, so the item itself adds nothing.
+                Some("message") => Ok(vec![LlmEvent::Ping]),
                 // The `added` form of a function_call has empty arguments —
                 // skip it (→ Ping) and dispatch off the complete `.done`.
                 _ => Ok(vec![LlmEvent::Ping]),
@@ -277,11 +266,6 @@ fn parse_one_event(raw: &str) -> Result<Vec<LlmEvent>> {
                 None => Ok(vec![LlmEvent::Ping]),
             }
         }
-        // A `url_citation` annotation on the answer text — a source surfaced
-        // by the provider-side web search (M1.9.4).
-        Some("response.output_text.annotation.added") => Ok(citation_event(env.annotation.as_ref())
-            .map(|e| vec![e])
-            .unwrap_or_else(|| vec![LlmEvent::Ping])),
         Some("response.completed") => {
             let response = env
                 .response
@@ -339,10 +323,12 @@ fn web_search_event(item: &ItemObject, phase: WebSearchPhase) -> Vec<LlmEvent> {
         return vec![LlmEvent::Ping];
     };
     let query = item.action.as_ref().and_then(search_query);
+    let sources = search_sources(item.action.as_ref());
     vec![LlmEvent::WebSearch {
         call_id,
         phase,
         query,
+        sources,
     }]
 }
 
@@ -363,40 +349,26 @@ fn search_query(action: &serde_json::Value) -> Option<String> {
     })
 }
 
-/// Turn one annotation into a `WebSearchSource`, if it is a `url_citation`
-/// with a non-empty URL. Other annotation kinds (file citations, …) yield
-/// `None` — the caller maps that to a `Ping`.
-fn citation_event(annotation: Option<&serde_json::Value>) -> Option<LlmEvent> {
-    let ann = annotation?;
-    if ann.get("type").and_then(|v| v.as_str()) != Some("url_citation") {
-        return None;
-    }
-    let url = ann
-        .get("url")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())?;
-    let title = ann
-        .get("title")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    Some(LlmEvent::WebSearchSource {
-        url: url.to_string(),
-        title,
-    })
-}
-
-/// Harvest `url_citation` sources from a `message` item's content parts —
-/// the structure is `[{ "type": "output_text", "annotations": [ … ] }, …]`.
-fn message_citations(content: Option<&serde_json::Value>) -> Vec<LlmEvent> {
-    let Some(parts) = content.and_then(|c| c.as_array()) else {
+/// Pull resolved source URLs out of a `web_search_call` action. The codex
+/// backend attaches them as `action.sources: [{type:"url", url:"…"}, …]`
+/// once the request opts in via `include: ["web_search_call.action.sources"]`
+/// (MILESTONES decision 2026-05-19). Only `type == "url"` entries with a
+/// non-empty URL are kept; a `Start`-frame action carries no `sources`.
+fn search_sources(action: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(arr) = action
+        .and_then(|a| a.get("sources"))
+        .and_then(|v| v.as_array())
+    else {
         return Vec::new();
     };
-    parts
-        .iter()
-        .filter_map(|p| p.get("annotations").and_then(|a| a.as_array()))
-        .flatten()
-        .filter_map(|ann| citation_event(Some(ann)))
+    arr.iter()
+        .filter(|s| s.get("type").and_then(|v| v.as_str()) == Some("url"))
+        .filter_map(|s| {
+            s.get("url")
+                .and_then(|v| v.as_str())
+                .filter(|u| !u.is_empty())
+                .map(str::to_string)
+        })
         .collect()
 }
 
@@ -494,6 +466,23 @@ mod tests {
     }
 
     #[test]
+    fn body_omits_include_unless_web_search() {
+        // `include` only governs web_search_call data — absent without it.
+        assert!(build_request_body(&req()).get("include").is_none());
+    }
+
+    #[test]
+    fn body_adds_include_for_web_search_sources() {
+        let mut r = req();
+        r.web_search = true;
+        let body = build_request_body(&r);
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["web_search_call.action.sources"])
+        );
+    }
+
+    #[test]
     fn parses_text_delta() {
         let raw = "event: response.output_text.delta\n\
                    data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}";
@@ -554,10 +543,13 @@ mod tests {
                 call_id,
                 phase,
                 query,
+                sources,
             }] => {
                 assert_eq!(call_id, "ws_1");
                 assert_eq!(*phase, WebSearchPhase::Started);
                 assert!(query.is_none());
+                // The `Start` frame has no `action`, hence no sources.
+                assert!(sources.is_empty());
             }
             other => panic!("expected WebSearch, got {other:?}"),
         }
@@ -573,12 +565,44 @@ mod tests {
                 call_id,
                 phase,
                 query,
+                sources,
             }] => {
                 assert_eq!(call_id, "ws_1");
                 assert_eq!(*phase, WebSearchPhase::Completed);
                 assert_eq!(query.as_deref(), Some("AI capex 2026"));
+                // No `sources` array on this action — none parsed.
+                assert!(sources.is_empty());
             }
             other => panic!("expected WebSearch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_web_search_sources_from_action() {
+        // With the `include` opt-in, a completed web_search_call's action
+        // carries the resolved sources. Empty-URL and non-`url` entries drop.
+        let raw = "data: {\"type\":\"response.output_item.done\",\"item\":{\
+                   \"type\":\"web_search_call\",\"id\":\"ws_7\",\"status\":\"completed\",\
+                   \"action\":{\"type\":\"search\",\"query\":\"ai capex\",\"sources\":[\
+                   {\"type\":\"url\",\"url\":\"https://a.com/x\"},\
+                   {\"type\":\"url\",\"url\":\"https://b.com/y\"},\
+                   {\"type\":\"url\",\"url\":\"\"},\
+                   {\"type\":\"other\",\"url\":\"https://c.com/z\"}]}}}";
+        match &parse_one_event(raw).unwrap()[..] {
+            [LlmEvent::WebSearch {
+                call_id,
+                phase,
+                query,
+                sources,
+            }] => {
+                assert_eq!(call_id, "ws_7");
+                assert_eq!(*phase, WebSearchPhase::Completed);
+                assert_eq!(query.as_deref(), Some("ai capex"));
+                assert_eq!(sources.len(), 2);
+                assert_eq!(sources[0], "https://a.com/x");
+                assert_eq!(sources[1], "https://b.com/y");
+            }
+            other => panic!("expected WebSearch with sources, got {other:?}"),
         }
     }
 
@@ -588,60 +612,6 @@ mod tests {
         // has empty arguments and must wait for `.done`.
         let raw = "data: {\"type\":\"response.output_item.added\",\"item\":{\
                    \"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"echo\"}}";
-        assert!(matches!(parse_one_event(raw).unwrap()[..], [LlmEvent::Ping]));
-    }
-
-    #[test]
-    fn parses_url_citation_annotation() {
-        let raw = "data: {\"type\":\"response.output_text.annotation.added\",\
-                   \"annotation\":{\"type\":\"url_citation\",\
-                   \"url\":\"https://example.com/a\",\"title\":\"Example A\"}}";
-        match &parse_one_event(raw).unwrap()[..] {
-            [LlmEvent::WebSearchSource { url, title }] => {
-                assert_eq!(url, "https://example.com/a");
-                assert_eq!(title.as_deref(), Some("Example A"));
-            }
-            other => panic!("expected WebSearchSource, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn non_url_citation_annotation_is_ping() {
-        let raw = "data: {\"type\":\"response.output_text.annotation.added\",\
-                   \"annotation\":{\"type\":\"file_citation\",\"file_id\":\"f1\"}}";
-        assert!(matches!(parse_one_event(raw).unwrap()[..], [LlmEvent::Ping]));
-    }
-
-    #[test]
-    fn parses_citations_from_a_message_item() {
-        // The provider attaches url_citation annotations to the answer text;
-        // they ride along on the completed `message` item.
-        let raw = "data: {\"type\":\"response.output_item.done\",\"item\":{\
-                   \"type\":\"message\",\"role\":\"assistant\",\"content\":[{\
-                   \"type\":\"output_text\",\"text\":\"hi\",\"annotations\":[\
-                   {\"type\":\"url_citation\",\"url\":\"https://e.com/x\",\"title\":\"X\"},\
-                   {\"type\":\"url_citation\",\"url\":\"https://e.com/y\"}]}]}}";
-        let evts = parse_one_event(raw).unwrap();
-        assert_eq!(evts.len(), 2);
-        match (&evts[0], &evts[1]) {
-            (
-                LlmEvent::WebSearchSource { url: u1, title: t1 },
-                LlmEvent::WebSearchSource { url: u2, title: t2 },
-            ) => {
-                assert_eq!(u1, "https://e.com/x");
-                assert_eq!(t1.as_deref(), Some("X"));
-                assert_eq!(u2, "https://e.com/y");
-                assert!(t2.is_none());
-            }
-            other => panic!("expected two WebSearchSource, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn message_item_without_citations_is_ping() {
-        let raw = "data: {\"type\":\"response.output_item.done\",\"item\":{\
-                   \"type\":\"message\",\"role\":\"assistant\",\"content\":[{\
-                   \"type\":\"output_text\",\"text\":\"plain answer\"}]}}";
         assert!(matches!(parse_one_event(raw).unwrap()[..], [LlmEvent::Ping]));
     }
 
