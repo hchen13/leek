@@ -32,9 +32,11 @@ What works today:
 - **Tools** — `echo` (deterministic, proves the function-call loop) and
   `web_fetch` (fetch a URL as text). Domain tools are M3.
 - **Guards** — idle timeout, wall-clock ceiling with staged soft-prompts,
-  iteration cap, cost cap, doom-loop detector, and a context-limit fallback.
-  Full auto-compaction is the intended M1.8 behavior and is still pending.
-  Observability guards are on by default; hard caps are opt-in.
+  iteration cap, cost cap, and a doom-loop detector. Observability guards
+  are on by default; hard caps are opt-in.
+- **Auto-compaction** — near the context-window limit a turn folds its
+  early context into a traceable summary and continues, instead of
+  stopping (M1.8 — replaced the interim context-limit stop).
 - **Per-turn metrics** — every turn writes a `turn_metrics` row (stop reason,
   iterations, tokens, cost, triggering guard) and emits a
   `turn_metrics_recorded` event.
@@ -83,7 +85,8 @@ curl -X POST localhost:8964/api/v1/sessions/<id>/messages -H 'content-type: appl
 | GET | `/stream/sessions/{id}/events` | Live SSE event stream |
 
 SSE event kinds: `message_created`, `assistant_delta`, `tool_call`,
-`tool_result`, `assistant_done`, `turn_metrics_recorded`, `error`.
+`tool_result`, `compaction_started`, `compaction_completed`,
+`assistant_done`, `turn_metrics_recorded`, `error`.
 
 ### Guard configuration
 
@@ -97,7 +100,8 @@ Until a settings UI exists, guards are tuned by environment variable
 | `LEEK_MAX_ITERATIONS` | off | Cap LLM iterations per turn (opt-in) |
 | `LEEK_COST_CAP_USD` | off | Cap estimated USD cost per turn (opt-in) |
 | `LEEK_DOOM_LOOP_THRESHOLD` | `3` | Abort after N identical `(tool, args)` calls in a row |
-| `LEEK_AUTO_COMPACT_THRESHOLD` | `0.90` | Current fallback stops with diagnostics at this threshold; intended behavior is summarize-and-continue |
+| `LEEK_AUTO_COMPACT_THRESHOLD` | `0.90` | Fraction of the context window at which a turn auto-compacts — summarize early context and continue |
+| `LEEK_CONTEXT_WINDOW` | per-model | Override the context window the auto-compaction trigger is sized against, in tokens (mainly for tests — a small window trips compaction within a few turns) |
 
 ### Repository layout
 
@@ -138,9 +142,9 @@ corpus、skill、委派子 agent —— 那些是后续 milestone。
 - **工具** —— `echo`（确定性，验证 function-call 循环）和 `web_fetch`
   （把 URL 抓成文本）。领域工具在 M3。
 - **Guards** —— idle timeout、wall-clock 上限（带阶段化软提示）、迭代
-  上限、成本上限、doom-loop 检测、context-limit fallback。真正
-  auto-compaction 是 M1.8 的目标行为，目前仍待补。可观测性 guard
-  默认开，硬上限 opt-in。
+  上限、成本上限、doom-loop 检测。可观测性 guard 默认开，硬上限 opt-in。
+- **Auto-compaction** —— 上下文接近窗口上限时，turn 把早期上下文折叠成
+  可追溯摘要并继续，而不是停下（M1.8 —— 取代了临时的 context-limit 停止）。
 - **Per-turn metrics** —— 每个 turn 写一行 `turn_metrics`（停止原因、
   迭代数、token、成本、触发的 guard），并发一个 `turn_metrics_recorded`
   事件。
@@ -189,7 +193,8 @@ curl -X POST localhost:8964/api/v1/sessions/<id>/messages -H 'content-type: appl
 | GET | `/stream/sessions/{id}/events` | SSE 实时事件流 |
 
 SSE 事件类型：`message_created`、`assistant_delta`、`tool_call`、
-`tool_result`、`assistant_done`、`turn_metrics_recorded`、`error`。
+`tool_result`、`compaction_started`、`compaction_completed`、
+`assistant_done`、`turn_metrics_recorded`、`error`。
 
 ### Guard 配置
 
@@ -202,7 +207,8 @@ SSE 事件类型：`message_created`、`assistant_delta`、`tool_call`、
 | `LEEK_MAX_ITERATIONS` | 关 | 每 turn 的 LLM 迭代上限（opt-in） |
 | `LEEK_COST_CAP_USD` | 关 | 每 turn 估算美元成本上限（opt-in） |
 | `LEEK_DOOM_LOOP_THRESHOLD` | `3` | 连续 N 次相同 `(tool, args)` 调用即中止 |
-| `LEEK_AUTO_COMPACT_THRESHOLD` | `0.90` | 当前 fallback 会在此阈值诊断性停止；目标行为是摘要压缩后继续 |
+| `LEEK_AUTO_COMPACT_THRESHOLD` | `0.90` | 上下文用量达到窗口的此比例时 turn 自动压缩——摘要早期上下文后继续 |
+| `LEEK_CONTEXT_WINDOW` | per-model | 覆盖 auto-compaction 触发线所用的 context window（token 数；主要用于测试——小窗口几个 turn 就触发压缩） |
 
 ### 仓库结构
 
