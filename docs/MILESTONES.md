@@ -28,7 +28,7 @@
 
 ---
 
-## 状态标识（2026-05-18）
+## 状态标识（2026-05-19）
 
 老的 `rebuild` 分支完成了 M1 + Phase 0g 清理，之后被诊断为携带
 了过多的确定性系统脚手架（routing 层、deliverable 分类、plan_guard），
@@ -50,15 +50,15 @@ frontend active tree 全部清底重写。旧代码通过 git history 查询，
 
 - **M0 completed（2026-05-18）**：runtime / migration / frontend
   active tree 已 clean-room 重写，HTTP + SQLite + SSE echo 骨架可跑。
-- **M1 core completed（2026-05-18）**：echo worker 已替换为真实主 agent
-  loop；Codex OAuth、Responses streaming、工具循环、turn_metrics 和
-  大部分 M1 guard set 已接入。M1 没有接 corpus / skill / subagent /
-  domain tools。
-- **M1 未完成项 — auto-compaction（M1.8 子提交）**：上下文到 90%
-  context window 时摘要压缩旧上下文并继续同一个 turn。当前代码用的是
-  一个 `context_limit` 停止分支（开发中被擅自加入的工程护栏，见
-  decision log 2026-05-19 第二条），必须被 auto-compaction 替换。
-  M1 在此之前不算完成。
+- **M1 completed（2026-05-19）**：echo worker 已替换为真实主 agent
+  loop；Codex OAuth、Responses streaming、工具循环、turn_metrics、
+  M1 guard set 已接入。收尾子提交 M1.8 auto-compaction 已落地——到阈值
+  时摘要压缩早期上下文并继续同一个 turn，`context_limit` 停止分支已移除；
+  `LEEK_CONTEXT_WINDOW` env override 让触发窗口可配。gpt-5.5 context
+  window 默认值修正为 codex 实际值 272K。M1 没有接 corpus / skill /
+  subagent / domain tools——那些是后续 milestone。
+  验收：PM 代码审查 + `cargo test` 50/50 + 浏览器 E2E（compaction
+  触发 / tool 折叠 / 压缩后继续 / 召回 全部 live 验证）。
 - **M1.9 pending**：锁定 workbench UX / event contract：chat 只放
   最终回复，canvas 放 note/tool/search/corpus/subagent 过程 artifact，
   tool result 拆成 `model_output / display_payload / debug_payload`。
