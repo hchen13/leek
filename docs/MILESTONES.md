@@ -68,9 +68,21 @@ frontend active tree 全部清底重写。旧代码通过 git history 查询，
   （`LEEK_WEB_SEARCH` opt-in，已实测经 codex backend 可用）。
   验收：PM 代码审查 + `cargo test` 68/68 + 浏览器 E2E（6 类事件 + 4 个
   surface 全部 live 验证）。
-- **M1.9 part 2 pending（M1.9.6–M1.9.7）**：前端 workbench——chat 工具
-  摘要（运行中逐条 + 完成聚合）、基础 canvas（turn 分段，note/tool/
-  web_fetch/search cards）+ Plan / TODO widget。
+- **M1.9 part 2 completed（2026-05-19，M1.9.6–M1.9.7）**：前端
+  workbench 落地——三栏布局（Sessions │ Chat │ Canvas）；chat 工具
+  摘要（运行中逐条显示、完成后聚合、可跳转 canvas）；canvas 按 turn
+  分段（note / tool / web_fetch / search cards，失败卡默认折叠可
+  展开）；Plan / TODO widget；`store.ts` 按 `payload.surface` 路由。
+  同批后端补全 web_search `url_citation` 来源映射 + clippy
+  `TurnContext` 重构。M1.9 全部完成。
+  验收：PM 代码审查 + `cargo test` 73/73 + `cargo clippy` 0 warning
+  + 浏览器 E2E（3 个 turn：plan / web_fetch / 失败工具 / note_trace
+  / 19 次 web_search 全部 live 验证）。commit `595ab4a`（后端）+
+  `32a1fca`（前端）。
+  验收发现：web_search 来源卡片需在 Responses API 请求里带 `include`
+  参数才有数据（codex backend 经 `web_search_call.action.sources`
+  暴露来源）；leek 当前未带,故来源恒空——非代码缺陷,已写 follow-up
+  收尾,详见 decision log 2026-05-19。
 
 ---
 
@@ -318,9 +330,13 @@ canvas / right rail 的边界锁死。
 > Scope 第 1–2 项（REQUIREMENTS 成为权威源、AGENTS.md 重指向）是文档
 > 工作，已随 `REQUIREMENTS.md` / `AGENTS.md` 落地，不再单列 sub-commit。
 >
-> **状态（2026-05-19）**：M1.9.1–M1.9.5（后端事件契约）已完成并验收，
-> 单个 commit `2a5dde1`（5 个 sub-commit 互相耦合、无法干净切分）。
-> M1.9.6–M1.9.7（前端 workbench）待派。
+> **状态（2026-05-19）**：M1.9 全部完成并验收。M1.9.1–M1.9.5（后端
+> 事件契约）单个 commit `2a5dde1`（5 个 sub-commit 互相耦合、无法
+> 干净切分）。M1.9.6–M1.9.7（前端 workbench）commit `32a1fca`；
+> 同批 `595ab4a` 补全 web_search `url_citation` 来源映射（后端）。
+> 验收发现：search 来源卡片需在请求里带 `include` 参数才有数据
+> （codex backend 经 `web_search_call.action.sources` 暴露来源）；
+> leek 当前未带,已写 follow-up 收尾——见 decision log 2026-05-19。
 
 ### 验收
 
@@ -802,3 +818,41 @@ Task 形态——有 eval case 端到端跑通：
     约束，加它是过度工程。
 - 影响：ARCHITECTURE §5（新增 context window / 阈值可配置说明）、
   REQUIREMENTS §7.1（Auto-compaction 小节加配置说明）。
+
+### 2026-05-19 — web_search 来源：codex backend 经 `include` 参数暴露
+
+- M1.9 part 2 验收时实测 web_search（`LEEK_WEB_SEARCH=1`，一个 turn
+  跑了 19 次搜索）：search 卡片来源恒为空。抓 codex backend
+  （`chatgpt.com/backend-api/codex/responses`）原始 SSE 确认：message
+  item 的 `output_text` `annotations` 恒为 `[]`，整条流也没有
+  `response.output_text.annotation.added` 事件——codex backend 不发
+  answer-level 的 `url_citation` 注解。
+- 据此一度结论“codex backend 不通过结构化数据暴露来源、search 卡片
+  注定恒空”。**这个结论下早了**——当时没试 Responses API 的
+  `include` 请求参数。
+- 复测：请求体加 `include` 后，codex backend 把来源按每次搜索发回
+  （两个值都实测 HTTP 200）：
+  - `include: ["web_search_call.action.sources"]` → 每个
+    `web_search_call` item 的 `action` 多出
+    `sources: [{"type":"url","url":…}]`。
+  - `include: ["web_search_call.results"]` → 多出
+    `results: [{"type":"text_result",title,url,snippet}]`（更全，
+    但 snippet 每条可达 ~200 词、单次搜索几十条，数据量大）。
+- 结论（更正前一条）：web_search 来源**是结构化、可取的**，且按
+  `web_search_call` 归属（比 answer-level 注解更准）。leek 当前请求
+  没带 `include` 才拿不到。`url_citation`（codex backend 确实不发）
+  与 `web_search_call` 上的 sources 是两条不同的东西。
+- 收尾：一个 follow-up 任务——`build_request_body` 在 web_search 开
+  启时加 `include: ["web_search_call.action.sources"]`、`responses.rs`
+  解析 `web_search_call` 的 `action.sources`、sources 直接进对应搜索
+  的 `search_lifecycle` completion frame（按每次搜索归属，不再需要
+  M1.9 part 2 的 turn 级累积 / `last_search` / enriched-frame）。
+- `url_citation` 注解解析一并移除：leek 无 provider 抽象、只用 codex
+  backend，该 backend 确认不发 `url_citation`，这条路径对 leek 恒死
+  ——按 clean-room 不留死代码的原则删掉，`action.sources` 作唯一
+  来源路径。将来若接非-codex 的 Responses API，再按需从 git history
+  取回。
+- M1.9 part 2 代码（`595ab4a`/`32a1fca`）本身无误：search 卡片的
+  `sources` 字段与前端渲染 part 2 已铺好，follow-up 只补请求参数 +
+  换解析来源。M1.9.1–M1.9.7 + workbench 仍属完成，本条是验收期发现
+  的增强，单独派，不重开 M1.9 编号。
