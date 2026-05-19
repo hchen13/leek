@@ -7,8 +7,9 @@
 //!
 //! Prices are baked in, not config-driven: cost is plumbing, not a user
 //! preference, and a misconfigured price is a worse failure than a stale one.
-//! The `gpt-5.5` row is a leek-side estimate — the codex backend does not
-//! publish a pricing surface. Revise when vendor numbers change.
+//! The `gpt-5.5` *prices* are a leek-side estimate — the codex backend
+//! publishes no pricing surface; its context window (272K) is the real
+//! value from the codex `/models` cache. Revise when vendor numbers change.
 
 use super::Usage;
 
@@ -22,13 +23,12 @@ pub struct ModelPrice {
     pub context_window_tokens: i64,
 }
 
-/// Effective context window for `model`, in tokens. Defaults to 400K when
-/// unknown — conservative on the high side so the auto-compaction trigger
-/// does not over-fire on a model we simply do not have a row for.
+/// Effective context window for `model`, in tokens. Defaults to 272K when
+/// unknown — the same fallback codex's own `model_info_from_slug` uses.
 pub fn context_window(model: &str) -> i64 {
     lookup(model)
         .map(|p| p.context_window_tokens)
-        .unwrap_or(400_000)
+        .unwrap_or(272_000)
 }
 
 /// Exact-match price lookup (case / whitespace insensitive). `None` for an
@@ -40,7 +40,7 @@ pub fn lookup(model: &str) -> Option<ModelPrice> {
             input_per_million: 5.0,
             output_per_million: 15.0,
             cached_input_per_million: Some(0.5),
-            context_window_tokens: 400_000,
+            context_window_tokens: 272_000,
         }),
         "gpt-5" => Some(ModelPrice {
             input_per_million: 1.25,
@@ -90,9 +90,9 @@ mod tests {
 
     #[test]
     fn context_window_falls_back_for_unknown() {
-        assert_eq!(context_window("gpt-5.5"), 400_000);
+        assert_eq!(context_window("gpt-5.5"), 272_000);
         assert_eq!(context_window("gpt-5-mini"), 200_000);
-        assert_eq!(context_window("not-a-model"), 400_000);
+        assert_eq!(context_window("not-a-model"), 272_000);
     }
 
     #[test]
