@@ -73,7 +73,7 @@ frontend active tree 全部清底重写。旧代码通过 git history 查询，
   摘要（运行中逐条显示、完成后聚合、可跳转 canvas）；canvas 按 turn
   分段（note / tool / web_fetch / search cards，失败卡默认折叠可
   展开）；Plan / TODO widget；`store.ts` 按 `payload.surface` 路由。
-  同批后端补全 web_search `url_citation` 来源映射 + clippy
+  同批后端补全 web_search 来源映射 + clippy
   `TurnContext` 重构。M1.9 全部完成。
   验收：PM 代码审查 + `cargo test` 73/73 + `cargo clippy` 0 warning
   + 浏览器 E2E（3 个 turn：plan / web_fetch / 失败工具 / note_trace
@@ -81,8 +81,8 @@ frontend active tree 全部清底重写。旧代码通过 git history 查询，
   `32a1fca`（前端）。
   验收发现：web_search 来源卡片需在 Responses API 请求里带 `include`
   参数才有数据（codex backend 经 `web_search_call.action.sources`
-  暴露来源）；leek 当前未带,故来源恒空——非代码缺陷,已写 follow-up
-  收尾,详见 decision log 2026-05-19。
+  暴露来源）；M1.9 part 2 当时未带——已由 follow-up commit `cc26f44`
+  收尾验收（详见 decision log 2026-05-19）。
 
 ---
 
@@ -333,10 +333,10 @@ canvas / right rail 的边界锁死。
 > **状态（2026-05-19）**：M1.9 全部完成并验收。M1.9.1–M1.9.5（后端
 > 事件契约）单个 commit `2a5dde1`（5 个 sub-commit 互相耦合、无法
 > 干净切分）。M1.9.6–M1.9.7（前端 workbench）commit `32a1fca`；
-> 同批 `595ab4a` 补全 web_search `url_citation` 来源映射（后端）。
+> 同批 `595ab4a` 补全 web_search 来源映射（后端）。
 > 验收发现：search 来源卡片需在请求里带 `include` 参数才有数据
 > （codex backend 经 `web_search_call.action.sources` 暴露来源）；
-> leek 当前未带,已写 follow-up 收尾——见 decision log 2026-05-19。
+> 已由 follow-up commit `cc26f44` 收尾验收——见 decision log 2026-05-19。
 
 ### 验收
 
@@ -842,7 +842,7 @@ Task 形态——有 eval case 端到端跑通：
   `web_search_call` 归属（比 answer-level 注解更准）。leek 当前请求
   没带 `include` 才拿不到。`url_citation`（codex backend 确实不发）
   与 `web_search_call` 上的 sources 是两条不同的东西。
-- 收尾：一个 follow-up 任务——`build_request_body` 在 web_search 开
+- 收尾（follow-up 已完成验收，commit `cc26f44`）——`build_request_body` 在 web_search 开
   启时加 `include: ["web_search_call.action.sources"]`、`responses.rs`
   解析 `web_search_call` 的 `action.sources`、sources 直接进对应搜索
   的 `search_lifecycle` completion frame（按每次搜索归属，不再需要
