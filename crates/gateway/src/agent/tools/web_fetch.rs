@@ -7,7 +7,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use super::ToolOutcome;
+use super::{ResultArtifact, ToolOutcome, ToolUi};
 use crate::llm::ToolSpec;
 
 /// Cap the body so a large page cannot blow up the model's context.
@@ -38,19 +38,36 @@ pub fn spec() -> ToolSpec {
     }
 }
 
+/// UI metadata (REQUIREMENTS §4.1) — registered separately from `spec`;
+/// never sent to the model. The result renders as a link-preview card.
+pub fn ui() -> ToolUi {
+    ToolUi {
+        display_name: "读取网页",
+        result: ResultArtifact::Card("web_preview"),
+        summary: |args| {
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let host = reqwest::Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| url.to_string());
+            format!("读取网页 · {host}")
+        },
+    }
+}
+
 pub async fn run(http: &reqwest::Client, args: &serde_json::Value) -> ToolOutcome {
     let Some(url) = args.get("url").and_then(|v| v.as_str()) else {
-        return ToolOutcome::err("web_fetch: missing required string argument 'url'.");
+        return ToolOutcome::error("web_fetch: missing required string argument 'url'.");
     };
     let url = match validate_url(url) {
         Ok(url) => url,
-        Err(e) => return ToolOutcome::err(e),
+        Err(e) => return ToolOutcome::error(e),
     };
 
     let resp = match http.get(url.clone()).timeout(FETCH_TIMEOUT).send().await {
         Ok(r) => r,
         Err(e) => {
-            return ToolOutcome::err(format!("web_fetch: request to '{url}' failed: {e}"));
+            return ToolOutcome::error(format!("web_fetch: request to '{url}' failed: {e}"));
         }
     };
 
@@ -58,26 +75,71 @@ pub async fn run(http: &reqwest::Client, args: &serde_json::Value) -> ToolOutcom
     let body = match resp.text().await {
         Ok(b) => b,
         Err(e) => {
-            return ToolOutcome::err(format!(
+            return ToolOutcome::error(format!(
                 "web_fetch: could not read the body of '{url}': {e}"
             ));
         }
     };
+    let host = url.host_str().unwrap_or("").to_string();
 
     if !status.is_success() {
-        return ToolOutcome::err(format!(
-            "web_fetch: '{url}' returned HTTP {status}. Body preview: {}",
-            truncate_chars(&body, 500).0
-        ));
+        let preview = truncate_chars(&body, 500).0;
+        return ToolOutcome {
+            model_output: format!(
+                "web_fetch: '{url}' returned HTTP {status}. Body preview: {preview}"
+            ),
+            display_payload: serde_json::json!({
+                "url": url.as_str(), "host": host,
+                "status": status.as_u16(), "error": format!("HTTP {status}"),
+            }),
+            debug_payload: serde_json::json!({
+                "url": url.as_str(), "http_status": status.as_u16(),
+                "body_chars": body.chars().count(),
+            }),
+            is_error: true,
+        };
     }
 
+    let title = extract_title(&body);
     let (text, truncated) = truncate_chars(&body, MAX_BODY_CHARS);
-    if truncated {
-        ToolOutcome::ok(format!(
-            "{text}\n\n[web_fetch: body truncated at {MAX_BODY_CHARS} characters]"
-        ))
+    let model_output = if truncated {
+        format!("{text}\n\n[web_fetch: body truncated at {MAX_BODY_CHARS} characters]")
     } else {
-        ToolOutcome::ok(text)
+        text
+    };
+    // The link-preview card reads `display_payload`; the model gets the page
+    // text via `model_output`. The two are not parsed from each other.
+    ToolOutcome::ok(
+        model_output,
+        serde_json::json!({
+            "url": url.as_str(), "host": host, "title": title,
+            "status": status.as_u16(),
+            "char_count": body.chars().count(), "truncated": truncated,
+        }),
+        serde_json::json!({
+            "url": url.as_str(), "http_status": status.as_u16(),
+            "body_chars": body.chars().count(), "truncated": truncated,
+        }),
+    )
+}
+
+/// Best-effort `<title>` for the link-preview card. ASCII-case folding is
+/// enough — only the tag name matters, and lowercasing ASCII leaves byte
+/// offsets valid for slicing the original `html`.
+fn extract_title(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let open = lower.find("<title")?;
+    let gt = lower[open..].find('>')? + open + 1;
+    let close = lower[gt..].find("</title>")? + gt;
+    let title = html
+        .get(gt..close)?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.chars().take(200).collect())
     }
 }
 
@@ -184,5 +246,12 @@ mod tests {
         let (text, truncated) = truncate_chars("ab", 3);
         assert_eq!(text, "ab");
         assert!(!truncated);
+    }
+
+    #[test]
+    fn extract_title_reads_the_head_title() {
+        let html = "<html><head><TITLE>  Hello\n  World </TITLE></head><body>x</body>";
+        assert_eq!(extract_title(html).as_deref(), Some("Hello World"));
+        assert!(extract_title("<html><body>no title</body></html>").is_none());
     }
 }

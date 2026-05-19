@@ -49,7 +49,7 @@ pub async fn post(
     let user = messages::insert(&st.pool, &session_id, "user", &body.content).await?;
     st.emit(
         &session_id,
-        "message_created",
+        crate::agent::events::kind::MESSAGE_CREATED,
         serde_json::json!({
             "seq": user.seq,
             "role": "user",

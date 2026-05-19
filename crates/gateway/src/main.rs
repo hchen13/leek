@@ -82,6 +82,14 @@ async fn serve(vault_path: &Path, port: u16) -> Result<()> {
         .build()
         .context("building the shared HTTP client")?;
     let guards = agent::GuardConfig::from_env();
+    // Provider-side web search (M1.9.4) is opt-in: the codex backend gates
+    // web search behind its own config, so leek keeps the capability off
+    // unless `LEEK_WEB_SEARCH` is set (ARCHITECTURE §12.3 — capability
+    // opt-in).
+    let web_search = matches!(
+        std::env::var("LEEK_WEB_SEARCH").ok().as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    );
 
     let state = api::AppState {
         pool: vault.pool,
@@ -89,6 +97,7 @@ async fn serve(vault_path: &Path, port: u16) -> Result<()> {
         codex,
         http,
         guards,
+        web_search,
     };
 
     let app = api::router(state);

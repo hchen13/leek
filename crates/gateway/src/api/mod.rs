@@ -27,12 +27,16 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// Agent-loop safety nets, resolved once at startup.
     pub guards: GuardConfig,
+    /// Whether to offer the provider-side `web_search` tool (M1.9.4).
+    /// Resolved from `LEEK_WEB_SEARCH` at startup; off by default.
+    pub web_search: bool,
 }
 
 impl AppState {
     /// Persist an event to the durable log, then fan it out to live SSE
     /// subscribers. Use for meaningful, replayable lifecycle events.
-    pub async fn emit(&self, session_id: &str, kind: &str, payload: serde_json::Value) {
+    pub async fn emit(&self, session_id: &str, kind: &str, mut payload: serde_json::Value) {
+        stamp_surface(&mut payload, kind);
         match crate::vault::events::insert(&self.pool, session_id, kind, &payload).await {
             Ok(event) => self.bus.publish(session_id, event).await,
             Err(e) => {
@@ -45,7 +49,8 @@ impl AppState {
     /// high-frequency ephemeral events (assistant token deltas): the durable
     /// record of a turn is its `messages` row, not every streamed token.
     /// `seq = -1` marks the event as not coming from the durable log.
-    pub async fn emit_ephemeral(&self, session_id: &str, kind: &str, payload: serde_json::Value) {
+    pub async fn emit_ephemeral(&self, session_id: &str, kind: &str, mut payload: serde_json::Value) {
+        stamp_surface(&mut payload, kind);
         let event = Event {
             seq: -1,
             kind: kind.to_string(),
@@ -53,6 +58,19 @@ impl AppState {
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         self.bus.publish(session_id, event).await;
+    }
+}
+
+/// Stamp an event payload with its workbench surface (M1.9.1), from the one
+/// classification table in `agent::events` — the frontend reads the surface
+/// off the event instead of hardcoding the map. A non-object payload is left
+/// untouched (every gateway event payload is a JSON object).
+fn stamp_surface(payload: &mut serde_json::Value, kind: &str) {
+    if let serde_json::Value::Object(map) = payload {
+        map.insert(
+            "surface".to_string(),
+            crate::agent::events::surface_for(kind).as_str().into(),
+        );
     }
 }
 

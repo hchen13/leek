@@ -14,8 +14,14 @@
 //! Auto-compaction is the one boundary that recovers by *continuing*: near
 //! the context-window limit it folds the early context into a summary and
 //! runs on, instead of stopping (see `compaction`; REQUIREMENTS §7.1).
+//!
+//! The loop emits the M1.9 workbench event contract (see `events`): every
+//! event names the surface that consumes it, and the canvas process
+//! artifacts — note trace, tool lifecycle, provider search — share one
+//! envelope.
 
 mod compaction;
+pub mod events;
 mod guards;
 mod prompt;
 mod tools;
@@ -29,7 +35,7 @@ use anyhow::Result;
 use futures::StreamExt;
 
 use crate::api::AppState;
-use crate::llm::{pricing, ChatMessage, ChatRequest, LlmEvent, Role, StopReason};
+use crate::llm::{pricing, ChatMessage, ChatRequest, LlmEvent, Role, StopReason, WebSearchPhase};
 use crate::vault::{messages, sessions, turn_metrics};
 
 /// The model leek runs on, with its fixed M1 inference settings. There is no
@@ -55,7 +61,7 @@ pub async fn run_turn(st: AppState, session_id: String, turn_id: String) {
         tracing::error!(error = %e, session_id, turn_id, "agent turn failed at the storage layer");
         st.emit(
             &session_id,
-            "error",
+            events::kind::ERROR,
             serde_json::json!({ "turn_id": turn_id, "message": e.to_string() }),
         )
         .await;
@@ -100,7 +106,10 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
     // Prior-iteration function_call / function_call_output items, re-sent so
     // the model sees the whole multi-turn tool dialog.
     let mut additional_inputs: Vec<serde_json::Value> = Vec::new();
-    let mut assistant_text = String::new();
+    // The final reply only — the text of the turn-ending iteration. Text
+    // from earlier iterations precedes a tool call, so it is Note Trace and
+    // goes to the canvas, never into the chat message (REQUIREMENTS §2.3).
+    let mut final_reply = String::new();
     let mut iteration_count: usize = 0;
     let mut tool_call_count: usize = 0;
     let mut tool_error_count: usize = 0;
@@ -217,6 +226,7 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
             additional_inputs: iter_inputs,
             reasoning_effort: Some(REASONING_EFFORT.to_string()),
             verbosity: Some(VERBOSITY.to_string()),
+            web_search: st.web_search,
         };
 
         // ── call the model ──────────────────────────────────────────────
@@ -230,6 +240,10 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
         };
 
         // ── consume the streamed response (idle-timeout guarded) ────────
+        // `iter_text` is this iteration's assistant text. Whether it is a
+        // Note Trace or the final reply is known only once the stream ends
+        // — did the model also emit tool calls? — so it is classified below.
+        let mut iter_text = String::new();
         let mut pending: Vec<(String, String, String)> = Vec::new();
         let mut iter_stop: Option<StopReason> = None;
         let mut idle_hit = false;
@@ -249,11 +263,15 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
             let Some(event) = item else { break 'stream };
             match event {
                 Ok(LlmEvent::TextDelta { text }) => {
-                    assistant_text.push_str(&text);
+                    iter_text.push_str(&text);
                     st.emit_ephemeral(
                         session_id,
-                        "assistant_delta",
-                        serde_json::json!({ "turn_id": turn_id, "text": text }),
+                        events::kind::ASSISTANT_DELTA,
+                        serde_json::json!({
+                            "turn_id": turn_id,
+                            "iteration": iteration_count,
+                            "text": text,
+                        }),
                     )
                     .await;
                 }
@@ -262,6 +280,31 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
                     name,
                     arguments,
                 }) => pending.push((call_id, name, arguments)),
+                Ok(LlmEvent::WebSearch {
+                    call_id,
+                    phase,
+                    query,
+                }) => {
+                    // Provider-side search (M1.9.4): observed, not dispatched
+                    // — normalize it to a canvas search artifact.
+                    let phase = match phase {
+                        WebSearchPhase::Started => events::Phase::Start,
+                        WebSearchPhase::Completed => events::Phase::Completion,
+                    };
+                    st.emit(
+                        session_id,
+                        events::kind::SEARCH_LIFECYCLE,
+                        events::CanvasArtifact::search(
+                            turn_id,
+                            iteration_count,
+                            &call_id,
+                            phase,
+                            query.as_deref(),
+                        )
+                        .into_payload(),
+                    )
+                    .await;
+                }
                 Ok(LlmEvent::Usage(u)) => {
                     input_tokens += u.input_tokens as u64;
                     output_tokens += u.output_tokens as u64;
@@ -278,22 +321,39 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
         }
 
         if fatal_error.is_some() {
+            // The turn ends here — the partial text is the final reply.
+            final_reply = iter_text;
             stop_reason = "fatal_error".into();
             break 'turn;
         }
         if idle_hit {
+            final_reply = iter_text;
             stop_reason = "idle_timeout".into();
             first_guard.get_or_insert("idle_timeout");
             break 'turn;
         }
 
-        // ── no tool calls → the model finished ──────────────────────────
+        // ── no tool calls → the model finished: this text is the reply ──
         if pending.is_empty() {
+            final_reply = iter_text;
             stop_reason = match iter_stop {
                 Some(StopReason::MaxTokens) => "max_tokens".into(),
                 _ => "end_turn".into(),
             };
             break 'turn;
+        }
+
+        // The iteration also emitted tool calls, so its text is narration
+        // around them — a Note Trace, shown on the canvas, never in the chat
+        // message (REQUIREMENTS §2.3).
+        let note = iter_text.trim();
+        if !note.is_empty() {
+            st.emit(
+                session_id,
+                events::kind::NOTE_TRACE,
+                events::CanvasArtifact::note(turn_id, iteration_count, note).into_payload(),
+            )
+            .await;
         }
 
         // ── dispatch tool calls, re-inject results, loop ────────────────
@@ -311,43 +371,73 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
                 }
             }
 
-            st.emit(
-                session_id,
-                "tool_call",
-                serde_json::json!({
-                    "turn_id": turn_id, "call_id": call_id,
-                    "name": name, "arguments": arguments,
-                }),
-            )
-            .await;
-
             let args_value: serde_json::Value =
                 serde_json::from_str(&arguments).unwrap_or(serde_json::Value::Null);
+
+            // Where does this tool's result render? `update_plan` updates the
+            // right-rail Plan widget; every other tool gets a canvas tool
+            // card (REQUIREMENTS §2.4, §2.6). The registry decides — the loop
+            // does not special-case tool names.
+            let to_plan = matches!(
+                tools::ui(&name).map(|u| u.result),
+                Some(tools::ResultArtifact::Plan)
+            );
+
+            // Start frame — a canvas tool card only; the plan tool has none.
+            if !to_plan {
+                st.emit(
+                    session_id,
+                    events::kind::TOOL_LIFECYCLE,
+                    tools::tool_artifact(turn_id, iteration_count, &call_id, &name, &args_value, None)
+                        .into_payload(),
+                )
+                .await;
+            }
+
             let outcome = tools::dispatch(&st.http, &name, &args_value).await;
             if outcome.is_error {
                 tool_error_count += 1;
             }
 
-            st.emit(
-                session_id,
-                "tool_result",
-                serde_json::json!({
-                    "turn_id": turn_id, "call_id": call_id, "name": name,
-                    "is_error": outcome.is_error,
-                    "output_preview": preview(&outcome.output),
-                }),
-            )
-            .await;
+            if to_plan {
+                // The plan tool is not a canvas card and not a gate. Emit the
+                // plan only on success — a rejected update leaves it unchanged.
+                if !outcome.is_error {
+                    st.emit(
+                        session_id,
+                        events::kind::PLAN_UPDATED,
+                        plan_payload(turn_id, &outcome),
+                    )
+                    .await;
+                }
+            } else {
+                st.emit(
+                    session_id,
+                    events::kind::TOOL_LIFECYCLE,
+                    tools::tool_artifact(
+                        turn_id,
+                        iteration_count,
+                        &call_id,
+                        &name,
+                        &args_value,
+                        Some(&outcome),
+                    )
+                    .into_payload(),
+                )
+                .await;
+            }
 
             // Re-inject the call and its result so the next iteration sees
-            // the full tool dialog (order matters: call before output).
+            // the full tool dialog (order matters: call before output). Only
+            // `model_output` reaches the model — the display / debug payloads
+            // are UI-only (REQUIREMENTS §4.2).
             additional_inputs.push(serde_json::json!({
                 "type": "function_call", "call_id": call_id,
                 "name": name, "arguments": arguments,
             }));
             additional_inputs.push(serde_json::json!({
                 "type": "function_call_output", "call_id": call_id,
-                "output": outcome.output,
+                "output": outcome.model_output,
             }));
         }
 
@@ -359,11 +449,11 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
     }
 
     // ── finalize: assistant message + metrics + lifecycle events ────────
-    let final_text = compose_final_text(&assistant_text, &stop_reason, fatal_error.as_deref());
+    let final_text = compose_final_text(&final_reply, &stop_reason, fatal_error.as_deref());
     let assistant = messages::insert(&st.pool, session_id, "assistant", &final_text).await?;
     st.emit(
         session_id,
-        "message_created",
+        events::kind::MESSAGE_CREATED,
         serde_json::json!({
             "seq": assistant.seq, "role": "assistant",
             "content": assistant.content, "created_at": assistant.created_at,
@@ -398,7 +488,7 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
 
     st.emit(
         session_id,
-        "turn_metrics_recorded",
+        events::kind::TURN_METRICS_RECORDED,
         serde_json::json!({
             "turn_id": turn_id,
             "stop_reason": stop_reason,
@@ -418,7 +508,7 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
 
     st.emit(
         session_id,
-        "assistant_done",
+        events::kind::ASSISTANT_DONE,
         serde_json::json!({
             "turn_id": turn_id,
             "message_seq": assistant.seq,
@@ -432,8 +522,8 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Short preview of a tool output for the SSE `tool_result` event — the model
-/// gets the full output via `function_call_output`; the event is just for UI.
+/// Short, char-safe preview of a long string for an SSE event payload —
+/// used by auto-compaction for its `summary_preview`.
 fn preview(s: &str) -> String {
     const MAX: usize = 280;
     if s.chars().count() <= MAX {
@@ -441,6 +531,24 @@ fn preview(s: &str) -> String {
     }
     let head: String = s.chars().take(MAX).collect();
     format!("{head}…")
+}
+
+/// Build the `plan_updated` payload from `update_plan`'s display payload.
+/// The loop forwards the tool's structured plan to the right-rail widget
+/// (REQUIREMENTS §2.6) verbatim — it does not interpret the plan.
+fn plan_payload(turn_id: &str, outcome: &tools::ToolOutcome) -> serde_json::Value {
+    let display = &outcome.display_payload;
+    serde_json::json!({
+        "turn_id": turn_id,
+        "plan": display
+            .get("plan")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        "explanation": display
+            .get("explanation")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    })
 }
 
 /// Compose the persisted assistant message. A guard- or error-stopped turn

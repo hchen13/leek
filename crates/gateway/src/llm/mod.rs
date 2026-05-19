@@ -27,6 +27,13 @@ pub struct ChatRequest {
     pub reasoning_effort: Option<String>,
     /// `low` / `medium` / `high`; `None` = backend default.
     pub verbosity: Option<String>,
+    /// Offer the provider-side `web_search` tool (M1.9.4). When `true`,
+    /// `build_request_body` appends the built-in `web_search` tool; the
+    /// provider runs searches server-side and the loop normalizes the
+    /// search lifecycle into `search_lifecycle` canvas events. Off unless
+    /// `LEEK_WEB_SEARCH` is set — the capability stays opt-in until it is
+    /// verified live against the codex backend.
+    pub web_search: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +93,23 @@ pub enum LlmEvent {
     /// it to keep the idle-timeout timer alive while the model is working
     /// silently.
     Ping,
+    /// A provider-side web search (M1.9.4). The provider runs the search
+    /// itself; the loop does not dispatch or re-inject anything — it only
+    /// observes the lifecycle to draw the canvas search card.
+    WebSearch {
+        call_id: String,
+        phase: WebSearchPhase,
+        /// The search query — reported once the provider has it (on
+        /// completion); `None` while the search is still starting.
+        query: Option<String>,
+    },
+}
+
+/// Lifecycle phase of a provider-side web search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSearchPhase {
+    Started,
+    Completed,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

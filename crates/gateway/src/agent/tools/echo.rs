@@ -4,7 +4,7 @@
 //! calls `echo` exercises the full `function_call` → `function_call_output`
 //! → continue path with a known, deterministic result.
 
-use super::ToolOutcome;
+use super::{ResultArtifact, ToolOutcome, ToolUi};
 use crate::llm::ToolSpec;
 
 pub fn spec() -> ToolSpec {
@@ -26,11 +26,28 @@ pub fn spec() -> ToolSpec {
     }
 }
 
-pub fn run(args: &serde_json::Value) -> ToolOutcome {
-    match args.get("text").and_then(|v| v.as_str()) {
-        Some(text) => ToolOutcome::ok(text.to_string()),
-        None => ToolOutcome::err("echo: missing required string argument 'text'."),
+/// UI metadata (REQUIREMENTS §4.1) — registered separately from `spec`;
+/// never sent to the model.
+pub fn ui() -> ToolUi {
+    ToolUi {
+        display_name: "回显",
+        result: ResultArtifact::Card("text"),
+        summary: |args| {
+            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            format!("回显 · {}", super::summary_snippet(text))
+        },
     }
+}
+
+pub fn run(args: &serde_json::Value) -> ToolOutcome {
+    let Some(text) = args.get("text").and_then(|v| v.as_str()) else {
+        return ToolOutcome::error("echo: missing required string argument 'text'.");
+    };
+    ToolOutcome::ok(
+        text,
+        serde_json::json!({ "text": text }),
+        serde_json::json!({ "char_count": text.chars().count() }),
+    )
 }
 
 #[cfg(test)]
@@ -41,7 +58,9 @@ mod tests {
     fn echoes_text_verbatim() {
         let out = run(&serde_json::json!({ "text": "leek-m1" }));
         assert!(!out.is_error);
-        assert_eq!(out.output, "leek-m1");
+        assert_eq!(out.model_output, "leek-m1");
+        // The card reads the structured payload, not parsed `model_output`.
+        assert_eq!(out.display_payload["text"], "leek-m1");
     }
 
     #[test]

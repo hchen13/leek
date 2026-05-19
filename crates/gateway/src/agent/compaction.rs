@@ -262,6 +262,8 @@ async fn summarize(
         additional_inputs: Vec::new(),
         reasoning_effort: Some("low".to_string()),
         verbosity: None,
+        // The summary call carries no tools — provider search included.
+        web_search: false,
     };
 
     let mut stream = codex

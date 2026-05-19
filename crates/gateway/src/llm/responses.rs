@@ -11,7 +11,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::Deserialize;
 
-use super::{ChatRequest, LlmEvent, StopReason, Usage};
+use super::{ChatRequest, LlmEvent, StopReason, Usage, WebSearchPhase};
 
 /// Build the Responses API request body for `req`.
 ///
@@ -36,20 +36,27 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
         "store": false,
     });
 
-    if !req.tools.is_empty() {
-        let tools: Vec<serde_json::Value> = req
-            .tools
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.parameters,
-                    "strict": false,
-                })
+    let mut tools: Vec<serde_json::Value> = req
+        .tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+                "strict": false,
             })
-            .collect();
+        })
+        .collect();
+    // Provider-side web search (M1.9.4): a built-in tool, not a client
+    // function tool — the provider runs it server-side. The minimal
+    // `{type:"web_search"}` form is the OpenAI Responses API shape; leek
+    // keeps it opt-in (see `ChatRequest.web_search`).
+    if req.web_search {
+        tools.push(serde_json::json!({ "type": "web_search" }));
+    }
+    if !tools.is_empty() {
         body["tools"] = serde_json::Value::Array(tools);
     }
 
@@ -155,6 +162,12 @@ struct ItemObject {
     /// Wire form is a JSON string (codex-rs `ResponseItem`).
     #[serde(default)]
     arguments: Option<String>,
+    /// `web_search_call` items carry their id in `id`, not `call_id`.
+    #[serde(default)]
+    id: Option<String>,
+    /// `web_search_call` action — `{type:"search", query, queries}`.
+    #[serde(default)]
+    action: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -211,26 +224,38 @@ fn parse_one_event(raw: &str) -> Result<Vec<LlmEvent>> {
             Ok(vec![LlmEvent::TextDelta { text }])
         }
         // Function-call items: arguments are accumulated server-side and
-        // delivered complete on `output_item.done`. The `added` event has
-        // empty arguments — skip it (→ Ping) to avoid a partial dispatch.
+        // delivered complete on `output_item.done`. A `web_search_call`
+        // item is a provider-side search (M1.9.4) — `.done` completes it
+        // with the query in `action`.
         Some("response.output_item.done") => {
             let Some(item) = env.item else {
                 return Ok(vec![LlmEvent::Ping]);
             };
-            if item.type_.as_deref() == Some("function_call") {
-                let call_id = item
-                    .call_id
-                    .ok_or_else(|| anyhow!("function_call done missing 'call_id'"))?;
-                let name = item
-                    .name
-                    .ok_or_else(|| anyhow!("function_call done missing 'name'"))?;
-                Ok(vec![LlmEvent::FunctionCall {
-                    call_id,
-                    name,
-                    arguments: item.arguments.unwrap_or_default(),
-                }])
-            } else {
-                Ok(vec![LlmEvent::Ping])
+            match item.type_.as_deref() {
+                Some("function_call") => {
+                    let call_id = item
+                        .call_id
+                        .ok_or_else(|| anyhow!("function_call done missing 'call_id'"))?;
+                    let name = item
+                        .name
+                        .ok_or_else(|| anyhow!("function_call done missing 'name'"))?;
+                    Ok(vec![LlmEvent::FunctionCall {
+                        call_id,
+                        name,
+                        arguments: item.arguments.unwrap_or_default(),
+                    }])
+                }
+                Some("web_search_call") => Ok(web_search_event(&item, WebSearchPhase::Completed)),
+                // The `added` form of a function_call has empty arguments —
+                // skip it (→ Ping) and dispatch off the complete `.done`.
+                _ => Ok(vec![LlmEvent::Ping]),
+            }
+        }
+        // A `web_search_call` item appearing means a search has started.
+        Some("response.output_item.added") => {
+            match env.item.filter(|i| i.type_.as_deref() == Some("web_search_call")) {
+                Some(item) => Ok(web_search_event(&item, WebSearchPhase::Started)),
+                None => Ok(vec![LlmEvent::Ping]),
             }
         }
         Some("response.completed") => {
@@ -282,6 +307,38 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Normalize a `web_search_call` item into a `WebSearch` event. An item with
+/// no id cannot be correlated across its start / completion frames — skip it
+/// (→ Ping) rather than emit a dangling artifact.
+fn web_search_event(item: &ItemObject, phase: WebSearchPhase) -> Vec<LlmEvent> {
+    let Some(call_id) = item.id.clone().or_else(|| item.call_id.clone()) else {
+        return vec![LlmEvent::Ping];
+    };
+    let query = item.action.as_ref().and_then(search_query);
+    vec![LlmEvent::WebSearch {
+        call_id,
+        phase,
+        query,
+    }]
+}
+
+/// Pull the query out of a `web_search_call` action
+/// (`{type:"search", query, queries}`) — `query` first, else the first of
+/// `queries`.
+fn search_query(action: &serde_json::Value) -> Option<String> {
+    let from = |v: Option<&serde_json::Value>| {
+        v.and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    from(action.get("query")).or_else(|| {
+        from(action
+            .get("queries")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +356,7 @@ mod tests {
             additional_inputs: Vec::new(),
             reasoning_effort: None,
             verbosity: None,
+            web_search: false,
         }
     }
 
@@ -352,6 +410,29 @@ mod tests {
     }
 
     #[test]
+    fn body_omits_web_search_unless_enabled() {
+        // Default request: no tools at all.
+        assert!(build_request_body(&req()).get("tools").is_none());
+    }
+
+    #[test]
+    fn body_appends_web_search_tool() {
+        let mut r = req();
+        r.web_search = true;
+        r.tools = vec![ToolSpec {
+            name: "echo".into(),
+            description: "Echo.".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }];
+        let body = build_request_body(&r);
+        let tools = body["tools"].as_array().unwrap();
+        // The function tool plus the built-in web_search tool.
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().any(|t| t["type"] == "web_search"));
+        assert!(tools.iter().any(|t| t["type"] == "function" && t["name"] == "echo"));
+    }
+
+    #[test]
     fn parses_text_delta() {
         let raw = "event: response.output_text.delta\n\
                    data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}";
@@ -401,6 +482,52 @@ mod tests {
             }
             other => panic!("expected FunctionCall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_web_search_started() {
+        let raw = "data: {\"type\":\"response.output_item.added\",\"item\":{\
+                   \"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"in_progress\"}}";
+        match &parse_one_event(raw).unwrap()[..] {
+            [LlmEvent::WebSearch {
+                call_id,
+                phase,
+                query,
+            }] => {
+                assert_eq!(call_id, "ws_1");
+                assert_eq!(*phase, WebSearchPhase::Started);
+                assert!(query.is_none());
+            }
+            other => panic!("expected WebSearch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_web_search_completed_with_query() {
+        let raw = "data: {\"type\":\"response.output_item.done\",\"item\":{\
+                   \"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\
+                   \"action\":{\"type\":\"search\",\"query\":\"AI capex 2026\"}}}";
+        match &parse_one_event(raw).unwrap()[..] {
+            [LlmEvent::WebSearch {
+                call_id,
+                phase,
+                query,
+            }] => {
+                assert_eq!(call_id, "ws_1");
+                assert_eq!(*phase, WebSearchPhase::Completed);
+                assert_eq!(query.as_deref(), Some("AI capex 2026"));
+            }
+            other => panic!("expected WebSearch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn output_item_added_for_function_call_is_ping() {
+        // Only web_search_call cares about `.added`; a function_call there
+        // has empty arguments and must wait for `.done`.
+        let raw = "data: {\"type\":\"response.output_item.added\",\"item\":{\
+                   \"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"echo\"}}";
+        assert!(matches!(parse_one_event(raw).unwrap()[..], [LlmEvent::Ping]));
     }
 
     #[test]

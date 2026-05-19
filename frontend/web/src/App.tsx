@@ -22,12 +22,15 @@ type EventRow = {
   created_at: string;
 };
 
-// Lifecycle events shown in the right-hand log. `assistant_delta` is handled
-// separately — it streams into the pending bubble instead of flooding the log.
+// Workbench events shown in the right-hand log (M1.9 event contract; each
+// payload carries its `surface`). `assistant_delta` is handled separately —
+// it streams into the pending bubble instead of flooding the log.
 const LOG_KINDS = [
   "message_created",
-  "tool_call",
-  "tool_result",
+  "note_trace",
+  "tool_lifecycle",
+  "search_lifecycle",
+  "plan_updated",
   "compaction_started",
   "compaction_completed",
   "assistant_done",
