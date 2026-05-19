@@ -175,9 +175,11 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
                     session_id,
                     turn_id,
                     &system,
-                    &mut compaction_summary,
-                    &mut chat_messages,
-                    &mut additional_inputs,
+                    compaction::TurnContext {
+                        summary: &mut compaction_summary,
+                        messages: &mut chat_messages,
+                        tool_dialog: &mut additional_inputs,
+                    },
                     ctx_tokens,
                 )
                 .await
@@ -247,6 +249,11 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
         let mut pending: Vec<(String, String, String)> = Vec::new();
         let mut iter_stop: Option<StopReason> = None;
         let mut idle_hit = false;
+        // Provider web-search state for this iteration: url_citation sources
+        // (deduped by URL) and the most recent completed search, so the
+        // sources can be attached to its canvas card once the stream ends.
+        let mut iter_sources: Vec<serde_json::Value> = Vec::new();
+        let mut last_search: Option<(String, Option<String>)> = None;
         'stream: loop {
             // The idle timer wraps every `next()`: a `Ping` (reasoning
             // lifecycle event) resets it, so only genuine silence trips it.
@@ -286,8 +293,14 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
                     query,
                 }) => {
                     // Provider-side search (M1.9.4): observed, not dispatched
-                    // — normalize it to a canvas search artifact.
-                    let phase = match phase {
+                    // — normalize it to a canvas search artifact. Sources
+                    // arrive later as url_citation annotations, so the last
+                    // completed search is remembered for an enriched frame
+                    // emitted once the stream ends.
+                    if phase == WebSearchPhase::Completed {
+                        last_search = Some((call_id.clone(), query.clone()));
+                    }
+                    let canvas_phase = match phase {
                         WebSearchPhase::Started => events::Phase::Start,
                         WebSearchPhase::Completed => events::Phase::Completion,
                     };
@@ -298,12 +311,27 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
                             turn_id,
                             iteration_count,
                             &call_id,
-                            phase,
+                            canvas_phase,
                             query.as_deref(),
+                            Vec::new(),
                         )
                         .into_payload(),
                     )
                     .await;
+                }
+                Ok(LlmEvent::WebSearchSource { url, title }) => {
+                    // A url_citation from the provider's web search — collect
+                    // it, deduped by URL (REQUIREMENTS §4.3).
+                    let seen = iter_sources
+                        .iter()
+                        .any(|s| s.get("url").and_then(|v| v.as_str()) == Some(url.as_str()));
+                    if !seen {
+                        iter_sources.push(serde_json::json!({
+                            "url": url,
+                            "host": web_search_host(&url),
+                            "title": title,
+                        }));
+                    }
                 }
                 Ok(LlmEvent::Usage(u)) => {
                     input_tokens += u.input_tokens as u64;
@@ -317,6 +345,29 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
                     fatal_error = Some(e.to_string());
                     break 'stream;
                 }
+            }
+        }
+
+        // Provider search surfaced url_citation sources: emit an enriched
+        // completion frame for the iteration's last search call so its canvas
+        // card shows them. Same artifact_id as the earlier completion frame —
+        // the frontend updates one card (REQUIREMENTS §4.3).
+        if let Some((call_id, query)) = &last_search {
+            if !iter_sources.is_empty() {
+                st.emit(
+                    session_id,
+                    events::kind::SEARCH_LIFECYCLE,
+                    events::CanvasArtifact::search(
+                        turn_id,
+                        iteration_count,
+                        call_id,
+                        events::Phase::Completion,
+                        query.as_deref(),
+                        iter_sources,
+                    )
+                    .into_payload(),
+                )
+                .await;
             }
         }
 
@@ -549,6 +600,14 @@ fn plan_payload(turn_id: &str, outcome: &tools::ToolOutcome) -> serde_json::Valu
             .cloned()
             .unwrap_or(serde_json::Value::Null),
     })
+}
+
+/// Host of a provider-search source URL, for the canvas search card. A URL
+/// that does not parse is carried without a host (the card shows the URL).
+fn web_search_host(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
 }
 
 /// Compose the persisted assistant message. A guard- or error-stopped turn

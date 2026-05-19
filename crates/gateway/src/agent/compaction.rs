@@ -73,12 +73,27 @@ pub enum Compacted {
     Skipped,
 }
 
+/// The mutable turn context `compact` folds in place. Bundled into one handle
+/// so `compact` carries a single parameter rather than three free-standing
+/// `&mut`s — the running summary, the kept messages and the kept tool dialog
+/// are one logical thing (the turn's evolving context).
+pub struct TurnContext<'a> {
+    /// Running summary of context folded on earlier passes. `compact`
+    /// replaces it with a fresh summary that folds the previous one in.
+    pub summary: &'a mut Option<String>,
+    /// Session messages — drained of the early ones, left with the tail.
+    pub messages: &'a mut Vec<ChatMessage>,
+    /// Re-injected function_call / function_call_output dialog — likewise
+    /// drained of the early pairs.
+    pub tool_dialog: &'a mut Vec<serde_json::Value>,
+}
+
 /// Attempt one auto-compaction pass.
 ///
-/// On `Done` the turn context is mutated in place: the early messages and
-/// tool dialog are dropped, `*summary` is replaced with a fresh summary
-/// (folding in any previous one), and `messages` / `tool_dialog` are left
-/// holding only the recent tail. Emits `compaction_started` /
+/// On `Done` the turn context (`ctx`) is mutated in place: the early messages
+/// and tool dialog are dropped, `ctx.summary` is replaced with a fresh summary
+/// (folding in any previous one), and `ctx.messages` / `ctx.tool_dialog` are
+/// left holding only the recent tail. Emits `compaction_started` /
 /// `compaction_completed`. An `Err` is a failed summary model call — the
 /// caller treats it as an ordinary fatal model error.
 pub async fn compact(
@@ -86,12 +101,10 @@ pub async fn compact(
     session_id: &str,
     turn_id: &str,
     system: &str,
-    summary: &mut Option<String>,
-    messages: &mut Vec<ChatMessage>,
-    tool_dialog: &mut Vec<serde_json::Value>,
+    ctx: TurnContext<'_>,
     tokens_before: u32,
 ) -> Result<Compacted> {
-    let (early_msgs, early_items) = plan_split(messages.len(), tool_dialog.len());
+    let (early_msgs, early_items) = plan_split(ctx.messages.len(), ctx.tool_dialog.len());
     if early_msgs == 0 && early_items == 0 {
         return Ok(Compacted::Skipped);
     }
@@ -104,17 +117,18 @@ pub async fn compact(
     .await;
 
     let transcript = render_for_summary(
-        summary.as_deref(),
-        &messages[..early_msgs],
-        &tool_dialog[..early_items],
+        ctx.summary.as_deref(),
+        &ctx.messages[..early_msgs],
+        &ctx.tool_dialog[..early_items],
     );
     let folded = summarize(&st.codex, st.guards.idle_timeout, transcript).await?;
 
-    messages.drain(..early_msgs);
-    tool_dialog.drain(..early_items);
-    *summary = Some(folded);
+    ctx.messages.drain(..early_msgs);
+    ctx.tool_dialog.drain(..early_items);
+    *ctx.summary = Some(folded);
 
-    let tokens_after = estimate_context_tokens(system, summary.as_deref(), messages, tool_dialog);
+    let tokens_after =
+        estimate_context_tokens(system, ctx.summary.as_deref(), ctx.messages, ctx.tool_dialog);
 
     st.emit(
         session_id,
@@ -125,7 +139,7 @@ pub async fn compact(
             "tokens_after": tokens_after,
             "messages_folded": early_msgs,
             "tool_calls_folded": early_items / 2,
-            "summary_preview": super::preview(summary.as_deref().unwrap_or("")),
+            "summary_preview": super::preview(ctx.summary.as_deref().unwrap_or("")),
         }),
     )
     .await;

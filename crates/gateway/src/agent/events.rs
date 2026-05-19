@@ -177,12 +177,16 @@ impl CanvasArtifact {
 
     /// A provider-side web-search artifact (REQUIREMENTS §4.3). One card per
     /// search call; the call id is both the artifact id and the identity.
+    /// `sources` are the `url_citation` results — empty on the `Start` frame
+    /// and the bare `Completion` frame, populated on the enriched completion
+    /// frame the loop emits once the answer's citations are in.
     pub fn search(
         turn_id: &str,
         iteration: usize,
         call_id: &str,
         phase: Phase,
         query: Option<&str>,
+        sources: Vec<serde_json::Value>,
     ) -> Self {
         Self {
             turn_id: turn_id.to_string(),
@@ -190,7 +194,7 @@ impl CanvasArtifact {
             phase,
             canvas_identity: format!("search-{call_id}"),
             iteration,
-            data: serde_json::json!({ "query": query }),
+            data: serde_json::json!({ "query": query, "sources": sources }),
         }
     }
 }
@@ -253,9 +257,23 @@ mod tests {
         );
         assert_eq!(start.artifact_id, done.artifact_id);
 
-        let s = CanvasArtifact::search("t", 1, "ws_2", Phase::Completion, Some("q")).into_payload();
+        let s = CanvasArtifact::search("t", 1, "ws_2", Phase::Completion, Some("q"), Vec::new())
+            .into_payload();
         assert_eq!(s["artifact_id"], "search-ws_2");
         assert_eq!(s["data"]["query"], "q");
+        assert_eq!(s["data"]["sources"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn search_artifact_carries_its_sources() {
+        let sources = vec![serde_json::json!({
+            "url": "https://example.com/a", "host": "example.com", "title": "A"
+        })];
+        let p = CanvasArtifact::search("t", 3, "ws_9", Phase::Completion, Some("ai capex"), sources)
+            .into_payload();
+        assert_eq!(p["data"]["query"], "ai capex");
+        assert_eq!(p["data"]["sources"][0]["host"], "example.com");
+        assert_eq!(p["data"]["sources"][0]["title"], "A");
     }
 
     #[test]

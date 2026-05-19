@@ -103,6 +103,15 @@ pub enum LlmEvent {
         /// completion); `None` while the search is still starting.
         query: Option<String>,
     },
+    /// A source surfaced by the provider-side web search — one `url_citation`
+    /// annotation on the model's answer text (M1.9.4, REQUIREMENTS §4.3). The
+    /// loop collects these and attaches them to the iteration's search card;
+    /// they are display-only and never re-injected into the model context.
+    WebSearchSource {
+        url: String,
+        /// The page title, when the provider supplies one.
+        title: Option<String>,
+    },
 }
 
 /// Lifecycle phase of a provider-side web search.
