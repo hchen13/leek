@@ -83,6 +83,10 @@ frontend active tree 全部清底重写。旧代码通过 git history 查询，
   参数才有数据（codex backend 经 `web_search_call.action.sources`
   暴露来源）；M1.9 part 2 当时未带——已由 follow-up commit `cc26f44`
   收尾验收（详见 decision log 2026-05-19）。
+  进一步：2026-05-20 M1 用户测试时发现卡片显示问题（同站多页看着像
+  重复、`open_page` 被误标成"网页搜索"），又派 follow-up 改用
+  `web_search_call.results` 做 `action.type` 分流——commit `cf1d872`，
+  见 decision log 2026-05-20。
 
 ---
 
@@ -337,6 +341,10 @@ canvas / right rail 的边界锁死。
 > 验收发现：search 来源卡片需在请求里带 `include` 参数才有数据
 > （codex backend 经 `web_search_call.action.sources` 暴露来源）；
 > 已由 follow-up commit `cc26f44` 收尾验收——见 decision log 2026-05-19。
+> 2026-05-20 进一步 follow-up commit `cf1d872`：`include` 改为
+> `web_search_call.results`，按 `action.type` 分流四变体卡片
+> （search / open_page / find_in_page / Unknown）——见 decision log
+> 2026-05-20。
 
 ### 验收
 
@@ -856,3 +864,68 @@ Task 形态——有 eval case 端到端跑通：
   `sources` 字段与前端渲染 part 2 已铺好，follow-up 只补请求参数 +
   换解析来源。M1.9.1–M1.9.7 + workbench 仍属完成，本条是验收期发现
   的增强，单独派，不重开 M1.9 编号。
+- **后续修正（2026-05-20）**：本条结论中"`action.sources` 作唯一
+  来源路径"被进一步推翻——M1 用户测试发现 `action.sources` 仅 URL
+  无标题、卡片同站多页看着重复；且 `web_search_call.action.type` 不
+  止 `"search"`，还有 `"open_page"` 等。改为 `include:
+  ["web_search_call.results"]`，一个值覆盖所有 activity，且带标题/
+  snippet。详见 decision log 2026-05-20。
+
+### 2026-05-20 — web_search 卡片整顿：用 `results` + 按 action.type 分流
+
+- M1 用户在 workbench 测试时发现 web_search 卡片的两个 UX 问题：
+  - **同站不同页看着像重复**：`action.sources` 只给 URL 不给标题，
+    卡片 title fallback 到 host——实测一次 ServiceNow 股票代码查询
+    返回 27 条结果，9 条 reddit URL 是 9 个不同帖子，但都渲染成 9 行
+    "www.reddit.com"，视觉上看着像重复条目。
+  - **`open_page` 被误标成搜索**：`web_search_call.action.type` 不止
+    `"search"`，还有 `"open_page"`（agent 打开页面读内容）、
+    `"find_in_page"`（页面内 pattern 查找）等。leek 一刀切按"网页
+    搜索"渲染，`open_page` 没 query/sources 就掉进 "(本次搜索没有
+    返回可引用来源)" 这个误导空状态。
+- 直连 codex backend 抓 3 个研究 prompt 实测 `web_search_call.action.type`
+  的真实形态：`"search"` × 2 + `"open_page"` × 3，每种 `action` 的字段
+  不同（`search` 有 `query`/`queries`/`sources`；`open_page` 只有
+  `url`；`find_in_page` 文档列了 `url`/`pattern`，本次未触发但已防御
+  落地）。关键发现：
+  - **`include: ["web_search_call.results"]` 一个值就够** —— `results`
+    覆盖所有 activity：对 `search` 是结果列表（`title` + `url` +
+    `snippet`），对 `open_page` 是 agent 读到的页面内容片段。
+    **`action.sources` 是 `results` 的 URL-only 子集，整丢**（直接推翻
+    了 2026-05-19 决定的"`action.sources` 作唯一来源路径"）。
+  - `results[i].snippet` 带 codex 内部头需剥：`【turnXkindN】
+    [wordlim: N] Published: …; Crawled: …;`（search）或
+    `Content type: …; Source: open(…); Total lines: N\nL<N>: …`
+    （open_page，body 每行带 `L<N>:` 行号前缀）。
+- 用户拍板四变体卡片设计（2026-05-20）：
+  - **search** 卡：`网页搜索 · <query> · N 条结果`，top 6 标题列表
+    （整行可点跳）+ "显示全部 N 条"展开；
+  - **open_page** 卡：`打开网页 · <host>`，标题（无标题则 URL，均可
+    点跳）+ ~200 词 cleaned snippet 默认展开；
+  - **find_in_page** 卡：`页面内查找 · <pattern> · <host>` + URL +
+    匹配段落默认展开；
+  - **Unknown**：`网页活动 · <type>` + 防御性 JSON 字段 dump。
+- 实现（commit `cf1d872`）：
+  - 后端：`include` 切到 `results`、`responses.rs::web_search_event`
+    按 `action.type` 分流到 `WebSearchAction` enum 四个变体（Search /
+    OpenPage / FindInPage / Unknown）、新增 `clean_snippet` 剥前缀、
+    `CanvasArtifact::search` 签名通用化为接受 `data: Value`、单测覆盖
+    四种 action.type + clean_snippet 各种头格式。
+  - 前端：`Artifact` 加 `actionType` + 变体字段、`Canvas.tsx`
+    `renderSearchCard` 顶部 const 全改 accessor + 结构性 `if` 换
+    `<Switch>/<Match>`（Solid store 字段只在 accessor 上下文才被追踪
+    ——否则 start→completion 切变体不响应，要 turn 折叠重 mount 才
+    显示；`find_in_page` 触发了这个 bug，PM E2E 暴露并就地一起修）。
+  - 删旧 "(本次搜索没有返回可引用来源)" 空状态文案。
+- 后端事件契约：`search_lifecycle.data` 现按变体载荷，顶层一律带
+  `action_type` 字段供前端分流；事件 `kind` 保持 `search_lifecycle`，
+  对外契约稳定。
+- PM 浏览器 E2E 验收：`LEEK_WEB_SEARCH=1` 跑研究 prompt 触发 search +
+  2×open_page + find_in_page，canvas 三种变体全部 live 自动渲染正确，
+  find_in_page 不再卡在"搜索中…"。`cargo test` 78/78、`cargo clippy`
+  0 warning、前端 build 通过。
+- **F2 follow-up（memory 已记）**：用户提出 leek 应**归档每 turn 的
+  原始 LLM transcript**（codex backend 请求体 + raw SSE 响应），让
+  debug 直接翻档案、而不是每次叫 PM 重抓。本次卡片整顿期间多次直连
+  codex backend 抓 SSE 让用户察觉到这个 observability 缺口，作为独立
+  follow-up 推进——属于数据持久化基础设施，跟显示无关，不裹在本任务。
