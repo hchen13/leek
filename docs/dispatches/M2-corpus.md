@@ -206,15 +206,29 @@ fixture 在 `crates/gateway/tests/fixtures/corpus/`，3–4 个小 md 中英混�
 - 不动 echo / web_fetch / update_plan 工具
 - 不引入新事件 kind（corpus_search / corpus_read 都走 tool_lifecycle）
 
-## 验收（PM 浏览器 E2E，本次合并 dispatch 的关键收益）
+## 验收
 
-1. **构建 + 测试** —— `cargo test` / `cargo clippy --all-targets` 全绿；前端 `npm run build` 通过。
-2. **启动日志** —— gateway 启动时看到 `corpus loaded: ~300 docs from ./corpus`。
-3. **浏览器 E2E**（`LEEK_WEB_SEARCH=1` 起 stack）：
-   - 跑一个**纯 corpus 问题**（如 "Munger 怎么看 circle of competence?"）：agent 应当调 `corpus_search` → canvas 出"知识库搜索"卡，top N 命中里包含 munger 目录文件 → 可能继续调 `corpus_read` 读全文 → 最终答案 cite 出处（`<id>`）。
-   - 跑一个**会触发求证纪律的事实问题**（如 "$NVDA 现在交易在哪个交易所?"）：agent 应当先调 `web_search`，不再直接用世界知识答。
-   - **检查 system prompt 已注入** —— 走 F2 transcript API：`GET /api/v1/sessions/{id}/transcripts/{turn}/{iter}/request | grep -c "求证纪律"` 应 ≥ 1、`| grep -c "corpus"` 应 ≥ 1（orientation 内容里有 corpus 字眼）。
-4. **手动 sanity** —— 挑个真 corpus query 直接对着 `Corpus::search` 跑（单测或临时 example），top 5 hits 视觉看着合理。
+> **executor 做不了浏览器 E2E**（没浏览器能力），但 **API 层 E2E 完全能做**。下面拆成两块：executor 自测做掉**所有 API 层验证**，PM 拿到报告后只补浏览器视觉验。
+
+### Executor 自测（汇报前都做完）
+
+1. **构建 + 测试** —— `cargo test` / `cargo clippy --all-targets` 全绿；前端 `npm --prefix frontend/web run build` 通过。
+2. **启动日志** —— `LEEK_WEB_SEARCH=1` 起 gateway，stdout / tracing 里出现 `corpus loaded: N docs from <root>`（N 应该是几百量级）。
+3. **手动 sanity（Rust）** —— 临时 example 或单测对真 `./corpus/` 跑 `Corpus::search("munger circle of competence", 5)`，top 5 hits 里至少 1 条 id 路径含 `munger`；top 5 文本看着合理（不是噪声）。
+4. **API 层 E2E**（用 curl，三件事）：
+   - **corpus 问题**：`curl -X POST /api/v1/sessions` 建 session，`POST .../messages` 发 "Munger 怎么看 circle of competence?"，poll `GET .../events?since=...` 等到 `assistant_done`。检查事件流应含至少一条 `tool_lifecycle` payload 里 `tool == "corpus_search"`、`display_payload.kind == "corpus_search"`、`hits` 数组非空、且至少一条 hit 的 `id` 路径含 `munger`。
+   - **事实问题（求证纪律生效）**：同上发 "$NVDA 现在交易在哪个交易所?"，验事件流里有 `tool_lifecycle` `tool == "web_search"` 或 `search_lifecycle`（model 没 fallback 到训练知识直接答）。
+   - **system prompt 已注入**：从上面任一 turn 拿 `turn_id`，`GET /api/v1/sessions/{id}/transcripts` 拿到 iteration，`curl .../transcripts/{turn_id}/{iter}/request | grep -c "求证纪律"` ≥ 1，`grep -c "corpus"` ≥ 1（orientation 文本里有 corpus 字眼）。
+
+汇报里把这四块的实际命令 + 输出片段贴出来。
+
+### PM 验收（PM 自己做，executor 不用管）
+
+executor 不用做也无法做的：
+
+- **浏览器 E2E**（PM 用 Claude-in-Chrome MCP）：canvas 上 `corpus_search` 卡片渲染正确（query + N 条结果列表 + 标题可点 + snippet 可展开）、`corpus_read` 卡片渲染正确（标题 + body preview + 展开看全文 + frontmatter 显示）、tool 摘要在 chat 侧聚合正确、turn 段头标 tool 计数对得上。
+- **视觉对照 spec** —— 卡片标签（"知识库搜索"/"读取知识库"）、空状态文案、失败 toggle 配合得上 spec。
+- **回归** —— 自测项的所有 cargo / 启动日志 / API 检查 PM 这边再跑一遍。
 
 ## 提交
 
