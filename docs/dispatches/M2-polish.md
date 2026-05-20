@@ -39,7 +39,7 @@
 **Docs**：
 
 - `README.md`（英 + 中两段）工具列表删 echo。
-- `tests/m1-m2-manual.md`：**删 T2**（"显式 echo"那条）；T3-T10 重编号为 T2-T9，或者把 T2 改成 `update_plan` 的极简显式调用版本（你定）。
+- `tests/m1-m2-manual.md`：**PM 已预先 clean** —— T2 删除、T3-T10 已 renumber 为 T2-T9（commit 见 git log）。worker 不动这个文件。
 - `docs/MILESTONES.md` 里 M1 scope 表格 "M1.x | turn_metrics 表 + GuardConfig 脚手架" 等行没提 echo，不用动；如果其它地方有 echo 字眼一并清。
 
 ### B. 全局 markdown 渲染

@@ -3,6 +3,8 @@
 > 起 stack（`LEEK_WEB_SEARCH=1` 起 gateway + 前端 `npm run dev`）后访问 <http://localhost:5173/>，**每条用一个新 session**（左上「+ 新会话」），把 prompt 块复制到底部 composer，回车发送，观察 **chat / canvas / 右栏 Plan widget** 三处反应。
 >
 > 由浅入深排列——前面几条不过的话不用跳后面。
+>
+> 共 9 条（T1 闲聊 → T9 失败工具折叠）。
 
 ---
 
@@ -20,19 +22,7 @@
 
 ---
 
-## T2 · 显式 echo（基础 function call 链）
-
-**prompt**：
-
-```
-用 echo 工具回显这句话：hello leek!
-```
-
-**预期**：canvas 出 1 张 `echo` 工具卡（绿色 ✓，display_payload 显示回显文本）；chat 工具摘要 "已执行 1 步"；turn header `1 工具`。
-
----
-
-## T3 · 显式 web_fetch（leek 自家 HTTP 工具）
+## T2 · 显式 web_fetch（leek 自家 HTTP 工具）
 
 **prompt**：
 
@@ -44,7 +34,7 @@
 
 ---
 
-## T4 · 显式 corpus_search（M2.1 + M2.2 主要验证）
+## T3 · 显式 corpus_search（M2.1 + M2.2 主要验证）
 
 **prompt**：
 
@@ -58,7 +48,7 @@
 
 ---
 
-## T5 · 显式 corpus_read（M2.2 另一半）
+## T4 · 显式 corpus_read（M2.2 另一半）
 
 **prompt**：
 
@@ -70,7 +60,7 @@
 
 ---
 
-## T6 · update_plan + 右栏 Plan widget（M1.9 + agent 编排）
+## T5 · update_plan + 右栏 Plan widget（M1.9 + agent 编排）
 
 **prompt**：
 
@@ -84,7 +74,7 @@
 
 ---
 
-## T7 · 多轮对话（同一 session 接上下文）
+## T6 · 多轮对话（同一 session 接上下文）
 
 **第 1 轮 prompt**：
 
@@ -104,7 +94,7 @@ Munger 的版本和 Buffett 的有什么区别？
 
 ---
 
-## T8 · 求证纪律（M2.4 — 事实问题不能脑补）
+## T7 · 求证纪律（M2.4 — 事实问题不能脑补）
 
 **prompt**：
 
@@ -118,7 +108,7 @@ $AMD 现在交易在哪个交易所？
 
 ---
 
-## T9 · 长程多工具任务（不指定工具，看 agent 自主编排）
+## T8 · 长程多工具任务（不指定工具，看 agent 自主编排）
 
 **prompt**：
 
@@ -138,7 +128,7 @@ $AMD 现在交易在哪个交易所？
 
 ---
 
-## T10 · 失败工具 + 失败卡 toggle（M1.9 折叠 UI）
+## T9 · 失败工具 + 失败卡 toggle（M1.9 折叠 UI）
 
 **prompt**：
 
