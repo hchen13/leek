@@ -219,3 +219,47 @@ fixture 在 `crates/gateway/tests/fixtures/corpus/`，3–4 个小 md 中英混�
 ## 提交
 
 改动留工作区，**别 commit、不 stage**，汇报即可——PM 验收后整个 M2 一次性 commit（**推荐单 commit** 一次到位，本次 dispatch 主题就是"M2 整个落地"）。
+
+---
+
+## 执行建议（meta — 这次 dispatch 偏大，分阶段做更顺）
+
+### Discovery 用 subagent，主 context 留给 coding
+
+这条任务有一段不小的前置 discovery（corpus schema + 现有工具 / 前端模式）。**别让主 context 被研究材料挤掉 coding 预算**。建议派 subagent（`Agent` 工具，`subagent_type: "Explore"` 或 `general-purpose`）做以下独立调研，**一个 message 里并行 spawn**：
+
+1. 读 `corpus/AGENTS.md`，总结"frontmatter 字段、目录结构、loader 要跳过哪些子目录"——返回一页摘要而非整文。
+2. 看现有工具实现（`crates/gateway/src/agent/tools/{echo,web_fetch,update_plan,mod}.rs`），返回"`ToolSpec` 怎么注册 / 工具 dispatch 怎么写 / `ToolUi` 注册表对接 / 前端 `Canvas.tsx::renderToolCard` 的 `display_payload.kind` 分支模式"摘要。
+3. 读 `harness/corpus_orientation.md`（确认内容 + 长度，给 M2.3 用）。
+4. 看现有 fixture 测试模式（`crates/gateway/tests/fixtures/`、`tests/` 目录结构），返回一页 conventions。
+
+这四个 discovery 互相独立，并行 spawn 比串行快、也避免它们污染主 context。
+
+### 分阶段实现
+
+1. **M2.1（Corpus loader + BM25）先做透** —— 这块单测可隔离验证、跟其他模块无依赖。BM25 公式（idf 算、k1/b 边界、tokenize CJK + 英文混排）容易写错，**单测扎实再往下**。`cargo test` 全绿前别开 M2.2。
+2. **M2.2（两个工具 + 前端卡片）跟上** —— 依赖 M2.1 的 `Corpus::search` / `read` API。后端工具先写完测过，再动前端 `Canvas.tsx` 加 `display_payload.kind` 分支。
+3. **M2.3 + M2.4（两段 system prompt 注入）最后并行做** —— 与前两步独立、改动最小（只动 `prompt.rs`）。
+
+每个阶段做完 `cargo test` / `cargo clippy` 跑一遍，**早失败早改**比累到最后整批修便宜。
+
+### 并行可以做的
+
+- 初始 scaffolding 多个新文件 → 一个 message 里 `Write` 并行。
+- `cargo test` / `cargo clippy` / `npm run build` → 一个 background bash 串起来或并发。
+- 读多份文件做交叉对照 → 一个 message 多个 `Read`。
+
+### 别走偏
+
+- **不要重构 echo / web_fetch / update_plan** —— 是 reference pattern，照抄结构、不改它们。
+- **不要读完整 304 个 corpus 文件** —— schema 从 `corpus/AGENTS.md` + 1–2 个 sample 就够。一旦你开始打开 `sources/principles/munger/*.md` 一个个看，stop——你不需要内容、你需要 schema。
+- **不要引入 embedding / 热加载 / phrase queries / corpus-expert subagent** —— 都不在 scope（embedding 是架构决策延后，subagent 是 M2.7 独立 milestone）。
+- **不要在 M2.1 就接 AppState** ——loader 模块本身先独立 testable，AppState 注入是 M2.1 末尾的最后一步（一行改）。
+
+### 遇到不确定的工程取舍
+
+spec 倾向哪个走哪个（比如 BM25 手写优先、frontmatter 用 `gray_matter`）。spec 没拍的细节（比如 BM25 的 stopword 列表、snippet 长度精确数）——**挑你认为最稳的、commit message 或代码注释里说明理由即可，别为细节卡死进度**。
+
+### 汇报时附上
+
+报告里除了改动清单 + 测试结果，**也讲清你是怎么分阶段做的、哪几个 discovery subagent 跑过、有没有发现意外的事**（比如 corpus 里有奇怪文件 / 现有 tool pattern 跟 spec 描述不符 / harness/corpus_orientation.md 已经超 800 tokens 等）。这些「过程信息」对 PM 验收 + 后续 dispatch 调整有用。
