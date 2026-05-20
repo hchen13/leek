@@ -7,11 +7,13 @@
 mod agent;
 mod api;
 mod bus;
+mod corpus;
 mod llm;
 mod vault;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -27,6 +29,12 @@ struct Cli {
     /// Vault SQLite path (per-user data store).
     #[arg(long, global = true, default_value = "./vault.db")]
     vault: PathBuf,
+
+    /// Corpus root (M2.1). Resolution order: this flag → env
+    /// `LEEK_CORPUS_DIR` → default `./corpus/`. A missing root is not a
+    /// startup error — the gateway runs with an empty corpus instead.
+    #[arg(long, global = true)]
+    corpus: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -66,13 +74,29 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let corpus_root = resolve_corpus_root(cli.corpus.as_deref());
     match cli.command {
-        Command::Serve { port } => serve(&cli.vault, port).await,
+        Command::Serve { port } => serve(&cli.vault, &corpus_root, port).await,
         Command::Auth { command } => run_auth(&cli.vault, command).await,
     }
 }
 
-async fn serve(vault_path: &Path, port: u16) -> Result<()> {
+/// Resolve the corpus root: `--corpus <dir>` → `LEEK_CORPUS_DIR` →
+/// default `./corpus/`. Returns the path without checking existence — a
+/// missing path is handled downstream by `Corpus::load` (graceful empty).
+fn resolve_corpus_root(cli_arg: Option<&Path>) -> PathBuf {
+    if let Some(p) = cli_arg {
+        return p.to_path_buf();
+    }
+    if let Ok(env) = std::env::var("LEEK_CORPUS_DIR") {
+        if !env.is_empty() {
+            return PathBuf::from(env);
+        }
+    }
+    PathBuf::from("./corpus")
+}
+
+async fn serve(vault_path: &Path, corpus_root: &Path, port: u16) -> Result<()> {
     let vault = vault::Vault::open(vault_path).await?;
 
     let codex = llm::codex::CodexClient::new(vault.pool.clone(), vault::LOCAL_USER)?;
@@ -90,6 +114,17 @@ async fn serve(vault_path: &Path, port: u16) -> Result<()> {
         std::env::var("LEEK_WEB_SEARCH").ok().as_deref(),
         Some("1" | "true" | "on" | "yes")
     );
+    // M2.1: load the corpus once at startup. A missing root yields an
+    // empty corpus + warn — the agent still serves generic answers.
+    let corpus = corpus::Corpus::load(corpus_root)?;
+    tracing::info!(
+        docs = corpus.len(),
+        root = %corpus_root.display(),
+        "corpus loaded: {} docs from {}",
+        corpus.len(),
+        corpus_root.display()
+    );
+    let corpus = Arc::new(corpus);
 
     let state = api::AppState {
         pool: vault.pool,
@@ -98,6 +133,7 @@ async fn serve(vault_path: &Path, port: u16) -> Result<()> {
         http,
         guards,
         web_search,
+        corpus,
     };
 
     let app = api::router(state);

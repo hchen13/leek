@@ -422,7 +422,7 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
                 .await;
             }
 
-            let outcome = tools::dispatch(&st.http, &name, &args_value).await;
+            let outcome = tools::dispatch(&st.http, &st.corpus, &name, &args_value).await;
             if outcome.is_error {
                 tool_error_count += 1;
             }

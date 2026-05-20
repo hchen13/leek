@@ -1,15 +1,28 @@
-//! System-prompt builder — deliberately minimal for M1.
+//! System-prompt builder — assembled most-stable-first
+//! (ARCHITECTURE §4.1, best KV-cache reuse).
 //!
-//! ARCHITECTURE §4.1 orders the system prompt most-stable-first. M1 only has
-//! the parts that exist yet: the identity, and the tool roster. Corpus
-//! orientation (M2) and the skill index (M2.5) slot in later — they are NOT
-//! introduced here. No tool-usage prose: the model picks tools from the
-//! task and each tool's own description (sent via the API tools array).
+//! Order (M2):
+//!   IDENTITY  →  OPERATING  →  SEEK_VERIFICATION_DISCIPLINE  →
+//!   CORPUS_ORIENTATION  →  # 可用工具
+//!
+//! The identity (who leek is) is fixed text. The operating note (how the
+//! loop works) is short and tactical. The verification-discipline section
+//! is leek's invariant: facts get searched before they get answered. The
+//! corpus orientation tells the model how to think about its
+//! knowledge-base — what corpus is for, how to query it. The tool roster
+//! is last (it's the most volatile section, and the model also gets each
+//! tool's full schema via the API tools array — so prompt prose is just
+//! orientation, not the source of truth).
 
 use crate::llm::ToolSpec;
 
-/// leek's identity — most stable section, always first (best KV-cache reuse).
+/// leek's identity — most stable section, always first.
 const IDENTITY: &str = include_str!("../../../../harness/identity.md");
+
+/// Investing-corpus orientation — how to think about the read-only
+/// knowledge layer (M2.3). Static, user-maintained file under
+/// `harness/`. Static include, not runtime read.
+const CORPUS_ORIENTATION: &str = include_str!("../../../../harness/corpus_orientation.md");
 
 /// A short operating note. Not methodology — just how the loop works.
 const OPERATING: &str = "\
@@ -18,12 +31,32 @@ const OPERATING: &str = "\
 工具结果会回到你这里继续推理；掌握足够信息后直接作答，不要为了凑步骤而\
 多调工具。回答用用户的语言。";
 
-/// Build the M1 system prompt: identity + operating note + tool roster.
+/// Seek-verification discipline (M2.4) — locked wording per MILESTONES
+/// decision log 2026-05-20. Kept inline (not in `harness/`) because it
+/// is harness behaviour, tightly coupled to the tool set (`web_search`);
+/// it is not corpus content.
+const SEEK_VERIFICATION_DISCIPLINE: &str = "\
+# 求证纪律\n\n\
+对**具体事实**（股票代码、公司、价格、新闻、事件、日期、数字等），\n\
+先搜后答 —— 用 web_search 查到再回答，不要直接用训练里的世界知识。\n\
+- 一次搜索返回 0 条或不相关 → 换 query 重试 1-2 次\n\
+- 仍搜不到 → 明说\"搜不到\"\n\
+- 若用户仍要训练知识答案 → 显式标注「以下来自训练知识，无法用搜索\n\
+  证实，可能过时」再给\n\n\
+分析、判断、推理是你的本职，不必为它做搜索表演。但**分析依赖的事实**\n\
+必须搜过、可追溯。";
+
+/// Build the system prompt. Sections are joined with blank lines so
+/// each one reads as a distinct frame to the model.
 pub fn build_system_prompt(tools: &[ToolSpec]) -> String {
-    let mut p = String::with_capacity(2048);
+    let mut p = String::with_capacity(4096);
     p.push_str(IDENTITY.trim());
     p.push_str("\n\n");
     p.push_str(OPERATING);
+    p.push_str("\n\n");
+    p.push_str(SEEK_VERIFICATION_DISCIPLINE);
+    p.push_str("\n\n");
+    p.push_str(CORPUS_ORIENTATION.trim());
 
     if !tools.is_empty() {
         p.push_str("\n\n# 可用工具\n\n");
@@ -42,8 +75,8 @@ pub fn build_system_prompt(tools: &[ToolSpec]) -> String {
     p
 }
 
-/// First sentence-ish of a description, whitespace-collapsed and capped — the
-/// roster is orientation, the full schema is in the API tools array.
+/// First sentence-ish of a description, whitespace-collapsed and capped —
+/// the roster is orientation, the full schema is in the API tools array.
 fn first_line(desc: &str) -> String {
     let collapsed = desc.split_whitespace().collect::<Vec<_>>().join(" ");
     let cut = collapsed
@@ -63,13 +96,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_has_identity_and_no_corpus() {
+    fn prompt_has_identity_and_operating() {
         let p = build_system_prompt(&[]);
         assert!(p.contains("leek"));
         assert!(p.contains("运行方式"));
-        // M1 must not pull in the corpus-orientation section.
-        assert!(!p.contains("corpus orientation"));
-        assert!(!p.contains("# 可用工具"));
+    }
+
+    #[test]
+    fn prompt_includes_corpus_orientation() {
+        // M2.3 — the orientation file's signature phrase appears verbatim
+        // in the assembled prompt.
+        let p = build_system_prompt(&[]);
+        assert!(p.contains("corpus orientation"));
+        assert!(p.contains("双轴"));
+        // From the orientation doc — confirms `include_str!` actually
+        // pulled the file in, not just a hard-coded blurb.
+        assert!(p.contains("principles → knowledge → sources"));
+    }
+
+    #[test]
+    fn prompt_has_seek_verification_discipline() {
+        // M2.4 — the verification-discipline section is present with
+        // its signature phrasing.
+        let p = build_system_prompt(&[]);
+        assert!(p.contains("求证纪律"));
+        assert!(p.contains("先搜后答"));
+        assert!(p.contains("web_search"));
+    }
+
+    #[test]
+    fn prompt_section_order_is_stable_first() {
+        // IDENTITY → OPERATING → DISCIPLINE → CORPUS_ORIENTATION → tools.
+        let p = build_system_prompt(&[ToolSpec {
+            name: "echo".into(),
+            description: "Echo text.".into(),
+            parameters: serde_json::json!({}),
+        }]);
+        let i_identity = p.find("leek").unwrap();
+        let i_operating = p.find("运行方式").unwrap();
+        let i_discipline = p.find("求证纪律").unwrap();
+        let i_corpus = p.find("corpus orientation").unwrap();
+        let i_tools = p.find("# 可用工具").unwrap();
+        assert!(i_identity < i_operating);
+        assert!(i_operating < i_discipline);
+        assert!(i_discipline < i_corpus);
+        assert!(i_corpus < i_tools);
     }
 
     #[test]

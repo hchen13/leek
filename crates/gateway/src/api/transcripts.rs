@@ -122,6 +122,7 @@ mod tests {
             http: reqwest::Client::new(),
             guards: GuardConfig::default(),
             web_search: false,
+            corpus: std::sync::Arc::new(crate::corpus::Corpus::empty()),
         }
     }
 

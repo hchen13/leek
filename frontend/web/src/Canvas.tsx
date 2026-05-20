@@ -139,6 +139,98 @@ export function Canvas(props: CanvasProps) {
         </div>
       );
     }
+    if (a.cardKind === "corpus_search") {
+      // Accessors throughout so a start→completion store update flows
+      // into the rendered branch (same pattern as renderSearchCard).
+      const dpAcc = () => a.displayPayload ?? {};
+      const query = () => String(dpAcc().query ?? "");
+      const hits = () =>
+        (dpAcc().hits as Array<{
+          id: string;
+          title: string;
+          snippet: string;
+          score: number;
+        }>) ?? [];
+      const showAll = () => expanded().has(a.artifactId);
+      const visible = () =>
+        showAll() ? hits() : hits().slice(0, SEARCH_TOP_N);
+      return (
+        <Show
+          when={hits().length > 0}
+          fallback={<p class="muted">0 条结果 · "{query()}"</p>}
+        >
+          <ol class="search-result-list">
+            <For each={visible()}>
+              {(h) => (
+                <li>
+                  <span class="corpus-hit-title">{h.title}</span>
+                  <span class="muted"> · {h.id}</span>
+                  <Show when={h.snippet}>
+                    <div class="corpus-snippet muted">{h.snippet}</div>
+                  </Show>
+                </li>
+              )}
+            </For>
+          </ol>
+          <Show when={hits().length > SEARCH_TOP_N}>
+            <button
+              class="card-expand"
+              onClick={() => toggle(expanded, setExpanded, a.artifactId)}
+            >
+              {showAll() ? "收起" : `显示全部 ${hits().length} 条`}
+            </button>
+          </Show>
+        </Show>
+      );
+    }
+    if (a.cardKind === "corpus_read") {
+      const dpAcc = () => a.displayPayload ?? {};
+      const docTitle = () => String(dpAcc().title ?? "");
+      const docId = () => String(dpAcc().id ?? "");
+      const preview = () => String(dpAcc().body_preview ?? "");
+      const fullBody = () => String(dpAcc().body ?? preview());
+      const bytes = () => Number(dpAcc().body_bytes ?? 0);
+      const frontmatterEntries = () => {
+        const fm = dpAcc().frontmatter;
+        if (!fm || typeof fm !== "object") return [] as Array<[string, string]>;
+        return Object.entries(fm as Record<string, unknown>).map(
+          ([k, v]) => [k, String(v)] as [string, string],
+        );
+      };
+      const showFull = () => expanded().has(a.artifactId);
+      return (
+        <div class="corpus-read">
+          <Show when={docTitle()}>
+            <div class="corpus-doc-title">{docTitle()}</div>
+          </Show>
+          <div class="muted corpus-id">
+            {docId()} · {bytes()} 字节
+          </div>
+          <Show when={frontmatterEntries().length > 0}>
+            <div class="corpus-frontmatter muted">
+              <For each={frontmatterEntries()}>
+                {([k, v]) => (
+                  <span class="corpus-fm-entry">
+                    {k}: <b>{v}</b> ·{" "}
+                  </span>
+                )}
+              </For>
+            </div>
+          </Show>
+          <pre class="card-pre corpus-body">
+            {showFull() ? fullBody() : preview()}
+          </pre>
+          <Show when={fullBody().length > preview().length}>
+            <button
+              class="card-expand"
+              onClick={() => toggle(expanded, setExpanded, a.artifactId)}
+            >
+              {showFull() ? "收起全文" : "展开全文"}
+            </button>
+          </Show>
+        </div>
+      );
+    }
     return <pre class="card-pre">{formatJson(dp)}</pre>;
   };
 

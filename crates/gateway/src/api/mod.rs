@@ -12,8 +12,11 @@ use axum::routing::{get, patch};
 use axum::{Json, Router};
 use tower_http::cors::{Any, CorsLayer};
 
+use std::sync::Arc;
+
 use crate::agent::GuardConfig;
 use crate::bus::EventBus;
+use crate::corpus::Corpus;
 use crate::llm::codex::CodexClient;
 use crate::vault::events::Event;
 
@@ -31,6 +34,11 @@ pub struct AppState {
     /// Whether to offer the provider-side `web_search` tool (M1.9.4).
     /// Resolved from `LEEK_WEB_SEARCH` at startup; off by default.
     pub web_search: bool,
+    /// Read-only knowledge corpus (M2.1). Loaded once at startup, shared
+    /// across requests via `Arc`. An empty corpus is a graceful-degrade
+    /// path — the gateway boots without the knowledge layer rather than
+    /// abort on a missing root.
+    pub corpus: Arc<Corpus>,
 }
 
 impl AppState {

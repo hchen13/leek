@@ -17,11 +17,16 @@
 //! plumbs them. Tool names and descriptions stay vendor-neutral
 //! (ARCHITECTURE §12.1).
 
+mod corpus_read;
+mod corpus_search;
 mod echo;
 mod update_plan;
 mod web_fetch;
 
+use std::sync::Arc;
+
 use crate::agent::events::{self, CanvasArtifact, Phase};
+use crate::corpus::Corpus;
 use crate::llm::ToolSpec;
 
 /// Outcome of running one tool call — the three result surfaces of
@@ -91,7 +96,13 @@ pub struct ToolUi {
 
 /// The function-tool specs offered to the model this milestone.
 pub fn specs() -> Vec<ToolSpec> {
-    vec![echo::spec(), web_fetch::spec(), update_plan::spec()]
+    vec![
+        echo::spec(),
+        web_fetch::spec(),
+        update_plan::spec(),
+        corpus_search::spec(),
+        corpus_read::spec(),
+    ]
 }
 
 /// UI metadata for a tool, or `None` for an unknown name.
@@ -100,17 +111,30 @@ pub fn ui(name: &str) -> Option<ToolUi> {
         "echo" => Some(echo::ui()),
         "web_fetch" => Some(web_fetch::ui()),
         "update_plan" => Some(update_plan::ui()),
+        "corpus_search" => Some(corpus_search::ui()),
+        "corpus_read" => Some(corpus_read::ui()),
         _ => None,
     }
 }
 
 /// Dispatch one function call. An unknown name is a structured error, not a
 /// panic — the model gets it back as `function_call_output` and can recover.
-pub async fn dispatch(http: &reqwest::Client, name: &str, args: &serde_json::Value) -> ToolOutcome {
+///
+/// The `corpus` arg is the shared read-only knowledge layer (M2.1); only
+/// the corpus tools consume it, but it lives on the dispatch signature
+/// rather than a per-tool closure so the agent loop has one call site.
+pub async fn dispatch(
+    http: &reqwest::Client,
+    corpus: &Arc<Corpus>,
+    name: &str,
+    args: &serde_json::Value,
+) -> ToolOutcome {
     match name {
         "echo" => echo::run(args),
         "web_fetch" => web_fetch::run(http, args).await,
         "update_plan" => update_plan::run(args),
+        "corpus_search" => corpus_search::run(corpus, args),
+        "corpus_read" => corpus_read::run(corpus, args),
         other => ToolOutcome::error(format!(
             "unknown tool '{other}' — it is not in the available tool set"
         )),
@@ -189,7 +213,13 @@ mod tests {
     #[test]
     fn dispatch_unknown_tool_is_a_structured_error() {
         let http = reqwest::Client::new();
-        let out = futures::executor::block_on(dispatch(&http, "nope", &serde_json::Value::Null));
+        let corpus = Arc::new(Corpus::empty());
+        let out = futures::executor::block_on(dispatch(
+            &http,
+            &corpus,
+            "nope",
+            &serde_json::Value::Null,
+        ));
         assert!(out.is_error);
         assert!(out.model_output.contains("unknown tool"));
     }
@@ -199,9 +229,20 @@ mod tests {
         assert!(ui("echo").is_some());
         assert!(ui("web_fetch").is_some());
         assert!(ui("update_plan").is_some());
+        assert!(ui("corpus_search").is_some());
+        assert!(ui("corpus_read").is_some());
         assert!(ui("nope").is_none());
         // update_plan renders to the right rail, not a canvas tool card.
         assert_eq!(ui("update_plan").unwrap().result, ResultArtifact::Plan);
+        // corpus tools render as canvas cards with their own kinds.
+        assert_eq!(
+            ui("corpus_search").unwrap().result,
+            ResultArtifact::Card("corpus_search")
+        );
+        assert_eq!(
+            ui("corpus_read").unwrap().result,
+            ResultArtifact::Card("corpus_read")
+        );
     }
 
     #[test]
