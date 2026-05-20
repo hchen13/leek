@@ -104,6 +104,18 @@ frontend active tree 全部清底重写。旧代码通过 git history 查询，
   corpus_read × 4，答案 cite 出 corpus path；事实问题（$NVDA）触发
   web_search 不再 fallback 训练知识。commit `0e4e67d`，见 decision
   log 2026-05-20「M2 — corpus 接入」。
+- **M2 polish completed（2026-05-20）**：M2 之后两件 follow-up 一并
+  落地。**A** 删 echo 测试工具（M0 留下、M2 后无验证价值）—— 文件 +
+  tools 注册 + 所有 fixture + README 中英两版工具列表全清，保留 main.rs
+  / messages.rs / README 里 "M0 echo worker / M1 replaces the echo" 等
+  历史叙述。**B** 全局 markdown 渲染 —— 新增 `frontend/web/src/markdown.ts`
+  统一入口（`marked` + `dompurify`），chat 流式 `assistant_delta` 期间
+  **实时** parse + render（Solid accessor binding，不是流末才渲），canvas
+  上 note / corpus_read body / corpus_search snippet / open_page snippet
+  / find_in_page match / Plan step 都走 markdown，新增 `.markdown-body`
+  CSS 暗色主题 typography。DOMPurify hook 自动给 `<a>` 加 `target="_blank"`，
+  每次渲染前都 sanitize（防 prompt injection）。commit `f619c73`，见
+  decision log 2026-05-20「M2 polish — 删 echo + 全局 markdown 实时渲染」。
 
 ---
 
@@ -1114,3 +1126,75 @@ Task 形态——有 eval case 端到端跑通：
   排序。
 - 闭环：cf1d872 web_search 卡片整顿、9de67a6 求证纪律延后、
   fe84c15 dispatch 验收拆分 全部由本条收口。
+
+### 2026-05-20 — M2 polish:删 echo + 全局 markdown 实时渲染
+
+- 背景:M2 落地后用户在前端测时直接发现两个 polish 项 ——
+  - `echo` 是 M0 测试工具,M2 之后线上无价值且 ToolSpec 描述会误导
+    model 在 testing 场景误调（"用户显式 echo 时调"这种 explicit-only
+    工具语义本身就是噪声）。
+  - chat 流式输出和 canvas 卡片都按纯文本渲染:`[link](url)` /
+    `**bold**` / 三反引号 code block 全按 raw 字符显示;corpus_read
+    的 body 在 `<pre>` 里,markdown 结构（标题/列表/blockquote）扁平
+    成一团预格式化文本,read 一篇 corpus 等于读源码。
+- 用户决策（2026-05-20）：两件 polish 合并一个 dispatch,写进
+  `docs/dispatches/M2-polish.md`,worker session 一次性做完。
+- 实现（commit `f619c73`,17 文件,净 +808 / -159）：
+  - **A 删 echo**:删 `crates/gateway/src/agent/tools/echo.rs`;
+    `tools/mod.rs` 移除 mod / spec / ui / dispatch 四处引用;单测
+    fixture 里 echo 字面量改 web_fetch（guards / events / prompt /
+    compaction / responses 多处）;doc 注释更新;README 中英两段
+    工具列表删 echo。保留 main.rs / messages.rs / README 里讲 M0→M1
+    演化的"echo worker" / "M1 replaces the echo" 等历史叙述（spec 明确
+    "历史不删"）。
+  - **B 全局 markdown**:
+    - 新增 `frontend/web/src/markdown.ts` 统一入口,两个函数:
+      `renderMarkdown`（block）/ `renderInlineMarkdown`（inline,无
+      `<p>` 外包,用于 plan step / corpus snippet 等一行 layout）。
+      内部 `marked.parse` + `DOMPurify.sanitize`。
+    - DOMPurify hook 在 module load 时注册一次,自动给所有 `<a>` 加
+      `target="_blank" rel="noopener noreferrer"`。
+    - **每次渲染前都 sanitize** —— LLM 输出本质 untrusted,prompt
+      injection 可能注入 `<script>` / `onerror=` / `javascript:` URL,
+      DOMPurify 全 strip。
+    - `Chat.tsx`:`m.content`（历史）和 `wb.state.streaming.text`（流式
+      bubble）都走 `renderMarkdown`,JSX 用 `innerHTML={() => ...}`
+      accessor 形式 —— Solid 在每个 `assistant_delta` 触发 streaming.text
+      变化时自动重 parse + 重 render。**关键:实时渲染,不是流末才一次性
+      渲**。
+    - `Canvas.tsx`:note 卡 text / corpus_read body / open_page snippet
+      走 block render;corpus_search snippet / find_in_page match 走
+      inline render（短文本无需 `<p>` 包）。
+    - `PlanWidget.tsx`:step.step 走 inline render（避免 plan 一行
+      layout 被 `<p>` 拆行）。
+    - `styles.css` 新增 `.markdown-body` class,统一 h1-h6 / ul / ol /
+      blockquote / code inline / pre code / a / strong / em / table /
+      hr 在暗色主题下的 typography。
+  - 单测:新增 `frontend/web/tests/markdown.test.mjs`（jsdom + node 跑）,
+    15 个 sanity 覆盖 bold / link / target hook / script strip / onerror
+    strip / javascript URL strip / empty / null / heading / list / fenced
+    code / inline 无 `<p>` / inline script strip。
+- 测试:`cargo test` 125 → 123（−2 echo 单测移除,符合预期）;
+  `cargo clippy` 0 warning;前端 build OK,bundle 增量来自 marked +
+  dompurify（约 50 KB,acceptable）;`node tests/markdown.test.mjs`
+  15/15 PASS。
+- PM 浏览器 E2E（关键验收 — 流式实时性）:
+  - 跑 "用 corpus_read 读 wikis/principles/concepts/circle-of-competence.md,
+    然后用 markdown 列表把要点重新组织——关键概念加粗,附 corpus path 作
+    markdown 链接" 这个 turn,26.3s 完成 1 工具。
+  - **中段截图（6s）**:chat ASSISTANT · STREAMING 已经在渲染
+    `<ul><li>` bullets,**不是等流完才一次性渲**,实时性达标。
+  - **终态截图（完成后）**:chat 多层 list（• → ◦）+ inline bold
+    （**Coca-Cola 1989** / **USAir 1989** / **Apple 2016+** /
+    **互联网泡沫 1999–2000** / **Duan 的 Apple / Maotai / NetEase**）
+    全渲染;canvas corpus_read 卡的 body 完整 markdown 渲染（`##概念解析`
+    / `###定义` 标题大字 / `**Circle of competence**` 加粗 /
+    `*你能稳定可靠地判断的领域*` 斜体 / `> "What counts..."` blockquote
+    左边框 + muted 色;frontmatter chips 完整列出 confidence / created /
+    layer / slug / sources / tags / tier / title / type / updated）。
+- echo grep 收口:active 路径 `grep -rn '\becho\b' crates/gateway/src/
+  frontend/web/src/ tests/m1-m2-manual.md` 仅 0 命中,只剩 README + main.rs
+  + messages.rs 的 3 条历史叙述（"M1 replaces the echo with a real agent
+  loop" / "M0's echo worker is gone"）—— spec 明确允许保留。
+- 闭环:这条收尾 dispatch spec `c7c99ce` + `81d6186`（PM 预先 clean
+  tests）+ `f619c73` 实现。
