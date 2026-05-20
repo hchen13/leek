@@ -376,6 +376,9 @@ canvas / right rail 的边界锁死。
 - Corpus loader：从一个根目录读 markdown，做 lexical（BM25）检索
 - 工具：`corpus_search(query)`、`corpus_read(id)`
 - 默认 corpus 注入到主 agent 的 system prompt（目标 < 800 tokens）
+- 求证纪律 prompt section：约束 model 对事实问题"先搜后答"，搜不到
+  要明说（M1 用户测试 2026-05-20 发现 model 在搜索 0 结果时直接 fallback
+  到训练知识，详见 decision log 2026-05-20）
 
 ### Sub-commits（计划）
 
@@ -384,6 +387,7 @@ canvas / right rail 的边界锁死。
 | M2.1 | Corpus loader + BM25 索引，内存中                   |
 | M2.2 | `corpus_search` + `corpus_read` 工具                |
 | M2.3 | 系统 prompt 默认注入精选 corpus 片段                |
+| M2.4 | 求证纪律 prompt section（事实先搜后答）              |
 
 ### Design decisions（locked）
 
@@ -929,3 +933,28 @@ Task 形态——有 eval case 端到端跑通：
   debug 直接翻档案、而不是每次叫 PM 重抓。本次卡片整顿期间多次直连
   codex backend 抓 SSE 让用户察觉到这个 observability 缺口，作为独立
   follow-up 推进——属于数据持久化基础设施，跟显示无关，不裹在本任务。
+
+### 2026-05-20 — 求证纪律（search-first prompt discipline）——延后到 M2.4
+
+- M1 用户测试发现：问 "$NOW 是什么股票" 时，model 发了一次搜索
+  query `"finance: NOW"`，codex backend 字面对待 `finance:` 不识别的
+  operator、返回 0 结果。model 没换 query 重试，直接用训练知识答出
+  "$NOW = ServiceNow"——答案碰巧对，但跳过了 web 求证。
+- 用户提出 leek 不应直接用世界知识回答事实问题——即使答案对，投研
+  agent 用户也无法分辨哪些是搜的、哪些是脑补的；且训练知识有过时
+  / 幻觉风险。
+- 这是 system prompt / harness behavior 问题：current `OPERATING`
+  章节（`crates/gateway/src/agent/prompt.rs`）对工具使用是 permissive
+  的（"需要外部信息或要执行动作时调用工具"），没有强制"事实必查"。
+- 用户决策（2026-05-20）：**这是 harness 问题，延后到 M2 处理**（M2
+  本就要扩 system prompt）。新增 M2.4 sub-commit 落地"求证纪律"
+  section。先记本条，M1 用户测试不被这条 block。
+- 设计 sketch（待 M2.4 时确认细节）：在 `prompt.rs` 的 `OPERATING`
+  与工具清单之间加一段 `# 求证纪律`。约束：
+  - 事实问题（代码/价格/新闻/事件/日期/数字等）**先搜后答**；
+  - 一次搜 0 结果或不相关 → 换 query 重试 1–2 次；
+  - 仍搜不到 → 明说"搜不到"；若用户仍要训练答案，显式标注「来自
+    训练知识，无法用搜索证实，可能过时」；
+  - 分析、判断、推理不受约束，但其**事实依据**必须搜过、可追溯。
+- 严格度档位（M2.4 实现时再选）：当前 sketch 是"搜不到可加 caveat 后
+  给训练答案"。更严的档是"搜不到就停、不给训练答案"。当时再敲。
