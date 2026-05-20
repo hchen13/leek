@@ -8,6 +8,7 @@
 
 import { createSignal, For, Show } from "solid-js";
 
+import { renderMarkdown } from "./markdown";
 import type { Message, Turn } from "./types";
 
 type Streaming = { turnId: string; iteration: number; text: string };
@@ -139,7 +140,12 @@ export function Chat(props: ChatProps) {
               <Show when={m.role === "assistant"}>{renderSummary(turnForMessage(m.seq))}</Show>
               <div classList={{ msg: true, [m.role]: true }}>
                 <span class="role">{m.role}</span>
-                <p>{m.content}</p>
+                {/* User and assistant bodies both go through markdown so a
+                    user-pasted snippet renders the same as an assistant
+                    reply. innerHTML is reactive — Solid's JSX compiler
+                    wraps the RHS in an effect that re-evaluates when
+                    `m` (or any signal it reads) changes. */}
+                <div class="msg-body markdown-body" innerHTML={renderMarkdown(m.content)} />
               </div>
             </>
           )}
@@ -150,7 +156,15 @@ export function Chat(props: ChatProps) {
         <Show when={bubbleText()}>
           <div class="msg assistant pending">
             <span class="role">assistant · streaming</span>
-            <p>{bubbleText()}</p>
+            {/* The streaming binding — accessor form so Solid re-evaluates
+                renderMarkdown on every `assistant_delta` that grows
+                streaming.text. No createMemo needed; re-parsing each delta
+                is cheap and avoids dependency-tracking surprises (spec
+                M2-polish §B "streaming 渲染陷阱"). */}
+            <div
+              class="msg-body markdown-body"
+              innerHTML={renderMarkdown(bubbleText())}
+            />
           </div>
         </Show>
         <Show when={props.sending() && !bubbleText()}>

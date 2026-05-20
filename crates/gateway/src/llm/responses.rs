@@ -618,22 +618,22 @@ mod tests {
     fn body_serializes_function_tool() {
         let mut r = req();
         r.tools = vec![ToolSpec {
-            name: "echo".into(),
-            description: "Echo text.".into(),
+            name: "web_fetch".into(),
+            description: "Fetch a URL.".into(),
             parameters: serde_json::json!({ "type": "object" }),
         }];
         let body = build_request_body(&r);
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
-        assert_eq!(tools[0]["name"], "echo");
+        assert_eq!(tools[0]["name"], "web_fetch");
     }
 
     #[test]
     fn body_appends_additional_inputs() {
         let mut r = req();
         r.additional_inputs = vec![
-            serde_json::json!({ "type": "function_call", "call_id": "c1", "name": "echo", "arguments": "{}" }),
+            serde_json::json!({ "type": "function_call", "call_id": "c1", "name": "web_fetch", "arguments": "{}" }),
             serde_json::json!({ "type": "function_call_output", "call_id": "c1", "output": "ok" }),
         ];
         let body = build_request_body(&r);
@@ -665,8 +665,8 @@ mod tests {
         let mut r = req();
         r.web_search = true;
         r.tools = vec![ToolSpec {
-            name: "echo".into(),
-            description: "Echo.".into(),
+            name: "web_fetch".into(),
+            description: "Fetch a URL.".into(),
             parameters: serde_json::json!({ "type": "object" }),
         }];
         let body = build_request_body(&r);
@@ -674,7 +674,7 @@ mod tests {
         // The function tool plus the built-in web_search tool.
         assert_eq!(tools.len(), 2);
         assert!(tools.iter().any(|t| t["type"] == "web_search"));
-        assert!(tools.iter().any(|t| t["type"] == "function" && t["name"] == "echo"));
+        assert!(tools.iter().any(|t| t["type"] == "function" && t["name"] == "web_fetch"));
     }
 
     #[test]
@@ -730,8 +730,8 @@ mod tests {
     #[test]
     fn parses_function_call_done() {
         let raw = "data: {\"type\":\"response.output_item.done\",\"item\":{\
-                   \"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"echo\",\
-                   \"arguments\":\"{\\\"text\\\":\\\"x\\\"}\"}}";
+                   \"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"web_fetch\",\
+                   \"arguments\":\"{\\\"url\\\":\\\"x\\\"}\"}}";
         match &parse_one_event(raw).unwrap()[..] {
             [LlmEvent::FunctionCall {
                 call_id,
@@ -739,8 +739,8 @@ mod tests {
                 arguments,
             }] => {
                 assert_eq!(call_id, "call_1");
-                assert_eq!(name, "echo");
-                assert_eq!(arguments, "{\"text\":\"x\"}");
+                assert_eq!(name, "web_fetch");
+                assert_eq!(arguments, "{\"url\":\"x\"}");
             }
             other => panic!("expected FunctionCall, got {other:?}"),
         }
@@ -878,7 +878,7 @@ mod tests {
         // Only web_search_call cares about `.added`; a function_call there
         // has empty arguments and must wait for `.done`.
         let raw = "data: {\"type\":\"response.output_item.added\",\"item\":{\
-                   \"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"echo\"}}";
+                   \"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"web_fetch\"}}";
         assert!(matches!(parse_one_event(raw).unwrap()[..], [LlmEvent::Ping]));
     }
 

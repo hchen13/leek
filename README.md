@@ -29,8 +29,10 @@ What works today:
 - **Agent loop** — codex OAuth → Responses API → streamed assistant reply.
   The loop calls the model, dispatches tool calls, feeds results back, and
   repeats until the model finishes or a guard stops it.
-- **Tools** — `echo` (deterministic, proves the function-call loop) and
-  `web_fetch` (fetch a URL as text). Domain tools are M3.
+- **Tools** — `web_fetch` (fetch a URL as text), `update_plan` (right-rail
+  TODO widget), and `corpus_search` / `corpus_read` against the investing
+  knowledge layer (M2). Provider-side `web_search` is opt-in via
+  `LEEK_WEB_SEARCH`. Domain tools are M3.
 - **Guards** — idle timeout, wall-clock ceiling with staged soft-prompts,
   iteration cap, cost cap, and a doom-loop detector. Observability guards
   are on by default; hard caps are opt-in.
@@ -143,8 +145,9 @@ corpus、skill、委派子 agent —— 那些是后续 milestone。
 - **Agent loop** —— codex OAuth → Responses API → 流式 assistant 回复。
   loop 调模型、派发工具调用、把结果喂回去，循环到模型结束或某个 guard
   中止。
-- **工具** —— `echo`（确定性，验证 function-call 循环）和 `web_fetch`
-  （把 URL 抓成文本）。领域工具在 M3。
+- **工具** —— `web_fetch`（把 URL 抓成文本）、`update_plan`（右栏 TODO
+  widget）、以及面向投研知识层的 `corpus_search` / `corpus_read`（M2）。
+  Provider 侧 `web_search` 通过 `LEEK_WEB_SEARCH` opt-in。领域工具在 M3。
 - **Guards** —— idle timeout、wall-clock 上限（带阶段化软提示）、迭代
   上限、成本上限、doom-loop 检测。可观测性 guard 默认开，硬上限 opt-in。
 - **Auto-compaction** —— 上下文接近窗口上限时，turn 把早期上下文折叠成

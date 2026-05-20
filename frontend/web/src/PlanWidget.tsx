@@ -6,6 +6,7 @@
 
 import { For, Show } from "solid-js";
 
+import { renderInlineMarkdown } from "./markdown";
 import type { Plan, PlanStep } from "./types";
 
 type PlanWidgetProps = { plan: () => Plan | null };
@@ -34,7 +35,10 @@ export function PlanWidget(props: PlanWidgetProps) {
             {(s) => (
               <li classList={{ "plan-step": true, [`p-${s.status}`]: true }}>
                 <span class="plan-mark">{stepMark(s.status)}</span>
-                <span class="plan-text">{s.step}</span>
+                {/* Plan steps are one-liners — parseInline avoids the
+                    wrapping `<p>` that would push the bullet onto its own
+                    row. `.p-{status} .plan-text` color rules still apply. */}
+                <span class="plan-text markdown-body" innerHTML={renderInlineMarkdown(s.step)} />
               </li>
             )}
           </For>

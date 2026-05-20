@@ -175,22 +175,22 @@ mod tests {
 
     #[test]
     fn doom_loop_fires_on_n_identical() {
-        let w = window(&[("echo", "{}"), ("echo", "{}"), ("echo", "{}")]);
+        let w = window(&[("web_fetch", "{}"), ("web_fetch", "{}"), ("web_fetch", "{}")]);
         assert!(detect_doom_loop(&w, 3));
     }
 
     #[test]
     fn doom_loop_ignores_below_threshold() {
-        let w = window(&[("echo", "{}"), ("echo", "{}")]);
+        let w = window(&[("web_fetch", "{}"), ("web_fetch", "{}")]);
         assert!(!detect_doom_loop(&w, 3));
     }
 
     #[test]
     fn doom_loop_ignores_differing_args() {
         let w = window(&[
-            ("echo", "{\"t\":1}"),
-            ("echo", "{\"t\":2}"),
-            ("echo", "{\"t\":1}"),
+            ("web_fetch", "{\"t\":1}"),
+            ("web_fetch", "{\"t\":2}"),
+            ("web_fetch", "{\"t\":1}"),
         ]);
         assert!(!detect_doom_loop(&w, 3));
     }

@@ -1,7 +1,7 @@
 //! Client-side function tools — the M1.9 tool set.
 //!
-//! M1 kept the surface tiny (`echo`, `web_fetch`). M1.9 adds `update_plan`
-//! and splits two concerns the model and the workbench need kept apart:
+//! M1 kept the surface tiny (`web_fetch`). M1.9 adds `update_plan` and
+//! splits two concerns the model and the workbench need kept apart:
 //!
 //! - The **LLM-facing spec** (`ToolSpec`: name, description, JSON schema) is
 //!   all the model sees.
@@ -19,7 +19,6 @@
 
 mod corpus_read;
 mod corpus_search;
-mod echo;
 mod update_plan;
 mod web_fetch;
 
@@ -97,7 +96,6 @@ pub struct ToolUi {
 /// The function-tool specs offered to the model this milestone.
 pub fn specs() -> Vec<ToolSpec> {
     vec![
-        echo::spec(),
         web_fetch::spec(),
         update_plan::spec(),
         corpus_search::spec(),
@@ -108,7 +106,6 @@ pub fn specs() -> Vec<ToolSpec> {
 /// UI metadata for a tool, or `None` for an unknown name.
 pub fn ui(name: &str) -> Option<ToolUi> {
     match name {
-        "echo" => Some(echo::ui()),
         "web_fetch" => Some(web_fetch::ui()),
         "update_plan" => Some(update_plan::ui()),
         "corpus_search" => Some(corpus_search::ui()),
@@ -130,7 +127,6 @@ pub async fn dispatch(
     args: &serde_json::Value,
 ) -> ToolOutcome {
     match name {
-        "echo" => echo::run(args),
         "web_fetch" => web_fetch::run(http, args).await,
         "update_plan" => update_plan::run(args),
         "corpus_search" => corpus_search::run(corpus, args),
@@ -226,7 +222,6 @@ mod tests {
 
     #[test]
     fn ui_registry_covers_the_tool_set() {
-        assert!(ui("echo").is_some());
         assert!(ui("web_fetch").is_some());
         assert!(ui("update_plan").is_some());
         assert!(ui("corpus_search").is_some());
@@ -247,23 +242,23 @@ mod tests {
 
     #[test]
     fn tool_artifact_start_then_done_share_one_card() {
-        let args = serde_json::json!({ "text": "hi" });
-        let start = tool_artifact("t", 1, "c1", "echo", &args, None).into_payload();
+        let args = serde_json::json!({ "url": "https://example.com" });
+        let start = tool_artifact("t", 1, "c1", "web_fetch", &args, None).into_payload();
         assert_eq!(start["phase"], "start");
-        assert_eq!(start["data"]["tool"], "echo");
+        assert_eq!(start["data"]["tool"], "web_fetch");
         assert!(start["data"]["display_name"].is_string());
         assert!(start["data"]["summary"].is_string());
         // No result payload on the start frame.
         assert!(start["data"]["display_payload"].is_null());
 
         let outcome = ToolOutcome::ok(
-            "hi",
-            serde_json::json!({ "text": "hi" }),
+            "ok",
+            serde_json::json!({ "url": "https://example.com" }),
             serde_json::json!({}),
         );
-        let done = tool_artifact("t", 1, "c1", "echo", &args, Some(&outcome)).into_payload();
+        let done = tool_artifact("t", 1, "c1", "web_fetch", &args, Some(&outcome)).into_payload();
         assert_eq!(done["phase"], "completion");
-        assert_eq!(done["data"]["display_payload"]["text"], "hi");
+        assert_eq!(done["data"]["display_payload"]["url"], "https://example.com");
         // Same id and identity → the frontend updates one card, not two.
         assert_eq!(start["artifact_id"], done["artifact_id"]);
         assert_eq!(start["canvas_identity"], done["canvas_identity"]);

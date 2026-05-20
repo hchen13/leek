@@ -7,6 +7,7 @@
 
 import { createMemo, createSignal, For, Match, Show, Switch } from "solid-js";
 
+import { renderInlineMarkdown, renderMarkdown } from "./markdown";
 import type { Artifact, Message, Turn } from "./types";
 
 type CanvasProps = {
@@ -166,7 +167,10 @@ export function Canvas(props: CanvasProps) {
                   <span class="corpus-hit-title">{h.title}</span>
                   <span class="muted"> · {h.id}</span>
                   <Show when={h.snippet}>
-                    <div class="corpus-snippet muted">{h.snippet}</div>
+                    <div
+                      class="corpus-snippet muted markdown-body"
+                      innerHTML={renderInlineMarkdown(h.snippet)}
+                    />
                   </Show>
                 </li>
               )}
@@ -217,9 +221,14 @@ export function Canvas(props: CanvasProps) {
               </For>
             </div>
           </Show>
-          <pre class="card-pre corpus-body">
-            {showFull() ? fullBody() : preview()}
-          </pre>
+          {/* The body is markdown — drop the `<pre>` wrapper that came
+              from before-markdown verbatim render so paragraphs / lists /
+              code blocks reflow normally. `.corpus-body` keeps the
+              scroll-cap and border; `.markdown-body` adds typography. */}
+          <div
+            class="corpus-body markdown-body"
+            innerHTML={renderMarkdown(showFull() ? fullBody() : preview())}
+          />
           <Show when={fullBody().length > preview().length}>
             <button
               class="card-expand"
@@ -380,7 +389,10 @@ export function Canvas(props: CanvasProps) {
               </a>
             </Show>
             <Show when={a.pageSnippet}>
-              <pre class="card-pre">{a.pageSnippet}</pre>
+              <div
+                class="page-snippet markdown-body"
+                innerHTML={renderMarkdown(a.pageSnippet)}
+              />
             </Show>
           </Match>
           <Match when={actionType() === "find_in_page"}>
@@ -399,7 +411,10 @@ export function Canvas(props: CanvasProps) {
                 <For each={a.matches ?? []}>
                   {(m) => (
                     <li>
-                      <pre class="card-pre">{m}</pre>
+                      <div
+                        class="match-text markdown-body"
+                        innerHTML={renderInlineMarkdown(m)}
+                      />
                     </li>
                   )}
                 </For>
@@ -414,7 +429,14 @@ export function Canvas(props: CanvasProps) {
   const renderNotes = (notes: Artifact[]) => (
     <div class="card note-card">
       <div class="card-label">Note Trace</div>
-      <For each={notes}>{(n) => <p class="note-text">{n.text}</p>}</For>
+      <For each={notes}>
+        {(n) => (
+          <div
+            class="note-text markdown-body"
+            innerHTML={renderMarkdown(n.text ?? "")}
+          />
+        )}
+      </For>
     </div>
   );
 

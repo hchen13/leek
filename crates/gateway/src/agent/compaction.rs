@@ -385,17 +385,17 @@ mod tests {
         let dialog = vec![
             serde_json::json!({
                 "type": "function_call", "call_id": "c1",
-                "name": "echo", "arguments": "{\"text\":\"x\"}"
+                "name": "web_fetch", "arguments": "{\"url\":\"https://example.com\"}"
             }),
             serde_json::json!({
-                "type": "function_call_output", "call_id": "c1", "output": "echoed-x"
+                "type": "function_call_output", "call_id": "c1", "output": "fetched-body"
             }),
         ];
         let t = render_for_summary(Some("旧摘要内容"), &[user("早期问题")], &dialog);
         assert!(t.contains("旧摘要内容"));
         assert!(t.contains("早期问题"));
-        assert!(t.contains("echo"));
-        assert!(t.contains("结果：echoed-x"));
+        assert!(t.contains("web_fetch"));
+        assert!(t.contains("结果：fetched-body"));
     }
 
     #[test]

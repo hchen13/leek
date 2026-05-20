@@ -1,8 +1,8 @@
 //! `web_fetch` — fetch an HTTP(S) URL and return its body as text.
 //!
-//! A real, non-deterministic tool alongside `echo`. M1 keeps it deliberately
-//! small (no JS rendering, no crawling) — the milestone's weight is the loop
-//! and the guards, not this tool.
+//! M1's first real, non-deterministic tool. Kept deliberately small (no JS
+//! rendering, no crawling) — the milestone's weight is the loop and the
+//! guards, not this tool.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;

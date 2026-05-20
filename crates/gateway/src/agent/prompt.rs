@@ -128,8 +128,8 @@ mod tests {
     fn prompt_section_order_is_stable_first() {
         // IDENTITY → OPERATING → DISCIPLINE → CORPUS_ORIENTATION → tools.
         let p = build_system_prompt(&[ToolSpec {
-            name: "echo".into(),
-            description: "Echo text.".into(),
+            name: "web_fetch".into(),
+            description: "Fetch a URL.".into(),
             parameters: serde_json::json!({}),
         }]);
         let i_identity = p.find("leek").unwrap();
@@ -146,12 +146,12 @@ mod tests {
     #[test]
     fn prompt_lists_tools() {
         let tools = vec![ToolSpec {
-            name: "echo".into(),
-            description: "Echo text back. Useful for testing.".into(),
+            name: "web_fetch".into(),
+            description: "Fetch a URL as text. Useful for verification.".into(),
             parameters: serde_json::json!({}),
         }];
         let p = build_system_prompt(&tools);
         assert!(p.contains("# 可用工具"));
-        assert!(p.contains("`echo`"));
+        assert!(p.contains("`web_fetch`"));
     }
 }

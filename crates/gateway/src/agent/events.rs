@@ -246,7 +246,7 @@ mod tests {
             "t",
             1,
             "call_9",
-            "echo::{}".into(),
+            "web_fetch::{}".into(),
             Phase::Start,
             serde_json::json!({}),
         );
@@ -254,7 +254,7 @@ mod tests {
             "t",
             1,
             "call_9",
-            "echo::{}".into(),
+            "web_fetch::{}".into(),
             Phase::Completion,
             serde_json::json!({}),
         );
