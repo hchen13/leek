@@ -87,6 +87,12 @@ frontend active tree 全部清底重写。旧代码通过 git history 查询，
   重复、`open_page` 被误标成"网页搜索"），又派 follow-up 改用
   `web_search_call.results` 做 `action.type` 分流——commit `cf1d872`，
   见 decision log 2026-05-20。
+- **F2 completed（2026-05-20）**：LLM transcript 归档落地——每条
+  codex backend 请求（主 iteration + auto-compaction summary call）
+  原始 request body + raw SSE response 写进 `llm_transcripts` 表，
+  3 个 read API 端点（list 元数据 + raw request + raw response）。
+  PM debug 调研"provider 实际发了 / 收了什么"时直接翻 vault.db，
+  不再回拨 codex backend。commit `59d65cc`，见 decision log 2026-05-20。
 
 ---
 
@@ -958,3 +964,63 @@ Task 形态——有 eval case 端到端跑通：
   - 分析、判断、推理不受约束，但其**事实依据**必须搜过、可追溯。
 - 严格度档位（M2.4 实现时再选）：当前 sketch 是"搜不到可加 caveat 后
   给训练答案"。更严的档是"搜不到就停、不给训练答案"。当时再敲。
+
+### 2026-05-20 — F2:LLM transcript 归档（per-iteration 原始请求 + SSE 响应）
+
+- 背景：M1 用户测试期间，PM debug 多次为"`web_search_call` 长啥样"
+  这种问题直连 codex backend 抓 raw SSE——leek 当前只持久化
+  `events` 表（已处理后），没保存原始 LLM 层。每次 debug 都得重新
+  消耗 token、复现状态难。
+- 用户反馈（memory `feedback_transcript_archive`）：leek 应按
+  turn × iteration 归档原始 LLM transcript，debug 直接翻档案。
+- 实现（commit `59d65cc`）：
+  - **Schema**：新 migration `0004_llm_transcripts.sql`——表加
+    `request_body` BLOB（leek 构造的请求 JSON verbatim，Authorization
+    header 不在 body，无凭证泄漏）+ `response_stream` BLOB（raw SSE
+    `event:` / `data:` 框架 verbatim）+ `http_status`（200 / 4xx-5xx /
+    0 sentinel 表 stream 中断）+ started_at / finished_at；
+    `(turn_id, iteration)` UNIQUE；FK 到 sessions ON DELETE CASCADE。
+  - **写入**：`vault::llm_transcripts::insert_request` 在 POST 前
+    eagerly 插入（crash 容灾），`finalize` 在 stream 终止时一次写入
+    response_stream + status + finished_at；`codex::chat` 用 RAII
+    `TranscriptGuard` 在 stream 自然结束 / 提前 drop（idle_timeout
+    取消、consumer cancel）时 tokio::spawn finalize，`completed`
+    atomic flag 区分 200 vs 0 sentinel；非 2xx 立刻 finalize 错误
+    响应体。
+  - **请求归属**：`ChatRequest` 加 `session_id` / `turn_id` /
+    `iteration` 三字段，`build_request_body` 不读、不上 wire；agent
+    loop 用独立的 `transcript_iter` 计数器（含 compaction sub-call，
+    与 `turn_metrics.iteration_count` 解耦），每个 LLM call 占一行。
+  - **API**：`GET /api/v1/sessions/{id}/transcripts` list（元数据 +
+    sizes 不含 raw bytes）；`GET .../{turn_id}/{iteration}/request`
+    返回 `application/json` raw bytes；`GET
+    .../{turn_id}/{iteration}/response` 返回 `text/event-stream` raw
+    bytes——`curl | jq` / `curl | grep` 直读不用 base64。
+  - **解耦**：`parse_sse_stream` 改泛型签名 take bytes stream，方便
+    `codex::chat` 在外层 tap 字节。
+- 不做（MVP）：不动 `events` 表、不动前端、不做 retention / 压缩、
+  不做 chunk-level eager finalize。
+- 单测：vault 5 个（round-trip / UNIQUE / 排序 / session scoping /
+  unfinalized）+ api 5 个（list 空+含 / raw bytes Content-Type / 404）。
+  cargo test 78→88（+10），clippy 0 warning，前端 build 通过。
+- PM curl E2E：
+  - happy path（"用一句中文打招呼"）：~4s 完成，http_status=200，
+    response_bytes=20725，末尾到 response.completed event 完整。
+  - idle_timeout：web_search 长 turn 触发 90s idle_timeout，
+    http_status=0 sentinel + partial bytes 准确归档（被杀前的数据
+    完整保留）。
+  - goal use case（"NVDA 在哪个交易所"）：~10s 完成，
+    response_bytes=48436，档案里直接 grep 到
+    `"web_search_call","status":"completed","action":{"type":"search",
+    "queries":[...]}` + `"results":[...]`——以后调研 web_search_call
+    形状不需要回拨 codex backend，闭环用户反馈。
+- 已知约束（spec 明确）：
+  - status=0 既可能是 idle_timeout 杀流、也可能是上游 transport
+    error，schema 不区分；PM 看 buffer 末尾是否到 response.completed
+    即可判。
+  - 没做 retention，数据量大了再说（可能 follow-up 加 gzip BLOB /
+    周期截断）。
+  - finalize 是 tokio::spawn 异步，turn 结束后立刻 GET 可能瞬间看到
+    http_status=null；等 ~百 ms 即落盘。
+- 闭环 memory `feedback_transcript_archive`（2026-05-20 创建）。后续
+  PM 调研路径变了：先 vault.db / API，找不到再考虑直连 codex backend。
