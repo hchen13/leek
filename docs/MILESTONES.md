@@ -93,6 +93,17 @@ frontend active tree 全部清底重写。旧代码通过 git history 查询，
   3 个 read API 端点（list 元数据 + raw request + raw response）。
   PM debug 调研"provider 实际发了 / 收了什么"时直接翻 vault.db，
   不再回拨 codex backend。commit `59d65cc`，见 decision log 2026-05-20。
+- **M2 completed（2026-05-20，M2.1–M2.4）**：投研 corpus 接入完整链路
+  落地。`crates/gateway/src/corpus/` 手写 BM25 + 倒排索引 +
+  CJK 字符级 / Latin word 混排 tokenizer，启动时 load ~300 文档；
+  `corpus_search` / `corpus_read` 两个工具走标准 ToolSpec / ToolUi /
+  display_payload 三分契约；主 agent system prompt 现按
+  IDENTITY → OPERATING → 求证纪律 → corpus orientation → 可用工具
+  五段顺序组装；前端 Canvas.tsx 加 `corpus_search` / `corpus_read`
+  两个 cardKind 分支。M1 实测 corpus 问题触发 corpus_search × 2 +
+  corpus_read × 4，答案 cite 出 corpus path；事实问题（$NVDA）触发
+  web_search 不再 fallback 训练知识。commit `0e4e67d`，见 decision
+  log 2026-05-20「M2 — corpus 接入」。
 
 ---
 
@@ -366,6 +377,10 @@ canvas / right rail 的边界锁死。
 ---
 
 ## M2 — Corpus
+
+> **状态（2026-05-20）**：M2.1–M2.4 一次性合并 dispatch 完成
+> （commit `0e4e67d`，dispatch spec 见 `docs/dispatches/M2-corpus.md`，
+> 决策详情见 decision log 2026-05-20「M2 — corpus 接入」）。
 
 ### 目标
 
@@ -1024,3 +1039,78 @@ Task 形态——有 eval case 端到端跑通：
     http_status=null；等 ~百 ms 即落盘。
 - 闭环 memory `feedback_transcript_archive`（2026-05-20 创建）。后续
   PM 调研路径变了：先 vault.db / API，找不到再考虑直连 codex backend。
+
+### 2026-05-20 — M2 — corpus 接入（loader + 工具 + system prompt 注入）
+
+- 背景：M2 把让 leek 区别于通用 agent 的内容层 corpus 接进来。
+  仓库的 `./corpus/`（用户维护、独立 git 子库、Karpathy LLM Wiki
+  pattern）已经成型——296 个 markdown，两轴 principles/knowledge ×
+  sources/wikis，frontmatter 含 title/tier/layer/type/source_url 等。
+- 用户决策（2026-05-20）：M2.1–M2.4 **合并一次性 dispatch**——中间
+  状态（M2.1 单出 / M2.2 单出）前端没变化、用户没法验，所以一次
+  做完 PM 才能 e2e 验"agent 调 corpus 搜出原文、cite 出处、按求证
+  纪律答事实"完整链路。Dispatch spec 写进 `docs/dispatches/M2-corpus.md`
+  （+「执行建议」+「Executor 自测 vs PM 浏览器 E2E」拆分），4 个
+  docs commit 加上 spec 演进：`2dab0c5` → `8b68e64` → `fe84c15`。
+- 实现（commit `0e4e67d`，CC session
+  `a352dae1-a703-496f-ad32-a608ac9939bf`）：
+  - **M2.1 Corpus loader + BM25 索引**：手写 BM25（k1=1.2, b=0.75）
+    + 倒排索引；tokenize CJK 字符级 + Latin/ASCII whitespace +
+    lowercase；UTF-8 safe snippet（`floor_char_boundary` /
+    `ceil_char_boundary`）；YAML-lite frontmatter parser 优雅降级；
+    title 优先级 frontmatter → 第一个 h1 → 文件名；跳 dotfiles /
+    `tools/`，**纳入 `_meta/`**（taxonomy 也可搜）。Corpus 根可
+    `--corpus` / `LEEK_CORPUS_DIR` 覆盖，默认 `./corpus/`；missing
+    优雅退化空 corpus；启动 tracing info log。AppState 加
+    `corpus: Arc<Corpus>`。
+  - **M2.2 corpus_search / corpus_read 工具**：标准三分输出
+    `model_output`（格式化列表 / 全 body 给模型）/ `display_payload`
+    （`kind="corpus_search"|"corpus_read"` + 字段）/ `debug_payload`；
+    ToolSpec description 显式 nudge "BEFORE the public web for any
+    question that might be covered by principles" 和 "after
+    corpus_search surfaces a promising hit"；`corpus_read.display_payload`
+    塞完整 body（corpus 页 ~250 行 lint cap，bounded），canvas 展开
+    全文不需 round-trip。
+  - **M2.3 corpus orientation**：`include_str!("../../../../harness/
+    corpus_orientation.md")`，注入主 agent system prompt。
+  - **M2.4 求证纪律 prompt section**：inline const，按 decision log
+    2026-05-19 锁的措辞写。
+  - prompt.rs 五段顺序：IDENTITY → OPERATING → **求证纪律** →
+    **corpus orientation** → 可用工具（4 个 prompt 单测包含
+    `prompt_section_order_is_stable_first` 验全顺序）。
+  - 前端 Canvas.tsx 加 `corpus_search` / `corpus_read` 两个 cardKind
+    分支，按 F1 的 accessor pattern 写（start→completion 切变体能
+    live 响应），含 top N 列表 + 展开全部、frontmatter chips +
+    展开全文。
+- 测试 88 → 125（+37：corpus 13 + bm25 8 + loader 5 + corpus_search 5
+  + corpus_read 5 + prompt 4 - 1 改名）；clippy 0 warning；前端 build
+  37.64 KB。
+- PM 验收（执行 + 浏览器 E2E）：
+  - **启动日志**：`corpus loaded: 296 docs from ./corpus`。
+  - **API E2E corpus 问题**："Munger 怎么看 circle of competence?" →
+    6 工具调用（corpus_search × 2 + corpus_read × 4）→ top hits 含
+    munger 目录 + circle-of-competence wiki + Buffett-Munger-Dalio
+    比较 wiki → 答案 cite `wikis/principles/concepts/circle-of-competence.md`
+    + `sources/principles/munger/poor-charlies-almanack.md`，引出
+    5 段原文、最后压成"不要证明自己聪明,要知道自己在哪些少数地方
+    真有优势,只在那些地方下注"。
+  - **API E2E 事实问题（求证纪律）**："$NVDA 现在交易在哪个交易所?"
+    → 4 web_search 事件 fired，没 fallback 训练知识。
+  - **F2 transcript**：request body grep 到 求证纪律 1 次 +
+    corpus orientation 1 次 + tools array 含 corpus_search +
+    corpus_read。
+  - **真 corpus sanity**：`cargo test --ignored corpus_sanity_real_corpus`
+    在 296 文档上 top 5 排序合理（wikis 的 circle-of-competence 在 #3）。
+  - **浏览器**：canvas 上 corpus_search 卡 = query + top 6 标题列表 +
+    "显示全部 10 条" 展开；corpus_read 卡 = 标题 + ID + 字节数 +
+    frontmatter chips（confidence/format/layer/slug/sources/tags/
+    tier/title/type/updated）+ body preview + "展开全文"。
+- 已知 BM25 v0 行为（接受 trade-off）：搜索 "Munger circle of
+  competence" 时 `_meta/status.md` / `_meta/log.md` 排在前面（这些
+  metadata 文件确实高频提及 munger / circle / competence）；目标
+  概念 wiki `circle-of-competence.md` 在 top 3。是否做 path-based
+  weighting（sources/principles > _meta）/ title-only boost / 过滤
+  _meta 从默认搜索结果里——未来若召回不够再说，本次接受 v0 lexical
+  排序。
+- 闭环：cf1d872 web_search 卡片整顿、9de67a6 求证纪律延后、
+  fe84c15 dispatch 验收拆分 全部由本条收口。
