@@ -36,12 +36,20 @@ export type Surface = "chat" | "canvas" | "right_rail" | "lifecycle";
 /** Lifecycle phase of a canvas artifact frame. */
 export type Phase = "start" | "completion" | "error";
 
-/** A `url_citation` source on a provider-search card (REQUIREMENTS §4.3). */
-export type Source = { url: string; host: string | null; title: string | null };
+/** One result on a provider-search card — a title (may fall back to host),
+ *  the URL it points to, and the URL's host (parsed gateway-side).
+ *  (REQUIREMENTS §4.3, MILESTONES decision 2026-05-20.) */
+export type SearchResult = { title: string | null; url: string; host: string | null };
 
 /** A canvas process card, accumulated from one or more `CanvasArtifact`
  *  frames sharing an `artifactId`. Notes are instantaneous; tool / search
- *  artifacts move `start` → `completion` / `error`. */
+ *  artifacts move `start` → `completion` / `error`.
+ *
+ *  Search-card variants share the `kind: "search"` artifact but render
+ *  differently per `actionType`: `search` (a query result list),
+ *  `open_page` (one fetched page + snippet), `find_in_page` (matches
+ *  inside a page), or an unknown activity. The variant-specific fields
+ *  are nullable — only the ones for the current `actionType` are set. */
 export type Artifact = {
   artifactId: string;
   canvasIdentity: string;
@@ -58,9 +66,19 @@ export type Artifact = {
   args?: unknown;
   displayPayload?: Record<string, unknown>;
   debugPayload?: Record<string, unknown>;
-  // search
+  // search — common
+  actionType?: string;
+  // search — `search` variant
   query?: string | null;
-  sources?: Source[];
+  results?: SearchResult[];
+  resultsTotal?: number;
+  // search — `open_page` / `find_in_page` variants
+  pageUrl?: string;
+  pageHost?: string | null;
+  pageTitle?: string | null;
+  pageSnippet?: string | null;
+  pattern?: string;
+  matches?: string[];
 };
 
 export type TurnMetrics = {

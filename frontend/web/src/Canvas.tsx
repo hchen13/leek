@@ -5,7 +5,7 @@
 // cards are hidden by default and revealed by a settings toggle (§2.4).
 // The canvas never shows the final reply — that lives only in chat.
 
-import { createMemo, createSignal, For, Show } from "solid-js";
+import { createMemo, createSignal, For, Match, Show, Switch } from "solid-js";
 
 import type { Artifact, Message, Turn } from "./types";
 
@@ -76,6 +76,11 @@ function snippet(text: string, max = 64): string {
   const one = text.replace(/\s+/g, " ").trim();
   return one.length <= max ? one : one.slice(0, max) + "…";
 }
+
+/** Default count of search results shown before the "show all" button —
+ *  the backend already orders by relevance, so the top of the list is the
+ *  most useful page (REQUIREMENTS §4.3). */
+const SEARCH_TOP_N = 6;
 
 function formatJson(value: unknown): string {
   try {
@@ -161,42 +166,158 @@ export function Canvas(props: CanvasProps) {
     );
   };
 
-  const renderSearchCard = (a: Artifact) => (
-    <div
-      id={`card-${a.artifactId}`}
-      classList={{ card: true, "search-card": true, highlighted: props.highlight() === a.artifactId }}
-    >
-      <div class="card-head">
-        <span classList={{ "status-dot": true, running: a.phase === "start", ok: a.phase !== "start" }} />
-        <span class="card-name">网页搜索</span>
-        <span class="card-summary">{a.query ?? ""}</span>
-      </div>
-      <Show when={a.phase === "start"}>
-        <p class="card-running">搜索中…</p>
-      </Show>
-      <Show when={a.phase !== "start"}>
-        <Show
-          when={a.sources && a.sources.length > 0}
-          fallback={<p class="muted">（本次搜索没有返回可引用来源）</p>}
+  const renderSearchCard = (a: Artifact) => {
+    // Every field read on `a` happens through an accessor so Solid tracks
+    // it — a plain `const x = a.foo` freezes `x` at mount time, which made
+    // the start→completion transition silently stick on the start frame
+    // for variants whose start fallback doesn't read the same fields as
+    // their completion body (find_in_page was the case that exposed this).
+    // Structural variant branching uses `<Switch>`/`<Match>`: each `when`
+    // is an accessor, so the active branch re-evaluates on every store
+    // change.
+    const isStart = () => a.phase === "start";
+    const actionType = () => a.actionType;
+    const allResults = () => a.results ?? [];
+    const total = () => a.resultsTotal ?? allResults().length;
+    const showAll = () => expanded().has(a.artifactId);
+    const visible = () =>
+      showAll() ? allResults() : allResults().slice(0, SEARCH_TOP_N);
+
+    return (
+      <div
+        id={`card-${a.artifactId}`}
+        classList={{
+          card: true,
+          "search-card": true,
+          highlighted: props.highlight() === a.artifactId,
+        }}
+      >
+        <div class="card-head">
+          <span
+            classList={{ "status-dot": true, running: isStart(), ok: !isStart() }}
+          />
+          <Switch
+            fallback={
+              <>
+                <span class="card-name">网页活动</span>
+                <span class="card-summary">{actionType()}</span>
+              </>
+            }
+          >
+            <Match when={isStart() || !actionType()}>
+              <span class="card-name">网页搜索</span>
+              <span class="card-summary">{a.query ?? ""}</span>
+            </Match>
+            <Match when={actionType() === "search"}>
+              <span class="card-name">网页搜索</span>
+              <span class="card-summary">{a.query ?? ""}</span>
+              <span class="muted"> · {total()} 条结果</span>
+            </Match>
+            <Match when={actionType() === "open_page"}>
+              <span class="card-name">打开网页</span>
+              <span class="card-summary">{a.pageHost ?? a.pageUrl ?? ""}</span>
+            </Match>
+            <Match when={actionType() === "find_in_page"}>
+              <span class="card-name">页面内查找</span>
+              <span class="card-summary">{a.pattern ?? ""}</span>
+              <Show when={a.pageHost}>
+                <span class="muted"> · {a.pageHost}</span>
+              </Show>
+            </Match>
+          </Switch>
+        </div>
+        <Switch
+          fallback={
+            // Unknown variant — dump the variant-shaped fields defensively.
+            <pre class="card-pre">
+              {formatJson({
+                url: a.pageUrl,
+                host: a.pageHost,
+                pattern: a.pattern,
+                query: a.query,
+              })}
+            </pre>
+          }
         >
-          <ul class="source-list">
-            <For each={a.sources}>
-              {(s) => (
-                <li>
-                  <a href={s.url} target="_blank" rel="noreferrer">
-                    {s.title ?? s.host ?? s.url}
-                  </a>
-                  <Show when={s.host}>
-                    <span class="muted"> · {s.host}</span>
-                  </Show>
-                </li>
-              )}
-            </For>
-          </ul>
-        </Show>
-      </Show>
-    </div>
-  );
+          <Match when={isStart()}>
+            <p class="card-running">搜索中…</p>
+          </Match>
+          <Match when={!actionType()}>
+            {/* Legacy `search_lifecycle` events from before the variant
+                split — render nothing variant-specific, don't crash. */}
+            {null}
+          </Match>
+          <Match when={actionType() === "search"}>
+            <Show
+              when={allResults().length > 0}
+              fallback={<p class="muted">0 条结果</p>}
+            >
+              <ol class="search-result-list">
+                <For each={visible()}>
+                  {(r) => (
+                    <li>
+                      <a href={r.url} target="_blank" rel="noreferrer">
+                        {r.title ?? r.host ?? r.url}
+                      </a>
+                      <Show when={r.host}>
+                        <span class="muted"> · {r.host}</span>
+                      </Show>
+                    </li>
+                  )}
+                </For>
+              </ol>
+              <Show when={allResults().length > SEARCH_TOP_N}>
+                <button
+                  class="card-expand"
+                  onClick={() => toggle(expanded, setExpanded, a.artifactId)}
+                >
+                  {showAll() ? "收起" : `显示全部 ${total()} 条`}
+                </button>
+              </Show>
+            </Show>
+          </Match>
+          <Match when={actionType() === "open_page"}>
+            <Show when={a.pageUrl}>
+              <a
+                class="web-title"
+                href={a.pageUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                {a.pageTitle ?? a.pageUrl ?? ""}
+              </a>
+            </Show>
+            <Show when={a.pageSnippet}>
+              <pre class="card-pre">{a.pageSnippet}</pre>
+            </Show>
+          </Match>
+          <Match when={actionType() === "find_in_page"}>
+            <Show when={a.pageUrl}>
+              <a
+                class="web-title"
+                href={a.pageUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                {a.pageUrl}
+              </a>
+            </Show>
+            <Show when={a.matches && a.matches.length > 0}>
+              <ul class="search-result-list">
+                <For each={a.matches ?? []}>
+                  {(m) => (
+                    <li>
+                      <pre class="card-pre">{m}</pre>
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </Show>
+          </Match>
+        </Switch>
+      </div>
+    );
+  };
 
   const renderNotes = (notes: Artifact[]) => (
     <div class="card note-card">

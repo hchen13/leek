@@ -96,17 +96,16 @@ pub enum LlmEvent {
     /// A provider-side web search (M1.9.4). The provider runs the search
     /// itself; the loop does not dispatch or re-inject anything — it only
     /// observes the lifecycle to draw the canvas search card.
+    ///
+    /// The variant inside `action` says what kind of search activity this
+    /// was — a query, an `open_page`, a `find_in_page` — and carries the
+    /// fields appropriate to that activity. `None` on the `Start` frame:
+    /// the `output_item.added` event has no `action`, so the activity is
+    /// unknown until the matching `output_item.done` arrives.
     WebSearch {
         call_id: String,
         phase: WebSearchPhase,
-        /// The search query — reported once the provider has it (on
-        /// completion); `None` while the search is still starting.
-        query: Option<String>,
-        /// Resolved source URLs for this search, parsed from the backend's
-        /// `web_search_call.action.sources` (REQUIREMENTS §4.3, MILESTONES
-        /// decision 2026-05-19). Empty on the `Start` frame; populated on
-        /// `Completed` — the request opts in to this data via `include`.
-        sources: Vec<String>,
+        action: Option<WebSearchAction>,
     },
 }
 
@@ -115,6 +114,57 @@ pub enum LlmEvent {
 pub enum WebSearchPhase {
     Started,
     Completed,
+}
+
+/// What a `web_search_call` did — derived from the backend's `action.type`
+/// (MILESTONES decision 2026-05-20). Each variant carries the fields that
+/// activity is meaningful with; `Unknown` keeps the raw `action.type` so an
+/// unrecognized activity still renders something instead of crashing.
+///
+/// The request opts in to per-call results via
+/// `include: ["web_search_call.results"]`. That one value covers all
+/// activities — `Search` gets a list of `{title, url}`, `OpenPage` gets the
+/// page's title and a cleaned content snippet, `FindInPage` gets matching
+/// passages.
+#[derive(Debug, Clone)]
+pub enum WebSearchAction {
+    /// `action.type == "search"` — a query over the web.
+    Search {
+        /// The query the provider actually ran. `None` if absent.
+        query: Option<String>,
+        /// One entry per `text_result` in the call's `results`. Snippets
+        /// are dropped: search cards show titles + URLs only.
+        results: Vec<SearchResult>,
+    },
+    /// `action.type == "open_page"` — the provider opened a URL and read it.
+    OpenPage {
+        url: String,
+        /// The page's title — `None` if absent.
+        title: Option<String>,
+        /// Cleaned page content from `results[0].snippet`. `None` if
+        /// `results` was empty.
+        snippet: Option<String>,
+    },
+    /// `action.type == "find_in_page"` — pattern lookup inside an opened
+    /// page. Matches are cleaned snippets from each `results` entry.
+    FindInPage {
+        url: String,
+        pattern: String,
+        matches: Vec<String>,
+    },
+    /// Any other `action.type` — recorded so the UI can show the activity
+    /// name without guessing what to render.
+    Unknown {
+        /// The raw `action.type`.
+        kind: String,
+    },
+}
+
+/// One entry in a `Search` action's `results`.
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub title: Option<String>,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

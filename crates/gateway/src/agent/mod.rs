@@ -35,7 +35,10 @@ use anyhow::Result;
 use futures::StreamExt;
 
 use crate::api::AppState;
-use crate::llm::{pricing, ChatMessage, ChatRequest, LlmEvent, Role, StopReason, WebSearchPhase};
+use crate::llm::{
+    pricing, ChatMessage, ChatRequest, LlmEvent, Role, StopReason, WebSearchAction,
+    WebSearchPhase,
+};
 use crate::vault::{messages, sessions, turn_metrics};
 
 /// The model leek runs on, with its fixed M1 inference settings. There is no
@@ -285,28 +288,23 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
                 Ok(LlmEvent::WebSearch {
                     call_id,
                     phase,
-                    query,
-                    sources,
+                    action,
                 }) => {
-                    // Provider-side search (M1.9.4): observed, not dispatched
-                    // — normalized to a canvas search artifact. The backend
-                    // reports each search's resolved sources on its
-                    // `Completed` frame's `action.sources` (MILESTONES
-                    // decision 2026-05-19); they ride straight onto its card.
+                    // Provider-side search (M1.9.4): observed, not
+                    // dispatched — normalized to a canvas search artifact.
+                    // The backend reports per-call results on the
+                    // `Completed` frame via the request's
+                    // `include: ["web_search_call.results"]` opt-in
+                    // (MILESTONES decision 2026-05-20). The activity kind
+                    // (`search` / `open_page` / `find_in_page` / unknown)
+                    // is mapped to a variant-specific `data` body — the
+                    // event kind stays `search_lifecycle` so the contract
+                    // is stable.
                     let canvas_phase = match phase {
                         WebSearchPhase::Started => events::Phase::Start,
                         WebSearchPhase::Completed => events::Phase::Completion,
                     };
-                    let source_cards: Vec<serde_json::Value> = sources
-                        .iter()
-                        .map(|url| {
-                            serde_json::json!({
-                                "url": url,
-                                "host": web_search_host(url),
-                                "title": serde_json::Value::Null,
-                            })
-                        })
-                        .collect();
+                    let data = build_search_data(action.as_ref());
                     st.emit(
                         session_id,
                         events::kind::SEARCH_LIFECYCLE,
@@ -315,8 +313,7 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
                             iteration_count,
                             &call_id,
                             canvas_phase,
-                            query.as_deref(),
-                            source_cards,
+                            data,
                         )
                         .into_payload(),
                     )
@@ -568,12 +565,63 @@ fn plan_payload(turn_id: &str, outcome: &tools::ToolOutcome) -> serde_json::Valu
     })
 }
 
-/// Host of a provider-search source URL, for the canvas search card. A URL
-/// that does not parse is carried without a host (the card shows the URL).
+/// Host of a provider-search URL, for the canvas search card. A URL that
+/// does not parse is carried without a host (the card shows the URL).
 fn web_search_host(url: &str) -> Option<String> {
     reqwest::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
+}
+
+/// Map a `WebSearchAction` variant to the `search_lifecycle` `data` body the
+/// frontend renders. `None` (the `Start` frame) yields an empty object —
+/// the activity is only known on completion. Each variant tags its body
+/// with `action_type` so the renderer never guesses the activity from the
+/// presence or absence of fields.
+fn build_search_data(action: Option<&WebSearchAction>) -> serde_json::Value {
+    match action {
+        None => serde_json::json!({}),
+        Some(WebSearchAction::Search { query, results }) => {
+            let results_json: Vec<serde_json::Value> = results
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "title": r.title,
+                        "url": r.url,
+                        "host": web_search_host(&r.url),
+                    })
+                })
+                .collect();
+            let total = results_json.len();
+            serde_json::json!({
+                "action_type": "search",
+                "query": query,
+                "results": results_json,
+                "results_total": total,
+            })
+        }
+        Some(WebSearchAction::OpenPage { url, title, snippet }) => {
+            serde_json::json!({
+                "action_type": "open_page",
+                "url": url,
+                "host": web_search_host(url),
+                "title": title,
+                "snippet": snippet,
+            })
+        }
+        Some(WebSearchAction::FindInPage { url, pattern, matches }) => {
+            serde_json::json!({
+                "action_type": "find_in_page",
+                "url": url,
+                "host": web_search_host(url),
+                "pattern": pattern,
+                "matches": matches,
+            })
+        }
+        Some(WebSearchAction::Unknown { kind }) => {
+            serde_json::json!({ "action_type": kind })
+        }
+    }
 }
 
 /// Compose the persisted assistant message. A guard- or error-stopped turn

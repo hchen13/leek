@@ -58,19 +58,44 @@ function mergeData(art: Artifact, kind: Artifact["kind"], data: Record<string, u
     }
     return;
   }
-  // search
-  if (data.query != null) art.query = String(data.query);
-  const sources = data.sources;
-  if (Array.isArray(sources) && sources.length > 0) {
-    art.sources = sources.map((s) => {
-      const o = (s ?? {}) as Record<string, unknown>;
-      return {
-        url: String(o.url ?? ""),
-        host: o.host == null ? null : String(o.host),
-        title: o.title == null ? null : String(o.title),
-      };
-    });
+  // search — the activity variant is in `action_type`. A Start frame has
+  // an empty `data`, so `actionType` may be unset until the Completed frame
+  // arrives; the renderer treats unset as a still-loading state.
+  if (data.action_type != null) art.actionType = String(data.action_type);
+
+  if (data.action_type === "search") {
+    if (data.query !== undefined) {
+      art.query = data.query == null ? null : String(data.query);
+    }
+    if (Array.isArray(data.results)) {
+      art.results = data.results.map((r) => {
+        const o = (r ?? {}) as Record<string, unknown>;
+        return {
+          title: o.title == null ? null : String(o.title),
+          url: String(o.url ?? ""),
+          host: o.host == null ? null : String(o.host),
+        };
+      });
+    }
+    if (data.results_total != null) art.resultsTotal = Number(data.results_total);
+  } else if (data.action_type === "open_page") {
+    if (data.url != null) art.pageUrl = String(data.url);
+    if (data.host !== undefined) art.pageHost = data.host == null ? null : String(data.host);
+    if (data.title !== undefined) art.pageTitle = data.title == null ? null : String(data.title);
+    if (data.snippet !== undefined) {
+      art.pageSnippet = data.snippet == null ? null : String(data.snippet);
+    }
+  } else if (data.action_type === "find_in_page") {
+    if (data.url != null) art.pageUrl = String(data.url);
+    if (data.host !== undefined) art.pageHost = data.host == null ? null : String(data.host);
+    if (data.pattern != null) art.pattern = String(data.pattern);
+    if (Array.isArray(data.matches)) {
+      art.matches = data.matches.map((m) => String(m ?? ""));
+    }
   }
+  // Any other `action_type` (Unknown variant) renders by its name with no
+  // variant-specific fields; a Start frame (no action_type) carries
+  // nothing yet and waits for Completed.
 }
 
 export function createWorkbench() {

@@ -176,17 +176,20 @@ impl CanvasArtifact {
     }
 
     /// A provider-side web-search artifact (REQUIREMENTS §4.3). One card per
-    /// search call; the call id is both the artifact id and the identity.
-    /// `sources` come from the backend's `web_search_call.action.sources`
-    /// (MILESTONES decision 2026-05-19) — empty on the `Start` frame, and
-    /// carrying the search's resolved sources on the `Completion` frame.
+    /// `web_search_call`; the call id is both the artifact id and the
+    /// identity. `data` is assembled by the agent loop from the call's
+    /// `action.type` variant (MILESTONES decision 2026-05-20):
+    /// `search` carries a query plus a title+url result list; `open_page`
+    /// carries the page url + a cleaned content snippet; `find_in_page`
+    /// carries a url + pattern + matches; an unknown activity falls back to
+    /// its `action_type` name. The `Start` frame's `data` is empty — the
+    /// activity is only known on completion.
     pub fn search(
         turn_id: &str,
         iteration: usize,
         call_id: &str,
         phase: Phase,
-        query: Option<&str>,
-        sources: Vec<serde_json::Value>,
+        data: serde_json::Value,
     ) -> Self {
         Self {
             turn_id: turn_id.to_string(),
@@ -194,7 +197,7 @@ impl CanvasArtifact {
             phase,
             canvas_identity: format!("search-{call_id}"),
             iteration,
-            data: serde_json::json!({ "query": query, "sources": sources }),
+            data,
         }
     }
 }
@@ -257,23 +260,34 @@ mod tests {
         );
         assert_eq!(start.artifact_id, done.artifact_id);
 
-        let s = CanvasArtifact::search("t", 1, "ws_2", Phase::Completion, Some("q"), Vec::new())
-            .into_payload();
+        let s = CanvasArtifact::search(
+            "t",
+            1,
+            "ws_2",
+            Phase::Completion,
+            serde_json::json!({ "action_type": "search", "query": "q", "results": [] }),
+        )
+        .into_payload();
         assert_eq!(s["artifact_id"], "search-ws_2");
         assert_eq!(s["data"]["query"], "q");
-        assert_eq!(s["data"]["sources"], serde_json::json!([]));
+        assert_eq!(s["data"]["results"], serde_json::json!([]));
     }
 
     #[test]
-    fn search_artifact_carries_its_sources() {
-        let sources = vec![serde_json::json!({
-            "url": "https://example.com/a", "host": "example.com", "title": "A"
-        })];
-        let p = CanvasArtifact::search("t", 3, "ws_9", Phase::Completion, Some("ai capex"), sources)
-            .into_payload();
-        assert_eq!(p["data"]["query"], "ai capex");
-        assert_eq!(p["data"]["sources"][0]["host"], "example.com");
-        assert_eq!(p["data"]["sources"][0]["title"], "A");
+    fn search_artifact_passes_data_through_verbatim() {
+        // The envelope does not interpret the variant-specific data — the
+        // agent loop builds it from the action variant and we just wrap it.
+        let data = serde_json::json!({
+            "action_type": "open_page",
+            "url": "https://example.com/a",
+            "host": "example.com",
+            "title": "A",
+            "snippet": "hello",
+        });
+        let p = CanvasArtifact::search("t", 3, "ws_9", Phase::Completion, data).into_payload();
+        assert_eq!(p["data"]["action_type"], "open_page");
+        assert_eq!(p["data"]["snippet"], "hello");
+        assert_eq!(p["data"]["host"], "example.com");
     }
 
     #[test]

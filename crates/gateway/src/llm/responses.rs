@@ -11,7 +11,9 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::Deserialize;
 
-use super::{ChatRequest, LlmEvent, StopReason, Usage, WebSearchPhase};
+use super::{
+    ChatRequest, LlmEvent, SearchResult, StopReason, Usage, WebSearchAction, WebSearchPhase,
+};
 
 /// Build the Responses API request body for `req`.
 ///
@@ -55,11 +57,12 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
     // keeps it opt-in (see `ChatRequest.web_search`).
     if req.web_search {
         tools.push(serde_json::json!({ "type": "web_search" }));
-        // Opt in to per-search source data: the backend then attaches each
-        // search's resolved sources to its `web_search_call.action.sources`
-        // (MILESTONES decision 2026-05-19). Without this `include` the search
-        // card stays sourceless — codex does not surface them otherwise.
-        body["include"] = serde_json::json!(["web_search_call.action.sources"]);
+        // Opt in to per-call results (MILESTONES decision 2026-05-20). One
+        // value, `web_search_call.results`, covers every activity kind:
+        // `search` results carry titles + URLs, `open_page` carries the
+        // page snippet, `find_in_page` carries matched passages. Without
+        // this `include` the search cards show only the activity outline.
+        body["include"] = serde_json::json!(["web_search_call.results"]);
     }
     if !tools.is_empty() {
         body["tools"] = serde_json::Value::Array(tools);
@@ -170,9 +173,17 @@ struct ItemObject {
     /// `web_search_call` items carry their id in `id`, not `call_id`.
     #[serde(default)]
     id: Option<String>,
-    /// `web_search_call` action — `{type:"search", query, queries, sources}`.
+    /// `web_search_call` action — its `type` ("search" / "open_page" /
+    /// "find_in_page" / …) selects the variant; the rest of the keys
+    /// (`query`, `url`, `pattern`, …) depend on that variant.
     #[serde(default)]
     action: Option<serde_json::Value>,
+    /// `web_search_call` results — one `text_result` per entry, populated
+    /// when the request opts in via
+    /// `include: ["web_search_call.results"]` (MILESTONES decision
+    /// 2026-05-20). Empty on the `Start` frame.
+    #[serde(default)]
+    results: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -315,27 +326,66 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Normalize a `web_search_call` item into a `WebSearch` event. An item with
-/// no id cannot be correlated across its start / completion frames — skip it
-/// (→ Ping) rather than emit a dangling artifact.
+/// Normalize a `web_search_call` item into a `WebSearch` event. An item
+/// with no id cannot be correlated across its start / completion frames —
+/// skip it (→ Ping) rather than emit a dangling artifact. The activity
+/// variant is only known on completion; the `Start` frame carries `None`.
 fn web_search_event(item: &ItemObject, phase: WebSearchPhase) -> Vec<LlmEvent> {
     let Some(call_id) = item.id.clone().or_else(|| item.call_id.clone()) else {
         return vec![LlmEvent::Ping];
     };
-    let query = item.action.as_ref().and_then(search_query);
-    let sources = search_sources(item.action.as_ref());
+    let action = match phase {
+        WebSearchPhase::Started => None,
+        WebSearchPhase::Completed => parse_web_search_action(item),
+    };
     vec![LlmEvent::WebSearch {
         call_id,
         phase,
-        query,
-        sources,
+        action,
     }]
 }
 
-/// Pull the query out of a `web_search_call` action
-/// (`{type:"search", query, queries}`) — `query` first, else the first of
-/// `queries`.
-fn search_query(action: &serde_json::Value) -> Option<String> {
+/// Map a completed `web_search_call`'s `action.type` onto a
+/// `WebSearchAction` variant (MILESTONES decision 2026-05-20). An item
+/// with no `action` returns `None` (nothing to render); an unrecognized
+/// `type` becomes `Unknown` so the card still shows the activity name.
+fn parse_web_search_action(item: &ItemObject) -> Option<WebSearchAction> {
+    let action = item.action.as_ref()?;
+    let kind = action.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match kind {
+        "search" => {
+            let query = pull_query(action);
+            let results = parse_search_results(item);
+            Some(WebSearchAction::Search { query, results })
+        }
+        "open_page" => {
+            let url = pull_action_str(action, "url").unwrap_or_default();
+            let (title, snippet) = parse_first_result(item);
+            Some(WebSearchAction::OpenPage {
+                url,
+                title,
+                snippet,
+            })
+        }
+        "find_in_page" => {
+            let url = pull_action_str(action, "url").unwrap_or_default();
+            let pattern = pull_action_str(action, "pattern").unwrap_or_default();
+            let matches = parse_match_snippets(item);
+            Some(WebSearchAction::FindInPage {
+                url,
+                pattern,
+                matches,
+            })
+        }
+        other => Some(WebSearchAction::Unknown {
+            kind: other.to_string(),
+        }),
+    }
+}
+
+/// Pull the query out of a `search` action — `query` first, else the first
+/// of `queries`. Empty strings are treated as absent.
+fn pull_query(action: &serde_json::Value) -> Option<String> {
     let from = |v: Option<&serde_json::Value>| {
         v.and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
@@ -349,27 +399,176 @@ fn search_query(action: &serde_json::Value) -> Option<String> {
     })
 }
 
-/// Pull resolved source URLs out of a `web_search_call` action. The codex
-/// backend attaches them as `action.sources: [{type:"url", url:"…"}, …]`
-/// once the request opts in via `include: ["web_search_call.action.sources"]`
-/// (MILESTONES decision 2026-05-19). Only `type == "url"` entries with a
-/// non-empty URL are kept; a `Start`-frame action carries no `sources`.
-fn search_sources(action: Option<&serde_json::Value>) -> Vec<String> {
-    let Some(arr) = action
-        .and_then(|a| a.get("sources"))
-        .and_then(|v| v.as_array())
-    else {
+/// Pull a string field off an action, dropping empty strings.
+fn pull_action_str(action: &serde_json::Value, key: &str) -> Option<String> {
+    action
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Parse a `web_search_call`'s `results` into title+url pairs — search
+/// cards show titles and URLs only, so the snippet is dropped here. Only
+/// `type == "text_result"` entries with a non-empty URL survive.
+fn parse_search_results(item: &ItemObject) -> Vec<SearchResult> {
+    let Some(arr) = item.results.as_ref() else {
         return Vec::new();
     };
     arr.iter()
-        .filter(|s| s.get("type").and_then(|v| v.as_str()) == Some("url"))
-        .filter_map(|s| {
-            s.get("url")
+        .filter(|r| r.get("type").and_then(|v| v.as_str()) == Some("text_result"))
+        .filter_map(|r| {
+            let url = r
+                .get("url")
                 .and_then(|v| v.as_str())
-                .filter(|u| !u.is_empty())
-                .map(str::to_string)
+                .filter(|u| !u.is_empty())?;
+            let title = r
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            Some(SearchResult {
+                title,
+                url: url.to_string(),
+            })
         })
         .collect()
+}
+
+/// First `text_result` of an `open_page` call — its title and the cleaned
+/// page snippet. `None`s if the entry or its fields are absent.
+fn parse_first_result(item: &ItemObject) -> (Option<String>, Option<String>) {
+    let arr = item.results.as_ref();
+    let first = arr.and_then(|a| {
+        a.iter()
+            .find(|r| r.get("type").and_then(|v| v.as_str()) == Some("text_result"))
+    });
+    let Some(r) = first else {
+        return (None, None);
+    };
+    let title = r
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let snippet = r
+        .get("snippet")
+        .and_then(|v| v.as_str())
+        .map(clean_snippet)
+        .filter(|s| !s.is_empty());
+    (title, snippet)
+}
+
+/// All `text_result` snippets of a `find_in_page` call, cleaned. Empty
+/// snippets are dropped.
+fn parse_match_snippets(item: &ItemObject) -> Vec<String> {
+    let Some(arr) = item.results.as_ref() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter(|r| r.get("type").and_then(|v| v.as_str()) == Some("text_result"))
+        .filter_map(|r| {
+            r.get("snippet")
+                .and_then(|v| v.as_str())
+                .map(clean_snippet)
+                .filter(|s| !s.is_empty())
+        })
+        .collect()
+}
+
+/// Strip the codex backend's internal snippet header so the body lands on
+/// the canvas as plain page content. Two header shapes appear in practice:
+///
+/// - `search`: `【turn0search0】 [wordlim: 200] Published: …; Crawled: …;`
+/// - `open_page`: `【turn0view0】 [wordlim: 200] Content type: …; Source: open(…); Total lines: N\n`
+///   followed by body lines each prefixed with `L<N>: `.
+///
+/// Each stage is best-effort — a snippet that does not match a stage is
+/// left as-is past that point. Inline `【N†...】` citations that appear
+/// after a body line's `L<N>: ` prefix are kept (they identify references
+/// in the page, not header noise).
+fn clean_snippet(raw: &str) -> String {
+    let mut s = raw.trim_start();
+
+    // 1. Leading 【...】 citation tag.
+    if let Some(rest) = s.strip_prefix('【') {
+        if let Some(end) = rest.find('】') {
+            s = rest[end + '】'.len_utf8()..].trim_start();
+        }
+    }
+
+    // 2. [wordlim: N] marker.
+    if let Some(after) = strip_wordlim(s) {
+        s = after.trim_start();
+    }
+
+    // 3. Activity header — search-style or open_page-style. They never
+    //    co-occur, so trying one or the other is sufficient.
+    if let Some(after) = strip_search_header(s) {
+        s = after;
+    } else if let Some(after) = strip_open_page_header(s) {
+        s = after;
+    }
+
+    // 4. Per-line `L<N>: ` prefix — open_page (and presumably find_in_page)
+    //    body lines.
+    let body: String = s
+        .lines()
+        .map(strip_line_marker)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    body.trim().to_string()
+}
+
+fn strip_wordlim(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    let inner = rest[..end].trim_start();
+    if !inner.starts_with("wordlim:") {
+        return None;
+    }
+    Some(&rest[end + 1..])
+}
+
+fn strip_search_header(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix("Published:")?;
+    let semi = rest.find(';')?;
+    let rest = rest[semi + 1..].trim_start();
+    let rest = rest.strip_prefix("Crawled:")?;
+    let semi = rest.find(';')?;
+    Some(&rest[semi + 1..])
+}
+
+fn strip_open_page_header(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix("Content type:")?;
+    let semi = rest.find(';')?;
+    let rest = rest[semi + 1..].trim_start();
+    let rest = rest.strip_prefix("Source:")?;
+    // `Source: open(...)` — the `;` after this field comes AFTER the
+    // closing `)`, not the `;` inside the JSON-like blob.
+    let paren_close = rest.find(')')?;
+    let after_paren = &rest[paren_close + 1..];
+    let semi = after_paren.find(';')?;
+    let rest = after_paren[semi + 1..].trim_start();
+    let rest = rest.strip_prefix("Total lines:")?;
+    let nl = rest.find('\n').unwrap_or(rest.len());
+    Some(&rest[nl..])
+}
+
+fn strip_line_marker(line: &str) -> &str {
+    let Some(rest) = line.strip_prefix('L') else {
+        return line;
+    };
+    let digits_end = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits_end == 0 {
+        return line;
+    }
+    let rest = &rest[digits_end..];
+    let Some(rest) = rest.strip_prefix(':') else {
+        return line;
+    };
+    rest.strip_prefix(' ').unwrap_or(rest)
 }
 
 #[cfg(test)]
@@ -472,13 +671,13 @@ mod tests {
     }
 
     #[test]
-    fn body_adds_include_for_web_search_sources() {
+    fn body_adds_include_for_web_search_results() {
         let mut r = req();
         r.web_search = true;
         let body = build_request_body(&r);
         assert_eq!(
             body["include"],
-            serde_json::json!(["web_search_call.action.sources"])
+            serde_json::json!(["web_search_call.results"])
         );
     }
 
@@ -542,14 +741,13 @@ mod tests {
             [LlmEvent::WebSearch {
                 call_id,
                 phase,
-                query,
-                sources,
+                action,
             }] => {
                 assert_eq!(call_id, "ws_1");
                 assert_eq!(*phase, WebSearchPhase::Started);
-                assert!(query.is_none());
-                // The `Start` frame has no `action`, hence no sources.
-                assert!(sources.is_empty());
+                // The Start frame has no action — only the matching .done
+                // knows what activity this call ran.
+                assert!(action.is_none());
             }
             other => panic!("expected WebSearch, got {other:?}"),
         }
@@ -564,45 +762,101 @@ mod tests {
             [LlmEvent::WebSearch {
                 call_id,
                 phase,
-                query,
-                sources,
+                action,
             }] => {
                 assert_eq!(call_id, "ws_1");
                 assert_eq!(*phase, WebSearchPhase::Completed);
-                assert_eq!(query.as_deref(), Some("AI capex 2026"));
-                // No `sources` array on this action — none parsed.
-                assert!(sources.is_empty());
+                match action {
+                    Some(WebSearchAction::Search { query, results }) => {
+                        assert_eq!(query.as_deref(), Some("AI capex 2026"));
+                        // No `results` on this item — nothing to extract.
+                        assert!(results.is_empty());
+                    }
+                    other => panic!("expected Search variant, got {other:?}"),
+                }
             }
             other => panic!("expected WebSearch, got {other:?}"),
         }
     }
 
     #[test]
-    fn parses_web_search_sources_from_action() {
-        // With the `include` opt-in, a completed web_search_call's action
-        // carries the resolved sources. Empty-URL and non-`url` entries drop.
+    fn parses_web_search_search_with_results() {
+        // With `include: ["web_search_call.results"]`, the completed item
+        // carries a `results` array. Empty-URL and non-`text_result` entries
+        // drop; titles are trimmed.
         let raw = "data: {\"type\":\"response.output_item.done\",\"item\":{\
                    \"type\":\"web_search_call\",\"id\":\"ws_7\",\"status\":\"completed\",\
-                   \"action\":{\"type\":\"search\",\"query\":\"ai capex\",\"sources\":[\
-                   {\"type\":\"url\",\"url\":\"https://a.com/x\"},\
-                   {\"type\":\"url\",\"url\":\"https://b.com/y\"},\
-                   {\"type\":\"url\",\"url\":\"\"},\
-                   {\"type\":\"other\",\"url\":\"https://c.com/z\"}]}}}";
+                   \"action\":{\"type\":\"search\",\"query\":\"ai capex\"},\
+                   \"results\":[\
+                   {\"type\":\"text_result\",\"title\":\" Page A \",\"url\":\"https://a.com/x\",\"snippet\":\"sx\"},\
+                   {\"type\":\"text_result\",\"title\":\"Page B\",\"url\":\"https://b.com/y\",\"snippet\":\"sy\"},\
+                   {\"type\":\"text_result\",\"title\":\"Page C\",\"url\":\"\",\"snippet\":\"sz\"},\
+                   {\"type\":\"other\",\"title\":\"Page D\",\"url\":\"https://d.com/z\",\"snippet\":\"sw\"}]}}";
         match &parse_one_event(raw).unwrap()[..] {
             [LlmEvent::WebSearch {
                 call_id,
                 phase,
-                query,
-                sources,
+                action,
             }] => {
                 assert_eq!(call_id, "ws_7");
                 assert_eq!(*phase, WebSearchPhase::Completed);
-                assert_eq!(query.as_deref(), Some("ai capex"));
-                assert_eq!(sources.len(), 2);
-                assert_eq!(sources[0], "https://a.com/x");
-                assert_eq!(sources[1], "https://b.com/y");
+                match action {
+                    Some(WebSearchAction::Search { query, results }) => {
+                        assert_eq!(query.as_deref(), Some("ai capex"));
+                        assert_eq!(results.len(), 2);
+                        assert_eq!(results[0].title.as_deref(), Some("Page A"));
+                        assert_eq!(results[0].url, "https://a.com/x");
+                        assert_eq!(results[1].title.as_deref(), Some("Page B"));
+                        assert_eq!(results[1].url, "https://b.com/y");
+                    }
+                    other => panic!("expected Search variant, got {other:?}"),
+                }
             }
-            other => panic!("expected WebSearch with sources, got {other:?}"),
+            other => panic!("expected WebSearch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_web_search_open_page_with_cleaned_snippet() {
+        // open_page items carry `action: { type, url }` and a single
+        // `results` entry whose snippet has a Content-type / Source /
+        // Total-lines header followed by `L<N>: …` body lines.
+        let raw = "data: {\"type\":\"response.output_item.done\",\"item\":{\
+                   \"type\":\"web_search_call\",\"id\":\"ws_9\",\"status\":\"completed\",\
+                   \"action\":{\"type\":\"open_page\",\"url\":\"https://example.com/p\"},\
+                   \"results\":[{\"type\":\"text_result\",\"title\":\" Page Title \",\
+                   \"url\":\"https://example.com/p\",\
+                   \"snippet\":\"【turn0view0】 [wordlim: 200] Content type: text/html; Source: open({}); Total lines: 2\\nL0: Hello\\nL1: World\"}]}}";
+        match &parse_one_event(raw).unwrap()[..] {
+            [LlmEvent::WebSearch { action, .. }] => match action {
+                Some(WebSearchAction::OpenPage {
+                    url,
+                    title,
+                    snippet,
+                }) => {
+                    assert_eq!(url, "https://example.com/p");
+                    assert_eq!(title.as_deref(), Some("Page Title"));
+                    assert_eq!(snippet.as_deref(), Some("Hello\nWorld"));
+                }
+                other => panic!("expected OpenPage variant, got {other:?}"),
+            },
+            other => panic!("expected WebSearch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_web_search_unknown_action_type() {
+        // An unrecognized activity is recorded so the card can show the
+        // type name instead of guessing fields.
+        let raw = "data: {\"type\":\"response.output_item.done\",\"item\":{\
+                   \"type\":\"web_search_call\",\"id\":\"ws_x\",\"status\":\"completed\",\
+                   \"action\":{\"type\":\"refine_query\"}}}";
+        match &parse_one_event(raw).unwrap()[..] {
+            [LlmEvent::WebSearch { action, .. }] => match action {
+                Some(WebSearchAction::Unknown { kind }) => assert_eq!(kind, "refine_query"),
+                other => panic!("expected Unknown variant, got {other:?}"),
+            },
+            other => panic!("expected WebSearch, got {other:?}"),
         }
     }
 
@@ -651,5 +905,35 @@ mod tests {
     fn event_boundary_none_for_partial_multibyte() {
         // Chunk ends mid-character — no boundary yet.
         assert!(find_event_boundary(b"data: hi\xe4\xb8").is_none());
+    }
+
+    // clean_snippet — codex backend's internal snippet header has two
+    // shapes (MILESTONES decision 2026-05-20). Each test exercises one,
+    // plus a passthrough case and an inline-citation case.
+
+    #[test]
+    fn clean_snippet_strips_search_header() {
+        let raw = "【turn0search0】 [wordlim: 200] Published: 2 months ago; Crawled: 5 days ago;   Real content here.";
+        assert_eq!(clean_snippet(raw), "Real content here.");
+    }
+
+    #[test]
+    fn clean_snippet_strips_open_page_header_and_line_markers() {
+        let raw = "【turn0view0】 [wordlim: 200] Content type: text/html; Source: open({\"ref_id\":\"x\"}); Total lines: 3\nL0: Hello\nL1: \nL2: 【0†Skip to main content】";
+        assert_eq!(clean_snippet(raw), "Hello\n\n【0†Skip to main content】");
+    }
+
+    #[test]
+    fn clean_snippet_passthrough_when_no_header() {
+        // A snippet without any recognized header is returned trimmed.
+        assert_eq!(clean_snippet("  just text  "), "just text");
+    }
+
+    #[test]
+    fn clean_snippet_keeps_inline_citations_in_body() {
+        // The `L<N>:` prefix drops; the inline 【N†...】 stays — it
+        // identifies a reference inside the page, not header noise.
+        let raw = "【turn0view0】 [wordlim: 200] Content type: text/html; Source: open(()); Total lines: 1\nL0: see 【7†Foo†bar.com】 here";
+        assert_eq!(clean_snippet(raw), "see 【7†Foo†bar.com】 here");
     }
 }
