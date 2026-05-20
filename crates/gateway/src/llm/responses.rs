@@ -88,10 +88,17 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
     body
 }
 
-/// Parse a Responses API SSE stream into a flow of `LlmEvent`s.
-pub fn parse_sse_stream(resp: reqwest::Response) -> BoxStream<'static, Result<LlmEvent>> {
-    let mut bytes = resp.bytes_stream();
-
+/// Parse a Responses API SSE byte stream into a flow of `LlmEvent`s.
+///
+/// Takes the bytes stream (not the `Response`) so that `CodexClient` can
+/// tap each chunk into the F2 transcript buffer before handing the stream
+/// to the parser — the parser stays a pure bytes-to-events transform.
+pub fn parse_sse_stream<S>(bytes_stream: S) -> BoxStream<'static, Result<LlmEvent>>
+where
+    S: futures::Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>>
+        + Send
+        + 'static,
+{
     Box::pin(try_stream! {
         // Buffer at the byte level: the backend can split a multi-byte UTF-8
         // character (CJK text) across two HTTP chunks, so decoding chunks
@@ -99,7 +106,8 @@ pub fn parse_sse_stream(resp: reqwest::Response) -> BoxStream<'static, Result<Ll
         // is pure ASCII, so scanning raw bytes is safe; we only decode UTF-8
         // once a whole event has been extracted.
         let mut buf: Vec<u8> = Vec::new();
-        while let Some(chunk) = bytes.next().await {
+        futures::pin_mut!(bytes_stream);
+        while let Some(chunk) = bytes_stream.next().await {
             let chunk = chunk.context("reading SSE chunk")?;
             buf.extend_from_slice(&chunk);
 
@@ -589,6 +597,11 @@ mod tests {
             reasoning_effort: None,
             verbosity: None,
             web_search: false,
+            // Transcript-routing fields are irrelevant to `build_request_body`
+            // (it doesn't touch them) — placeholders keep the struct valid.
+            session_id: String::new(),
+            turn_id: String::new(),
+            iteration: 0,
         }
     }
 

@@ -34,6 +34,28 @@ pub struct ChatRequest {
     /// `LEEK_WEB_SEARCH` is set — the capability stays opt-in until it is
     /// verified live against the codex backend.
     pub web_search: bool,
+
+    // === F2 transcript routing ===
+    // These three fields are leek-internal metadata for the
+    // `llm_transcripts` archive — they DO NOT travel on the wire.
+    // `build_request_body` ignores them; only `CodexClient::chat` reads
+    // them when it inserts and finalizes the transcript row.
+
+    /// Session the call belongs to. Used to route the archived row to
+    /// the right `llm_transcripts.session_id`.
+    pub session_id: String,
+    /// Turn the call belongs to.
+    pub turn_id: String,
+    /// Per-turn monotonic LLM-call sequence number. Spans both the main
+    /// agent iterations and the auto-compaction summary call: every code
+    /// path that hits `codex.chat` allocates a fresh number, so the
+    /// archive has one row per actual provider call.
+    ///
+    /// This is intentionally a different series from
+    /// `turn_metrics.iteration_count`, which counts only main-loop
+    /// iterations (compaction is tracked separately there as
+    /// `compaction_count`).
+    pub iteration: i64,
 }
 
 #[derive(Debug, Clone)]

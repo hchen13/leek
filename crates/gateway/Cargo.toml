@@ -18,6 +18,7 @@ tower-http = { workspace = true }
 async-stream = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
+bytes = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

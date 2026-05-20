@@ -4,18 +4,20 @@
 //! from the vault, refresh near expiry) and turns a `ChatRequest` into a
 //! streamed `LlmEvent` flow over the OpenAI Responses API.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
+use futures::StreamExt;
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 
 use super::oauth::{self, CodexTokens};
 use super::{responses, ChatRequest, LlmEvent};
-use crate::vault::auth_tokens;
+use crate::vault::{auth_tokens, llm_transcripts};
 
 /// codex backend Responses endpoint.
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -60,9 +62,46 @@ impl CodexClient {
     }
 
     /// Send one chat request; returns the streamed, normalized event flow.
+    ///
+    /// Hooks F2 transcript archival around the request: the raw request
+    /// body is inserted before the POST (so a mid-stream crash still
+    /// leaves evidence), and the raw SSE response is finalized when the
+    /// returned stream ends — natural end, consumer-side drop, or a
+    /// non-2xx that never streamed. The hooks are best-effort; their
+    /// failures log and don't break the call (the model interaction
+    /// matters more than the debug log).
     pub async fn chat(&self, req: ChatRequest) -> Result<BoxStream<'static, Result<LlmEvent>>> {
         let access_token = self.access_token().await?;
         let body = responses::build_request_body(&req);
+        let started_at = chrono::Utc::now().to_rfc3339();
+
+        // F2: archive the request body before sending it.
+        let request_bytes = serde_json::to_vec(&body)
+            .context("serializing request body for the transcript archive")?;
+        let row_id = match llm_transcripts::insert_request(
+            &self.pool,
+            &req.session_id,
+            &req.turn_id,
+            req.iteration,
+            &req.model,
+            &request_bytes,
+            &started_at,
+        )
+        .await
+        {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    session_id = %req.session_id,
+                    turn_id = %req.turn_id,
+                    iteration = req.iteration,
+                    "inserting llm_transcripts request row failed; \
+                     proceeding without archive for this call",
+                );
+                None
+            }
+        };
 
         let resp = self
             .http
@@ -77,10 +116,70 @@ impl CodexClient {
 
         let status = resp.status();
         if !status.is_success() {
+            // F2: archive the error body verbatim, then bail as before.
             let text = resp.text().await.unwrap_or_default();
+            if let Some(row_id) = row_id {
+                let now = chrono::Utc::now().to_rfc3339();
+                if let Err(e) = llm_transcripts::finalize(
+                    &self.pool,
+                    row_id,
+                    text.as_bytes(),
+                    status.as_u16() as i64,
+                    &now,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, row_id, "finalizing failed-request transcript");
+                }
+            }
             bail!("codex backend returned {status}: {}", redact(&text));
         }
-        Ok(responses::parse_sse_stream(resp))
+
+        // F2: tap each chunk into a shared buffer; the buffer accumulates
+        // the raw SSE response, which finalize writes back to the vault
+        // when the stream terminates (natural end or consumer-side drop).
+        let raw_bytes = resp.bytes_stream();
+        let buffer = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let completed = Arc::new(AtomicBool::new(false));
+
+        let buffer_for_tap = buffer.clone();
+        let tapped = async_stream::stream! {
+            futures::pin_mut!(raw_bytes);
+            while let Some(chunk) = raw_bytes.next().await {
+                if let Ok(ref b) = chunk {
+                    buffer_for_tap.lock().await.extend_from_slice(b);
+                }
+                yield chunk;
+            }
+        };
+
+        let parsed = responses::parse_sse_stream(tapped);
+
+        // RAII guard: when the wrapper stream below is dropped — either
+        // because it ran to the end or because the consumer cancelled
+        // (an idle_timeout cuts the agent loop short) — spawn a task to
+        // finalize the row with whatever bytes accumulated. `completed`
+        // distinguishes "stream ran to the end" (status=200) from "stream
+        // was cut short" (status=0, sentinel for incomplete).
+        let guard = row_id.map(|id| TranscriptGuard {
+            pool: self.pool.clone(),
+            row_id: id,
+            buffer: buffer.clone(),
+            completed: completed.clone(),
+        });
+
+        let final_stream = async_stream::stream! {
+            // Hold the guard inside the stream so its drop tracks the
+            // stream's own drop — `move` would defeat that.
+            let _g = guard;
+            futures::pin_mut!(parsed);
+            while let Some(event) = parsed.next().await {
+                yield event;
+            }
+            completed.store(true, Ordering::Relaxed);
+        };
+
+        Ok(Box::pin(final_stream))
     }
 
     /// Stored token state for the `auth status` command.
@@ -152,6 +251,50 @@ impl CodexClient {
         }
 
         Ok(cached.as_ref().unwrap().access_token.clone())
+    }
+}
+
+/// RAII guard for the F2 transcript: when this drops (either because the
+/// wrapper stream ran to completion or because the consumer cancelled
+/// it), spawn a task to finalize the row with the bytes accumulated so
+/// far. `Drop` runs synchronously so the async `finalize` is spawned —
+/// the drop happens inside the agent loop's tokio task, which is always
+/// in a tokio runtime, so the spawn is safe.
+struct TranscriptGuard {
+    pool: SqlitePool,
+    row_id: i64,
+    buffer: Arc<tokio::sync::Mutex<Vec<u8>>>,
+    /// `true` once the wrapper stream's body ran to its end. `false` at
+    /// drop time means the consumer dropped us early (or the upstream
+    /// raised an SSE error and the stream terminated abnormally).
+    completed: Arc<AtomicBool>,
+}
+
+impl Drop for TranscriptGuard {
+    fn drop(&mut self) {
+        let pool = self.pool.clone();
+        let row_id = self.row_id;
+        let buffer = self.buffer.clone();
+        let status: i64 = if self.completed.load(Ordering::Relaxed) {
+            200
+        } else {
+            // Sentinel: the stream did not run to completion — partial
+            // body is still archived, but the status flags incompleteness.
+            0
+        };
+        tokio::spawn(async move {
+            let buf = buffer.lock().await.clone();
+            let now = chrono::Utc::now().to_rfc3339();
+            if let Err(e) =
+                llm_transcripts::finalize(&pool, row_id, &buf, status, &now).await
+            {
+                tracing::warn!(
+                    error = %e,
+                    row_id,
+                    "finalizing llm_transcript row failed (background)"
+                );
+            }
+        });
     }
 }
 

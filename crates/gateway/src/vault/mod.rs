@@ -2,9 +2,11 @@
 //!
 //! M0 schema: users / sessions / messages / events.
 //! M1 adds: turn_metrics (per-turn observability) + codex_auth (OAuth tokens).
+//! F2 adds: llm_transcripts (raw per-iteration request + SSE response).
 
 pub mod auth_tokens;
 pub mod events;
+pub mod llm_transcripts;
 pub mod messages;
 pub mod sessions;
 pub mod turn_metrics;

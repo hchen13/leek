@@ -114,6 +114,12 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
     // goes to the canvas, never into the chat message (REQUIREMENTS §2.3).
     let mut final_reply = String::new();
     let mut iteration_count: usize = 0;
+    // LLM-call sequence number for the transcript archive (F2). It
+    // includes BOTH main iterations and any auto-compaction summary calls
+    // — every code path that hits `codex.chat` bumps this — so it
+    // intentionally diverges from `iteration_count`. One row per provider
+    // call lands in `llm_transcripts`.
+    let mut transcript_iter: i64 = 0;
     let mut tool_call_count: usize = 0;
     let mut tool_error_count: usize = 0;
     let mut input_tokens: u64 = 0;
@@ -173,6 +179,9 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
                 )
             };
             if ctx_tokens >= compact_trigger {
+                // Compaction's summary call is one LLM call — give it its
+                // own slot in the transcript series.
+                transcript_iter += 1;
                 match compaction::compact(
                     st,
                     session_id,
@@ -184,6 +193,7 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
                         tool_dialog: &mut additional_inputs,
                     },
                     ctx_tokens,
+                    transcript_iter,
                 )
                 .await
                 {
@@ -202,6 +212,7 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
         }
 
         iteration_count += 1;
+        transcript_iter += 1;
 
         // ── per-iteration developer hint: wall-clock soft prompt ────────
         let mut iter_inputs = additional_inputs.clone();
@@ -232,6 +243,9 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
             reasoning_effort: Some(REASONING_EFFORT.to_string()),
             verbosity: Some(VERBOSITY.to_string()),
             web_search: st.web_search,
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            iteration: transcript_iter,
         };
 
         // ── call the model ──────────────────────────────────────────────

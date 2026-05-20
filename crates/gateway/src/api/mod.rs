@@ -4,6 +4,7 @@ pub mod events;
 pub mod health;
 pub mod messages;
 pub mod sessions;
+pub mod transcripts;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -96,12 +97,26 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/sessions/{id}/events", get(events::history))
         .route("/stream/sessions/{id}/events", get(events::stream))
+        // F2: raw LLM-layer archive (per-iteration request + SSE response).
+        .route(
+            "/api/v1/sessions/{id}/transcripts",
+            get(transcripts::list),
+        )
+        .route(
+            "/api/v1/sessions/{id}/transcripts/{turn_id}/{iteration}/request",
+            get(transcripts::request_body),
+        )
+        .route(
+            "/api/v1/sessions/{id}/transcripts/{turn_id}/{iteration}/response",
+            get(transcripts::response_stream),
+        )
         .layer(cors)
         .with_state(state)
 }
 
 /// Handler error type. `anyhow::Error` maps to 500; the explicit constructors
 /// cover the 4xx cases.
+#[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     message: String,

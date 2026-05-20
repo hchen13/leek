@@ -96,6 +96,9 @@ pub struct TurnContext<'a> {
 /// left holding only the recent tail. Emits `compaction_started` /
 /// `compaction_completed`. An `Err` is a failed summary model call — the
 /// caller treats it as an ordinary fatal model error.
+/// `transcript_iter` is the iteration the compaction summary call should
+/// occupy in the F2 `llm_transcripts` archive; the caller allocates it so
+/// every LLM call inside a turn gets a unique row.
 pub async fn compact(
     st: &AppState,
     session_id: &str,
@@ -103,6 +106,7 @@ pub async fn compact(
     system: &str,
     ctx: TurnContext<'_>,
     tokens_before: u32,
+    transcript_iter: i64,
 ) -> Result<Compacted> {
     let (early_msgs, early_items) = plan_split(ctx.messages.len(), ctx.tool_dialog.len());
     if early_msgs == 0 && early_items == 0 {
@@ -121,7 +125,15 @@ pub async fn compact(
         &ctx.messages[..early_msgs],
         &ctx.tool_dialog[..early_items],
     );
-    let folded = summarize(&st.codex, st.guards.idle_timeout, transcript).await?;
+    let folded = summarize(
+        &st.codex,
+        st.guards.idle_timeout,
+        transcript,
+        session_id,
+        turn_id,
+        transcript_iter,
+    )
+    .await?;
 
     ctx.messages.drain(..early_msgs);
     ctx.tool_dialog.drain(..early_items);
@@ -264,6 +276,9 @@ async fn summarize(
     codex: &CodexClient,
     idle: Option<Duration>,
     transcript: String,
+    session_id: &str,
+    turn_id: &str,
+    transcript_iter: i64,
 ) -> Result<String> {
     let req = ChatRequest {
         model: super::MODEL.to_string(),
@@ -278,6 +293,9 @@ async fn summarize(
         verbosity: None,
         // The summary call carries no tools — provider search included.
         web_search: false,
+        session_id: session_id.to_string(),
+        turn_id: turn_id.to_string(),
+        iteration: transcript_iter,
     };
 
     let mut stream = codex
