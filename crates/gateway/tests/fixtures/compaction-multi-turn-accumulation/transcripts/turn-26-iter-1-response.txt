@@ -1,0 +1,414 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_071d62ae49dd529d016a0f296fac148191aa4e93a47f3fa890","object":"response","created_at":1779378543,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"# Identity\n\n你是 **leek**——一个 truth-seeking investment partner。\n\nleek 不是金融助手（不是来跑数据），不是研究 GPT（不是来生成 essay）。\n你是用户做投资决策的伙伴：帮他更接近真相，最终决策权在他那里，但\n你的判断是他最重要的输入之一。\n\n你不预设自己是教练、师爷、助手中的某一种——这些角色由用户在使用\n过程中自己赋予。他要解释你拉开教学密度，他要 actionable 你给仓位\n和触发条件，他只要数据你不抢戏。读取这些信号是你的工作。\n\n## 使命\n\n**帮用户做出最接近真相的投资决策。**\n\n\"最接近真相\" 不等于 \"正确\"——市场和未来都有 irreducible 不确定性。\n你的工作是：在已知信息下把推理做扎实、把不确定性表达诚实，让用户\n事后复盘时能说\"决策过程是对的\"，无论 outcome 如何。\n\n# 运行方式\n\n你在一个带工具的 agent loop 里运行。需要外部信息或要执行动作时调用工具，工具结果会回到你这里继续推理；掌握足够信息后直接作答，不要为了凑步骤而多调工具。回答用用户的语言。\n\n# 求证纪律\n\n对**具体事实**（股票代码、公司、价格、新闻、事件、日期、数字等），\n先搜后答 —— 用 web_search 查到再回答，不要直接用训练里的世界知识。\n- 一次搜索返回 0 条或不相关 → 换 query 重试 1-2 次\n- 仍搜不到 → 明说\"搜不到\"\n- 若用户仍要训练知识答案 → 显式标注「以下来自训练知识，无法用搜索\n证实，可能过时」再给\n\n分析、判断、推理是你的本职，不必为它做搜索表演。但**分析依赖的事实**\n必须搜过、可追溯。\n\n# corpus orientation\n\n**corpus 是你大脑的延伸，不是外部参考资料。** 你\"就是\" corpus 的具身化——它的双轴布局决定了你在每一层的存在方式。\n\n## 双轴结构\n\n- **轴 1：内容性质**\n  - **principles** —— 思维框架（Buffett / Munger / Dalio 等思想家的 mental models、first principles、投资哲学）。慢变。这一层是你**思考引擎**本身。\n  - **knowledge** —— 世界事实（公司画像、行业格局、宏观状态、新闻、研报、filings）。快变。这一层是你**看世界的素材**。\n- **轴 2：加工阶段**\n  - **sources** —— 原始材料。read-only。\n  - **wikis** —— 编织好的概念/实体页面。\n\n4 象限及你与它们的关系：\n\n| | sources（原料） | wikis（成品） |\n|---|---|---|\n| **principles** | 思想家原文（Buffett 致股东信、Munger 演讲、Dalio Principles 等）。需要原文出处或语境时检索。 | **核心思维框架已注入你的 system prompt**——你心里默认就这样想问题；需要完整语境时再检索 corpus。 |\n| **knowledge** | 研报、新闻、filings、transcripts 原文。wiki 不足时检索。 | 实体 / 概念 / 主题 / 比较 / query 页面。**用 `corpus_search` 调取**，不要凭空编数。 |\n\n整个 corpus 对你都是 **read-only**——`wikis/` 由人或 promotion pipeline 维护；你的发现要进 corpus 必须走 ingest/promotion 通道，不能直接编辑。\n\n## 思考顺序\n\n**principles → knowledge → sources**：先用已默认的 principles 框架定方向（lens），再用 knowledge wiki 把方向落到具体标的与数字（situational data），最后只在 wiki 层不足时回 sources 兜底取原文出处。\n\n颠倒——先翻案例凑立场——是反向归纳，警觉它。principles 是**看世界的镜片**，不是 knowledge 的\"高级版本\"。\n\n## knowledge 使用与临时工作模型\n\nknowledge 层不是“查到了就不用调研”，也不是“没查到就不能做”。正确顺序是：\n\n- 对具体公司、行业、产业链、区域或宏观环境，先查 corpus knowledge：有覆盖就用它来\n  确定调研方向、关键变量和已有事实；没有覆盖就从基础事实开始搭建。\n- 不管 knowledge 是否命中，都必须继续做当前调研。corpus 命中只是提高起点，不替代\n  当下的数据、公告、价格、资金面、渠道、竞争和宏观核验。\n- 当 knowledge 缺失或明显过旧时，在本 session 内建立临时 working model：标明它是\n  session 事实与推断，不是 corpus 已沉淀知识，也不是长期能力边界。\n- 临时 working model 至少说明：产业链/价值链、需求驱动、价格与渠道、竞争/替代品、\n  监管与宏观、财务口径、资金面/流动性中哪些已经查到，哪些仍是缺口。\n- 临时 working model 不是\"待办清单\"。它必须落到 active plan：每个缺口要么\n  继续用 web_search / web_fetch / 财务 / 行情 / 资金面工具查清，要么在工具\n  不可用或用户禁止外部检索时，把计划项完成为“已确认阻塞”。\n- 输出时区分：corpus 已有 knowledge、session 新查事实、基于事实的临时推断。不要把\n  临时推断写成 corpus 已有知识。\n\n# 可用工具\n\n下列工具已接入。是否调用、何时调用，由任务和每个工具自己的 description（已随 API 传给你）决定 —— 这里只是一个清单。\n\n- `web_fetch` — Fetch the contents of an HTTP(S) URL and return the response body as text.\n- `update_plan` — Record or update a short, user-visible plan / TODO list for the current multi-step task.\n- `corpus_search` — Search leek's curated investing-wisdom corpus by keyword and return the top hits (id, title, snippet, BM25 score).\n- `corpus_read` — Read one document from leek's corpus by its id (the POSIX-style relative path returned by `corpus_search`, e.g.\n","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"916e0457-9a17-45f0-b29b-83a08c3f3c43","prompt_cache_retention":"24h","reasoning":{"effort":"xhigh","summary":null},"safety_identifier":"user-fP3i4Yy125xxEy5mdOYUM5GF","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"low"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Fetch the contents of an HTTP(S) URL and return the response body as text. Use it to read a specific web page or HTTP API endpoint that the user named, or that earlier research surfaced. Returns up to ~16000 characters; a longer body is truncated and marked as such. Does not run JavaScript — a page that renders client-side comes back as raw HTML.","name":"web_fetch","parameters":{"additionalProperties":false,"properties":{"url":{"description":"Absolute http:// or https:// URL to fetch.","type":"string"}},"required":["url"],"type":"object"},"strict":false},{"type":"function","description":"Record or update a short, user-visible plan / TODO list for the current multi-step task. Each call REPLACES the whole plan, so always send every step. Use it to track progress on work that takes several steps, and keep it short. The plan is shown to the user as a checklist — it does not gate or block your reply; finish whenever the answer is ready. Skip it entirely for simple, single-step tasks.","name":"update_plan","parameters":{"additionalProperties":false,"properties":{"explanation":{"description":"Optional one-line note on what changed in the plan.","type":"string"},"plan":{"description":"The full plan — every step, in order.","items":{"additionalProperties":false,"properties":{"status":{"description":"This step's status.","enum":["pending","in_progress","completed"],"type":"string"},"step":{"description":"What this step does.","type":"string"}},"required":["step","status"],"type":"object"},"type":"array"}},"required":["plan"],"type":"object"},"strict":false},{"type":"function","description":"Search leek's curated investing-wisdom corpus by keyword and return the top hits (id, title, snippet, BM25 score). Use this BEFORE pulling on the public web for any question that might be covered by principles (Munger, Buffett, Dalio, …) or by previously curated knowledge pages. The id returned here is the input to `corpus_read` when you need the full document body. Lexical-only (no embeddings); tokenization handles CJK per-character and Latin words on whitespace.","name":"corpus_search","parameters":{"additionalProperties":false,"properties":{"limit":{"description":"Maximum hits to return (default 5, max 25).","maximum":25,"minimum":1,"type":"integer"},"query":{"description":"Search query — keywords or short phrase. Examples: 'circle of competence', 'NVDA GPU 市场', 'margin of safety'.","type":"string"}},"required":["query"],"type":"object"},"strict":false},{"type":"function","description":"Read one document from leek's corpus by its id (the POSIX-style relative path returned by `corpus_search`, e.g. 'sources/principles/munger/circle.md'). Returns the FULL body for reasoning. Use after `corpus_search` surfaces a promising hit and you need the document's full text or frontmatter.","name":"corpus_read","parameters":{"additionalProperties":false,"properties":{"id":{"description":"Document id — the POSIX-style relative path returned by corpus_search. No leading slash.","type":"string"}},"required":["id"],"type":"object"},"strict":false},{"type":"web_search","return_token_budget":"default","search_context_size":"medium","user_location":{"type":"approximate","city":null,"country":"US","region":null,"timezone":null}}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":0}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"resp_071d62ae49dd529d016a0f296fac148191aa4e93a47f3fa890","object":"response","created_at":1779378543,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"# Identity\n\n你是 **leek**——一个 truth-seeking investment partner。\n\nleek 不是金融助手（不是来跑数据），不是研究 GPT（不是来生成 essay）。\n你是用户做投资决策的伙伴：帮他更接近真相，最终决策权在他那里，但\n你的判断是他最重要的输入之一。\n\n你不预设自己是教练、师爷、助手中的某一种——这些角色由用户在使用\n过程中自己赋予。他要解释你拉开教学密度，他要 actionable 你给仓位\n和触发条件，他只要数据你不抢戏。读取这些信号是你的工作。\n\n## 使命\n\n**帮用户做出最接近真相的投资决策。**\n\n\"最接近真相\" 不等于 \"正确\"——市场和未来都有 irreducible 不确定性。\n你的工作是：在已知信息下把推理做扎实、把不确定性表达诚实，让用户\n事后复盘时能说\"决策过程是对的\"，无论 outcome 如何。\n\n# 运行方式\n\n你在一个带工具的 agent loop 里运行。需要外部信息或要执行动作时调用工具，工具结果会回到你这里继续推理；掌握足够信息后直接作答，不要为了凑步骤而多调工具。回答用用户的语言。\n\n# 求证纪律\n\n对**具体事实**（股票代码、公司、价格、新闻、事件、日期、数字等），\n先搜后答 —— 用 web_search 查到再回答，不要直接用训练里的世界知识。\n- 一次搜索返回 0 条或不相关 → 换 query 重试 1-2 次\n- 仍搜不到 → 明说\"搜不到\"\n- 若用户仍要训练知识答案 → 显式标注「以下来自训练知识，无法用搜索\n证实，可能过时」再给\n\n分析、判断、推理是你的本职，不必为它做搜索表演。但**分析依赖的事实**\n必须搜过、可追溯。\n\n# corpus orientation\n\n**corpus 是你大脑的延伸，不是外部参考资料。** 你\"就是\" corpus 的具身化——它的双轴布局决定了你在每一层的存在方式。\n\n## 双轴结构\n\n- **轴 1：内容性质**\n  - **principles** —— 思维框架（Buffett / Munger / Dalio 等思想家的 mental models、first principles、投资哲学）。慢变。这一层是你**思考引擎**本身。\n  - **knowledge** —— 世界事实（公司画像、行业格局、宏观状态、新闻、研报、filings）。快变。这一层是你**看世界的素材**。\n- **轴 2：加工阶段**\n  - **sources** —— 原始材料。read-only。\n  - **wikis** —— 编织好的概念/实体页面。\n\n4 象限及你与它们的关系：\n\n| | sources（原料） | wikis（成品） |\n|---|---|---|\n| **principles** | 思想家原文（Buffett 致股东信、Munger 演讲、Dalio Principles 等）。需要原文出处或语境时检索。 | **核心思维框架已注入你的 system prompt**——你心里默认就这样想问题；需要完整语境时再检索 corpus。 |\n| **knowledge** | 研报、新闻、filings、transcripts 原文。wiki 不足时检索。 | 实体 / 概念 / 主题 / 比较 / query 页面。**用 `corpus_search` 调取**，不要凭空编数。 |\n\n整个 corpus 对你都是 **read-only**——`wikis/` 由人或 promotion pipeline 维护；你的发现要进 corpus 必须走 ingest/promotion 通道，不能直接编辑。\n\n## 思考顺序\n\n**principles → knowledge → sources**：先用已默认的 principles 框架定方向（lens），再用 knowledge wiki 把方向落到具体标的与数字（situational data），最后只在 wiki 层不足时回 sources 兜底取原文出处。\n\n颠倒——先翻案例凑立场——是反向归纳，警觉它。principles 是**看世界的镜片**，不是 knowledge 的\"高级版本\"。\n\n## knowledge 使用与临时工作模型\n\nknowledge 层不是“查到了就不用调研”，也不是“没查到就不能做”。正确顺序是：\n\n- 对具体公司、行业、产业链、区域或宏观环境，先查 corpus knowledge：有覆盖就用它来\n  确定调研方向、关键变量和已有事实；没有覆盖就从基础事实开始搭建。\n- 不管 knowledge 是否命中，都必须继续做当前调研。corpus 命中只是提高起点，不替代\n  当下的数据、公告、价格、资金面、渠道、竞争和宏观核验。\n- 当 knowledge 缺失或明显过旧时，在本 session 内建立临时 working model：标明它是\n  session 事实与推断，不是 corpus 已沉淀知识，也不是长期能力边界。\n- 临时 working model 至少说明：产业链/价值链、需求驱动、价格与渠道、竞争/替代品、\n  监管与宏观、财务口径、资金面/流动性中哪些已经查到，哪些仍是缺口。\n- 临时 working model 不是\"待办清单\"。它必须落到 active plan：每个缺口要么\n  继续用 web_search / web_fetch / 财务 / 行情 / 资金面工具查清，要么在工具\n  不可用或用户禁止外部检索时，把计划项完成为“已确认阻塞”。\n- 输出时区分：corpus 已有 knowledge、session 新查事实、基于事实的临时推断。不要把\n  临时推断写成 corpus 已有知识。\n\n# 可用工具\n\n下列工具已接入。是否调用、何时调用，由任务和每个工具自己的 description（已随 API 传给你）决定 —— 这里只是一个清单。\n\n- `web_fetch` — Fetch the contents of an HTTP(S) URL and return the response body as text.\n- `update_plan` — Record or update a short, user-visible plan / TODO list for the current multi-step task.\n- `corpus_search` — Search leek's curated investing-wisdom corpus by keyword and return the top hits (id, title, snippet, BM25 score).\n- `corpus_read` — Read one document from leek's corpus by its id (the POSIX-style relative path returned by `corpus_search`, e.g.\n","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"916e0457-9a17-45f0-b29b-83a08c3f3c43","prompt_cache_retention":"24h","reasoning":{"effort":"xhigh","summary":null},"safety_identifier":"user-fP3i4Yy125xxEy5mdOYUM5GF","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"low"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Fetch the contents of an HTTP(S) URL and return the response body as text. Use it to read a specific web page or HTTP API endpoint that the user named, or that earlier research surfaced. Returns up to ~16000 characters; a longer body is truncated and marked as such. Does not run JavaScript — a page that renders client-side comes back as raw HTML.","name":"web_fetch","parameters":{"additionalProperties":false,"properties":{"url":{"description":"Absolute http:// or https:// URL to fetch.","type":"string"}},"required":["url"],"type":"object"},"strict":false},{"type":"function","description":"Record or update a short, user-visible plan / TODO list for the current multi-step task. Each call REPLACES the whole plan, so always send every step. Use it to track progress on work that takes several steps, and keep it short. The plan is shown to the user as a checklist — it does not gate or block your reply; finish whenever the answer is ready. Skip it entirely for simple, single-step tasks.","name":"update_plan","parameters":{"additionalProperties":false,"properties":{"explanation":{"description":"Optional one-line note on what changed in the plan.","type":"string"},"plan":{"description":"The full plan — every step, in order.","items":{"additionalProperties":false,"properties":{"status":{"description":"This step's status.","enum":["pending","in_progress","completed"],"type":"string"},"step":{"description":"What this step does.","type":"string"}},"required":["step","status"],"type":"object"},"type":"array"}},"required":["plan"],"type":"object"},"strict":false},{"type":"function","description":"Search leek's curated investing-wisdom corpus by keyword and return the top hits (id, title, snippet, BM25 score). Use this BEFORE pulling on the public web for any question that might be covered by principles (Munger, Buffett, Dalio, …) or by previously curated knowledge pages. The id returned here is the input to `corpus_read` when you need the full document body. Lexical-only (no embeddings); tokenization handles CJK per-character and Latin words on whitespace.","name":"corpus_search","parameters":{"additionalProperties":false,"properties":{"limit":{"description":"Maximum hits to return (default 5, max 25).","maximum":25,"minimum":1,"type":"integer"},"query":{"description":"Search query — keywords or short phrase. Examples: 'circle of competence', 'NVDA GPU 市场', 'margin of safety'.","type":"string"}},"required":["query"],"type":"object"},"strict":false},{"type":"function","description":"Read one document from leek's corpus by its id (the POSIX-style relative path returned by `corpus_search`, e.g. 'sources/principles/munger/circle.md'). Returns the FULL body for reasoning. Use after `corpus_search` surfaces a promising hit and you need the document's full text or frontmatter.","name":"corpus_read","parameters":{"additionalProperties":false,"properties":{"id":{"description":"Document id — the POSIX-style relative path returned by corpus_search. No leading slash.","type":"string"}},"required":["id"],"type":"object"},"strict":false},{"type":"web_search","return_token_budget":"default","search_context_size":"medium","user_location":{"type":"approximate","city":null,"country":"US","region":null,"timezone":null}}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":1}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","type":"message","status":"in_progress","content":[],"phase":"final_answer","role":"assistant"},"output_index":0,"sequence_number":2}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","content_index":0,"item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","output_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""},"sequence_number":3}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"最","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"PKGbSEwI8TrmnNr","output_index":0,"sequence_number":4}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"能","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"g2u5ZlsHL66uhrF","output_index":0,"sequence_number":5}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"体现","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"i35mcfd4zj0upF","output_index":0,"sequence_number":6}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"的是","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"vnQMBpNlbwbwkq","output_index":0,"sequence_number":7}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" **","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"CyrNO59jKTuLG","output_index":0,"sequence_number":8}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"200","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"MTKL5M4AqgmQE","output_index":0,"sequence_number":9}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"8","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"b7RoEClMzeXVvrv","output_index":0,"sequence_number":10}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" 年","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"UMDl1aWnACh7OQ","output_index":0,"sequence_number":11}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" ","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"LP9hrWNsPhjXXI7","output_index":0,"sequence_number":12}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"9","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"iiLPBtQkrCuHdKY","output_index":0,"sequence_number":13}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" 月","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"OzR2Q8mqovi1CE","output_index":0,"sequence_number":14}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"买","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"pKwGng2iy1414vR","output_index":0,"sequence_number":15}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Goldman","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"wOGaTcqp","output_index":0,"sequence_number":16}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Sachs","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"hRyPZFgD79","output_index":0,"sequence_number":17}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" 优","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"YXG8ZdnbdygifM","output_index":0,"sequence_number":18}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"先","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"bbaKpWybTKp5OE1","output_index":0,"sequence_number":19}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"股","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"EwXi700UCFq0GzA","output_index":0,"sequence_number":20}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"**","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"mKsgoo4k9cyHXt","output_index":0,"sequence_number":21}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"。\n\n","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"YwZEk2oEirfhF","output_index":0,"sequence_number":22}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"原因","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"u6yJak0eY2Xwi5","output_index":0,"sequence_number":23}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"：","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"E6qJwW7ZGi2NMmP","output_index":0,"sequence_number":24}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"当","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"nl47BRC8fP9yNBY","output_index":0,"sequence_number":25}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"时","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"1qaMVph3lR1fihg","output_index":0,"sequence_number":26}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"市场","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"tk5BKH5Z8QzNK7","output_index":0,"sequence_number":27}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"对","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"mlm5i1fqUrwVXJe","output_index":0,"sequence_number":28}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"投","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"RIPGAiaJP53ZJzN","output_index":0,"sequence_number":29}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"行","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"yfqhPbjR2UYbpNC","output_index":0,"sequence_number":30}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"体系","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"QUwQGx9Z2MHNsS","output_index":0,"sequence_number":31}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"极","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"sEnnCyAkMgyVJbr","output_index":0,"sequence_number":32}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"度","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"jrMztSk9zJYgsJ3","output_index":0,"sequence_number":33}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"恐","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"EOqKzjuUVhJdmDl","output_index":0,"sequence_number":34}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"惧","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"AOUI1Mde4D9rgPF","output_index":0,"sequence_number":35}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"，","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"CZyP3UXwIqpYFxY","output_index":0,"sequence_number":36}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"Le","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"vbJohugtrlFd4j","output_index":0,"sequence_number":37}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"hman","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"K3MNDUYxS6iM","output_index":0,"sequence_number":38}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" 刚","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"Gu5BGiWALsM4iI","output_index":0,"sequence_number":39}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"破","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"qvA9uUX94Yuzrpc","output_index":0,"sequence_number":40}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"产","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"Qo82Uk4pisTCc76","output_index":0,"sequence_number":41}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"，","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"aO9LC8Opv9LFmuj","output_index":0,"sequence_number":42}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"Gold","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"ksC7hdcL7EZ2","output_index":0,"sequence_number":43}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"man","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"xguWTiyztP1Vy","output_index":0,"sequence_number":44}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" ","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"ZWWiucTTCQsjTnF","output_index":0,"sequence_number":45}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"需要","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"EY052fwnJx4Het","output_index":0,"sequence_number":46}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"信","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"axSEcfFFOxqhpvs","output_index":0,"sequence_number":47}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"任","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"zCnbKR2r9tGSkqI","output_index":0,"sequence_number":48}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"背","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"leD7UiFYPkXC4sB","output_index":0,"sequence_number":49}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"书","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"ikT3W8PrwgZHl3A","output_index":0,"sequence_number":50}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"；","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"BWGP00rj0E71Gk8","output_index":0,"sequence_number":51}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"Buff","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"dugxvBE7eE5A","output_index":0,"sequence_number":52}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"ett","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"SIImtyTIZpsun","output_index":0,"sequence_number":53}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" ","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"QSDWYMelP0WfkIB","output_index":0,"sequence_number":54}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"不是","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"5X8DEF8QasoPgt","output_index":0,"sequence_number":55}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"盲","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"SHi55uT0akQE9BW","output_index":0,"sequence_number":56}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"目","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"phh9oeerVgGFLZm","output_index":0,"sequence_number":57}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"抄","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"B7wXBAwC1G9wcR0","output_index":0,"sequence_number":58}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"底","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"VFmy6biJcpugu8W","output_index":0,"sequence_number":59}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"普通","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"DEWsXdJZhG5hQz","output_index":0,"sequence_number":60}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"股","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"D57Vx52MNX5nySE","output_index":0,"sequence_number":61}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"，而","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"gyg2n57CyowLCs","output_index":0,"sequence_number":62}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"是","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"SSpTottZ36KCF39","output_index":0,"sequence_number":63}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"用","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"Asy6J3HVUCSn9ME","output_index":0,"sequence_number":64}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Berkshire","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"rYwgD8","output_index":0,"sequence_number":65}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" 的","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"Rj8ZwqyTy9ceDP","output_index":0,"sequence_number":66}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"现金","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"9dAtaLJGzEdBfn","output_index":0,"sequence_number":67}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"和","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"yMVxM0VeAGQ3wJs","output_index":0,"sequence_number":68}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"信誉","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"fvXaoh57XTXENv","output_index":0,"sequence_number":69}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"换","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"4NBgIhUgexeS0Uv","output_index":0,"sequence_number":70}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"来","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"OkpziBRMNOyN52k","output_index":0,"sequence_number":71}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" **","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"Gzl1ryph78gHH","output_index":0,"sequence_number":72}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"10","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"ybM1i08rvj2sj3","output_index":0,"sequence_number":73}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"%","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"hoCazdoMOlktvIn","output_index":0,"sequence_number":74}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" 优","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"3wPoZ8mpCCl0zr","output_index":0,"sequence_number":75}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"先","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"UMAC39B4y4whR3x","output_index":0,"sequence_number":76}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"股","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"fZQFfuj2jGgCsvE","output_index":0,"sequence_number":77}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"股","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"Sp6btxWJjXpNMKQ","output_index":0,"sequence_number":78}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"息","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"oPy1xXHj1wRJHlg","output_index":0,"sequence_number":79}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" +","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"OCQiXiiIh3bBsX","output_index":0,"sequence_number":80}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" ","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"yJa0YUJ9zP7gqQr","output_index":0,"sequence_number":81}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"认","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"3YUa9vTUBAxoVXE","output_index":0,"sequence_number":82}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"股","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"iTjOmgc6oWpvUfi","output_index":0,"sequence_number":83}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"权","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"oYY9jFqNwclr7na","output_index":0,"sequence_number":84}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"证","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"lznbMTXCRm0EODw","output_index":0,"sequence_number":85}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"**","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"MWy1XCG4D2vY5z","output_index":0,"sequence_number":86}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"。","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"TJXeKWR9JNyjbkx","output_index":0,"sequence_number":87}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"这","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"9V63zIl1ARSLyo9","output_index":0,"sequence_number":88}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"体现","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"A9n9DZtxWHeenO","output_index":0,"sequence_number":89}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"了","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"RWkJhUH96icy19J","output_index":0,"sequence_number":90}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"“","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"0zRt1JPpuVSFm4D","output_index":0,"sequence_number":91}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"别人","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"NOnIIOj8YUZtDv","output_index":0,"sequence_number":92}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"恐","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"WxlMicSAhPvkdzX","output_index":0,"sequence_number":93}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"惧","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"1JqfduY33mfvPVp","output_index":0,"sequence_number":94}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"时","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"Rk3AFQ6vPxdk3JE","output_index":0,"sequence_number":95}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"贪","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"9eMElcnQpg0ylFM","output_index":0,"sequence_number":96}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"婪","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"WR5lnpY5zq5k9gA","output_index":0,"sequence_number":97}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"”的","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"CRUYbNv0BvKJlG","output_index":0,"sequence_number":98}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"真正","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"hXBzEZDVgrgV15","output_index":0,"sequence_number":99}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"含","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"9nFdeWX7QW00gn2","output_index":0,"sequence_number":100}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"义","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"pPet7FEOMWFxRnz","output_index":0,"sequence_number":101}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"：","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"tw5XLfIpy9chzR5","output_index":0,"sequence_number":102}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"**","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"aEma51dto06zNf","output_index":0,"sequence_number":103}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"在","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"pfxy9X5j3CKSVCm","output_index":0,"sequence_number":104}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"系统","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"TMFkY6w6617NJk","output_index":0,"sequence_number":105}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"性","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"1psbDwfq9y5oA4P","output_index":0,"sequence_number":106}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"恐","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"JyWAhg3QW5Gkspd","output_index":0,"sequence_number":107}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"慌","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"DbKjTtbMopEYh5v","output_index":0,"sequence_number":108}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"中","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"8xkBkLzVOLlpT3W","output_index":0,"sequence_number":109}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"提供","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"7F2PmUEt0rEweb","output_index":0,"sequence_number":110}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"稀","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"DGg1U0Kf6T4bnlX","output_index":0,"sequence_number":111}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"缺","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"vHlaEXVhcNB3l48","output_index":0,"sequence_number":112}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"资本","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"OD2BFyvi957gcA","output_index":0,"sequence_number":113}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"，但","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"8X5JEdEjjVsrOA","output_index":0,"sequence_number":114}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"只","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"Zg6f2lPz9KbUwVe","output_index":0,"sequence_number":115}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"在","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"sSlb6olKjjup9Xz","output_index":0,"sequence_number":116}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"条","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"H3uqimkrNzjdF1E","output_index":0,"sequence_number":117}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"款","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"htwO5V6iF8PZR8t","output_index":0,"sequence_number":118}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"足","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"wa1dSJjfPXO88iE","output_index":0,"sequence_number":119}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"够","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"q15MxooUawb2Z2q","output_index":0,"sequence_number":120}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"保护","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"lQ3HJt8Orizuif","output_index":0,"sequence_number":121}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"自己","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"pwk7ugyJmhjLrV","output_index":0,"sequence_number":122}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"、","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"nZFWzbBoY7Ops6p","output_index":0,"sequence_number":123}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"赔率","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"RNO3cYEZDRCCz1","output_index":0,"sequence_number":124}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"明显","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"8TnsumCeJGQq1M","output_index":0,"sequence_number":125}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"偏","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"TYIxVJyJrN7qbNk","output_index":0,"sequence_number":126}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"向","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"d8RVTy4drG7KCDK","output_index":0,"sequence_number":127}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"自己","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"GBZtENvpn01gfN","output_index":0,"sequence_number":128}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"时","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"OnwsSofUdnmybHd","output_index":0,"sequence_number":129}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"出","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"uv6za0IaHzgDBpl","output_index":0,"sequence_number":130}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"手","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"q0v4IYNMOQSASn0","output_index":0,"sequence_number":131}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"**","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"VteQRtzPY4e0Sp","output_index":0,"sequence_number":132}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"。","item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"obfuscation":"rRB7WPX5aepGDWr","output_index":0,"sequence_number":133}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","content_index":0,"item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","logprobs":[],"output_index":0,"sequence_number":134,"text":"最能体现的是 **2008 年 9 月买 Goldman Sachs 优先股**。\n\n原因：当时市场对投行体系极度恐惧，Lehman 刚破产，Goldman 需要信任背书；Buffett 不是盲目抄底普通股，而是用 Berkshire 的现金和信誉换来 **10% 优先股股息 + 认股权证**。这体现了“别人恐惧时贪婪”的真正含义：**在系统性恐慌中提供稀缺资本，但只在条款足够保护自己、赔率明显偏向自己时出手**。"}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","content_index":0,"item_id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","output_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":"最能体现的是 **2008 年 9 月买 Goldman Sachs 优先股**。\n\n原因：当时市场对投行体系极度恐惧，Lehman 刚破产，Goldman 需要信任背书；Buffett 不是盲目抄底普通股，而是用 Berkshire 的现金和信誉换来 **10% 优先股股息 + 认股权证**。这体现了“别人恐惧时贪婪”的真正含义：**在系统性恐慌中提供稀缺资本，但只在条款足够保护自己、赔率明显偏向自己时出手**。"},"sequence_number":135}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"最能体现的是 **2008 年 9 月买 Goldman Sachs 优先股**。\n\n原因：当时市场对投行体系极度恐惧，Lehman 刚破产，Goldman 需要信任背书；Buffett 不是盲目抄底普通股，而是用 Berkshire 的现金和信誉换来 **10% 优先股股息 + 认股权证**。这体现了“别人恐惧时贪婪”的真正含义：**在系统性恐慌中提供稀缺资本，但只在条款足够保护自己、赔率明显偏向自己时出手**。"}],"phase":"final_answer","role":"assistant"},"output_index":0,"sequence_number":136}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_071d62ae49dd529d016a0f296fac148191aa4e93a47f3fa890","object":"response","created_at":1779378543,"status":"completed","background":false,"completed_at":1779378547,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"# Identity\n\n你是 **leek**——一个 truth-seeking investment partner。\n\nleek 不是金融助手（不是来跑数据），不是研究 GPT（不是来生成 essay）。\n你是用户做投资决策的伙伴：帮他更接近真相，最终决策权在他那里，但\n你的判断是他最重要的输入之一。\n\n你不预设自己是教练、师爷、助手中的某一种——这些角色由用户在使用\n过程中自己赋予。他要解释你拉开教学密度，他要 actionable 你给仓位\n和触发条件，他只要数据你不抢戏。读取这些信号是你的工作。\n\n## 使命\n\n**帮用户做出最接近真相的投资决策。**\n\n\"最接近真相\" 不等于 \"正确\"——市场和未来都有 irreducible 不确定性。\n你的工作是：在已知信息下把推理做扎实、把不确定性表达诚实，让用户\n事后复盘时能说\"决策过程是对的\"，无论 outcome 如何。\n\n# 运行方式\n\n你在一个带工具的 agent loop 里运行。需要外部信息或要执行动作时调用工具，工具结果会回到你这里继续推理；掌握足够信息后直接作答，不要为了凑步骤而多调工具。回答用用户的语言。\n\n# 求证纪律\n\n对**具体事实**（股票代码、公司、价格、新闻、事件、日期、数字等），\n先搜后答 —— 用 web_search 查到再回答，不要直接用训练里的世界知识。\n- 一次搜索返回 0 条或不相关 → 换 query 重试 1-2 次\n- 仍搜不到 → 明说\"搜不到\"\n- 若用户仍要训练知识答案 → 显式标注「以下来自训练知识，无法用搜索\n证实，可能过时」再给\n\n分析、判断、推理是你的本职，不必为它做搜索表演。但**分析依赖的事实**\n必须搜过、可追溯。\n\n# corpus orientation\n\n**corpus 是你大脑的延伸，不是外部参考资料。** 你\"就是\" corpus 的具身化——它的双轴布局决定了你在每一层的存在方式。\n\n## 双轴结构\n\n- **轴 1：内容性质**\n  - **principles** —— 思维框架（Buffett / Munger / Dalio 等思想家的 mental models、first principles、投资哲学）。慢变。这一层是你**思考引擎**本身。\n  - **knowledge** —— 世界事实（公司画像、行业格局、宏观状态、新闻、研报、filings）。快变。这一层是你**看世界的素材**。\n- **轴 2：加工阶段**\n  - **sources** —— 原始材料。read-only。\n  - **wikis** —— 编织好的概念/实体页面。\n\n4 象限及你与它们的关系：\n\n| | sources（原料） | wikis（成品） |\n|---|---|---|\n| **principles** | 思想家原文（Buffett 致股东信、Munger 演讲、Dalio Principles 等）。需要原文出处或语境时检索。 | **核心思维框架已注入你的 system prompt**——你心里默认就这样想问题；需要完整语境时再检索 corpus。 |\n| **knowledge** | 研报、新闻、filings、transcripts 原文。wiki 不足时检索。 | 实体 / 概念 / 主题 / 比较 / query 页面。**用 `corpus_search` 调取**，不要凭空编数。 |\n\n整个 corpus 对你都是 **read-only**——`wikis/` 由人或 promotion pipeline 维护；你的发现要进 corpus 必须走 ingest/promotion 通道，不能直接编辑。\n\n## 思考顺序\n\n**principles → knowledge → sources**：先用已默认的 principles 框架定方向（lens），再用 knowledge wiki 把方向落到具体标的与数字（situational data），最后只在 wiki 层不足时回 sources 兜底取原文出处。\n\n颠倒——先翻案例凑立场——是反向归纳，警觉它。principles 是**看世界的镜片**，不是 knowledge 的\"高级版本\"。\n\n## knowledge 使用与临时工作模型\n\nknowledge 层不是“查到了就不用调研”，也不是“没查到就不能做”。正确顺序是：\n\n- 对具体公司、行业、产业链、区域或宏观环境，先查 corpus knowledge：有覆盖就用它来\n  确定调研方向、关键变量和已有事实；没有覆盖就从基础事实开始搭建。\n- 不管 knowledge 是否命中，都必须继续做当前调研。corpus 命中只是提高起点，不替代\n  当下的数据、公告、价格、资金面、渠道、竞争和宏观核验。\n- 当 knowledge 缺失或明显过旧时，在本 session 内建立临时 working model：标明它是\n  session 事实与推断，不是 corpus 已沉淀知识，也不是长期能力边界。\n- 临时 working model 至少说明：产业链/价值链、需求驱动、价格与渠道、竞争/替代品、\n  监管与宏观、财务口径、资金面/流动性中哪些已经查到，哪些仍是缺口。\n- 临时 working model 不是\"待办清单\"。它必须落到 active plan：每个缺口要么\n  继续用 web_search / web_fetch / 财务 / 行情 / 资金面工具查清，要么在工具\n  不可用或用户禁止外部检索时，把计划项完成为“已确认阻塞”。\n- 输出时区分：corpus 已有 knowledge、session 新查事实、基于事实的临时推断。不要把\n  临时推断写成 corpus 已有知识。\n\n# 可用工具\n\n下列工具已接入。是否调用、何时调用，由任务和每个工具自己的 description（已随 API 传给你）决定 —— 这里只是一个清单。\n\n- `web_fetch` — Fetch the contents of an HTTP(S) URL and return the response body as text.\n- `update_plan` — Record or update a short, user-visible plan / TODO list for the current multi-step task.\n- `corpus_search` — Search leek's curated investing-wisdom corpus by keyword and return the top hits (id, title, snippet, BM25 score).\n- `corpus_read` — Read one document from leek's corpus by its id (the POSIX-style relative path returned by `corpus_search`, e.g.\n","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[{"id":"msg_071d62ae49dd529d016a0f2970b2348191a1af8f91ec0b0c53","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"最能体现的是 **2008 年 9 月买 Goldman Sachs 优先股**。\n\n原因：当时市场对投行体系极度恐惧，Lehman 刚破产，Goldman 需要信任背书；Buffett 不是盲目抄底普通股，而是用 Berkshire 的现金和信誉换来 **10% 优先股股息 + 认股权证**。这体现了“别人恐惧时贪婪”的真正含义：**在系统性恐慌中提供稀缺资本，但只在条款足够保护自己、赔率明显偏向自己时出手**。"}],"phase":"final_answer","role":"assistant"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"916e0457-9a17-45f0-b29b-83a08c3f3c43","prompt_cache_retention":"24h","reasoning":{"effort":"xhigh","summary":null},"safety_identifier":"user-fP3i4Yy125xxEy5mdOYUM5GF","service_tier":"default","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"low"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Fetch the contents of an HTTP(S) URL and return the response body as text. Use it to read a specific web page or HTTP API endpoint that the user named, or that earlier research surfaced. Returns up to ~16000 characters; a longer body is truncated and marked as such. Does not run JavaScript — a page that renders client-side comes back as raw HTML.","name":"web_fetch","parameters":{"additionalProperties":false,"properties":{"url":{"description":"Absolute http:// or https:// URL to fetch.","type":"string"}},"required":["url"],"type":"object"},"strict":false},{"type":"function","description":"Record or update a short, user-visible plan / TODO list for the current multi-step task. Each call REPLACES the whole plan, so always send every step. Use it to track progress on work that takes several steps, and keep it short. The plan is shown to the user as a checklist — it does not gate or block your reply; finish whenever the answer is ready. Skip it entirely for simple, single-step tasks.","name":"update_plan","parameters":{"additionalProperties":false,"properties":{"explanation":{"description":"Optional one-line note on what changed in the plan.","type":"string"},"plan":{"description":"The full plan — every step, in order.","items":{"additionalProperties":false,"properties":{"status":{"description":"This step's status.","enum":["pending","in_progress","completed"],"type":"string"},"step":{"description":"What this step does.","type":"string"}},"required":["step","status"],"type":"object"},"type":"array"}},"required":["plan"],"type":"object"},"strict":false},{"type":"function","description":"Search leek's curated investing-wisdom corpus by keyword and return the top hits (id, title, snippet, BM25 score). Use this BEFORE pulling on the public web for any question that might be covered by principles (Munger, Buffett, Dalio, …) or by previously curated knowledge pages. The id returned here is the input to `corpus_read` when you need the full document body. Lexical-only (no embeddings); tokenization handles CJK per-character and Latin words on whitespace.","name":"corpus_search","parameters":{"additionalProperties":false,"properties":{"limit":{"description":"Maximum hits to return (default 5, max 25).","maximum":25,"minimum":1,"type":"integer"},"query":{"description":"Search query — keywords or short phrase. Examples: 'circle of competence', 'NVDA GPU 市场', 'margin of safety'.","type":"string"}},"required":["query"],"type":"object"},"strict":false},{"type":"function","description":"Read one document from leek's corpus by its id (the POSIX-style relative path returned by `corpus_search`, e.g. 'sources/principles/munger/circle.md'). Returns the FULL body for reasoning. Use after `corpus_search` surfaces a promising hit and you need the document's full text or frontmatter.","name":"corpus_read","parameters":{"additionalProperties":false,"properties":{"id":{"description":"Document id — the POSIX-style relative path returned by corpus_search. No leading slash.","type":"string"}},"required":["id"],"type":"object"},"strict":false},{"type":"web_search","return_token_budget":"default","search_context_size":"medium","user_location":{"type":"approximate","city":null,"country":"US","region":null,"timezone":null}}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":{"input_tokens":9686,"input_tokens_details":{"cached_tokens":9088},"output_tokens":143,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":9829},"user":null,"metadata":{}},"sequence_number":137}
+

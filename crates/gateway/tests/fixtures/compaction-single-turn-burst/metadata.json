@@ -1,0 +1,25 @@
+{
+  "recorded_at": "2026-05-21T07:51:40Z",
+  "leek_git_rev": "4ab3514ce925d9a441ee20cc3ed0a3ac6f1028df",
+  "codex_model": "gpt-5.5",
+  "corpus_git_rev": "4ab3514ce925d9a441ee20cc3ed0a3ac6f1028df",
+  "session_id": "s-e97be86ce72146debaae7d0eacf76cba",
+  "total_cost_usd": 5.672847000000001,
+  "total_wall_clock_ms": 179992,
+  "stopped_by": "input_tokens_threshold",
+  "turns": [
+    {
+      "turn_id": "turn-77462c8e1b7445f1995205eea69c1d2f",
+      "turn_index": 1,
+      "user_message_preview": "从 corpus 里找所有关于'安全边际'(margin of safety)的论述，**全文摘录**每个出处的关键段落，不要总结要直引。每条注明出处文件与小节。",
+      "input_tokens": 1916163,
+      "output_tokens": 5888,
+      "tool_call_count": 32,
+      "iteration_count": 26,
+      "wall_clock_ms": 179992,
+      "cost_usd": 5.672847000000001,
+      "compaction_count": 0,
+      "stop_reason": "end_turn"
+    }
+  ]
+}

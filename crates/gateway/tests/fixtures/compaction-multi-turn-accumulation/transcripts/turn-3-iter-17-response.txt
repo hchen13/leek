@@ -1,0 +1,1056 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_0a602921c80ae72a016a0f0d209f5c8191974ebf82fa6dad38","object":"response","created_at":1779371297,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"# Identity\n\n你是 **leek**——一个 truth-seeking investment partner。\n\nleek 不是金融助手（不是来跑数据），不是研究 GPT（不是来生成 essay）。\n你是用户做投资决策的伙伴：帮他更接近真相，最终决策权在他那里，但\n你的判断是他最重要的输入之一。\n\n你不预设自己是教练、师爷、助手中的某一种——这些角色由用户在使用\n过程中自己赋予。他要解释你拉开教学密度，他要 actionable 你给仓位\n和触发条件，他只要数据你不抢戏。读取这些信号是你的工作。\n\n## 使命\n\n**帮用户做出最接近真相的投资决策。**\n\n\"最接近真相\" 不等于 \"正确\"——市场和未来都有 irreducible 不确定性。\n你的工作是：在已知信息下把推理做扎实、把不确定性表达诚实，让用户\n事后复盘时能说\"决策过程是对的\"，无论 outcome 如何。\n\n# 运行方式\n\n你在一个带工具的 agent loop 里运行。需要外部信息或要执行动作时调用工具，工具结果会回到你这里继续推理；掌握足够信息后直接作答，不要为了凑步骤而多调工具。回答用用户的语言。\n\n# 求证纪律\n\n对**具体事实**（股票代码、公司、价格、新闻、事件、日期、数字等），\n先搜后答 —— 用 web_search 查到再回答，不要直接用训练里的世界知识。\n- 一次搜索返回 0 条或不相关 → 换 query 重试 1-2 次\n- 仍搜不到 → 明说\"搜不到\"\n- 若用户仍要训练知识答案 → 显式标注「以下来自训练知识，无法用搜索\n证实，可能过时」再给\n\n分析、判断、推理是你的本职，不必为它做搜索表演。但**分析依赖的事实**\n必须搜过、可追溯。\n\n# corpus orientation\n\n**corpus 是你大脑的延伸，不是外部参考资料。** 你\"就是\" corpus 的具身化——它的双轴布局决定了你在每一层的存在方式。\n\n## 双轴结构\n\n- **轴 1：内容性质**\n  - **principles** —— 思维框架（Buffett / Munger / Dalio 等思想家的 mental models、first principles、投资哲学）。慢变。这一层是你**思考引擎**本身。\n  - **knowledge** —— 世界事实（公司画像、行业格局、宏观状态、新闻、研报、filings）。快变。这一层是你**看世界的素材**。\n- **轴 2：加工阶段**\n  - **sources** —— 原始材料。read-only。\n  - **wikis** —— 编织好的概念/实体页面。\n\n4 象限及你与它们的关系：\n\n| | sources（原料） | wikis（成品） |\n|---|---|---|\n| **principles** | 思想家原文（Buffett 致股东信、Munger 演讲、Dalio Principles 等）。需要原文出处或语境时检索。 | **核心思维框架已注入你的 system prompt**——你心里默认就这样想问题；需要完整语境时再检索 corpus。 |\n| **knowledge** | 研报、新闻、filings、transcripts 原文。wiki 不足时检索。 | 实体 / 概念 / 主题 / 比较 / query 页面。**用 `corpus_search` 调取**，不要凭空编数。 |\n\n整个 corpus 对你都是 **read-only**——`wikis/` 由人或 promotion pipeline 维护；你的发现要进 corpus 必须走 ingest/promotion 通道，不能直接编辑。\n\n## 思考顺序\n\n**principles → knowledge → sources**：先用已默认的 principles 框架定方向（lens），再用 knowledge wiki 把方向落到具体标的与数字（situational data），最后只在 wiki 层不足时回 sources 兜底取原文出处。\n\n颠倒——先翻案例凑立场——是反向归纳，警觉它。principles 是**看世界的镜片**，不是 knowledge 的\"高级版本\"。\n\n## knowledge 使用与临时工作模型\n\nknowledge 层不是“查到了就不用调研”，也不是“没查到就不能做”。正确顺序是：\n\n- 对具体公司、行业、产业链、区域或宏观环境，先查 corpus knowledge：有覆盖就用它来\n  确定调研方向、关键变量和已有事实；没有覆盖就从基础事实开始搭建。\n- 不管 knowledge 是否命中，都必须继续做当前调研。corpus 命中只是提高起点，不替代\n  当下的数据、公告、价格、资金面、渠道、竞争和宏观核验。\n- 当 knowledge 缺失或明显过旧时，在本 session 内建立临时 working model：标明它是\n  session 事实与推断，不是 corpus 已沉淀知识，也不是长期能力边界。\n- 临时 working model 至少说明：产业链/价值链、需求驱动、价格与渠道、竞争/替代品、\n  监管与宏观、财务口径、资金面/流动性中哪些已经查到，哪些仍是缺口。\n- 临时 working model 不是\"待办清单\"。它必须落到 active plan：每个缺口要么\n  继续用 web_search / web_fetch / 财务 / 行情 / 资金面工具查清，要么在工具\n  不可用或用户禁止外部检索时，把计划项完成为“已确认阻塞”。\n- 输出时区分：corpus 已有 knowledge、session 新查事实、基于事实的临时推断。不要把\n  临时推断写成 corpus 已有知识。\n\n# 可用工具\n\n下列工具已接入。是否调用、何时调用，由任务和每个工具自己的 description（已随 API 传给你）决定 —— 这里只是一个清单。\n\n- `web_fetch` — Fetch the contents of an HTTP(S) URL and return the response body as text.\n- `update_plan` — Record or update a short, user-visible plan / TODO list for the current multi-step task.\n- `corpus_search` — Search leek's curated investing-wisdom corpus by keyword and return the top hits (id, title, snippet, BM25 score).\n- `corpus_read` — Read one document from leek's corpus by its id (the POSIX-style relative path returned by `corpus_search`, e.g.\n","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"1c460329-4c46-47d6-adbd-7a066c52eeb4","prompt_cache_retention":"24h","reasoning":{"effort":"xhigh","summary":null},"safety_identifier":"user-fP3i4Yy125xxEy5mdOYUM5GF","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"low"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Fetch the contents of an HTTP(S) URL and return the response body as text. Use it to read a specific web page or HTTP API endpoint that the user named, or that earlier research surfaced. Returns up to ~16000 characters; a longer body is truncated and marked as such. Does not run JavaScript — a page that renders client-side comes back as raw HTML.","name":"web_fetch","parameters":{"additionalProperties":false,"properties":{"url":{"description":"Absolute http:// or https:// URL to fetch.","type":"string"}},"required":["url"],"type":"object"},"strict":false},{"type":"function","description":"Record or update a short, user-visible plan / TODO list for the current multi-step task. Each call REPLACES the whole plan, so always send every step. Use it to track progress on work that takes several steps, and keep it short. The plan is shown to the user as a checklist — it does not gate or block your reply; finish whenever the answer is ready. Skip it entirely for simple, single-step tasks.","name":"update_plan","parameters":{"additionalProperties":false,"properties":{"explanation":{"description":"Optional one-line note on what changed in the plan.","type":"string"},"plan":{"description":"The full plan — every step, in order.","items":{"additionalProperties":false,"properties":{"status":{"description":"This step's status.","enum":["pending","in_progress","completed"],"type":"string"},"step":{"description":"What this step does.","type":"string"}},"required":["step","status"],"type":"object"},"type":"array"}},"required":["plan"],"type":"object"},"strict":false},{"type":"function","description":"Search leek's curated investing-wisdom corpus by keyword and return the top hits (id, title, snippet, BM25 score). Use this BEFORE pulling on the public web for any question that might be covered by principles (Munger, Buffett, Dalio, …) or by previously curated knowledge pages. The id returned here is the input to `corpus_read` when you need the full document body. Lexical-only (no embeddings); tokenization handles CJK per-character and Latin words on whitespace.","name":"corpus_search","parameters":{"additionalProperties":false,"properties":{"limit":{"description":"Maximum hits to return (default 5, max 25).","maximum":25,"minimum":1,"type":"integer"},"query":{"description":"Search query — keywords or short phrase. Examples: 'circle of competence', 'NVDA GPU 市场', 'margin of safety'.","type":"string"}},"required":["query"],"type":"object"},"strict":false},{"type":"function","description":"Read one document from leek's corpus by its id (the POSIX-style relative path returned by `corpus_search`, e.g. 'sources/principles/munger/circle.md'). Returns the FULL body for reasoning. Use after `corpus_search` surfaces a promising hit and you need the document's full text or frontmatter.","name":"corpus_read","parameters":{"additionalProperties":false,"properties":{"id":{"description":"Document id — the POSIX-style relative path returned by corpus_search. No leading slash.","type":"string"}},"required":["id"],"type":"object"},"strict":false},{"type":"web_search","return_token_budget":"default","search_context_size":"medium","user_location":{"type":"approximate","city":null,"country":"US","region":null,"timezone":null}}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":0}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"resp_0a602921c80ae72a016a0f0d209f5c8191974ebf82fa6dad38","object":"response","created_at":1779371297,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"# Identity\n\n你是 **leek**——一个 truth-seeking investment partner。\n\nleek 不是金融助手（不是来跑数据），不是研究 GPT（不是来生成 essay）。\n你是用户做投资决策的伙伴：帮他更接近真相，最终决策权在他那里，但\n你的判断是他最重要的输入之一。\n\n你不预设自己是教练、师爷、助手中的某一种——这些角色由用户在使用\n过程中自己赋予。他要解释你拉开教学密度，他要 actionable 你给仓位\n和触发条件，他只要数据你不抢戏。读取这些信号是你的工作。\n\n## 使命\n\n**帮用户做出最接近真相的投资决策。**\n\n\"最接近真相\" 不等于 \"正确\"——市场和未来都有 irreducible 不确定性。\n你的工作是：在已知信息下把推理做扎实、把不确定性表达诚实，让用户\n事后复盘时能说\"决策过程是对的\"，无论 outcome 如何。\n\n# 运行方式\n\n你在一个带工具的 agent loop 里运行。需要外部信息或要执行动作时调用工具，工具结果会回到你这里继续推理；掌握足够信息后直接作答，不要为了凑步骤而多调工具。回答用用户的语言。\n\n# 求证纪律\n\n对**具体事实**（股票代码、公司、价格、新闻、事件、日期、数字等），\n先搜后答 —— 用 web_search 查到再回答，不要直接用训练里的世界知识。\n- 一次搜索返回 0 条或不相关 → 换 query 重试 1-2 次\n- 仍搜不到 → 明说\"搜不到\"\n- 若用户仍要训练知识答案 → 显式标注「以下来自训练知识，无法用搜索\n证实，可能过时」再给\n\n分析、判断、推理是你的本职，不必为它做搜索表演。但**分析依赖的事实**\n必须搜过、可追溯。\n\n# corpus orientation\n\n**corpus 是你大脑的延伸，不是外部参考资料。** 你\"就是\" corpus 的具身化——它的双轴布局决定了你在每一层的存在方式。\n\n## 双轴结构\n\n- **轴 1：内容性质**\n  - **principles** —— 思维框架（Buffett / Munger / Dalio 等思想家的 mental models、first principles、投资哲学）。慢变。这一层是你**思考引擎**本身。\n  - **knowledge** —— 世界事实（公司画像、行业格局、宏观状态、新闻、研报、filings）。快变。这一层是你**看世界的素材**。\n- **轴 2：加工阶段**\n  - **sources** —— 原始材料。read-only。\n  - **wikis** —— 编织好的概念/实体页面。\n\n4 象限及你与它们的关系：\n\n| | sources（原料） | wikis（成品） |\n|---|---|---|\n| **principles** | 思想家原文（Buffett 致股东信、Munger 演讲、Dalio Principles 等）。需要原文出处或语境时检索。 | **核心思维框架已注入你的 system prompt**——你心里默认就这样想问题；需要完整语境时再检索 corpus。 |\n| **knowledge** | 研报、新闻、filings、transcripts 原文。wiki 不足时检索。 | 实体 / 概念 / 主题 / 比较 / query 页面。**用 `corpus_search` 调取**，不要凭空编数。 |\n\n整个 corpus 对你都是 **read-only**——`wikis/` 由人或 promotion pipeline 维护；你的发现要进 corpus 必须走 ingest/promotion 通道，不能直接编辑。\n\n## 思考顺序\n\n**principles → knowledge → sources**：先用已默认的 principles 框架定方向（lens），再用 knowledge wiki 把方向落到具体标的与数字（situational data），最后只在 wiki 层不足时回 sources 兜底取原文出处。\n\n颠倒——先翻案例凑立场——是反向归纳，警觉它。principles 是**看世界的镜片**，不是 knowledge 的\"高级版本\"。\n\n## knowledge 使用与临时工作模型\n\nknowledge 层不是“查到了就不用调研”，也不是“没查到就不能做”。正确顺序是：\n\n- 对具体公司、行业、产业链、区域或宏观环境，先查 corpus knowledge：有覆盖就用它来\n  确定调研方向、关键变量和已有事实；没有覆盖就从基础事实开始搭建。\n- 不管 knowledge 是否命中，都必须继续做当前调研。corpus 命中只是提高起点，不替代\n  当下的数据、公告、价格、资金面、渠道、竞争和宏观核验。\n- 当 knowledge 缺失或明显过旧时，在本 session 内建立临时 working model：标明它是\n  session 事实与推断，不是 corpus 已沉淀知识，也不是长期能力边界。\n- 临时 working model 至少说明：产业链/价值链、需求驱动、价格与渠道、竞争/替代品、\n  监管与宏观、财务口径、资金面/流动性中哪些已经查到，哪些仍是缺口。\n- 临时 working model 不是\"待办清单\"。它必须落到 active plan：每个缺口要么\n  继续用 web_search / web_fetch / 财务 / 行情 / 资金面工具查清，要么在工具\n  不可用或用户禁止外部检索时，把计划项完成为“已确认阻塞”。\n- 输出时区分：corpus 已有 knowledge、session 新查事实、基于事实的临时推断。不要把\n  临时推断写成 corpus 已有知识。\n\n# 可用工具\n\n下列工具已接入。是否调用、何时调用，由任务和每个工具自己的 description（已随 API 传给你）决定 —— 这里只是一个清单。\n\n- `web_fetch` — Fetch the contents of an HTTP(S) URL and return the response body as text.\n- `update_plan` — Record or update a short, user-visible plan / TODO list for the current multi-step task.\n- `corpus_search` — Search leek's curated investing-wisdom corpus by keyword and return the top hits (id, title, snippet, BM25 score).\n- `corpus_read` — Read one document from leek's corpus by its id (the POSIX-style relative path returned by `corpus_search`, e.g.\n","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"1c460329-4c46-47d6-adbd-7a066c52eeb4","prompt_cache_retention":"24h","reasoning":{"effort":"xhigh","summary":null},"safety_identifier":"user-fP3i4Yy125xxEy5mdOYUM5GF","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"low"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Fetch the contents of an HTTP(S) URL and return the response body as text. Use it to read a specific web page or HTTP API endpoint that the user named, or that earlier research surfaced. Returns up to ~16000 characters; a longer body is truncated and marked as such. Does not run JavaScript — a page that renders client-side comes back as raw HTML.","name":"web_fetch","parameters":{"additionalProperties":false,"properties":{"url":{"description":"Absolute http:// or https:// URL to fetch.","type":"string"}},"required":["url"],"type":"object"},"strict":false},{"type":"function","description":"Record or update a short, user-visible plan / TODO list for the current multi-step task. Each call REPLACES the whole plan, so always send every step. Use it to track progress on work that takes several steps, and keep it short. The plan is shown to the user as a checklist — it does not gate or block your reply; finish whenever the answer is ready. Skip it entirely for simple, single-step tasks.","name":"update_plan","parameters":{"additionalProperties":false,"properties":{"explanation":{"description":"Optional one-line note on what changed in the plan.","type":"string"},"plan":{"description":"The full plan — every step, in order.","items":{"additionalProperties":false,"properties":{"status":{"description":"This step's status.","enum":["pending","in_progress","completed"],"type":"string"},"step":{"description":"What this step does.","type":"string"}},"required":["step","status"],"type":"object"},"type":"array"}},"required":["plan"],"type":"object"},"strict":false},{"type":"function","description":"Search leek's curated investing-wisdom corpus by keyword and return the top hits (id, title, snippet, BM25 score). Use this BEFORE pulling on the public web for any question that might be covered by principles (Munger, Buffett, Dalio, …) or by previously curated knowledge pages. The id returned here is the input to `corpus_read` when you need the full document body. Lexical-only (no embeddings); tokenization handles CJK per-character and Latin words on whitespace.","name":"corpus_search","parameters":{"additionalProperties":false,"properties":{"limit":{"description":"Maximum hits to return (default 5, max 25).","maximum":25,"minimum":1,"type":"integer"},"query":{"description":"Search query — keywords or short phrase. Examples: 'circle of competence', 'NVDA GPU 市场', 'margin of safety'.","type":"string"}},"required":["query"],"type":"object"},"strict":false},{"type":"function","description":"Read one document from leek's corpus by its id (the POSIX-style relative path returned by `corpus_search`, e.g. 'sources/principles/munger/circle.md'). Returns the FULL body for reasoning. Use after `corpus_search` surfaces a promising hit and you need the document's full text or frontmatter.","name":"corpus_read","parameters":{"additionalProperties":false,"properties":{"id":{"description":"Document id — the POSIX-style relative path returned by corpus_search. No leading slash.","type":"string"}},"required":["id"],"type":"object"},"strict":false},{"type":"web_search","return_token_budget":"default","search_context_size":"medium","user_location":{"type":"approximate","city":null,"country":"US","region":null,"timezone":null}}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":1}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"rs_0a602921c80ae72a016a0f0d2324748191b99fc0857e6d53a6","type":"reasoning","summary":[]},"output_index":0,"sequence_number":2}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"rs_0a602921c80ae72a016a0f0d2324748191b99fc0857e6d53a6","type":"reasoning","summary":[]},"output_index":0,"sequence_number":3}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","type":"message","status":"in_progress","content":[],"phase":"final_answer","role":"assistant"},"output_index":1,"sequence_number":4}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","content_index":0,"item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","output_index":1,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""},"sequence_number":5}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"先","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"b9NdICRk0hHYzv4","output_index":1,"sequence_number":6}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"说明","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"OtJuyJ7XVOXqZs","output_index":1,"sequence_number":7}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"：","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"DH0peN5XpBzYeWt","output_index":1,"sequence_number":8}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"196","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"w2kCIP26EYGTb","output_index":1,"sequence_number":9}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"5","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"9ESQVIIjMW03iaP","output_index":1,"sequence_number":10}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"-","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"YG03x8swHgTR7qL","output_index":1,"sequence_number":11}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"197","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"yZpyDmmRUynO9","output_index":1,"sequence_number":12}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"5","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"atdereBppBrjMSW","output_index":1,"sequence_number":13}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" 的","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"SL9EZQlRHTHx57","output_index":1,"sequence_number":14}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" corpus","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"KbOk7B7Mt","output_index":1,"sequence_number":15}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" ","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"7Ba26ZIJIhCyeVf","output_index":1,"sequence_number":16}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"里","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"LFw2tQXVc14jMaj","output_index":1,"sequence_number":17}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"，","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"80uiYv2dHzkvDSF","output_index":1,"sequence_number":18}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"Buff","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"OoINfLLa8vXZ","output_index":1,"sequence_number":19}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"ett","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"C8lI6qzfWUyUj","output_index":1,"sequence_number":20}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" ","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"rQWLWlItA3IP8M2","output_index":1,"sequence_number":21}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"还","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"hc0ufGx5LBcYY58","output_index":1,"sequence_number":22}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"不是","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"wsZhEMV1orv9rh","output_index":1,"sequence_number":23}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"用","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"aVD1pe4opLoInmi","output_index":1,"sequence_number":24}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"后来","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"4E8LWrIdiQr8F2","output_index":1,"sequence_number":25}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"那","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"LvT6dH1Ogu9Tf2b","output_index":1,"sequence_number":26}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"句","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"W6ZdisV40K3bZKP","output_index":1,"sequence_number":27}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" canonical","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"RUyHfg","output_index":1,"sequence_number":28}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" “","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"LIOxEellpwKg19","output_index":1,"sequence_number":29}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"Margin","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"xvqYBlStt3","output_index":1,"sequence_number":30}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" of","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"WzAnscCjXpo8e","output_index":1,"sequence_number":31}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Safety","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"ULtZSBLTK","output_index":1,"sequence_number":32}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"”","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"8lH66RCn18Sqasi","output_index":1,"sequence_number":33}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" 来","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"72MhnEIyH1D2ua","output_index":1,"sequence_number":34}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"讲","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"YAcRnrXSQcqlWTB","output_index":1,"sequence_number":35}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"；","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"XVGTyx4n48O3y9m","output_index":1,"sequence_number":36}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"更多","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"6OLhyADnRcN2rv","output_index":1,"sequence_number":37}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"是","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"SMACvKyMQ6y3c2p","output_index":1,"sequence_number":38}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"**","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"VBLx7kJCedeXJK","output_index":1,"sequence_number":39}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"操作","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"TlMJ6CSyQO2vtw","output_index":1,"sequence_number":40}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"语言","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"fRblu9pZziy8Zx","output_index":1,"sequence_number":41}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"**","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"OpcrWg11r0p4E0","output_index":1,"sequence_number":42}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"。\n\n","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"SFwEhtTwav910","output_index":1,"sequence_number":43}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"1","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"qyj5waJsSBHhcz5","output_index":1,"sequence_number":44}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":".","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"jIypKTeXKWT3GvU","output_index":1,"sequence_number":45}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" **","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"ItkkYZFMVOoX8","output_index":1,"sequence_number":46}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"196","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"jRWMq7jWaFm0q","output_index":1,"sequence_number":47}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"5","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Gk1Wr9NFjAfmo2O","output_index":1,"sequence_number":48}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"：","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"vsJFSKItOsneQ1E","output_index":1,"sequence_number":49}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"安全","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"0QHhNqImxanQgi","output_index":1,"sequence_number":50}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"边","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"fkLlHIhfmagkNTM","output_index":1,"sequence_number":51}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"际","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"xDSSbyyX7EzXOGU","output_index":1,"sequence_number":52}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"支持","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"VoNrimirYF34Lz","output_index":1,"sequence_number":53}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"集中","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"z6LGAgFT9H64ZR","output_index":1,"sequence_number":54}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"，而","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"ydtM1oT9zlQsay","output_index":1,"sequence_number":55}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"不是","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"xu1RSIt06gqZBC","output_index":1,"sequence_number":56}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"分","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"1GoBpd3a570OQB7","output_index":1,"sequence_number":57}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"散","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"2Nz4ZttXUR2s8Wr","output_index":1,"sequence_number":58}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"**","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"esZz2pmst5Y3Pr","output_index":1,"sequence_number":59}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"  \n","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"uqCoyfeKwZlk3","output_index":1,"sequence_number":60}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":">","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"uTdmJgUgYzMbhQ6","output_index":1,"sequence_number":61}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" “","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"AdKML2m4hb2DSE","output_index":1,"sequence_number":62}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"事实","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Rz6JxvXUJEwemq","output_index":1,"sequence_number":63}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"和","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"2IBtfcFnGEOykro","output_index":1,"sequence_number":64}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"逻","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"T5uSdLewyIhY28Y","output_index":1,"sequence_number":65}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"辑","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"E3znvGTwZBlU62q","output_index":1,"sequence_number":66}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"，","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"dJArO0H4PD5mQUC","output_index":1,"sequence_number":67}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"正确","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"PYenXTqjSPdTd7","output_index":1,"sequence_number":68}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"的","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"SYNkdyMJ92FBDNj","output_index":1,"sequence_number":69}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"概率","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"QwY4BbuxX03sjN","output_index":1,"sequence_number":70}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"极","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Z3DZLq6qbcpAbLC","output_index":1,"sequence_number":71}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"大","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"HzpOmjqyYkqGUPK","output_index":1,"sequence_number":72}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"……","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"ymJMHAUShSfpoV","output_index":1,"sequence_number":73}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"内","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"MqTcTbMJPZ9m1mT","output_index":1,"sequence_number":74}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"在","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"gKS39IJqywYFQ3V","output_index":1,"sequence_number":75}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"价值","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"cukO8jgXzD5V7L","output_index":1,"sequence_number":76}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"不","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"kQyhIOYvPvxDiK0","output_index":1,"sequence_number":77}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"可能","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"8oqw1Kao2cwLnB","output_index":1,"sequence_number":78}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"出现","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"UTgJoTAC1ydhMd","output_index":1,"sequence_number":79}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"根","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"3ixxuP0KvVveZUX","output_index":1,"sequence_number":80}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"本","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"ndu97NMKQ2jL5UM","output_index":1,"sequence_number":81}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"变化","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"oId3j277FdZL3c","output_index":1,"sequence_number":82}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"……","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"rNfJDDrE7sLx3W","output_index":1,"sequence_number":83}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"最多","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Rmgn8dRcOqgxq6","output_index":1,"sequence_number":84}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"拿","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"I4GuJncB2zOc3na","output_index":1,"sequence_number":85}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"出","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"bvHKzmvTHWYAxHE","output_index":1,"sequence_number":86}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"40","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"VQyyYXDhkHglol","output_index":1,"sequence_number":87}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"％","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"TPamRCWSoMrg9BZ","output_index":1,"sequence_number":88}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"的","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"vBPfmQ4J3MyrLGA","output_index":1,"sequence_number":89}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"净","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"pa4UPn5BP8woaGY","output_index":1,"sequence_number":90}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"资产","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"r65mALKUykwlCg","output_index":1,"sequence_number":91}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"。”","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"tgzzORCEk5TmBh","output_index":1,"sequence_number":92}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"  \n","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"esPScUtPhugYH","output_index":1,"sequence_number":93}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":">","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"2e1G64QkzQmSUPb","output_index":1,"sequence_number":94}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" “","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"JJSNuwj0mK8Mri","output_index":1,"sequence_number":95}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"严重","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"bNGZ8yMwc8thli","output_index":1,"sequence_number":96}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"永久","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"FftJzCHD1kVGnc","output_index":1,"sequence_number":97}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"性","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"MVQbEyM1Rr5M5Wa","output_index":1,"sequence_number":98}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"损","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"2VNeDrHp83fnBbg","output_index":1,"sequence_number":99}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"失","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"lKVY5VnTHMQB6pX","output_index":1,"sequence_number":100}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"的","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"VamXr5FtHZi0rvB","output_index":1,"sequence_number":101}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"风险","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"8q2qZ2afUpfCEe","output_index":1,"sequence_number":102}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"极","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Na7RvV65EHFYjwy","output_index":1,"sequence_number":103}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"低","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"dP2Acl6XlahCvhb","output_index":1,"sequence_number":104}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"。”","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"7c8qw0IpRz4UwN","output_index":1,"sequence_number":105}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"  \n","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"SM1vyejcae1p8","output_index":1,"sequence_number":106}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"—","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"QGoELfUrIeW4HIn","output_index":1,"sequence_number":107}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" `","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"iCZQf9B5URBrNh","output_index":1,"sequence_number":108}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"196","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"3L44LrCFJv4oK","output_index":1,"sequence_number":109}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"5","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"NtJPazgKgskWVKM","output_index":1,"sequence_number":110}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" partner","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"4l6jkALp","output_index":1,"sequence_number":111}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" letter","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"IeoArDsab","output_index":1,"sequence_number":112}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"`\n\n","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"rSkX4Z35tGeot","output_index":1,"sequence_number":113}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"意思","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"ai3F5ylCl79wfH","output_index":1,"sequence_number":114}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"：","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"XeRMbzUskjFwRHL","output_index":1,"sequence_number":115}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"他","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"MjLTSzjtJ7hmDFu","output_index":1,"sequence_number":116}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"把","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"GQTZ4YWRhCSlT6a","output_index":1,"sequence_number":117}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"安全","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"OeVytcQvgsj3Ze","output_index":1,"sequence_number":118}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"边","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"bi3eyjI63JdAGzv","output_index":1,"sequence_number":119}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"际","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"su0LohmxYNto27c","output_index":1,"sequence_number":120}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"理解","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"0nis7MAlS2DED0","output_index":1,"sequence_number":121}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"为","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"xarWhtySPlp0Vk0","output_index":1,"sequence_number":122}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"“","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"GHYyBSVKKCLMTzW","output_index":1,"sequence_number":123}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"价值","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"WiWC2E0louFQMs","output_index":1,"sequence_number":124}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"判断","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"xoa6hWy0mB1Ax7","output_index":1,"sequence_number":125}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"足","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"ov62hXJq5Kd0V6J","output_index":1,"sequence_number":126}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"够","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"kiTmeXF6gsfdyrR","output_index":1,"sequence_number":127}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"确定","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"qyLvtkatIpHQgf","output_index":1,"sequence_number":128}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" +","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"pgfXgyusvyjFEO","output_index":1,"sequence_number":129}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" 永","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"TODMkEljkL8FNO","output_index":1,"sequence_number":130}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"久","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"D4lXF51UK1D9AOG","output_index":1,"sequence_number":131}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"损","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Ex53BjSB6QvLkq8","output_index":1,"sequence_number":132}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"失","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"D22rwpDYo2tCiUB","output_index":1,"sequence_number":133}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"概率","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"12ueBHGznQ3YHR","output_index":1,"sequence_number":134}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"低","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"BUXU5ogWlCMGlmO","output_index":1,"sequence_number":135}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"”，","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"qcss8bSeRk7Peg","output_index":1,"sequence_number":136}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"所以","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"SiGAtTxWm0vfbd","output_index":1,"sequence_number":137}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"可以","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"vniTbZLDjt9Ht3","output_index":1,"sequence_number":138}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"重","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"z67bEbxFRFhSWz4","output_index":1,"sequence_number":139}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"仓","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"6g3dGXAE2DMX8he","output_index":1,"sequence_number":140}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"。\n\n","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"BmFk7lxDBW7kW","output_index":1,"sequence_number":141}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"2","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"fQjoP3ItMpIzbJg","output_index":1,"sequence_number":142}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":".","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"eTJ6pWvSILU9teS","output_index":1,"sequence_number":143}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" **","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"55MpN40F9oQD8","output_index":1,"sequence_number":144}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"196","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"2uRa05S1p074z","output_index":1,"sequence_number":145}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"9","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"HNPwUFqsPDJPkqR","output_index":1,"sequence_number":146}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"：","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"je9A9Ngo7WJZG6V","output_index":1,"sequence_number":147}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"没有","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"cip8IakIFuEgH5","output_index":1,"sequence_number":148}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"安全","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"xnl7956bSX3P86","output_index":1,"sequence_number":149}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"边","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"i8wbVLx4XmZiq8L","output_index":1,"sequence_number":150}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"际","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"pfNH7lVbe29h3WR","output_index":1,"sequence_number":151}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"就","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"lDh4dg2P81TZJPN","output_index":1,"sequence_number":152}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"停止","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"6UgQNGwso83Jvy","output_index":1,"sequence_number":153}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"游戏","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"jEY8wqxpPuutxy","output_index":1,"sequence_number":154}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"**","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"PCPiU9xAeODUvn","output_index":1,"sequence_number":155}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"  \n","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"SvUwDuoVV4hmb","output_index":1,"sequence_number":156}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":">","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"WU9ce9vXLmHkzrE","output_index":1,"sequence_number":157}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" “","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"9I3gjrB30Rb6PG","output_index":1,"sequence_number":158}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"我","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"kwUvJV7M4sXAOdq","output_index":1,"sequence_number":159}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"看","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"t0d83vdIcaw7A0U","output_index":1,"sequence_number":160}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"不到","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"XgbrJ4VhC2WnTR","output_index":1,"sequence_number":161}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"任何","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"2rOwHEZmgC7RU8","output_index":1,"sequence_number":162}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"机会","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Xq4vhbcH3GwQtI","output_index":1,"sequence_number":163}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"……","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"5IvrP6XAm3oAKa","output_index":1,"sequence_number":164}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"不","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"WPgXPqpqEfrstxi","output_index":1,"sequence_number":165}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"想","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"TdjSqgWDsGq7lWp","output_index":1,"sequence_number":166}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"拿","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"IVXWDMCNWrM0Xoy","output_index":1,"sequence_number":167}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"别","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"0VrkABYms2E4dTQ","output_index":1,"sequence_number":168}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"人的","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"wJ3BLaULgs91pd","output_index":1,"sequence_number":169}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"钱","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"bGiCLozNPwKKwLz","output_index":1,"sequence_number":170}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"误","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"yRTS23hjEjEMOm1","output_index":1,"sequence_number":171}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"打","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"fI4Yoak76eod4A1","output_index":1,"sequence_number":172}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"误","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"3LUS2hn38MdYmiL","output_index":1,"sequence_number":173}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"撞","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"YZ6Tj2KUlpSBeQH","output_index":1,"sequence_number":174}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"碰","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"hGhvjsSvCVUZTK1","output_index":1,"sequence_number":175}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"运","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"cVWlQlzJ82h0MJK","output_index":1,"sequence_number":176}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"气","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"h0AJ0Xd1Ok0DQQG","output_index":1,"sequence_number":177}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"。”","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Q9yAP0J7MCNHtU","output_index":1,"sequence_number":178}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"  \n","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"vaMK7nB9qUGCt","output_index":1,"sequence_number":179}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":">","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"sZhB7rLDz0G0DtJ","output_index":1,"sequence_number":180}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" “","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"vDmiPtyH6mbP8o","output_index":1,"sequence_number":181}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"不","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"kPMpsAyNOOBO2BF","output_index":1,"sequence_number":182}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"想","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"uAffMsFCpOnFWuW","output_index":1,"sequence_number":183}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"为了","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"mKovp9zRgOaqdV","output_index":1,"sequence_number":184}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"辉","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"rBcRZV4C5DLRiTl","output_index":1,"sequence_number":185}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"煌","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"jxRjbmSj7MNqEMo","output_index":1,"sequence_number":186}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"谢","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"wJkIttOovITZzUw","output_index":1,"sequence_number":187}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"幕","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"CFjGgLTpQPL1H4G","output_index":1,"sequence_number":188}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"而","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"pZx7CajgO9wGq0D","output_index":1,"sequence_number":189}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"做","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"LJvZSFycAHLSSsL","output_index":1,"sequence_number":190}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"自己","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"FSI26MDIieU6Wv","output_index":1,"sequence_number":191}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"不","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Uu8HZEeEjmKTpRt","output_index":1,"sequence_number":192}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"懂","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"KV2fff8FhePxOJ3","output_index":1,"sequence_number":193}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"的","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"b7l6lB50JQ2AGKn","output_index":1,"sequence_number":194}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"投资","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"X5hbBUG36Bw2In","output_index":1,"sequence_number":195}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"。”","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"r1rsYlkYWqvSDz","output_index":1,"sequence_number":196}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"  \n","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"zt846nrZMadWc","output_index":1,"sequence_number":197}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"—","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"6PoE2qxV750KPUc","output_index":1,"sequence_number":198}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" `","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"sirQqKBG5Tt4y2","output_index":1,"sequence_number":199}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"196","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"ZPdh2oseAwpPM","output_index":1,"sequence_number":200}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"9","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"EFU5Uslx5n7p9Wo","output_index":1,"sequence_number":201}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" May","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"SbKaT1gYAmEf","output_index":1,"sequence_number":202}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" partner","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"wpeQhpPb","output_index":1,"sequence_number":203}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" letter","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"htsIAOnOv","output_index":1,"sequence_number":204}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"`\n\n","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"ju47cxhmJ6XnH","output_index":1,"sequence_number":205}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"这","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"GOwKmhPJ5BE3aQY","output_index":1,"sequence_number":206}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"是一","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"nJjgHuzMYCTXYI","output_index":1,"sequence_number":207}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"处","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"EEpRzpIPkKjbIbR","output_index":1,"sequence_number":208}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"关键","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"pzRmD5Y3xp9ZNq","output_index":1,"sequence_number":209}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"变化","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"sHSywqF2JtiywS","output_index":1,"sequence_number":210}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"：","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"TbT5nkMfuBUTn6u","output_index":1,"sequence_number":211}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"安全","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"XKxejidoTc53Cu","output_index":1,"sequence_number":212}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"边","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"MHNxQfxY1JqDgdq","output_index":1,"sequence_number":213}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"际","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"V8LA5mhNL2wAgyd","output_index":1,"sequence_number":214}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"不","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"PiJpjfqu4nSnPLv","output_index":1,"sequence_number":215}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"只是","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"p7mZG58RonrT4v","output_index":1,"sequence_number":216}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"买","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"bdfUtjkmckbCnY7","output_index":1,"sequence_number":217}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"入","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"pWDC77HRdeuRtHZ","output_index":1,"sequence_number":218}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"标准","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Vt4SLKgglMPL2N","output_index":1,"sequence_number":219}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"，也","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"fOdegwCoUN4abt","output_index":1,"sequence_number":220}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"变","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"qkkcMoDswgV089h","output_index":1,"sequence_number":221}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"成","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"CgmQ6MGQ4SP9KRZ","output_index":1,"sequence_number":222}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"**","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"CAWPxsra6Q4GbX","output_index":1,"sequence_number":223}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"退出","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"pqAFtpxWYMTpNR","output_index":1,"sequence_number":224}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"/","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"uiJtXjqzezLP5Q6","output_index":1,"sequence_number":225}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"清","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"EFKw2XzKUMpDznB","output_index":1,"sequence_number":226}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"算","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"r1pxIX5Q65YHZkT","output_index":1,"sequence_number":227}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"纪律","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"x5U5Iz3bThVW3l","output_index":1,"sequence_number":228}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"**","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"fFRNiwBuBvz3d5","output_index":1,"sequence_number":229}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"。\n\n","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"4OFfiDRLTECmS","output_index":1,"sequence_number":230}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"3","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"cSYOe7jEFD7pY6v","output_index":1,"sequence_number":231}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":".","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"jTpWkzcox6KWVXs","output_index":1,"sequence_number":232}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" **","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"OcLf4dDfTRMhc","output_index":1,"sequence_number":233}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"197","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"fDbcKvv0R6DkE","output_index":1,"sequence_number":234}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"5","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"ydag3VoUD2KEinx","output_index":1,"sequence_number":235}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"：","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"kSgkJkBkb3wnZns","output_index":1,"sequence_number":236}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"从","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"MztiP5gIu4jBWNt","output_index":1,"sequence_number":237}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"便","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"4nBuk0CKnpF3OaC","output_index":1,"sequence_number":238}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"宜","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"7YoWV1KEBa7n6O6","output_index":1,"sequence_number":239}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"证券","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"1SaL6KqJdI2CIB","output_index":1,"sequence_number":240}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"扩","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"UXdAs2R0L68LQXH","output_index":1,"sequence_number":241}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"展","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"jTf0SuxJZ4479pL","output_index":1,"sequence_number":242}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"到","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Ww2IzSunGNRx299","output_index":1,"sequence_number":243}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"企业","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"9YczKWMwz2k6XJ","output_index":1,"sequence_number":244}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"质量","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"m2v3GyjEEid6gv","output_index":1,"sequence_number":245}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"与","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"3nBO1meMVvI4djG","output_index":1,"sequence_number":246}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"资产","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"blVKMa9ybwjwJK","output_index":1,"sequence_number":247}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"负","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Lzy0eFzTzQeEIIp","output_index":1,"sequence_number":248}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"债","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"8ys8cnjkXAKVATg","output_index":1,"sequence_number":249}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"表","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Yoqwbdc0olURS9a","output_index":1,"sequence_number":250}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"**","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"lg8vusZnyp6pqP","output_index":1,"sequence_number":251}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"  \n","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"qU2XLtC5e6Zrl","output_index":1,"sequence_number":252}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":">","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"nPJIg0jjcOdBp3S","output_index":1,"sequence_number":253}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" “","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"8UGfxdIv36SXLB","output_index":1,"sequence_number":254}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"有","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"2IkIITcfTFSilWr","output_index":1,"sequence_number":255}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"利","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"KPaPkCH73UZp2v9","output_index":1,"sequence_number":256}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"的","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"OejsLGJELIb3etX","output_index":1,"sequence_number":257}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"经济","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"5xInexYYUtiF8Z","output_index":1,"sequence_number":258}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"特","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"rlBXYXJByvQ8fBx","output_index":1,"sequence_number":259}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"征","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"m81yk34UQeLfHJN","output_index":1,"sequence_number":260}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"、","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"fGsyLkrT7Yoqx0X","output_index":1,"sequence_number":261}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"能","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"QT4Val7URMpJXWW","output_index":1,"sequence_number":262}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"干","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"oEAqUWOvPs8b00m","output_index":1,"sequence_number":263}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"且","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"D5UAFNabjeBgIeS","output_index":1,"sequence_number":264}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"诚","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Ymv9wb0qqMKPIlq","output_index":1,"sequence_number":265}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"实","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"8QpD29HZ7BDKBLR","output_index":1,"sequence_number":266}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"的","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"0fSOwsphX4K2Uft","output_index":1,"sequence_number":267}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"管理","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"NkQdwlGJDznT1l","output_index":1,"sequence_number":268}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"层","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"9QWV71otggMMxXe","output_index":1,"sequence_number":269}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"，以及","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"HWx9vPYqbNu2a","output_index":1,"sequence_number":270}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"以","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"8BG1M1Tp4Vz7jrA","output_index":1,"sequence_number":271}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"私人","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"LE6S3gRU8K6sKk","output_index":1,"sequence_number":272}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"所有","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"TLrgTKk37brSza","output_index":1,"sequence_number":273}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"者","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"6Mgj6Uis0mVpDAD","output_index":1,"sequence_number":274}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"视","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"HRZNcIsIsLPKQhl","output_index":1,"sequence_number":275}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"角","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"OnHKnHrnxRX3B7s","output_index":1,"sequence_number":276}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"衡","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"02hjBUuataxXDnL","output_index":1,"sequence_number":277}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"量","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"NqwP8DAWUAygVWr","output_index":1,"sequence_number":278}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"极","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"s09gagstopxSLfC","output_index":1,"sequence_number":279}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"具","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"M3fxFLZ4MEsYOYd","output_index":1,"sequence_number":280}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"吸","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"1CQC2LAbvgRBoP3","output_index":1,"sequence_number":281}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"引","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"043gqZCAzR6rSkU","output_index":1,"sequence_number":282}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"力","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"JnRCKgSysQFyNJ7","output_index":1,"sequence_number":283}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"的","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"n1cNnv9PDthTPtC","output_index":1,"sequence_number":284}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"买","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"aiXpZUdLn7YDkTw","output_index":1,"sequence_number":285}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"入","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"3hRcFCdUZtA7fir","output_index":1,"sequence_number":286}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"价格","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Vex36ylkLZoaFp","output_index":1,"sequence_number":287}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"。”","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"MJeT66cTRue0sU","output_index":1,"sequence_number":288}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"  \n","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"4xCZ6xLgg9QW4","output_index":1,"sequence_number":289}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":">","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"yqbEgAd7eFpg02r","output_index":1,"sequence_number":290}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" “","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"wVvHNPjLtGOq9S","output_index":1,"sequence_number":291}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"资产","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"HT5OA8pJuvNifI","output_index":1,"sequence_number":292}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"负","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Zs7OQbLaN6QrEYU","output_index":1,"sequence_number":293}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"债","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"9DFkRVxzfjyEbmf","output_index":1,"sequence_number":294}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"表","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"K23NOPhIn1cEBOU","output_index":1,"sequence_number":295}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"上","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"M2PZBir6F3uOFN6","output_index":1,"sequence_number":296}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"留","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Pfw4vjtYUHTr4N7","output_index":1,"sequence_number":297}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"有","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"CCykLH4ypf4kkNG","output_index":1,"sequence_number":298}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"充分","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"dKQfE3KfMpnEKM","output_index":1,"sequence_number":299}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"的","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"2xor67zgtoc4Qd7","output_index":1,"sequence_number":300}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"安全","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"zVknIRoI6x4rdv","output_index":1,"sequence_number":301}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"余","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"51A5aWo4Ndt237e","output_index":1,"sequence_number":302}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"量","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"EGb18WFUoHinrwE","output_index":1,"sequence_number":303}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"。”","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"l9hzxgjL0uJath","output_index":1,"sequence_number":304}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"  \n","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"sqF0JFljWM3pJ","output_index":1,"sequence_number":305}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"—","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"1ZjcdnIC1nhPrb5","output_index":1,"sequence_number":306}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" `","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"EskJyhzRQpydMg","output_index":1,"sequence_number":307}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"197","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Qgp0QQKppl607","output_index":1,"sequence_number":308}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"5","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"uADv3CRVwR6dBwv","output_index":1,"sequence_number":309}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Berkshire","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"zX5xZV","output_index":1,"sequence_number":310}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" letter","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"fwB39ePNX","output_index":1,"sequence_number":311}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"`\n\n","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"lw6x3GXlbgyyg","output_index":1,"sequence_number":312}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"到","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"ao9df4fzriu9TPH","output_index":1,"sequence_number":313}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Berkshire","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Sb06fr","output_index":1,"sequence_number":314}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" 阶","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"c5wsHsNcaIH5L8","output_index":1,"sequence_number":315}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"段","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"T6n5K9w8kBjYCF4","output_index":1,"sequence_number":316}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"，","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"FVHaAifuLLYPTH2","output_index":1,"sequence_number":317}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"安全","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"EefUxA80WGNzWS","output_index":1,"sequence_number":318}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"边","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"UnT3qZOdl1iAuE5","output_index":1,"sequence_number":319}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"际","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"V4ddocHADEH5TO0","output_index":1,"sequence_number":320}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"已","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"OcN5SpDiAB4rH7w","output_index":1,"sequence_number":321}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"不","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"1aPdr2hnSerYhnj","output_index":1,"sequence_number":322}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"只是","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"26FOU1kGgf5f2q","output_index":1,"sequence_number":323}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"低","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"mcEkvS5L0DydWSA","output_index":1,"sequence_number":324}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"价","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"j8hIpKpLljMkcF6","output_index":1,"sequence_number":325}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"，而","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"K6FIiAQ8K0REkP","output_index":1,"sequence_number":326}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"是","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"0RHxZfS56z9reQY","output_index":1,"sequence_number":327}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"：","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"e5qVBDjGcJ1pQtt","output_index":1,"sequence_number":328}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"好","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Z5nrIuxcGI2Xt6m","output_index":1,"sequence_number":329}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"生","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"5cgLBMQ2Efi34r1","output_index":1,"sequence_number":330}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"意","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"XRgcWk5GIYgf0cj","output_index":1,"sequence_number":331}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"、","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"w07SM6USKMTt2ww","output_index":1,"sequence_number":332}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"好","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"18ovAq577t3QZH6","output_index":1,"sequence_number":333}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"管理","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"i6FtVmUrRgcSox","output_index":1,"sequence_number":334}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"、","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"eTs3ELDlZf8VS2T","output_index":1,"sequence_number":335}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"好","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"rAbf0YM8trNDbko","output_index":1,"sequence_number":336}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"价格","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"DA10PAbPT9z3Rn","output_index":1,"sequence_number":337}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"，再","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"zEgtyiwpOVYIEi","output_index":1,"sequence_number":338}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"加","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"pxq8DtT8pYdUuPn","output_index":1,"sequence_number":339}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"保","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"TyYWn5DnzWKHs6b","output_index":1,"sequence_number":340}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"守","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"OlXFa2dliCHXt8Z","output_index":1,"sequence_number":341}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"融资","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"1xp3nzJnMqm8m2","output_index":1,"sequence_number":342}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"与","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"0eLx30xLXEigKbY","output_index":1,"sequence_number":343}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"流","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"pdHnD8YXGFB4rv6","output_index":1,"sequence_number":344}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"动","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"MRZd7DM8tTzTkqS","output_index":1,"sequence_number":345}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"性","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"Q0eJM7MUoHOBKLr","output_index":1,"sequence_number":346}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"。","item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"obfuscation":"enCMKS3C9R7L6Yu","output_index":1,"sequence_number":347}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","content_index":0,"item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","logprobs":[],"output_index":1,"sequence_number":348,"text":"先说明：1965-1975 的 corpus 里，Buffett 还不是用后来那句 canonical “Margin of Safety” 来讲；更多是**操作语言**。\n\n1. **1965：安全边际支持集中，而不是分散**  \n> “事实和逻辑，正确的概率极大……内在价值不可能出现根本变化……最多拿出40％的净资产。”  \n> “严重永久性损失的风险极低。”  \n— `1965 partner letter`\n\n意思：他把安全边际理解为“价值判断足够确定 + 永久损失概率低”，所以可以重仓。\n\n2. **1969：没有安全边际就停止游戏**  \n> “我看不到任何机会……不想拿别人的钱误打误撞碰运气。”  \n> “不想为了辉煌谢幕而做自己不懂的投资。”  \n— `1969 May partner letter`\n\n这是一处关键变化：安全边际不只是买入标准，也变成**退出/清算纪律**。\n\n3. **1975：从便宜证券扩展到企业质量与资产负债表**  \n> “有利的经济特征、能干且诚实的管理层，以及以私人所有者视角衡量极具吸引力的买入价格。”  \n> “资产负债表上留有充分的安全余量。”  \n— `1975 Berkshire letter`\n\n到 Berkshire 阶段，安全边际已不只是低价，而是：好生意、好管理、好价格，再加保守融资与流动性。"}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","content_index":0,"item_id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","output_index":1,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":"先说明：1965-1975 的 corpus 里，Buffett 还不是用后来那句 canonical “Margin of Safety” 来讲；更多是**操作语言**。\n\n1. **1965：安全边际支持集中，而不是分散**  \n> “事实和逻辑，正确的概率极大……内在价值不可能出现根本变化……最多拿出40％的净资产。”  \n> “严重永久性损失的风险极低。”  \n— `1965 partner letter`\n\n意思：他把安全边际理解为“价值判断足够确定 + 永久损失概率低”，所以可以重仓。\n\n2. **1969：没有安全边际就停止游戏**  \n> “我看不到任何机会……不想拿别人的钱误打误撞碰运气。”  \n> “不想为了辉煌谢幕而做自己不懂的投资。”  \n— `1969 May partner letter`\n\n这是一处关键变化：安全边际不只是买入标准，也变成**退出/清算纪律**。\n\n3. **1975：从便宜证券扩展到企业质量与资产负债表**  \n> “有利的经济特征、能干且诚实的管理层，以及以私人所有者视角衡量极具吸引力的买入价格。”  \n> “资产负债表上留有充分的安全余量。”  \n— `1975 Berkshire letter`\n\n到 Berkshire 阶段，安全边际已不只是低价，而是：好生意、好管理、好价格，再加保守融资与流动性。"},"sequence_number":349}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"先说明：1965-1975 的 corpus 里，Buffett 还不是用后来那句 canonical “Margin of Safety” 来讲；更多是**操作语言**。\n\n1. **1965：安全边际支持集中，而不是分散**  \n> “事实和逻辑，正确的概率极大……内在价值不可能出现根本变化……最多拿出40％的净资产。”  \n> “严重永久性损失的风险极低。”  \n— `1965 partner letter`\n\n意思：他把安全边际理解为“价值判断足够确定 + 永久损失概率低”，所以可以重仓。\n\n2. **1969：没有安全边际就停止游戏**  \n> “我看不到任何机会……不想拿别人的钱误打误撞碰运气。”  \n> “不想为了辉煌谢幕而做自己不懂的投资。”  \n— `1969 May partner letter`\n\n这是一处关键变化：安全边际不只是买入标准，也变成**退出/清算纪律**。\n\n3. **1975：从便宜证券扩展到企业质量与资产负债表**  \n> “有利的经济特征、能干且诚实的管理层，以及以私人所有者视角衡量极具吸引力的买入价格。”  \n> “资产负债表上留有充分的安全余量。”  \n— `1975 Berkshire letter`\n\n到 Berkshire 阶段，安全边际已不只是低价，而是：好生意、好管理、好价格，再加保守融资与流动性。"}],"phase":"final_answer","role":"assistant"},"output_index":1,"sequence_number":350}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_0a602921c80ae72a016a0f0d209f5c8191974ebf82fa6dad38","object":"response","created_at":1779371297,"status":"completed","background":false,"completed_at":1779371324,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"# Identity\n\n你是 **leek**——一个 truth-seeking investment partner。\n\nleek 不是金融助手（不是来跑数据），不是研究 GPT（不是来生成 essay）。\n你是用户做投资决策的伙伴：帮他更接近真相，最终决策权在他那里，但\n你的判断是他最重要的输入之一。\n\n你不预设自己是教练、师爷、助手中的某一种——这些角色由用户在使用\n过程中自己赋予。他要解释你拉开教学密度，他要 actionable 你给仓位\n和触发条件，他只要数据你不抢戏。读取这些信号是你的工作。\n\n## 使命\n\n**帮用户做出最接近真相的投资决策。**\n\n\"最接近真相\" 不等于 \"正确\"——市场和未来都有 irreducible 不确定性。\n你的工作是：在已知信息下把推理做扎实、把不确定性表达诚实，让用户\n事后复盘时能说\"决策过程是对的\"，无论 outcome 如何。\n\n# 运行方式\n\n你在一个带工具的 agent loop 里运行。需要外部信息或要执行动作时调用工具，工具结果会回到你这里继续推理；掌握足够信息后直接作答，不要为了凑步骤而多调工具。回答用用户的语言。\n\n# 求证纪律\n\n对**具体事实**（股票代码、公司、价格、新闻、事件、日期、数字等），\n先搜后答 —— 用 web_search 查到再回答，不要直接用训练里的世界知识。\n- 一次搜索返回 0 条或不相关 → 换 query 重试 1-2 次\n- 仍搜不到 → 明说\"搜不到\"\n- 若用户仍要训练知识答案 → 显式标注「以下来自训练知识，无法用搜索\n证实，可能过时」再给\n\n分析、判断、推理是你的本职，不必为它做搜索表演。但**分析依赖的事实**\n必须搜过、可追溯。\n\n# corpus orientation\n\n**corpus 是你大脑的延伸，不是外部参考资料。** 你\"就是\" corpus 的具身化——它的双轴布局决定了你在每一层的存在方式。\n\n## 双轴结构\n\n- **轴 1：内容性质**\n  - **principles** —— 思维框架（Buffett / Munger / Dalio 等思想家的 mental models、first principles、投资哲学）。慢变。这一层是你**思考引擎**本身。\n  - **knowledge** —— 世界事实（公司画像、行业格局、宏观状态、新闻、研报、filings）。快变。这一层是你**看世界的素材**。\n- **轴 2：加工阶段**\n  - **sources** —— 原始材料。read-only。\n  - **wikis** —— 编织好的概念/实体页面。\n\n4 象限及你与它们的关系：\n\n| | sources（原料） | wikis（成品） |\n|---|---|---|\n| **principles** | 思想家原文（Buffett 致股东信、Munger 演讲、Dalio Principles 等）。需要原文出处或语境时检索。 | **核心思维框架已注入你的 system prompt**——你心里默认就这样想问题；需要完整语境时再检索 corpus。 |\n| **knowledge** | 研报、新闻、filings、transcripts 原文。wiki 不足时检索。 | 实体 / 概念 / 主题 / 比较 / query 页面。**用 `corpus_search` 调取**，不要凭空编数。 |\n\n整个 corpus 对你都是 **read-only**——`wikis/` 由人或 promotion pipeline 维护；你的发现要进 corpus 必须走 ingest/promotion 通道，不能直接编辑。\n\n## 思考顺序\n\n**principles → knowledge → sources**：先用已默认的 principles 框架定方向（lens），再用 knowledge wiki 把方向落到具体标的与数字（situational data），最后只在 wiki 层不足时回 sources 兜底取原文出处。\n\n颠倒——先翻案例凑立场——是反向归纳，警觉它。principles 是**看世界的镜片**，不是 knowledge 的\"高级版本\"。\n\n## knowledge 使用与临时工作模型\n\nknowledge 层不是“查到了就不用调研”，也不是“没查到就不能做”。正确顺序是：\n\n- 对具体公司、行业、产业链、区域或宏观环境，先查 corpus knowledge：有覆盖就用它来\n  确定调研方向、关键变量和已有事实；没有覆盖就从基础事实开始搭建。\n- 不管 knowledge 是否命中，都必须继续做当前调研。corpus 命中只是提高起点，不替代\n  当下的数据、公告、价格、资金面、渠道、竞争和宏观核验。\n- 当 knowledge 缺失或明显过旧时，在本 session 内建立临时 working model：标明它是\n  session 事实与推断，不是 corpus 已沉淀知识，也不是长期能力边界。\n- 临时 working model 至少说明：产业链/价值链、需求驱动、价格与渠道、竞争/替代品、\n  监管与宏观、财务口径、资金面/流动性中哪些已经查到，哪些仍是缺口。\n- 临时 working model 不是\"待办清单\"。它必须落到 active plan：每个缺口要么\n  继续用 web_search / web_fetch / 财务 / 行情 / 资金面工具查清，要么在工具\n  不可用或用户禁止外部检索时，把计划项完成为“已确认阻塞”。\n- 输出时区分：corpus 已有 knowledge、session 新查事实、基于事实的临时推断。不要把\n  临时推断写成 corpus 已有知识。\n\n# 可用工具\n\n下列工具已接入。是否调用、何时调用，由任务和每个工具自己的 description（已随 API 传给你）决定 —— 这里只是一个清单。\n\n- `web_fetch` — Fetch the contents of an HTTP(S) URL and return the response body as text.\n- `update_plan` — Record or update a short, user-visible plan / TODO list for the current multi-step task.\n- `corpus_search` — Search leek's curated investing-wisdom corpus by keyword and return the top hits (id, title, snippet, BM25 score).\n- `corpus_read` — Read one document from leek's corpus by its id (the POSIX-style relative path returned by `corpus_search`, e.g.\n","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[{"id":"rs_0a602921c80ae72a016a0f0d2324748191b99fc0857e6d53a6","type":"reasoning","summary":[]},{"id":"msg_0a602921c80ae72a016a0f0d35c9cc8191809e23ba3a1cba79","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"先说明：1965-1975 的 corpus 里，Buffett 还不是用后来那句 canonical “Margin of Safety” 来讲；更多是**操作语言**。\n\n1. **1965：安全边际支持集中，而不是分散**  \n> “事实和逻辑，正确的概率极大……内在价值不可能出现根本变化……最多拿出40％的净资产。”  \n> “严重永久性损失的风险极低。”  \n— `1965 partner letter`\n\n意思：他把安全边际理解为“价值判断足够确定 + 永久损失概率低”，所以可以重仓。\n\n2. **1969：没有安全边际就停止游戏**  \n> “我看不到任何机会……不想拿别人的钱误打误撞碰运气。”  \n> “不想为了辉煌谢幕而做自己不懂的投资。”  \n— `1969 May partner letter`\n\n这是一处关键变化：安全边际不只是买入标准，也变成**退出/清算纪律**。\n\n3. **1975：从便宜证券扩展到企业质量与资产负债表**  \n> “有利的经济特征、能干且诚实的管理层，以及以私人所有者视角衡量极具吸引力的买入价格。”  \n> “资产负债表上留有充分的安全余量。”  \n— `1975 Berkshire letter`\n\n到 Berkshire 阶段，安全边际已不只是低价，而是：好生意、好管理、好价格，再加保守融资与流动性。"}],"phase":"final_answer","role":"assistant"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"1c460329-4c46-47d6-adbd-7a066c52eeb4","prompt_cache_retention":"24h","reasoning":{"effort":"xhigh","summary":null},"safety_identifier":"user-fP3i4Yy125xxEy5mdOYUM5GF","service_tier":"default","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"low"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Fetch the contents of an HTTP(S) URL and return the response body as text. Use it to read a specific web page or HTTP API endpoint that the user named, or that earlier research surfaced. Returns up to ~16000 characters; a longer body is truncated and marked as such. Does not run JavaScript — a page that renders client-side comes back as raw HTML.","name":"web_fetch","parameters":{"additionalProperties":false,"properties":{"url":{"description":"Absolute http:// or https:// URL to fetch.","type":"string"}},"required":["url"],"type":"object"},"strict":false},{"type":"function","description":"Record or update a short, user-visible plan / TODO list for the current multi-step task. Each call REPLACES the whole plan, so always send every step. Use it to track progress on work that takes several steps, and keep it short. The plan is shown to the user as a checklist — it does not gate or block your reply; finish whenever the answer is ready. Skip it entirely for simple, single-step tasks.","name":"update_plan","parameters":{"additionalProperties":false,"properties":{"explanation":{"description":"Optional one-line note on what changed in the plan.","type":"string"},"plan":{"description":"The full plan — every step, in order.","items":{"additionalProperties":false,"properties":{"status":{"description":"This step's status.","enum":["pending","in_progress","completed"],"type":"string"},"step":{"description":"What this step does.","type":"string"}},"required":["step","status"],"type":"object"},"type":"array"}},"required":["plan"],"type":"object"},"strict":false},{"type":"function","description":"Search leek's curated investing-wisdom corpus by keyword and return the top hits (id, title, snippet, BM25 score). Use this BEFORE pulling on the public web for any question that might be covered by principles (Munger, Buffett, Dalio, …) or by previously curated knowledge pages. The id returned here is the input to `corpus_read` when you need the full document body. Lexical-only (no embeddings); tokenization handles CJK per-character and Latin words on whitespace.","name":"corpus_search","parameters":{"additionalProperties":false,"properties":{"limit":{"description":"Maximum hits to return (default 5, max 25).","maximum":25,"minimum":1,"type":"integer"},"query":{"description":"Search query — keywords or short phrase. Examples: 'circle of competence', 'NVDA GPU 市场', 'margin of safety'.","type":"string"}},"required":["query"],"type":"object"},"strict":false},{"type":"function","description":"Read one document from leek's corpus by its id (the POSIX-style relative path returned by `corpus_search`, e.g. 'sources/principles/munger/circle.md'). Returns the FULL body for reasoning. Use after `corpus_search` surfaces a promising hit and you need the document's full text or frontmatter.","name":"corpus_read","parameters":{"additionalProperties":false,"properties":{"id":{"description":"Document id — the POSIX-style relative path returned by corpus_search. No leading slash.","type":"string"}},"required":["id"],"type":"object"},"strict":false},{"type":"web_search","return_token_budget":"default","search_context_size":"medium","user_location":{"type":"approximate","city":null,"country":"US","region":null,"timezone":null}}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":{"input_tokens":105173,"input_tokens_details":{"cached_tokens":2432},"output_tokens":1383,"output_tokens_details":{"reasoning_tokens":1034},"total_tokens":106556},"user":null,"metadata":{}},"sequence_number":351}
+
