@@ -21,6 +21,8 @@
 //! envelope.
 
 mod compaction;
+#[cfg(test)]
+mod compaction_replay_test;
 pub mod events;
 mod guards;
 mod prompt;
@@ -125,7 +127,6 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
     let mut cost_usd: f64 = 0.0;
-    let mut last_input_tokens: u32 = 0;
     // Sliding window of recent (tool, args) calls for the doom-loop detector.
     let mut doom_window: VecDeque<(String, String)> = VecDeque::new();
     // Auto-compaction state: the running summary of context folded away,
@@ -164,20 +165,18 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
         // Near the context-window limit, fold the early context into a
         // traceable summary and continue this turn — there is no
         // context-limit stop (REQUIREMENTS §7.1, MILESTONES M1.8). The
-        // provider's measured `input_tokens` is the accurate trigger; until
-        // the first iteration reports one, an estimate stands in so an
-        // already-oversized history still compacts before its first call.
+        // trigger signal is leek's own estimator over the assembled
+        // request: codex's reported `input_tokens` mixes in builtin
+        // web_search volume that compaction cannot shrink, so it cannot
+        // be the trigger (M2.5 — see `docs/dispatches/M2.5-compaction-fix.md`).
         if compact_trigger > 0 {
-            let ctx_tokens = if last_input_tokens > 0 {
-                last_input_tokens
-            } else {
-                compaction::estimate_context_tokens(
-                    &system,
-                    compaction_summary.as_deref(),
-                    &chat_messages,
-                    &additional_inputs,
-                )
-            };
+            let ctx_tokens = compaction::estimate_context_tokens(
+                &system,
+                compaction_summary.as_deref(),
+                &chat_messages,
+                &additional_inputs,
+                &tool_specs,
+            );
             if ctx_tokens >= compact_trigger {
                 // Compaction's summary call is one LLM call — give it its
                 // own slot in the transcript series.
@@ -187,6 +186,7 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
                     session_id,
                     turn_id,
                     &system,
+                    &tool_specs,
                     compaction::TurnContext {
                         summary: &mut compaction_summary,
                         messages: &mut chat_messages,
@@ -197,9 +197,8 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
                 )
                 .await
                 {
-                    Ok(compaction::Compacted::Done { tokens_after }) => {
+                    Ok(compaction::Compacted::Done) => {
                         compaction_count += 1;
-                        last_input_tokens = tokens_after;
                     }
                     Ok(compaction::Compacted::Skipped) => {}
                     Err(e) => {
@@ -337,7 +336,6 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
                     input_tokens += u.input_tokens as u64;
                     output_tokens += u.output_tokens as u64;
                     cost_usd += pricing::compute_cost(MODEL, &u);
-                    last_input_tokens = u.input_tokens;
                 }
                 Ok(LlmEvent::MessageEnd { stop_reason: sr }) => iter_stop = Some(sr),
                 Ok(LlmEvent::Ping) => {}

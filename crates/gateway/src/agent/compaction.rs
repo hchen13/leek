@@ -13,14 +13,16 @@
 //! ordinary model-call failure and surfaces through the loop's normal
 //! fatal-error path.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
+use tiktoken_rs::{o200k_base, CoreBPE};
 
 use crate::api::AppState;
 use crate::llm::codex::CodexClient;
-use crate::llm::{ChatMessage, ChatRequest, LlmEvent, Role};
+use crate::llm::{ChatMessage, ChatRequest, LlmEvent, Role, ToolSpec};
 
 /// Trailing session messages kept verbatim — never folded. Always includes
 /// the current user prompt (the last message). Four ≈ the last two Q&A
@@ -64,10 +66,11 @@ const COMPACTION_SYSTEM_PROMPT: &str = "\
 /// Outcome of a compaction attempt.
 #[derive(Debug)]
 pub enum Compacted {
-    /// The early context was folded into the summary. Carries an estimate
-    /// of the post-compaction context size so the loop can reset its
-    /// measured-token counter until the next iteration reports a real one.
-    Done { tokens_after: u32 },
+    /// The early context was folded into the summary. The agent loop only
+    /// needs to know that it happened so it can bump `compaction_count`;
+    /// the post-fold token estimate is reported separately on the
+    /// `compaction_completed` event.
+    Done,
     /// Nothing old enough to fold — the loop proceeds with the iteration.
     /// This is also what keeps compaction from looping with no progress.
     Skipped,
@@ -99,19 +102,20 @@ pub struct TurnContext<'a> {
 /// `transcript_iter` is the iteration the compaction summary call should
 /// occupy in the F2 `llm_transcripts` archive; the caller allocates it so
 /// every LLM call inside a turn gets a unique row.
+#[allow(clippy::too_many_arguments)]
 pub async fn compact(
     st: &AppState,
     session_id: &str,
     turn_id: &str,
     system: &str,
+    tools: &[ToolSpec],
     ctx: TurnContext<'_>,
     tokens_before: u32,
     transcript_iter: i64,
 ) -> Result<Compacted> {
-    let (early_msgs, early_items) = plan_split(ctx.messages.len(), ctx.tool_dialog.len());
-    if early_msgs == 0 && early_items == 0 {
+    let Some(plan) = plan_split_for(&ctx) else {
         return Ok(Compacted::Skipped);
-    }
+    };
 
     st.emit(
         session_id,
@@ -122,8 +126,8 @@ pub async fn compact(
 
     let transcript = render_for_summary(
         ctx.summary.as_deref(),
-        &ctx.messages[..early_msgs],
-        &ctx.tool_dialog[..early_items],
+        &ctx.messages[..plan.early_msgs],
+        &ctx.tool_dialog[..plan.early_items],
     );
     let folded = summarize(
         &st.codex,
@@ -135,12 +139,8 @@ pub async fn compact(
     )
     .await?;
 
-    ctx.messages.drain(..early_msgs);
-    ctx.tool_dialog.drain(..early_items);
-    *ctx.summary = Some(folded);
-
-    let tokens_after =
-        estimate_context_tokens(system, ctx.summary.as_deref(), ctx.messages, ctx.tool_dialog);
+    let summary_preview = super::preview(&folded);
+    let tokens_after = apply_compaction(ctx, plan, folded, system, tools);
 
     st.emit(
         session_id,
@@ -149,9 +149,9 @@ pub async fn compact(
             "turn_id": turn_id,
             "tokens_before": tokens_before,
             "tokens_after": tokens_after,
-            "messages_folded": early_msgs,
-            "tool_calls_folded": early_items / 2,
-            "summary_preview": super::preview(ctx.summary.as_deref().unwrap_or("")),
+            "messages_folded": plan.early_msgs,
+            "tool_calls_folded": plan.early_items / 2,
+            "summary_preview": summary_preview,
         }),
     )
     .await;
@@ -161,10 +161,57 @@ pub async fn compact(
         turn_id,
         tokens_before,
         tokens_after,
-        messages_folded = early_msgs,
+        messages_folded = plan.early_msgs,
         "auto-compaction folded the turn context"
     );
-    Ok(Compacted::Done { tokens_after })
+    Ok(Compacted::Done)
+}
+
+/// Replay-test seam. Plans a compaction over the current turn context,
+/// or `None` when there is nothing old enough to fold (matches `compact`'s
+/// `Skipped` outcome). Pairs with [`apply_compaction`].
+pub fn plan_split_for(ctx: &TurnContext<'_>) -> Option<CompactionPlan> {
+    let (early_msgs, early_items) = plan_split(ctx.messages.len(), ctx.tool_dialog.len());
+    if early_msgs == 0 && early_items == 0 {
+        return None;
+    }
+    Some(CompactionPlan {
+        early_msgs,
+        early_items,
+    })
+}
+
+/// Number of leading messages and tool-dialog items the compaction will
+/// fold. The split keeps `KEEP_MESSAGES` trailing messages and
+/// `KEEP_DIALOG_PAIRS` trailing call/output pairs verbatim.
+#[derive(Debug, Clone, Copy)]
+pub struct CompactionPlan {
+    pub early_msgs: usize,
+    pub early_items: usize,
+}
+
+/// Replay-test seam. Applies a planned compaction with the given summary
+/// text (production: produced by the codex summarizer; tests: a mock
+/// string). Drains the early messages and tool dialog from `ctx`, sets
+/// `ctx.summary` to the new summary, and returns the post-fold context
+/// token estimate.
+pub fn apply_compaction(
+    ctx: TurnContext<'_>,
+    plan: CompactionPlan,
+    summary: String,
+    system: &str,
+    tools: &[ToolSpec],
+) -> u32 {
+    ctx.messages.drain(..plan.early_msgs);
+    ctx.tool_dialog.drain(..plan.early_items);
+    *ctx.summary = Some(summary);
+    estimate_context_tokens(
+        system,
+        ctx.summary.as_deref(),
+        ctx.messages,
+        ctx.tool_dialog,
+        tools,
+    )
 }
 
 /// Wrap the current summary as the developer-role context block prepended
@@ -176,29 +223,73 @@ pub fn summary_message(summary: &str) -> ChatMessage {
     }
 }
 
-/// Estimated token size of a fully assembled request: system prompt, the
-/// compaction summary block (if present), session messages and tool dialog.
-/// The loop uses this only before its first iteration reports a real count.
+/// Tools tokenize at roughly 4× their JSON byte-tokenization once the
+/// Responses API renderer expands each function spec into the verbose
+/// internal description the model sees (M2.5 calibration against the
+/// step-1 fixtures — see `docs/dispatches/M2.5-compaction-fix.md`).
+const TOOL_EXPANSION: f32 = 4.0;
+/// Safety margin on the final estimate: a small over-bias so the trigger
+/// errs toward firing slightly early rather than missing the window. Set
+/// from M2.5 calibration p95 (worst-case over-estimate stays ≤ +10%).
+const SAFETY_MARGIN: f32 = 1.05;
+
+/// Estimated token size of the fully assembled request: system prompt,
+/// the compaction summary block (if present), session messages, the
+/// re-injected tool dialog, and the tool specs. After M2.5 this is the
+/// trigger signal for auto-compaction — codex's own reported
+/// `input_tokens` mixes leek-side context with builtin web_search
+/// volume, which leek cannot shrink. The estimator counts only what
+/// leek actually sends.
 pub fn estimate_context_tokens(
     system: &str,
     summary: Option<&str>,
     messages: &[ChatMessage],
     tool_dialog: &[serde_json::Value],
+    tools: &[ToolSpec],
 ) -> u32 {
     let mut total = estimate_tokens(system);
     if let Some(s) = summary {
-        // The block is sent with its header prefix; count both.
         total = total
             .saturating_add(estimate_tokens(SUMMARY_HEADER))
             .saturating_add(estimate_tokens(s));
     }
     for m in messages {
-        total = total.saturating_add(estimate_tokens(&m.content));
+        // Mirror the wire format `build_request_body` emits — the model
+        // sees the full `{role, content}` JSON object, not just the
+        // content string, so the estimate counts the wrapping too.
+        let wire = serde_json::json!({ "role": m.role.as_str(), "content": m.content });
+        total = total.saturating_add(estimate_tokens(&wire.to_string()));
     }
     for item in tool_dialog {
         total = total.saturating_add(estimate_tokens(&item.to_string()));
     }
-    total
+    // Tool specs are tokenized in the format `build_request_body` emits
+    // (`{type, name, description, parameters, strict}` per tool), then
+    // scaled by `TOOL_EXPANSION` to reflect the model-side expansion.
+    let tools_tokens = estimate_tool_specs_tokens(tools);
+    total = total.saturating_add((tools_tokens as f32 * TOOL_EXPANSION) as u32);
+    (total as f32 * SAFETY_MARGIN) as u32
+}
+
+fn estimate_tool_specs_tokens(tools: &[ToolSpec]) -> u32 {
+    if tools.is_empty() {
+        return 0;
+    }
+    let arr = serde_json::Value::Array(
+        tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                    "strict": false,
+                })
+            })
+            .collect(),
+    );
+    estimate_tokens(&arr.to_string())
 }
 
 /// Split point for compaction. Given the message count and tool-dialog item
@@ -326,12 +417,21 @@ async fn summarize(
     Ok(out)
 }
 
-/// Rough token estimate — about three UTF-8 bytes per token, a blended rate
-/// for the mixed Chinese / English text leek handles. Only ever a *fallback*
-/// signal: the provider's reported `input_tokens` is exact and supersedes it
-/// on every iteration after the first.
+/// BPE tokenizer aligned with gpt-5.5 (o200k_base). Loaded once on first
+/// use — building the encoder reads embedded byte-pair tables, which is
+/// not free, so the encoder is cached for the process lifetime.
+fn bpe() -> &'static CoreBPE {
+    static BPE: OnceLock<CoreBPE> = OnceLock::new();
+    BPE.get_or_init(|| {
+        o200k_base().expect("tiktoken-rs ships o200k_base byte-pair tables")
+    })
+}
+
+/// Token count for one chunk of text under the configured BPE. Used as a
+/// building block for [`estimate_context_tokens`]; not a fallback any
+/// more — after M2.5 this *is* the trigger signal.
 fn estimate_tokens(s: &str) -> u32 {
-    (s.len() / 3).try_into().unwrap_or(u32::MAX)
+    bpe().encode_with_special_tokens(s).len() as u32
 }
 
 #[cfg(test)]
@@ -375,9 +475,27 @@ mod tests {
 
     #[test]
     fn estimate_context_tokens_sums_its_parts() {
-        let small = estimate_context_tokens("sys", None, &[], &[]);
-        let big = estimate_context_tokens("sys", Some("a summary"), &[user("hello there")], &[]);
+        let small = estimate_context_tokens("sys", None, &[], &[], &[]);
+        let big = estimate_context_tokens(
+            "sys",
+            Some("a summary"),
+            &[user("hello there")],
+            &[],
+            &[],
+        );
         assert!(big > small);
+    }
+
+    #[test]
+    fn estimate_context_tokens_charges_for_tools() {
+        let spec = ToolSpec {
+            name: "web_fetch".into(),
+            description: "fetch a URL".into(),
+            parameters: serde_json::json!({"type":"object","properties":{}}),
+        };
+        let without = estimate_context_tokens("sys", None, &[], &[], &[]);
+        let with = estimate_context_tokens("sys", None, &[], &[], &[spec]);
+        assert!(with > without, "tools must add to the estimate");
     }
 
     #[test]
