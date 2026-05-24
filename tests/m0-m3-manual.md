@@ -409,9 +409,131 @@ skills/sample/SKILL.md         # frontmatter + body
 
 ---
 
-## 第七段:M3 A 股 MVP(等 worker 完成后追加)
+## 第七段:M3 A 股 MVP(5 工具 + 3 task 形态 + vendor fallback)
 
-T27-T33 占位 — 等 M3 worker subagent 实施完成后由 PM 填充(5 工具 + 3 task 形态 + vendor fallback)。
+### T27 · 单工具 `market_quote`
+
+**预先(可选)**:`export LEEK_TUSHARE_TOKEN=<your-token>` 启 gateway;若无 token,fallback 走新浪。
+
+**prompt**:
+
+```
+查一下贵州茅台(600519.SH)现在的报价。
+```
+
+**预期**:agent 调 `market_quote`,canvas 出 **市场报价卡** —— `600519.SH · 贵州茅台 · 收 ¥X,XXX · ±X.XX%`,附 timestamp + data_source(`primary` 或 `fallback-1`,**不暴露 vendor 名**);chat 答简短价格 + 涨跌。
+
+**看点**:无 token 时,debug_payload 里能看到 `attempts: [{vendor: tushare, status: "no token"}, {vendor: sina, status: ok}]`(debug 视图 OK 含 vendor 名,display 不含)。
+
+---
+
+### T28 · `get_candlesticks` 周线 50 根
+
+**prompt**:
+
+```
+拿一下 600519.SH 最近 50 根周线。
+```
+
+**预期**:agent 调 `get_candlesticks` with `period="1w", count=50`,canvas 出 K 线数据卡(JSON 表格形式 50 条 OHLCV + 成交量,**MVP 不渲图表**)。chat 给一段文字描述近期走势。
+
+---
+
+### T29 · `get_financials` 年报 5 年比率
+
+**prompt**:
+
+```
+600519.SH 最近 5 年的核心财务比率(ROE / 毛利率 / 资产负债率)。
+```
+
+**预期**:agent 调 `get_financials` with `statement="ratios", period="year", count=5`,canvas 出 5 行数据 + 中性字段名(`roe` / `gross_margin` / `debt_to_equity`,**不带 vendor schema**)。chat 答 ROE 历史变化。
+
+---
+
+### T30 · task 委派 `quick-screen`(< 2 分钟)
+
+**prompt**:
+
+```
+用 task 委派 quick-screen 帮我看看 600519.SH 现在能不能买。
+```
+
+**预期**:
+- canvas 主 turn 出 subagent_card `委派给 quick-screen · depth 1`
+- 展开内部 → 1-2 工具调用(market_quote + get_company_info + 可能 get_capital_flow)
+- subagent 返 200-300 字 digest("当前价 / 估值水平 / 资金情绪 / 是否值得深入研究")
+- 主 agent 综合给最终判断
+- wall_clock < 2 分钟
+
+**看点**:quick-screen `allowed_tools` 明确不含 `get_candlesticks` / `get_financials` / `web_search` / `corpus_search` → subagent 不深挖。
+
+---
+
+### T31 · task 委派 `deep-review`(完整 review)
+
+**prompt**:
+
+```
+用 task 委派 deep-review 做一份贵州茅台(600519.SH)的完整投资复盘:基本面 + 财务 + 估值 + corpus 历史观点 + 主要风险。
+```
+
+**预期**:
+- subagent_card depth 1,**5-15 分钟** wall_clock
+- 内部 10-30 工具调用(全工具集:market_quote / candlesticks / financials / company_info / capital_flow / corpus_search / corpus_read / web_search / web_fetch / update_plan)
+- 返 500-1500 字 digest 带数据 cite(`(2024年报 ROE 34.2%, 数据来源工具:get_financials)`,`(corpus: wikis/principles/concepts/circle-of-competence.md)`)
+- 主 agent 直接 forward subagent digest 作最终答案(基本不再加工)
+
+**看点**:`turn_metrics` 主 + 子两行,subagent 行的 `iteration_count` 应 ≥ 10,`cost_usd` 反映 deep-review 实际成本(可能 $0.50-$2.00 一次)。
+
+---
+
+### T32 · task 委派 `comparison`(嵌套 task)
+
+**prompt**:
+
+```
+对比白酒三龙头:贵州茅台(600519.SH)、五粮液(000858.SZ)、泸州老窖(000568.SZ)的基本面 + 估值水平。
+```
+
+**预期**:
+- canvas 主 turn 出 subagent_card `委派给 comparison · depth 1`
+- comparison 内部**并行** task 三个 quick-screen(depth=2) + 1 个 corpus-expert(可选,加 corpus 视角)
+- canvas 看到 1 个 comparison subagent_card,内部嵌套 3-4 个 subagent_card(各 quick-screen / corpus-expert)
+- 最终输出对比表(3 行 × 几列指标)+ 短结论
+
+**看点**:并行嵌套时 turn_metrics 表里 4-5 行(主 + comparison + 3 quick-screen + 1 corpus-expert),全部 `parent_turn_id` 链对。
+
+---
+
+### T33 · Vendor down 优雅 fallback
+
+**预先**:`LEEK_TUSHARE_TOKEN=invalid_garbage` 启 gateway(强迫 Tushare 失败)。
+
+**prompt**:
+
+```
+查一下 600519.SH 现在的报价。
+```
+
+**预期**:agent 调 `market_quote`,Tushare 返 invalid token error → 自动 fallback 到新浪 → 仍然返报价数据;canvas 卡片 display_payload 标 `data_source: "fallback-1"`,带 warning chip("主源不可用,使用备源");chat 答价格 OK 但提示数据 freshness 可能不同。
+
+**看点**:debug_payload 里 `attempts` 数组 2 条(tushare invalid_token + sina ok),vendor 名仅在 debug 出现。如果北向资金不可用类似处理,`get_capital_flow` 返 `north_flow_available: false` 不阻塞 main flow。
+
+---
+
+## 跑完之后(M0–M3 全部 33 条)
+
+- 想看 raw LLM 层(F2 归档):`curl http://localhost:8964/api/v1/sessions/{id}/transcripts`
+- 想 reset:删 vault.db + 删 `~/.leek/config.json`(M2.6 settings)
+- 想测 M2.5 compaction-fix replay(不需浏览器):`cargo test --workspace replay`
+- 想测 M3 命名中立:`cargo test --test m3_vendor_neutrality`(grep guardrail)
+- 想测 M3 vendor 实拉(需网络):`cargo test --test m3_integration -- --ignored`
+- M0-M3 全过 → leek MVP 完整功能上线,可转 M4(完整版 A 股 + memory 等)
+
+## 滚动维护
+
+新 milestone(M2.7+ / M4+)实施后追加 T34+ case。**不删旧 case**(回归 baseline 不丢);若某 case 因架构调整失效,标 SKIP + 注明 root cause(等下次 milestone 修复后 unSKIP)。
 
 ---
 
