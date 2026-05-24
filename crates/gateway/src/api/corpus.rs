@@ -62,6 +62,8 @@ mod tests {
             web_search: false,
             corpus,
             corpus_graph,
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+            hooks: std::sync::Arc::new(crate::hooks::HookEngine::default()),
         }
     }
 
@@ -119,6 +121,8 @@ mod tests {
             web_search: false,
             corpus,
             corpus_graph,
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+            hooks: std::sync::Arc::new(crate::hooks::HookEngine::default()),
         };
         let resp = graph(axum::extract::State(st)).await;
         assert_eq!(resp.0["nodes"].as_array().unwrap().len(), 0);
