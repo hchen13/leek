@@ -150,6 +150,15 @@ fn effective_body(_cfg: &Config, eff: &GuardConfig) -> serde_json::Value {
         // The config file says nothing about web_search (a capability flag,
         // not a guard) — but exposing the effective value here is helpful
         // for the UI, even when there is no editable field for it.
+        // M3 vendor token — string-valued, not a guard. Env LEEK_TUSHARE_TOKEN
+        // wins over config-file. Value is masked-friendly: we return the raw
+        // resolved value so the UI can decide whether to mask (typically yes).
+        "tushare_token": {
+            "value": std::env::var("LEEK_TUSHARE_TOKEN")
+                .ok()
+                .or_else(|| _cfg.tushare_token.clone()),
+            "overridden_by_env": env_set("LEEK_TUSHARE_TOKEN"),
+        },
         "web_search": {
             // Effective value is the AppState's startup-resolved boolean
             // (env-only today); echo it via `cfg` would be wrong since

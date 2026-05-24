@@ -230,12 +230,15 @@ export type SettingsConfig = {
   doom_loop_threshold?: number | null;
   auto_compact_threshold?: number | null;
   context_window?: number | null;
+  /** M3 vendor token. Optional, masked in UI. */
+  tushare_token?: string | null;
 };
 
 /** One field's effective value + env-override flag. The value is `null`
- *  when the guard is disabled (e.g. `cost_cap_usd = 0`). */
+ *  when the guard is disabled (e.g. `cost_cap_usd = 0`). For string fields
+ *  like tushare_token the value is a string instead of a number. */
 export type EffectiveField = {
-  value: number | null;
+  value: number | string | null;
   overridden_by_env: boolean;
 };
 
@@ -250,6 +253,8 @@ export type SettingsResponse = {
     doom_loop_threshold: EffectiveField;
     auto_compact_threshold: EffectiveField;
     context_window: EffectiveField;
+    /** M3 Tushare token (string field, masked in UI). */
+    tushare_token: EffectiveField;
     web_search: { value: boolean; overridden_by_env: boolean };
   };
   config_path: string;

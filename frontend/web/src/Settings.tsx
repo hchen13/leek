@@ -164,6 +164,8 @@ export function Settings(props: SettingsProps) {
   const fillDraftFrom = (resp: SettingsResponse) => {
     const next: Record<string, string> = {};
     for (const f of FIELDS) next[f.key] = draftOf(resp.config, f.key);
+    // M3 vendor token (string field, not in FIELDS — handled inline)
+    next.tushare_token = resp.config.tushare_token ?? "";
     setDraft(next);
   };
 
@@ -187,9 +189,9 @@ export function Settings(props: SettingsProps) {
    *  the loaded `config` go in. This keeps a save from re-asserting fields
    *  the user didn't touch, which matters for the env-override case (we
    *  don't want to "save" the env-resolved value back as the file value). */
-  const buildPatchBody = (): Record<string, number | null> => {
+  const buildPatchBody = (): Record<string, number | string | null> => {
     const cfg = data()?.config ?? {};
-    const out: Record<string, number | null> = {};
+    const out: Record<string, number | string | null> = {};
     const d = draft();
     for (const f of FIELDS) {
       const raw = d[f.key] ?? "";
@@ -199,12 +201,19 @@ export function Settings(props: SettingsProps) {
         out[f.key as string] = parsed;
       }
     }
+    // M3 vendor token — string field, separate handling.
+    const tokRaw = (d.tushare_token ?? "").trim();
+    const tokDraft = tokRaw === "" ? null : tokRaw;
+    const tokCurrent = cfg.tushare_token ?? null;
+    if (tokDraft !== tokCurrent) {
+      out.tushare_token = tokDraft;
+    }
     return out;
   };
 
   /** PATCH with the given body — `{}` is the "reset to defaults" path
    *  after `clearAllFields` writes nulls. */
-  const patchAndRefresh = async (body: Record<string, number | null>) => {
+  const patchAndRefresh = async (body: Record<string, number | string | null>) => {
     setSaving(true);
     setErrors([]);
     setTopError(null);
@@ -368,6 +377,43 @@ export function Settings(props: SettingsProps) {
                 </div>
               )}
             </For>
+
+            {/* M3 vendor 凭证 section — single string field, separate from numeric FIELDS */}
+            <div class="settings-field" data-field="tushare_token">
+              <label class="settings-label" for="settings-tushare_token">
+                Tushare Token (A 股数据主源)
+              </label>
+              <input
+                id="settings-tushare_token"
+                class="settings-input"
+                type="password"
+                placeholder="留空 = 仅用 fallback(新浪/东方财富)"
+                value={draft().tushare_token ?? ""}
+                disabled={saving()}
+                onInput={(e) => {
+                  setDraft({ ...draft(), tushare_token: e.currentTarget.value });
+                }}
+              />
+              <div class="settings-hint">
+                在 <a href="https://tushare.pro/register" target="_blank" rel="noopener noreferrer">tushare.pro</a> 注册免费 token,粘贴到此处启用 market_quote / get_financials / get_capital_flow 等工具的主数据源。空时自动走新浪 + 东方财富 fallback(覆盖率较低)。
+              </div>
+              <div class="settings-effective">
+                <span class="settings-eff-label">当前生效:</span>
+                <span class="settings-eff-value">
+                  {(() => {
+                    const eff = data()?.effective?.tushare_token;
+                    if (!eff || eff.value == null) return "未设置";
+                    return `已设置(${String(eff.value).slice(0, 4)}••••${String(eff.value).slice(-4)})`;
+                  })()}
+                </span>
+                <Show when={data()?.effective?.tushare_token?.overridden_by_env}>
+                  <span class="settings-env-badge" title="LEEK_TUSHARE_TOKEN 环境变量优先于此字段">⚠ 被环境变量 override</span>
+                </Show>
+              </div>
+              <Show when={errorFor("tushare_token")}>
+                <div class="settings-field-err">{errorFor("tushare_token")}</div>
+              </Show>
+            </div>
           </div>
 
           <footer class="settings-foot">
