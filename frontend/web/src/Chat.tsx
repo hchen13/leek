@@ -21,6 +21,8 @@ type ChatProps = {
   sending: () => boolean;
   send: (text: string) => void;
   focusCard: (artifactId: string, isError: boolean) => void;
+  /** M2.6: clicked from the cost-cap warning bar's "打开 Settings →" link. */
+  openSettings: () => void;
 };
 
 type SummaryStatus = "running" | "ok" | "error";
@@ -57,6 +59,22 @@ function aggregateText(items: SummaryItem[]): string {
   return text;
 }
 
+/** Show the cost-cap warning bar iff the turn was soft-stopped by the
+ *  cap (M2.6). The check leans on `stopReason === "cost_cap_exceeded"`
+ *  rather than just `costCap != null`, because in principle a future
+ *  event could carry cap telemetry without aborting the turn. Today the
+ *  two coincide. */
+function shouldShowCostCapBar(turn: Turn): boolean {
+  return turn.stopReason === "cost_cap_exceeded" && turn.costCap != null;
+}
+
+/** Pretty-print a USD amount: $0.50 for cents-sized values, $1.23 otherwise.
+ *  We always show 2 decimals so a cap of `$0.5` doesn't render as `$0.5`
+ *  next to an actual spend of `$0.61` (visually inconsistent). */
+function fmtUsd(n: number): string {
+  return `$${n.toFixed(2)}`;
+}
+
 export function Chat(props: ChatProps) {
   const [draft, setDraft] = createSignal("");
   const [expanded, setExpanded] = createSignal<Set<string>>(new Set());
@@ -86,6 +104,30 @@ export function Chat(props: ChatProps) {
     if (!s) return "";
     if (props.noted()[`${s.turnId}:${s.iteration}`]) return "";
     return s.text;
+  };
+
+  /** M2.6: render the cost-cap warning bar for a finished turn that hit
+   *  the cap. Placed at the *end* of the turn — after its summary and
+   *  any final assistant message — so it reads as "this is why the turn
+   *  stopped here", not as a header to what follows. Visible until the
+   *  user starts a new turn (which simply puts a new turn after it). */
+  const renderCostCapBar = (turn: Turn | undefined) => {
+    if (!turn || !shouldShowCostCapBar(turn)) return null;
+    const cap = turn.costCap!;
+    return (
+      <div class="cost-cap-bar" role="alert">
+        <span class="cost-cap-icon" aria-hidden="true">
+          ⚠
+        </span>
+        <span class="cost-cap-text">
+          本轮研究达到预算上限 {fmtUsd(cap.capUsd)}（实际 {fmtUsd(cap.actualCostUsd)}），
+          已在第 {cap.iterCount} 步停止。 再问一句可以继续 / 或在 Settings 调整预算
+        </span>
+        <button class="cost-cap-link" onClick={() => props.openSettings()}>
+          打开 Settings →
+        </button>
+      </div>
+    );
   };
 
   const renderSummary = (turn: Turn | undefined) => {
@@ -147,6 +189,10 @@ export function Chat(props: ChatProps) {
                     `m` (or any signal it reads) changes. */}
                 <div class="msg-body markdown-body" innerHTML={renderMarkdown(m.content)} />
               </div>
+              {/* M2.6: cost-cap warning bar at turn end. Lives after the
+                  assistant message so it reads as a postscript to the
+                  reply that the cap forced to stop early. */}
+              <Show when={m.role === "assistant"}>{renderCostCapBar(turnForMessage(m.seq))}</Show>
             </>
           )}
         </For>

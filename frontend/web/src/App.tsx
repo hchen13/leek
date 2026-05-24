@@ -12,6 +12,7 @@ import { Canvas } from "./Canvas";
 import { Chat } from "./Chat";
 import { CorpusBrain } from "./CorpusBrain";
 import { PlanWidget } from "./PlanWidget";
+import { Settings } from "./Settings";
 import { createWorkbench } from "./store";
 import type { EventRow, Message, Session } from "./types";
 
@@ -32,6 +33,9 @@ const EVENT_KINDS = [
   "turn_metrics_recorded",
   "compaction_started",
   "compaction_completed",
+  // M2.6: emitted just before a turn is soft-stopped for crossing the
+  // cost cap — chat surface uses it to render an in-turn warning bar.
+  "turn_cost_capped",
   "error",
 ];
 
@@ -43,6 +47,9 @@ export default function App() {
   const [showFailed, setShowFailed] = createSignal(false);
   const [highlight, setHighlight] = createSignal<string | null>(null);
   const [rightTab, setRightTab] = createSignal<RightTab>("canvas");
+  // M2.6: the settings modal is a plain show/hide flag — no router, the
+  // panel renders on top of the workbench when this is true.
+  const [showSettings, setShowSettings] = createSignal(false);
 
   const wb = createWorkbench();
   let stream: EventSource | undefined;
@@ -165,10 +172,21 @@ export default function App() {
   return (
     <div class="app">
       <aside class="sidebar">
-        <header>
+        <header class="sidebar-head">
           <h1>
             L.E.E.K <span>· workbench</span>
           </h1>
+          {/* M2.6 ⚙ — opens the settings modal. Plain unicode glyph keeps
+              the dependency surface zero; the title attribute is the
+              accessible label since the visible glyph is decorative. */}
+          <button
+            class="settings-gear"
+            onClick={() => setShowSettings(true)}
+            title="设置"
+            aria-label="打开设置"
+          >
+            ⚙
+          </button>
         </header>
         <button class="new" onClick={() => void newSession()}>
           + 新会话
@@ -201,6 +219,7 @@ export default function App() {
             sending={sending}
             send={(t) => void send(t)}
             focusCard={focusCard}
+            openSettings={() => setShowSettings(true)}
           />
           <section class="right-rail">
             <nav class="right-tabs">
@@ -241,6 +260,10 @@ export default function App() {
           <PlanWidget plan={() => wb.state.plan} />
         </Show>
       </main>
+
+      <Show when={showSettings()}>
+        <Settings onClose={() => setShowSettings(false)} />
+      </Show>
     </div>
   );
 }

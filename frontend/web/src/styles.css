@@ -672,6 +672,312 @@ h2 {
   font-weight: 600;
 }
 
+/* ── M2.6 cost cap warning bar (REQUIREMENTS — Chat surface) ───────────
+   A finished turn that hit the per-turn USD cap renders this bar after
+   the assistant reply, so the user understands *why* the answer stopped
+   early. Yellow accent (same hue as `--run`) for an at-a-glance "guard
+   tripped" signal that doesn't read as a hard error (which is red). */
+.cost-cap-bar {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 4px 0 2px;
+  padding: 10px 12px;
+  background: rgba(251, 191, 36, 0.10);
+  border: 1px solid rgba(251, 191, 36, 0.45);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 17px;
+  line-height: 1.45;
+}
+.cost-cap-icon {
+  color: var(--run);
+  font-size: 18px;
+  line-height: 1.25;
+  flex: 0 0 auto;
+}
+.cost-cap-text {
+  flex: 1;
+  word-break: break-word;
+}
+.cost-cap-link {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 1px solid rgba(251, 191, 36, 0.6);
+  color: var(--run);
+  border-radius: 5px;
+  font: inherit;
+  font-size: 16px;
+  padding: 3px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cost-cap-link:hover {
+  background: rgba(251, 191, 36, 0.18);
+  color: #fde68a;
+}
+
+/* ── M2.6 sidebar gear + settings modal ────────────────────────────────
+   The gear is a tiny ghost button next to the L.E.E.K logo. The modal
+   itself is a centered card on a translucent backdrop — backdrop click
+   or Escape closes it (Settings.tsx wires both). */
+.sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.settings-gear {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.settings-gear:hover {
+  background: var(--panel-2);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 32px 16px;
+  overflow-y: auto;
+}
+.settings-modal {
+  width: 100%;
+  max-width: 640px;
+  max-height: calc(100vh - 64px);
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+}
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.settings-head h2 {
+  font-size: 16px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+.settings-close {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  font-size: 26px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 6px;
+  border-radius: 6px;
+}
+.settings-close:hover {
+  color: var(--text);
+  background: var(--panel-2);
+}
+.settings-loading {
+  padding: 36px;
+  text-align: center;
+  color: var(--muted);
+}
+.settings-banner {
+  margin: 12px 18px 0;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 16px;
+  border: 1px solid var(--border);
+}
+.settings-banner.ok {
+  color: #6ee7b7;
+  border-color: rgba(52, 211, 153, 0.45);
+  background: rgba(52, 211, 153, 0.10);
+}
+.settings-banner.err {
+  color: #fca5a5;
+  border-color: rgba(248, 113, 113, 0.45);
+  background: rgba(248, 113, 113, 0.10);
+}
+.settings-body {
+  padding: 16px 18px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.settings-field {
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: var(--panel-2);
+  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: 1fr 200px;
+  grid-template-areas:
+    "label  input"
+    "hint   input"
+    "eff    eff"
+    "err    err";
+  column-gap: 16px;
+  row-gap: 4px;
+}
+.settings-label {
+  grid-area: label;
+  font-weight: 600;
+  font-size: 17px;
+  color: var(--text);
+}
+.settings-input {
+  grid-area: input;
+  align-self: start;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 9px;
+  font: inherit;
+  font-size: 16px;
+  width: 100%;
+}
+.settings-input:focus {
+  outline: none;
+  border-color: var(--blue-soft);
+}
+.settings-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.settings-hint {
+  grid-area: hint;
+  font-size: 15px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+.settings-effective {
+  grid-area: eff;
+  margin-top: 4px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 15px;
+  color: var(--muted);
+}
+.settings-eff-value {
+  color: var(--text);
+  font-family: ui-monospace, "SF Mono", monospace;
+}
+.settings-env-badge {
+  margin-left: 4px;
+  padding: 1px 8px;
+  border-radius: 11px;
+  background: rgba(251, 191, 36, 0.15);
+  border: 1px solid rgba(251, 191, 36, 0.45);
+  color: var(--run);
+  font-size: 14px;
+}
+.settings-field-err {
+  grid-area: err;
+  margin-top: 4px;
+  font-size: 15px;
+  color: var(--err);
+}
+.settings-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+  flex: 0 0 auto;
+  background: var(--panel);
+}
+.settings-path {
+  font-size: 15px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.settings-path code {
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-family: ui-monospace, "SF Mono", monospace;
+  font-size: 14px;
+  color: var(--text);
+}
+.settings-actions {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+.settings-btn {
+  padding: 7px 16px;
+  font: inherit;
+  font-size: 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+}
+.settings-btn:hover:not(:disabled) {
+  background: #232a36;
+}
+.settings-btn.primary {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: #fff;
+}
+.settings-btn.primary:hover:not(:disabled) {
+  background: #1d4ed8;
+}
+.settings-btn.ghost {
+  background: transparent;
+}
+.settings-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+@media (max-width: 540px) {
+  .settings-field {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "label"
+      "input"
+      "hint"
+      "eff"
+      "err";
+  }
+}
+
 /* Containers that used to lean on `.card-pre` for box + scroll — now they
    carry their own shell so the markdown body inside flows normally. */
 .corpus-body {

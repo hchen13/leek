@@ -233,6 +233,7 @@ export function createWorkbench() {
       compactions: 0,
       metrics: null,
       error: null,
+      costCap: null,
     });
     return d.turns[d.turns.length - 1];
   }
@@ -377,6 +378,16 @@ export function createWorkbench() {
           }
         } else if (ev.kind === "compaction_started") {
           turn.compactions += 1;
+        } else if (ev.kind === "turn_cost_capped") {
+          // M2.6: emitted just before the loop sets stop_reason =
+          // "cost_cap_exceeded". Stash the cap / actual / iter triple so
+          // the chat surface can render a precise warning bar without
+          // re-deriving these numbers from `turn_metrics_recorded`.
+          turn.costCap = {
+            capUsd: Number(ev.payload.cap_usd ?? 0),
+            actualCostUsd: Number(ev.payload.actual_cost_usd ?? 0),
+            iterCount: Number(ev.payload.iter_count ?? 0),
+          };
         } else if (ev.kind === "error") {
           turn.error = ev.payload.message == null ? null : String(ev.payload.message);
           turn.status = "done";

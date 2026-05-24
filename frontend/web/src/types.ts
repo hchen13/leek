@@ -88,6 +88,16 @@ export type TurnMetrics = {
   wallClockMs: number;
 };
 
+/** Cost cap trip details — populated from a `turn_cost_capped` event
+ *  (M2.6). The chat surface uses this to render an in-turn warning bar
+ *  with the actual cap + spend + iteration count. `null` until the cap
+ *  trips for a given turn. */
+export type TurnCostCap = {
+  capUsd: number;
+  actualCostUsd: number;
+  iterCount: number;
+};
+
 /** A turn's canvas section plus its lifecycle status. Built from the
  *  `canvas` and `lifecycle` events that carry the turn's `turn_id`. */
 export type Turn = {
@@ -100,6 +110,8 @@ export type Turn = {
   compactions: number;
   metrics: TurnMetrics | null;
   error: string | null;
+  /** Set when the per-turn cost cap tripped (M2.6). */
+  costCap: TurnCostCap | null;
 };
 
 export type PlanStep = {
@@ -175,4 +187,48 @@ export type Activation = {
    *  ANY prior session. The store seeds this and updates it on session
    *  switch / unload. */
   historical: Set<string>;
+};
+
+// ─── settings (M2.6) ──────────────────────────────────────────────────────
+//
+// The settings API returns `{ config, effective, config_path }`. `config`
+// is the raw `~/.leek/config.json` (every field may be null = "user has not
+// set it"); `effective` is what `GuardConfig::resolve` actually applies
+// after env vars layer on top, plus an `overridden_by_env` flag per field so
+// the UI can show a "⚠ env var override" badge without re-doing the
+// resolution.
+
+/** Raw config-file shape — every field optional. Mirrors the Rust
+ *  `crate::config::Config`. */
+export type SettingsConfig = {
+  idle_timeout_secs?: number | null;
+  wall_clock_secs?: number | null;
+  max_iterations?: number | null;
+  cost_cap_usd?: number | null;
+  doom_loop_threshold?: number | null;
+  auto_compact_threshold?: number | null;
+  context_window?: number | null;
+};
+
+/** One field's effective value + env-override flag. The value is `null`
+ *  when the guard is disabled (e.g. `cost_cap_usd = 0`). */
+export type EffectiveField = {
+  value: number | null;
+  overridden_by_env: boolean;
+};
+
+/** Shape returned by `GET /api/v1/settings` (and the `PATCH` response). */
+export type SettingsResponse = {
+  config: SettingsConfig;
+  effective: {
+    idle_timeout_secs: EffectiveField;
+    wall_clock_secs: EffectiveField;
+    max_iterations: EffectiveField;
+    cost_cap_usd: EffectiveField;
+    doom_loop_threshold: EffectiveField;
+    auto_compact_threshold: EffectiveField;
+    context_window: EffectiveField;
+    web_search: { value: boolean; overridden_by_env: boolean };
+  };
+  config_path: string;
 };
