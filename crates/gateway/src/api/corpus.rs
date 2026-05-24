@@ -65,6 +65,7 @@ mod tests {
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
             hooks: std::sync::Arc::new(crate::hooks::HookEngine::default()),
             agents: std::sync::Arc::new(crate::agents::AgentRegistry::default()),
+            vendors: std::sync::Arc::new(crate::vendors::VendorRegistry::for_test()),
         }
     }
 
@@ -126,6 +127,7 @@ mod tests {
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
             hooks: std::sync::Arc::new(crate::hooks::HookEngine::default()),
             agents: std::sync::Arc::new(crate::agents::AgentRegistry::default()),
+            vendors: std::sync::Arc::new(crate::vendors::VendorRegistry::for_test()),
         };
         let resp = graph(axum::extract::State(st)).await;
         assert_eq!(resp.0["nodes"].as_array().unwrap().len(), 0);

@@ -15,6 +15,7 @@ mod llm;
 mod plugins;
 mod skills;
 mod vault;
+mod vendors;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -180,6 +181,19 @@ async fn serve(vault_path: &Path, corpus_root: &Path, port: u16) -> Result<()> {
         agents::user_agents_dir().display(),
     );
 
+    // ── M3: A-share data vendor registry ──────────────────────────────
+    // Read the persisted Tushare token from the live config (loaded
+    // above into `Arc<RwLock<Config>>`); env var still wins inside the
+    // registry constructor. Sina + EastMoney are token-free.
+    let config_token = config
+        .read()
+        .ok()
+        .and_then(|c| c.tushare_token.clone());
+    let vendors_arc = Arc::new(vendors::VendorRegistry::from_env_and_config(
+        http.clone(),
+        config_token,
+    ));
+
     let state = api::AppState {
         pool: vault.pool,
         bus: bus::EventBus::new(),
@@ -192,6 +206,7 @@ async fn serve(vault_path: &Path, corpus_root: &Path, port: u16) -> Result<()> {
         skills: m25.skills,
         hooks: m25.hooks,
         agents: agents_arc,
+        vendors: vendors_arc,
     };
 
     let app = api::router(state);

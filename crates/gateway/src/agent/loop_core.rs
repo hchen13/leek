@@ -498,6 +498,7 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
                     &p.st.corpus,
                     &p.st.skills,
                     &p.st.agents,
+                    &p.st.vendors,
                     &name,
                     &args_value,
                 )

@@ -19,6 +19,11 @@
 
 mod corpus_read;
 mod corpus_search;
+mod get_candlesticks;
+mod get_capital_flow;
+mod get_company_info;
+mod get_financials;
+mod market_quote;
 mod task;
 mod update_plan;
 mod use_skill;
@@ -32,6 +37,7 @@ use crate::api::AppState;
 use crate::corpus::Corpus;
 use crate::llm::ToolSpec;
 use crate::skills::SkillRegistry;
+use crate::vendors::VendorRegistry;
 
 /// Outcome of running one tool call — the three result surfaces of
 /// REQUIREMENTS §4.2, produced by a single execution.
@@ -113,6 +119,15 @@ pub fn specs(skills: &Arc<SkillRegistry>, agents: &Arc<AgentRegistry>) -> Vec<To
         update_plan::spec(),
         corpus_search::spec(),
         corpus_read::spec(),
+        // M3 — A-share research tools. Always offered; an absent
+        // upstream token surfaces as a per-call structured error
+        // rather than removing the surface (the model can prompt
+        // the user to configure one).
+        market_quote::spec(),
+        get_candlesticks::spec(),
+        get_financials::spec(),
+        get_company_info::spec(),
+        get_capital_flow::spec(),
         task::spec(agents),
     ];
     if !skills.is_empty() {
@@ -130,6 +145,11 @@ pub fn ui(name: &str) -> Option<ToolUi> {
         "corpus_read" => Some(corpus_read::ui()),
         "use_skill" => Some(use_skill::ui()),
         "task" => Some(task::ui()),
+        "market_quote" => Some(market_quote::ui()),
+        "get_candlesticks" => Some(get_candlesticks::ui()),
+        "get_financials" => Some(get_financials::ui()),
+        "get_company_info" => Some(get_company_info::ui()),
+        "get_capital_flow" => Some(get_capital_flow::ui()),
         _ => None,
     }
 }
@@ -169,12 +189,21 @@ impl<'a> DispatchCtx<'a> {
 
 /// Dispatch one function call. An unknown name is a structured error, not a
 /// panic — the model gets it back as `function_call_output` and can recover.
+///
+/// 8 explicit `&Arc<…>` registries threaded through one call site is a
+/// lot, but each one is a different runtime surface (HTTP / corpus /
+/// skills / agents / vendors). Bundling them into a "ServiceBag" struct
+/// would make the call-site shorter at the cost of obscuring the
+/// dependency surface; given the small number of dispatch sites (loop +
+/// two unit tests) we accept the parameter count.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     ctx: &DispatchCtx<'_>,
     http: &reqwest::Client,
     corpus: &Arc<Corpus>,
     skills: &Arc<SkillRegistry>,
     _agents: &Arc<AgentRegistry>,
+    vendors: &Arc<VendorRegistry>,
     name: &str,
     args: &serde_json::Value,
 ) -> ToolOutcome {
@@ -184,6 +213,14 @@ pub async fn dispatch(
         "corpus_search" => corpus_search::run(corpus, args),
         "corpus_read" => corpus_read::run(corpus, args),
         "use_skill" => use_skill::run(skills, args),
+        // M3 — A-share research tools. Each runs the vendor-fallback
+        // chain inside its own module; the loop sees only the
+        // `ToolOutcome` triple.
+        "market_quote" => market_quote::run(vendors, args).await,
+        "get_candlesticks" => get_candlesticks::run(vendors, args).await,
+        "get_financials" => get_financials::run(vendors, args).await,
+        "get_company_info" => get_company_info::run(vendors, args).await,
+        "get_capital_flow" => get_capital_flow::run(vendors, args).await,
         "task" => match ctx.st {
             Some(st) => {
                 task::run(
@@ -280,6 +317,7 @@ mod tests {
         let corpus = Arc::new(Corpus::empty());
         let skills = Arc::new(SkillRegistry::default());
         let agents = Arc::new(AgentRegistry::default());
+        let vendors = Arc::new(VendorRegistry::for_test());
         let ctx = DispatchCtx::for_test();
         let out = futures::executor::block_on(dispatch(
             &ctx,
@@ -287,6 +325,7 @@ mod tests {
             &corpus,
             &skills,
             &agents,
+            &vendors,
             "nope",
             &serde_json::Value::Null,
         ));
@@ -344,6 +383,12 @@ mod tests {
         assert!(ui("corpus_search").is_some());
         assert!(ui("corpus_read").is_some());
         assert!(ui("task").is_some());
+        // M3 — A-share research tools.
+        assert!(ui("market_quote").is_some());
+        assert!(ui("get_candlesticks").is_some());
+        assert!(ui("get_financials").is_some());
+        assert!(ui("get_company_info").is_some());
+        assert!(ui("get_capital_flow").is_some());
         assert!(ui("nope").is_none());
         // update_plan renders to the right rail, not a canvas tool card.
         assert_eq!(ui("update_plan").unwrap().result, ResultArtifact::Plan);
@@ -372,6 +417,7 @@ mod tests {
         let corpus = Arc::new(Corpus::empty());
         let skills = Arc::new(SkillRegistry::default());
         let agents = Arc::new(AgentRegistry::default());
+        let vendors = Arc::new(VendorRegistry::for_test());
         let ctx = DispatchCtx::for_test();
         let out = futures::executor::block_on(dispatch(
             &ctx,
@@ -379,6 +425,7 @@ mod tests {
             &corpus,
             &skills,
             &agents,
+            &vendors,
             "task",
             &serde_json::json!({ "input": "hi" }),
         ));

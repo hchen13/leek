@@ -281,6 +281,7 @@ mod tests {
             skills: Arc::new(crate::skills::SkillRegistry::default()),
             hooks: Arc::new(crate::hooks::HookEngine::default()),
             agents: Arc::new(crate::agents::AgentRegistry::default()),
+            vendors: Arc::new(crate::vendors::VendorRegistry::for_test()),
         };
         TestState { st, _scratch: ScratchDir { path: dir }, _env: env }
     }

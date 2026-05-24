@@ -605,6 +605,7 @@ mod tests {
         use crate::llm::codex::CodexClient;
         use crate::skills::SkillRegistry;
         use crate::vault::Vault;
+        use crate::vendors::VendorRegistry;
         use std::sync::RwLock;
 
         let path = std::env::temp_dir()
@@ -625,6 +626,7 @@ mod tests {
             skills: Arc::new(SkillRegistry::default()),
             hooks: Arc::new(HookEngine::default()),
             agents: Arc::new(AgentRegistry::default()),
+            vendors: Arc::new(VendorRegistry::for_test()),
         }
     }
 }

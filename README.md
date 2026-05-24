@@ -108,6 +108,33 @@ Until a settings UI exists, guards are tuned by environment variable
 | `LEEK_AUTO_COMPACT_THRESHOLD` | `0.90` | Fraction of the context window at which a turn auto-compacts — summarize early context and continue |
 | `LEEK_CONTEXT_WINDOW` | per-model | Override the context window the auto-compaction trigger is sized against, in tokens (mainly for tests — a small window trips compaction within a few turns) |
 | `LEEK_WEB_SEARCH` | off | Offer the provider-side `web_search` tool (opt-in; the codex backend gates web search behind its own config) |
+| `LEEK_TUSHARE_TOKEN` | off | Token for the primary A-share data source. With no token, only the public-fallback paths work (snapshot quotes via `hq.sinajs.cn`, daily candles via EastMoney); fundamentals + capital-flow tools will return a structured error. Get a free token at <https://tushare.pro/register>. |
+
+### A-share research tools (M3)
+
+L.E.E.K ships five vendor-neutral A-share tools. Names and field shapes
+are generic (`market_quote`, `revenue`, `roe`, …) — the upstream
+identity is hidden from the model and stays in the `vendors/` module.
+
+| Tool | What it does | Vendors (primary → fallback) |
+|---|---|---|
+| `market_quote` | Snapshot price + day OHLC + volume + freshness | Tushare → Sina |
+| `get_candlesticks` | Historical OHLCV bars (1d / 1w / 1mo, ≤500 rows) | Tushare → EastMoney |
+| `get_financials` | Income / balance / cashflow / ratios (quarterly or annual) | Tushare |
+| `get_company_info` | Company profile + latest valuation indicators | Tushare |
+| `get_capital_flow` | Net flow over 1d / 5d / 20d, with northbound when quota allows | Tushare |
+
+Symbols accept `600519.SH` (preferred), bare `600519` (exchange
+inferred), or `sh600519`.
+
+Three subagent profiles wrap these tools into common research shapes
+(invoke via the `task` tool):
+
+| Agent | Best for |
+|---|---|
+| `quick-screen` | "Can I trade X right now?" — 1-2 tool calls, ≈200-300 word digest |
+| `deep-review` | Single-stock full review — 10-30 tool calls, 500-1500 word digest with citations |
+| `comparison` | N-ticker fan-out — spawns parallel `quick-screen` calls and rolls up to a comparison table |
 
 ### Repository layout
 
@@ -219,6 +246,31 @@ SSE 事件类型（M1.9 workbench 契约——每个 payload 带 `surface`：
 | `LEEK_AUTO_COMPACT_THRESHOLD` | `0.90` | 上下文用量达到窗口的此比例时 turn 自动压缩——摘要早期上下文后继续 |
 | `LEEK_CONTEXT_WINDOW` | per-model | 覆盖 auto-compaction 触发线所用的 context window（token 数；主要用于测试——小窗口几个 turn 就触发压缩） |
 | `LEEK_WEB_SEARCH` | 关 | 是否提供 provider-side `web_search` 工具（opt-in；codex backend 自身把 web search gate 在其配置后） |
+| `LEEK_TUSHARE_TOKEN` | 关 | A 股数据主源 token。不配置时只有公开 fallback 链可用（快照报价走 `hq.sinajs.cn`，日 K 走 EastMoney）；财报和资金流工具会返回结构化错误。免费 token 在 <https://tushare.pro/register> 注册。 |
+
+### A 股投研工具（M3）
+
+L.E.E.K 5 个 A 股工具命名/字段都对厂商中立（`market_quote`、`revenue`、
+`roe` 等通用术语）—— 具体上游身份隐藏在 `vendors/` 模块里，不进入模型上下文。
+
+| 工具 | 干什么 | Vendor（主 → fallback） |
+|---|---|---|
+| `market_quote` | 快照价 + 当日 OHLC + 量能 + freshness | Tushare → Sina |
+| `get_candlesticks` | 历史 OHLCV（1d/1w/1mo，≤500 行） | Tushare → EastMoney |
+| `get_financials` | 利润表 / 资产负债表 / 现金流 / 比率（季度或年度） | Tushare |
+| `get_company_info` | 公司画像 + 最新估值指标 | Tushare |
+| `get_capital_flow` | 1d/5d/20d 净流入，北向资金 quota 开通时附带 | Tushare |
+
+Symbol 接受 `600519.SH`（首选）、bare `600519`（自动推断交易所）、
+`sh600519` 任意一种。
+
+三个 subagent 形态把这五个工具组合成常用调研形态（用 `task` 工具调起）：
+
+| Agent | 适用场景 |
+|---|---|
+| `quick-screen` | "X 现在能不能买" —— 1-2 个工具调用，≈200-300 字 digest |
+| `deep-review` | 单只票完整 review —— 10-30 个工具调用，500-1500 字带 cite |
+| `comparison` | N 只票横向对比 —— 并行 fan-out `quick-screen` 后做对比表 |
 
 ### 仓库结构
 

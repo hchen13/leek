@@ -162,7 +162,23 @@ fn replay_single_turn_burst_triggers_within_turn() {
     let iters = load_fixture_iters("compaction-single-turn-burst");
     assert!(iters.len() >= 20, "fixture should have ≥20 iters");
 
-    let tool_specs = tools::specs(&std::sync::Arc::new(crate::skills::SkillRegistry::default()), &std::sync::Arc::new(crate::agents::AgentRegistry::default()));
+    // Pin tool surface to the fixture's recording-era set (see the
+    // sibling multi-turn test for the rationale).
+    let live = tools::specs(
+        &std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        &std::sync::Arc::new(crate::agents::AgentRegistry::default()),
+    );
+    let recorded_set = [
+        "web_fetch",
+        "update_plan",
+        "corpus_search",
+        "corpus_read",
+        "task",
+    ];
+    let tool_specs: Vec<crate::llm::ToolSpec> = live
+        .into_iter()
+        .filter(|s| recorded_set.contains(&s.name.as_str()))
+        .collect();
     let system = &iters[0].instructions;
     let trigger: u32 = 80_000;
 
@@ -233,7 +249,28 @@ fn replay_multi_turn_accumulation_triggers_at_turn_n() {
     let iters = load_fixture_iters("compaction-multi-turn-accumulation");
     assert!(iters.len() >= 60, "fixture should have ≥60 iters");
 
-    let tool_specs = tools::specs(&std::sync::Arc::new(crate::skills::SkillRegistry::default()), &std::sync::Arc::new(crate::agents::AgentRegistry::default()));
+    // The fixture was recorded under M2.5's tool surface (web_fetch,
+    // update_plan, corpus_search, corpus_read, task). Later milestones
+    // (M3) added more tools; including their descriptions would inflate
+    // the per-turn token budget against an M2.5-vintage system prompt
+    // and trip the estimator prematurely. Pin the test set to the
+    // recording-era list so this stays a regression test of the
+    // *trigger*, not of subsequent tool-surface growth.
+    let live = tools::specs(
+        &std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+        &std::sync::Arc::new(crate::agents::AgentRegistry::default()),
+    );
+    let recorded_set = [
+        "web_fetch",
+        "update_plan",
+        "corpus_search",
+        "corpus_read",
+        "task",
+    ];
+    let tool_specs: Vec<crate::llm::ToolSpec> = live
+        .into_iter()
+        .filter(|s| recorded_set.contains(&s.name.as_str()))
+        .collect();
     let system = &iters[0].instructions;
     let trigger: u32 = 8_000;
 

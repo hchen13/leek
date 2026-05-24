@@ -394,9 +394,10 @@ mod tests {
 
     #[test]
     fn shipped_builtin_agents_load_cleanly() {
-        // M2.7 spec §H ships `general-purpose` + `corpus-expert`. The
-        // shipped files must parse without errors — if a frontmatter
-        // typo lands, this test catches it before a user does.
+        // M2.7 spec §H ships `general-purpose` + `corpus-expert`; M3
+        // adds three A-share research workers. The shipped files must
+        // all parse without errors — if a frontmatter typo lands, this
+        // test catches it before a user does.
         let dir = builtin_agents_dir();
         if !dir.exists() {
             // Skip when run from a slim checkout that doesn't include
@@ -406,18 +407,38 @@ mod tests {
         let (reg, errs) = load_layered(&[(dir.as_path(), AgentLayer::Builtin)]);
         assert!(errs.is_empty(), "built-in AGENT.md errors: {errs:?}");
         let names = reg.names();
-        assert!(
-            names.contains(&"general-purpose".to_string()),
-            "missing general-purpose agent; loaded: {names:?}"
-        );
-        assert!(
-            names.contains(&"corpus-expert".to_string()),
-            "missing corpus-expert agent; loaded: {names:?}"
-        );
+        for required in [
+            "general-purpose",
+            "corpus-expert",
+            "quick-screen",
+            "deep-review",
+            "comparison",
+        ] {
+            assert!(
+                names.contains(&required.to_string()),
+                "missing built-in agent '{required}'; loaded: {names:?}"
+            );
+        }
         // corpus-expert ships with a restricted tool set; if a user
         // edits the file and forgets to keep the allow-list, this catches it.
         let ce = reg.get("corpus-expert").unwrap();
         assert!(ce.allowed_tools.contains(&"corpus_search".to_string()));
         assert!(ce.allowed_tools.contains(&"corpus_read".to_string()));
+        // quick-screen restricts to the three A-share snapshot tools.
+        let qs = reg.get("quick-screen").unwrap();
+        for t in ["market_quote", "get_company_info", "get_capital_flow"] {
+            assert!(
+                qs.allowed_tools.contains(&t.to_string()),
+                "quick-screen missing tool '{t}' in allow-list",
+            );
+        }
+        // deep-review explicitly opts into the full tool surface — its
+        // allowed_tools is empty (the loader's "empty = no restriction" rule).
+        assert!(reg.get("deep-review").unwrap().allowed_tools.is_empty());
+        // comparison spawns subagents and reads light data, so it owns
+        // task + the cheap getters.
+        let cmp = reg.get("comparison").unwrap();
+        assert!(cmp.allowed_tools.contains(&"task".to_string()));
+        assert!(cmp.allowed_tools.contains(&"market_quote".to_string()));
     }
 }

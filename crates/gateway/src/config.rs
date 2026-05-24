@@ -69,6 +69,11 @@ pub struct Config {
     /// Override for the model context window in tokens (mainly for tests
     /// that want to trip compaction without burning a real long turn).
     pub context_window: Option<i64>,
+    /// M3: persisted Tushare token for A-share research tools. The env
+    /// var `LEEK_TUSHARE_TOKEN` takes precedence at startup. Settings
+    /// API never echoes this back masked-or-otherwise — it stays
+    /// write-only from the API to avoid leaking via diagnostics.
+    pub tushare_token: Option<String>,
 }
 
 impl Config {
@@ -173,6 +178,9 @@ impl Config {
         }
         if patch.context_window.is_some() {
             self.context_window = patch.context_window;
+        }
+        if patch.tushare_token.is_some() {
+            self.tushare_token = patch.tushare_token;
         }
     }
 

@@ -28,6 +28,7 @@ use crate::hooks::HookEngine;
 use crate::llm::codex::CodexClient;
 use crate::skills::SkillRegistry;
 use crate::vault::events::Event;
+use crate::vendors::VendorRegistry;
 
 /// Shared, cheaply-cloneable handles for request handlers and agent turns.
 #[derive(Clone)]
@@ -70,6 +71,10 @@ pub struct AppState {
     /// tool allow-list. Empty registry is fine — `task` is still
     /// advertised (with `general-purpose` as the default).
     pub agents: Arc<AgentRegistry>,
+    /// Vendor registry (M3): upstream data clients (Tushare + Sina +
+    /// EastMoney) used by the A-share research tools. Vendor identity is
+    /// hidden from the model — see `vendors/` module docs.
+    pub vendors: Arc<VendorRegistry>,
 }
 
 impl AppState {
