@@ -16,7 +16,7 @@
 //! Plus plugin-bundled skills (see `crate::plugins`) which register at the
 //! user layer.
 
-mod loader;
+pub(crate) mod loader;
 mod skill;
 
 pub use loader::{builtin_skills_dir, expand_home, load_layered, user_skills_dir};

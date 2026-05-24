@@ -64,8 +64,10 @@ mod tests {
             corpus_graph,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
             hooks: std::sync::Arc::new(crate::hooks::HookEngine::default()),
+            agents: std::sync::Arc::new(crate::agents::AgentRegistry::default()),
         }
     }
+
 
     #[tokio::test]
     async fn graph_endpoint_returns_wiki_only_nodes() {
@@ -123,6 +125,7 @@ mod tests {
             corpus_graph,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
             hooks: std::sync::Arc::new(crate::hooks::HookEngine::default()),
+            agents: std::sync::Arc::new(crate::agents::AgentRegistry::default()),
         };
         let resp = graph(axum::extract::State(st)).await;
         assert_eq!(resp.0["nodes"].as_array().unwrap().len(), 0);

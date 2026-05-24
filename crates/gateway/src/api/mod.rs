@@ -1,5 +1,6 @@
 //! HTTP / SSE API — Axum router, shared state, error type.
 
+pub mod agents;
 pub mod corpus;
 pub mod events;
 pub mod health;
@@ -19,6 +20,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use std::sync::{Arc, RwLock};
 
+use crate::agents::AgentRegistry;
 use crate::bus::EventBus;
 use crate::config::Config;
 use crate::corpus::{Corpus, CorpusGraph};
@@ -62,6 +64,12 @@ pub struct AppState {
     /// lifecycle events. Triggered by the agent loop at well-defined points
     /// (PreToolUse, PostToolUse, etc.).
     pub hooks: Arc<HookEngine>,
+    /// Subagent registry (M2.7): three-layer merged set of `AGENT.md`
+    /// definitions. The `task` tool resolves an `agent_name` against this
+    /// to spawn a child loop with the named agent's system prompt and
+    /// tool allow-list. Empty registry is fine — `task` is still
+    /// advertised (with `general-purpose` as the default).
+    pub agents: Arc<AgentRegistry>,
 }
 
 impl AppState {
@@ -171,6 +179,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/skills/{name}", get(skills::detail))
         .route("/api/v1/hooks", get(hooks::list))
         .route("/api/v1/plugins", get(plugins::list))
+        // M2.7 subagent registry — read-only.
+        .route("/api/v1/agents", get(agents::list))
+        .route("/api/v1/agents/{name}", get(agents::detail))
         .layer(cors)
         .with_state(state)
 }

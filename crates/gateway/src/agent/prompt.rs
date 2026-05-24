@@ -18,6 +18,7 @@
 //! of the prompt; only one-line descriptions go in (M2.5 research notes
 //! §2 — Claude Code parity).
 
+use crate::agents::AgentRegistry;
 use crate::llm::ToolSpec;
 use crate::skills::SkillRegistry;
 
@@ -53,7 +54,20 @@ const SEEK_VERIFICATION_DISCIPLINE: &str = "\
 
 /// Build the system prompt. Sections are joined with blank lines so
 /// each one reads as a distinct frame to the model.
-pub fn build_system_prompt(tools: &[ToolSpec], skills: &SkillRegistry) -> String {
+///
+/// Section order:
+///   IDENTITY → OPERATING → DISCIPLINE → CORPUS_ORIENTATION
+///     → # 可用工具 → # 可用 Skills → # 可用 Subagents
+///
+/// Subagents come after skills because they are even softer: skills are
+/// recipes to import, agents are workers to spawn. The model decides
+/// which to use based on whether the task wants to *learn* a procedure
+/// (skill) vs *delegate* it (agent).
+pub fn build_system_prompt(
+    tools: &[ToolSpec],
+    skills: &SkillRegistry,
+    agents: &AgentRegistry,
+) -> String {
     let mut p = String::with_capacity(4096);
     p.push_str(IDENTITY.trim());
     p.push_str("\n\n");
@@ -90,6 +104,20 @@ pub fn build_system_prompt(tools: &[ToolSpec], skills: &SkillRegistry) -> String
             p.push('\n');
         }
     }
+
+    let agent_list = agents.iter_sorted();
+    if !agent_list.is_empty() {
+        p.push_str("\n\n# 可用 Subagents\n\n");
+        p.push_str(
+            "需要把一块**自成体系的子任务**外包出去时，用 task 工具把它交给一个 \
+             subagent —— subagent 跑自己独立的 agent loop，context 跟你隔离，\
+             返回 text digest。适合：corpus 跨多 doc 综合查询、可并行的 per-ticker \
+             扫描、上下文压力大的深挖。不适合：一次性查个事实，那直接调对应工具更轻。\n\n",
+        );
+        for a in agent_list {
+            p.push_str(&format!("- `{}` — {}\n", a.name, a.description.trim()));
+        }
+    }
     p
 }
 
@@ -112,11 +140,16 @@ fn first_line(desc: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::{AgentDef, AgentLayer, AgentRegistry};
     use crate::skills::{Skill, SkillLayer, SkillRegistry};
     use std::collections::HashMap;
 
     fn empty_skills() -> SkillRegistry {
         SkillRegistry::default()
+    }
+
+    fn empty_agents() -> AgentRegistry {
+        AgentRegistry::default()
     }
 
     fn one_skill_registry(name: &str, desc: &str, hidden: bool) -> SkillRegistry {
@@ -135,16 +168,32 @@ mod tests {
         SkillRegistry::new(m)
     }
 
+    fn one_agent_registry(name: &str, desc: &str) -> AgentRegistry {
+        let mut m = HashMap::new();
+        m.insert(
+            name.to_string(),
+            AgentDef {
+                name: name.into(),
+                description: desc.into(),
+                allowed_tools: vec![],
+                system_prompt: "body".into(),
+                model: None,
+                source_layer: AgentLayer::Builtin,
+            },
+        );
+        AgentRegistry::new(m)
+    }
+
     #[test]
     fn prompt_has_identity_and_operating() {
-        let p = build_system_prompt(&[], &empty_skills());
+        let p = build_system_prompt(&[], &empty_skills(), &empty_agents());
         assert!(p.contains("leek"));
         assert!(p.contains("运行方式"));
     }
 
     #[test]
     fn prompt_includes_corpus_orientation() {
-        let p = build_system_prompt(&[], &empty_skills());
+        let p = build_system_prompt(&[], &empty_skills(), &empty_agents());
         assert!(p.contains("corpus orientation"));
         assert!(p.contains("双轴"));
         assert!(p.contains("principles → knowledge → sources"));
@@ -152,7 +201,7 @@ mod tests {
 
     #[test]
     fn prompt_has_seek_verification_discipline() {
-        let p = build_system_prompt(&[], &empty_skills());
+        let p = build_system_prompt(&[], &empty_skills(), &empty_agents());
         assert!(p.contains("求证纪律"));
         assert!(p.contains("先搜后答"));
         assert!(p.contains("web_search"));
@@ -160,25 +209,28 @@ mod tests {
 
     #[test]
     fn prompt_section_order_is_stable_first() {
-        // IDENTITY → OPERATING → DISCIPLINE → CORPUS_ORIENTATION → tools → skills.
+        // IDENTITY → OPERATING → DISCIPLINE → CORPUS_ORIENTATION → tools → skills → agents.
         let tools = vec![ToolSpec {
             name: "web_fetch".into(),
             description: "Fetch a URL.".into(),
             parameters: serde_json::json!({}),
         }];
         let skills = one_skill_registry("alpha", "alpha skill", false);
-        let p = build_system_prompt(&tools, &skills);
+        let agents = one_agent_registry("beta", "beta agent");
+        let p = build_system_prompt(&tools, &skills, &agents);
         let i_identity = p.find("leek").unwrap();
         let i_operating = p.find("运行方式").unwrap();
         let i_discipline = p.find("求证纪律").unwrap();
         let i_corpus = p.find("corpus orientation").unwrap();
         let i_tools = p.find("# 可用工具").unwrap();
         let i_skills = p.find("# 可用 Skills").unwrap();
+        let i_agents = p.find("# 可用 Subagents").unwrap();
         assert!(i_identity < i_operating);
         assert!(i_operating < i_discipline);
         assert!(i_discipline < i_corpus);
         assert!(i_corpus < i_tools);
-        assert!(i_tools < i_skills, "skills index must come after tools (it's softer)");
+        assert!(i_tools < i_skills, "skills index must come after tools");
+        assert!(i_skills < i_agents, "agents index is softer than skills");
     }
 
     #[test]
@@ -188,14 +240,18 @@ mod tests {
             description: "Fetch a URL as text. Useful for verification.".into(),
             parameters: serde_json::json!({}),
         }];
-        let p = build_system_prompt(&tools, &empty_skills());
+        let p = build_system_prompt(&tools, &empty_skills(), &empty_agents());
         assert!(p.contains("# 可用工具"));
         assert!(p.contains("`web_fetch`"));
     }
 
     #[test]
     fn prompt_lists_skills_when_registry_non_empty() {
-        let p = build_system_prompt(&[], &one_skill_registry("corpus-research", "corpus research how-to", false));
+        let p = build_system_prompt(
+            &[],
+            &one_skill_registry("corpus-research", "corpus research how-to", false),
+            &empty_agents(),
+        );
         assert!(p.contains("# 可用 Skills"));
         assert!(p.contains("`corpus-research`"));
         assert!(p.contains("corpus research how-to"));
@@ -203,15 +259,36 @@ mod tests {
 
     #[test]
     fn prompt_skips_skill_section_when_only_hidden_skills() {
-        // disable-model-invocation: true skills must not show up in the index.
-        let p = build_system_prompt(&[], &one_skill_registry("hidden", "hidden one", true));
+        let p = build_system_prompt(
+            &[],
+            &one_skill_registry("hidden", "hidden one", true),
+            &empty_agents(),
+        );
         assert!(!p.contains("# 可用 Skills"));
         assert!(!p.contains("`hidden`"));
     }
 
     #[test]
     fn prompt_skips_skill_section_when_registry_empty() {
-        let p = build_system_prompt(&[], &empty_skills());
+        let p = build_system_prompt(&[], &empty_skills(), &empty_agents());
         assert!(!p.contains("# 可用 Skills"));
+    }
+
+    #[test]
+    fn prompt_lists_agents_when_registry_non_empty() {
+        let p = build_system_prompt(
+            &[],
+            &empty_skills(),
+            &one_agent_registry("corpus-expert", "corpus 专家"),
+        );
+        assert!(p.contains("# 可用 Subagents"));
+        assert!(p.contains("`corpus-expert`"));
+        assert!(p.contains("corpus 专家"));
+    }
+
+    #[test]
+    fn prompt_skips_agent_section_when_registry_empty() {
+        let p = build_system_prompt(&[], &empty_skills(), &empty_agents());
+        assert!(!p.contains("# 可用 Subagents"));
     }
 }

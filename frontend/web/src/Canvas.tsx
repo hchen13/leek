@@ -440,9 +440,101 @@ export function Canvas(props: CanvasProps) {
     </div>
   );
 
+  /** M2.7 subagent_card. A spawned subagent gets its own collapsible
+   *  card on the parent's canvas. The card head shows the spawn input
+   *  + agent name + status; the body lists the subagent's inner tool /
+   *  note / search cards (events the subagent loop emitted, routed in
+   *  by `parent_turn_id`) plus the result preview once it completes. */
+  const renderSubagentCard = (a: Artifact) => {
+    const badge =
+      a.phase === "error" ? "failed" : a.phase === "start" ? "running" : "ok";
+    const isRunning = a.phase === "start";
+    const showInner = expanded().has(a.artifactId);
+    const inner = a.innerArtifacts ?? [];
+    const stopLabel =
+      a.phase === "error"
+        ? a.errorMessage ?? "subagent error"
+        : a.stopReason && a.stopReason !== "end_turn"
+          ? `subagent ${a.stopReason}`
+          : "完成";
+    return (
+      <div
+        id={`card-${a.artifactId}`}
+        classList={{
+          card: true,
+          "subagent-card": true,
+          highlighted: props.highlight() === a.artifactId,
+        }}
+      >
+        <div class="card-head">
+          <span classList={{ "status-dot": true, [badge]: true }} />
+          <span class="card-name">委派给 {a.agentName ?? "subagent"}</span>
+          <Show when={a.depth != null}>
+            <span class="muted"> · depth {a.depth}</span>
+          </Show>
+          <span class="card-summary">{a.inputPreview ?? ""}</span>
+          <button class="card-expand" onClick={() => toggle(expanded, setExpanded, a.artifactId)}>
+            {showInner ? "收起" : `展开内部 (${inner.length})`}
+          </button>
+        </div>
+        <Show when={isRunning}>
+          <p class="card-running">subagent 运行中…</p>
+        </Show>
+        <Show when={!isRunning && a.resultPreview}>
+          <div class="subagent-result">
+            <div class="card-label">subagent 结果</div>
+            <div class="subagent-result-text">{a.resultPreview}</div>
+          </div>
+        </Show>
+        <Show when={!isRunning}>
+          <div class="muted subagent-meta">
+            {stopLabel}
+            <Show when={a.iterationCount != null}>
+              {` · ${a.iterationCount} 次迭代`}
+            </Show>
+            <Show when={a.toolCallCount != null}>
+              {` · ${a.toolCallCount} 工具调用`}
+            </Show>
+            <Show when={a.toolErrorCount != null && a.toolErrorCount > 0}>
+              {` · ${a.toolErrorCount} 错误`}
+            </Show>
+            <Show when={a.costUsd != null}>{` · $${(a.costUsd ?? 0).toFixed(4)}`}</Show>
+            <Show when={a.wallClockMs != null}>
+              {` · ${((a.wallClockMs ?? 0) / 1000).toFixed(1)}s`}
+            </Show>
+            <Show when={a.sourceLayer}>{` · ${a.sourceLayer}`}</Show>
+          </div>
+        </Show>
+        <Show when={showInner && inner.length > 0}>
+          <div class="subagent-inner">
+            <For each={inner}>
+              {(innerArt) => {
+                if (innerArt.kind === "note") {
+                  return (
+                    <div class="card note-card subagent-inner-card">
+                      <div class="card-label">subagent note</div>
+                      <div
+                        class="note-text markdown-body"
+                        innerHTML={renderMarkdown(innerArt.text ?? "")}
+                      />
+                    </div>
+                  );
+                }
+                if (innerArt.kind === "search") return renderSearchCard(innerArt);
+                if (innerArt.kind === "subagent") return renderSubagentCard(innerArt);
+                return renderToolCard(innerArt);
+              }}
+            </For>
+          </div>
+        </Show>
+      </div>
+    );
+  };
+
   const renderItem = (item: RenderItem) => {
     if (item.type === "notes") return renderNotes(item.notes);
     const a = item.artifact;
+    if (a.kind === "subagent") return renderSubagentCard(a);
     return a.kind === "search" ? renderSearchCard(a) : renderToolCard(a);
   };
 

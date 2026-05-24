@@ -5,6 +5,7 @@
 //! gone), bounded by the M1 guard set, with per-turn metrics recorded.
 
 mod agent;
+mod agents;
 mod api;
 mod bus;
 mod config;
@@ -166,6 +167,19 @@ async fn serve(vault_path: &Path, corpus_root: &Path, port: u16) -> Result<()> {
         m25.hook_event_count
     );
 
+    // ── M2.7: subagents ────────────────────────────────────────────────
+    // Same three-layer discovery as skills, but a separate registry +
+    // distinct AGENT.md files (ARCHITECTURE §4.2 — agents and skills
+    // share frontmatter style only, never types).
+    let agents_arc = load_agent_runtime();
+    tracing::info!(
+        agents = agents_arc.len(),
+        "M2.7 runtime loaded: {} agents from {} / {} / .leek/agents",
+        agents_arc.len(),
+        agents::builtin_agents_dir().display(),
+        agents::user_agents_dir().display(),
+    );
+
     let state = api::AppState {
         pool: vault.pool,
         bus: bus::EventBus::new(),
@@ -177,6 +191,7 @@ async fn serve(vault_path: &Path, corpus_root: &Path, port: u16) -> Result<()> {
         corpus_graph,
         skills: m25.skills,
         hooks: m25.hooks,
+        agents: agents_arc,
     };
 
     let app = api::router(state);
@@ -334,4 +349,27 @@ fn load_m25_runtime() -> M25Runtime {
         plugin_count: loaded_plugins.len(),
         hook_event_count,
     }
+}
+
+/// Resolve the three subagent layers and merge them into one
+/// `AgentRegistry`. Failures at any layer warn + skip — the gateway must
+/// boot even if a user's AGENT.md is malformed (M2.7 spec §C).
+fn load_agent_runtime() -> Arc<agents::AgentRegistry> {
+    use agents::AgentLayer;
+
+    let builtin = agents::builtin_agents_dir();
+    let user = agents::user_agents_dir();
+    let project = std::path::PathBuf::from(".leek/agents");
+
+    let layers: Vec<(&std::path::Path, AgentLayer)> = vec![
+        (builtin.as_path(), AgentLayer::Builtin),
+        (user.as_path(), AgentLayer::User),
+        (project.as_path(), AgentLayer::Project),
+    ];
+
+    let (reg, errs) = agents::load_layered(&layers);
+    for e in &errs {
+        tracing::warn!(error = %e, "agent load error");
+    }
+    Arc::new(reg)
 }

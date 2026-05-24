@@ -129,6 +129,7 @@ mod tests {
             corpus_graph,
             skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
             hooks: std::sync::Arc::new(crate::hooks::HookEngine::default()),
+            agents: std::sync::Arc::new(crate::agents::AgentRegistry::default()),
         }
     }
 

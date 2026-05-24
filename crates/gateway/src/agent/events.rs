@@ -43,6 +43,15 @@ pub mod kind {
     /// uses this for an in-chat warning bar (see `Chat.tsx`); the
     /// `assistant_done`'s `stop_reason` is the durable record.
     pub const TURN_COST_CAPPED: &str = "turn_cost_capped";
+    /// M2.7: subagent lifecycle. Emitted with `phase = "start"` when the
+    /// `task` tool spawns a subagent and `phase = "completion"` (or
+    /// `phase = "error"`) when the subagent loop returns. Carries the
+    /// subagent's name, input preview, result preview, and a roll-up of
+    /// its `turn_metrics` (iteration count, cost, wall-clock). The
+    /// frontend uses these to draw the `subagent_card` (REQUIREMENTS
+    /// §2.4 — every spawn lives inside the parent's canvas as its own
+    /// card, never flat in the parent's tool stream).
+    pub const SUBAGENT_LIFECYCLE: &str = "subagent_lifecycle";
     pub const ERROR: &str = "error";
 }
 
@@ -76,7 +85,10 @@ impl Surface {
 pub fn surface_for(event_kind: &str) -> Surface {
     match event_kind {
         kind::MESSAGE_CREATED | kind::ASSISTANT_DELTA => Surface::Chat,
-        kind::NOTE_TRACE | kind::TOOL_LIFECYCLE | kind::SEARCH_LIFECYCLE => Surface::Canvas,
+        kind::NOTE_TRACE
+        | kind::TOOL_LIFECYCLE
+        | kind::SEARCH_LIFECYCLE
+        | kind::SUBAGENT_LIFECYCLE => Surface::Canvas,
         kind::PLAN_UPDATED => Surface::RightRail,
         kind::ASSISTANT_DONE
         | kind::TURN_METRICS_RECORDED
@@ -85,6 +97,39 @@ pub fn surface_for(event_kind: &str) -> Surface {
         | kind::TURN_COST_CAPPED
         | kind::ERROR => Surface::Lifecycle,
         _ => Surface::Lifecycle,
+    }
+}
+
+/// Stamp a payload with `parent_turn_id` + `depth` if the event was
+/// produced inside a subagent loop. `parent_turn_id = None` means the
+/// caller is the main agent and the payload is left untouched (M2.7 spec
+/// §G — only subagent events carry the routing fields).
+pub fn stamp_parent(
+    mut payload: serde_json::Value,
+    parent_turn_id: Option<&str>,
+    depth: u32,
+) -> serde_json::Value {
+    stamp_parent_in_place(&mut payload, parent_turn_id, depth);
+    payload
+}
+
+/// Same as `stamp_parent`, but mutates in place. Used by `loop_core`
+/// after constructing a canvas-artifact payload through the regular
+/// builder.
+pub fn stamp_parent_in_place(
+    payload: &mut serde_json::Value,
+    parent_turn_id: Option<&str>,
+    depth: u32,
+) {
+    let Some(parent) = parent_turn_id else {
+        return;
+    };
+    if let serde_json::Value::Object(map) = payload {
+        map.insert(
+            "parent_turn_id".to_string(),
+            serde_json::Value::String(parent.to_string()),
+        );
+        map.insert("depth".to_string(), serde_json::Value::Number(depth.into()));
     }
 }
 
@@ -226,9 +271,36 @@ mod tests {
         assert_eq!(surface_for(kind::NOTE_TRACE), Surface::Canvas);
         assert_eq!(surface_for(kind::TOOL_LIFECYCLE), Surface::Canvas);
         assert_eq!(surface_for(kind::SEARCH_LIFECYCLE), Surface::Canvas);
+        // M2.7: subagent_lifecycle is a canvas surface — the frontend
+        // groups subagent activity under a subagent_card on the canvas.
+        assert_eq!(surface_for(kind::SUBAGENT_LIFECYCLE), Surface::Canvas);
         assert_eq!(surface_for(kind::PLAN_UPDATED), Surface::RightRail);
         assert_eq!(surface_for(kind::TURN_METRICS_RECORDED), Surface::Lifecycle);
         assert_eq!(surface_for(kind::COMPACTION_STARTED), Surface::Lifecycle);
+    }
+
+    #[test]
+    fn stamp_parent_adds_fields_only_for_subagent_events() {
+        // Main-agent event: parent_turn_id == None → payload untouched.
+        let main = stamp_parent(serde_json::json!({ "turn_id": "t1" }), None, 0);
+        assert!(main.get("parent_turn_id").is_none());
+        assert!(main.get("depth").is_none());
+
+        // Subagent event: parent_turn_id present → both fields injected.
+        let sub = stamp_parent(serde_json::json!({ "turn_id": "t1.sub-abc" }), Some("t1"), 1);
+        assert_eq!(sub["parent_turn_id"], "t1");
+        assert_eq!(sub["depth"], 1);
+        // Original fields preserved.
+        assert_eq!(sub["turn_id"], "t1.sub-abc");
+    }
+
+    #[test]
+    fn stamp_parent_in_place_is_a_no_op_for_non_objects() {
+        // A non-object payload (shouldn't happen in practice — every
+        // event carries a JSON object) must not panic.
+        let mut payload = serde_json::Value::String("not an object".into());
+        stamp_parent_in_place(&mut payload, Some("t1"), 1);
+        assert_eq!(payload, serde_json::Value::String("not an object".into()));
     }
 
     #[test]

@@ -162,7 +162,7 @@ fn replay_single_turn_burst_triggers_within_turn() {
     let iters = load_fixture_iters("compaction-single-turn-burst");
     assert!(iters.len() >= 20, "fixture should have ≥20 iters");
 
-    let tool_specs = tools::specs(&std::sync::Arc::new(crate::skills::SkillRegistry::default()));
+    let tool_specs = tools::specs(&std::sync::Arc::new(crate::skills::SkillRegistry::default()), &std::sync::Arc::new(crate::agents::AgentRegistry::default()));
     let system = &iters[0].instructions;
     let trigger: u32 = 80_000;
 
@@ -233,7 +233,7 @@ fn replay_multi_turn_accumulation_triggers_at_turn_n() {
     let iters = load_fixture_iters("compaction-multi-turn-accumulation");
     assert!(iters.len() >= 60, "fixture should have ≥60 iters");
 
-    let tool_specs = tools::specs(&std::sync::Arc::new(crate::skills::SkillRegistry::default()));
+    let tool_specs = tools::specs(&std::sync::Arc::new(crate::skills::SkillRegistry::default()), &std::sync::Arc::new(crate::agents::AgentRegistry::default()));
     let system = &iters[0].instructions;
     let trigger: u32 = 8_000;
 

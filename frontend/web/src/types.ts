@@ -43,7 +43,9 @@ export type SearchResult = { title: string | null; url: string; host: string | n
 
 /** A canvas process card, accumulated from one or more `CanvasArtifact`
  *  frames sharing an `artifactId`. Notes are instantaneous; tool / search
- *  artifacts move `start` → `completion` / `error`.
+ *  artifacts move `start` → `completion` / `error`. Subagent cards
+ *  (M2.7) collect every event the spawned subagent emits, plus the
+ *  spawn / completion roll-up.
  *
  *  Search-card variants share the `kind: "search"` artifact but render
  *  differently per `actionType`: `search` (a query result list),
@@ -53,7 +55,7 @@ export type SearchResult = { title: string | null; url: string; host: string | n
 export type Artifact = {
   artifactId: string;
   canvasIdentity: string;
-  kind: "note" | "tool" | "search";
+  kind: "note" | "tool" | "search" | "subagent";
   iteration: number;
   phase: Phase;
   // note
@@ -79,6 +81,26 @@ export type Artifact = {
   pageSnippet?: string | null;
   pattern?: string;
   matches?: string[];
+  // subagent (M2.7)
+  agentName?: string;
+  subagentTurnId?: string;
+  depth?: number;
+  inputPreview?: string;
+  resultPreview?: string;
+  stopReason?: string;
+  iterationCount?: number;
+  toolCallCount?: number;
+  toolErrorCount?: number;
+  costUsd?: number;
+  wallClockMs?: number;
+  sourceLayer?: string;
+  errorMessage?: string;
+  /** Inner artifacts the subagent emitted — its own tool / note / search
+   *  cards (and any nested subagent_card for depth=2). They are routed
+   *  here by `parent_turn_id` on the event payload, never flat onto the
+   *  parent turn's artifact list. Keyed by inner artifactId so a
+   *  start→completion update is a merge, not a duplicate. */
+  innerArtifacts?: Artifact[];
 };
 
 export type TurnMetrics = {

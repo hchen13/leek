@@ -280,6 +280,7 @@ mod tests {
             corpus_graph: Arc::new(crate::corpus::Corpus::empty().build_graph()),
             skills: Arc::new(crate::skills::SkillRegistry::default()),
             hooks: Arc::new(crate::hooks::HookEngine::default()),
+            agents: Arc::new(crate::agents::AgentRegistry::default()),
         };
         TestState { st, _scratch: ScratchDir { path: dir }, _env: env }
     }

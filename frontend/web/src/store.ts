@@ -46,6 +46,7 @@ function canvasKind(eventKind: string): Artifact["kind"] | null {
   if (eventKind === "note_trace") return "note";
   if (eventKind === "tool_lifecycle") return "tool";
   if (eventKind === "search_lifecycle") return "search";
+  if (eventKind === "subagent_lifecycle") return "subagent";
   return null;
 }
 
@@ -68,6 +69,27 @@ function mergeData(art: Artifact, kind: Artifact["kind"], data: Record<string, u
     if (data.debug_payload !== undefined) {
       art.debugPayload = data.debug_payload as Record<string, unknown>;
     }
+    return;
+  }
+  if (kind === "subagent") {
+    // M2.7 subagent_card. The payload schema is the gateway's emit_lifecycle
+    // (agent::subagent::emit_lifecycle). Start frames carry agent_name +
+    // input_preview + depth; completion frames add result_preview + the
+    // turn_metrics roll-up; error frames add `error`.
+    if (data.agent_name != null) art.agentName = String(data.agent_name);
+    if (data.subagent_turn_id != null) art.subagentTurnId = String(data.subagent_turn_id);
+    if (data.depth != null) art.depth = Number(data.depth);
+    if (data.input_preview != null) art.inputPreview = String(data.input_preview);
+    if (data.result_preview != null) art.resultPreview = String(data.result_preview);
+    if (data.stop_reason != null) art.stopReason = String(data.stop_reason);
+    if (data.iteration_count != null) art.iterationCount = Number(data.iteration_count);
+    if (data.tool_call_count != null) art.toolCallCount = Number(data.tool_call_count);
+    if (data.tool_error_count != null) art.toolErrorCount = Number(data.tool_error_count);
+    if (data.cost_usd != null) art.costUsd = Number(data.cost_usd);
+    if (data.wall_clock_ms != null) art.wallClockMs = Number(data.wall_clock_ms);
+    if (data.source_layer != null) art.sourceLayer = String(data.source_layer);
+    if (data.error != null) art.errorMessage = String(data.error);
+    if (!art.innerArtifacts) art.innerArtifacts = [];
     return;
   }
   // search — the activity variant is in `action_type`. A Start frame has
@@ -240,8 +262,52 @@ export function createWorkbench() {
 
   function applyCanvas(ev: EventRow) {
     const kind = canvasKind(ev.kind);
+    if (!kind) return;
+
+    // M2.7 subagent_lifecycle: the payload IS the data (no envelope —
+    // it's emitted via `st.emit(SUBAGENT_LIFECYCLE, data)` not through
+    // `CanvasArtifact`). The `turn_id` field is the PARENT turn, and
+    // `subagent_turn_id` is the spawned subagent's id. The card lives
+    // on the parent turn.
+    if (kind === "subagent") {
+      const parentTurnId = String(ev.payload.turn_id ?? "");
+      if (!parentTurnId) return;
+      const artifactId = String(ev.payload.artifact_id ?? "");
+      const canvasIdentity = String(ev.payload.canvas_identity ?? artifactId);
+      const phase = (ev.payload.phase as Phase) ?? "completion";
+      setState(
+        produce((d: WorkbenchState) => {
+          const turn = ensureTurn(d, parentTurnId);
+          const idx = turn.artifacts.findIndex((a) => a.artifactId === artifactId);
+          if (idx < 0) {
+            const art: Artifact = {
+              artifactId,
+              canvasIdentity,
+              kind: "subagent",
+              iteration: 0,
+              phase,
+              innerArtifacts: [],
+            };
+            mergeData(art, "subagent", ev.payload as Record<string, unknown>);
+            turn.artifacts.push(art);
+          } else {
+            const art = turn.artifacts[idx];
+            art.phase = phase;
+            mergeData(art, "subagent", ev.payload as Record<string, unknown>);
+          }
+        }),
+      );
+      return;
+    }
+
+    // Standard canvas envelope events (note_trace / tool_lifecycle /
+    // search_lifecycle). If the event carries `parent_turn_id`, it was
+    // emitted inside a subagent loop — route it into the parent turn's
+    // subagent_card matching `subagent_turn_id == ev.payload.turn_id`.
     const turnId = String(ev.payload.turn_id ?? "");
-    if (!kind || !turnId) return;
+    if (!turnId) return;
+    const parentTurnId =
+      ev.payload.parent_turn_id != null ? String(ev.payload.parent_turn_id) : null;
     const artifactId = String(ev.payload.artifact_id ?? "");
     const phase = (ev.payload.phase as Phase) ?? "completion";
     const iteration = Number(ev.payload.iteration ?? 0);
@@ -250,9 +316,38 @@ export function createWorkbench() {
 
     setState(
       produce((d: WorkbenchState) => {
+        if (parentTurnId) {
+          // Subagent-emitted event — append / merge into the parent
+          // turn's subagent_card whose subagent_turn_id == turnId.
+          const parentTurn = ensureTurn(d, parentTurnId);
+          const subagentCard = parentTurn.artifacts.find(
+            (a) => a.kind === "subagent" && a.subagentTurnId === turnId,
+          );
+          if (!subagentCard) {
+            // The lifecycle Start frame should arrive before any inner
+            // event. If it didn't, drop the event rather than crash —
+            // the next Start frame will rebuild the card.
+            return;
+          }
+          if (!subagentCard.innerArtifacts) subagentCard.innerArtifacts = [];
+          const idx = subagentCard.innerArtifacts.findIndex(
+            (a) => a.artifactId === artifactId,
+          );
+          if (idx < 0) {
+            const art: Artifact = { artifactId, canvasIdentity, kind, iteration, phase };
+            mergeData(art, kind, data);
+            subagentCard.innerArtifacts.push(art);
+          } else {
+            const art = subagentCard.innerArtifacts[idx];
+            art.phase = phase;
+            art.iteration = iteration;
+            mergeData(art, kind, data);
+          }
+          return;
+        }
+
+        // Main-agent event — same as before.
         const turn = ensureTurn(d, turnId);
-        // A note tells the chat bubble that this iteration's streamed text
-        // was narration, not the final reply.
         if (kind === "note") d.noted[`${turnId}:${iteration}`] = true;
 
         const idx = turn.artifacts.findIndex((a) => a.artifactId === artifactId);
@@ -261,8 +356,6 @@ export function createWorkbench() {
           mergeData(art, kind, data);
           turn.artifacts.push(art);
         } else {
-          // A later frame of the same artifact (start → completion / error,
-          // or the sources-enriched search frame) updates one card.
           const art = turn.artifacts[idx];
           art.phase = phase;
           art.iteration = iteration;

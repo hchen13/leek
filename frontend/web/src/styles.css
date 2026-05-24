@@ -449,6 +449,38 @@ h2 {
   background: transparent;
   border-style: dashed;
 }
+
+/* M2.7 subagent_card — a spawned subagent's whole activity collapsed
+ * into one card on the parent's canvas. Border + a left rule so the
+ * card visually reads as a different layer than the parent's tools. */
+.subagent-card {
+  border-left: 3px solid var(--blue-soft);
+  background: rgba(96, 165, 250, 0.05);
+}
+.subagent-result {
+  margin-top: 8px;
+}
+.subagent-result-text {
+  font-size: 16px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.subagent-meta {
+  margin-top: 6px;
+  font-size: 14px;
+}
+.subagent-inner {
+  margin-top: 10px;
+  padding-left: 12px;
+  border-left: 1px dashed var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.subagent-inner-card {
+  background: rgba(255, 255, 255, 0.03);
+}
 .card-label {
   font-size: 14px;
   text-transform: uppercase;

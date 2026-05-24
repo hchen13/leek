@@ -25,32 +25,27 @@ mod compaction;
 mod compaction_replay_test;
 pub mod events;
 mod guards;
+mod loop_core;
 mod prompt;
+mod subagent;
 mod tools;
 
 pub use guards::GuardConfig;
 
-use std::collections::VecDeque;
-use std::time::Instant;
-
 use anyhow::Result;
-use futures::StreamExt;
 
 use crate::api::AppState;
 use crate::hooks::{HookEvent, HookOutcome};
-use crate::llm::{
-    pricing, ChatMessage, ChatRequest, LlmEvent, Role, StopReason, WebSearchAction,
-    WebSearchPhase,
-};
+use crate::llm::{ChatMessage, Role, WebSearchAction};
 use crate::vault::{messages, sessions, turn_metrics};
 
 /// The model leek runs on, with its fixed M1 inference settings. There is no
 /// settings surface yet, so the main-agent values are constants: XHigh
 /// reasoning (the synthesizing agent gets the biggest thinking budget), Low
 /// verbosity. A tuning surface is a later milestone.
-const MODEL: &str = "gpt-5.5";
-const REASONING_EFFORT: &str = "xhigh";
-const VERBOSITY: &str = "low";
+pub(super) const MODEL: &str = "gpt-5.5";
+pub(super) const REASONING_EFFORT: &str = "xhigh";
+pub(super) const VERBOSITY: &str = "low";
 
 /// Cap on session history loaded as a turn's starting context. A turn whose
 /// context still outgrows the model window is handled by auto-compaction
@@ -79,14 +74,11 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
     // affects the *next* turn, so the guard set stays stable for the
     // duration of this loop (M2.6).
     let guards = guards::GuardConfig::resolve(&st.config_snapshot());
-    let started = Instant::now();
-    let started_at = chrono::Utc::now();
-    let wall_deadline = guards.wall_clock.map(|d| started + d);
 
     // ── context ─────────────────────────────────────────────────────────
     // Full session history (the just-posted user message is already in it).
     let history = messages::list(&st.pool, session_id, None, HISTORY_LIMIT).await?;
-    let mut chat_messages: Vec<ChatMessage> = history
+    let chat_messages: Vec<ChatMessage> = history
         .iter()
         .filter_map(|m| {
             let role = match m.role.as_str() {
@@ -161,490 +153,31 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
         }
     }
 
-    let tool_specs = tools::specs(&st.skills);
-    let system = prompt::build_system_prompt(&tool_specs, &st.skills);
-    // Auto-compaction trigger: a fraction of the context window. The window
-    // is `LEEK_CONTEXT_WINDOW` if set (a small value trips compaction within
-    // a few turns — handy for tests), else the per-model `pricing` value.
-    let context_window = guards
-        .context_window
-        .unwrap_or_else(|| pricing::context_window(MODEL));
-    let compact_trigger = (guards.auto_compact_threshold as f64 * context_window as f64) as u32;
+    let tool_specs = tools::specs(&st.skills, &st.agents);
+    let system = prompt::build_system_prompt(&tool_specs, &st.skills, &st.agents);
 
-    // ── turn state ──────────────────────────────────────────────────────
-    // Prior-iteration function_call / function_call_output items, re-sent so
-    // the model sees the whole multi-turn tool dialog.
-    let mut additional_inputs: Vec<serde_json::Value> = Vec::new();
-    // The final reply only — the text of the turn-ending iteration. Text
-    // from earlier iterations precedes a tool call, so it is Note Trace and
-    // goes to the canvas, never into the chat message (REQUIREMENTS §2.3).
-    let mut final_reply = String::new();
-    let mut iteration_count: usize = 0;
-    // LLM-call sequence number for the transcript archive (F2). It
-    // includes BOTH main iterations and any auto-compaction summary calls
-    // — every code path that hits `codex.chat` bumps this — so it
-    // intentionally diverges from `iteration_count`. One row per provider
-    // call lands in `llm_transcripts`.
-    let mut transcript_iter: i64 = 0;
-    let mut tool_call_count: usize = 0;
-    let mut tool_error_count: usize = 0;
-    let mut input_tokens: u64 = 0;
-    let mut output_tokens: u64 = 0;
-    let mut cost_usd: f64 = 0.0;
-    // Sliding window of recent (tool, args) calls for the doom-loop detector.
-    let mut doom_window: VecDeque<(String, String)> = VecDeque::new();
-    // Auto-compaction state: the running summary of context folded away,
-    // and how many times that has happened this turn.
-    let mut compaction_summary: Option<String> = None;
-    let mut compaction_count: usize = 0;
-
-    // Assigned by every `break 'turn` arm — declared uninitialized so the
-    // compiler rejects any future exit path that forgets to set it.
-    let stop_reason: String;
-    let mut first_guard: Option<&'static str> = None;
-    let mut fatal_error: Option<String> = None;
-
-    'turn: loop {
-        // ── pre-iteration guards ────────────────────────────────────────
-        if wall_deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
-            stop_reason = "wall_clock_exceeded".into();
-            first_guard.get_or_insert("wall_clock_exceeded");
-            break 'turn;
-        }
-        if guards
-            .max_iterations
-            .map(|c| iteration_count >= c)
-            .unwrap_or(false)
-        {
-            stop_reason = "max_iterations".into();
-            first_guard.get_or_insert("max_iterations");
-            break 'turn;
-        }
-        if guards.cost_cap_usd.map(|c| cost_usd >= c).unwrap_or(false) {
-            // M2.6: emit a dedicated event ahead of the stop_reason so the
-            // frontend can render a "本回合达到预算上限" warning bar without
-            // having to inspect `assistant_done.stop_reason`. The
-            // `assistant_done` event below still carries the same reason —
-            // this one just lets the chat surface react earlier.
-            let cap = guards.cost_cap_usd.unwrap_or(0.0);
-            st.emit(
-                session_id,
-                events::kind::TURN_COST_CAPPED,
-                serde_json::json!({
-                    "turn_id": turn_id,
-                    "cap_usd": cap,
-                    "actual_cost_usd": cost_usd,
-                    "iter_count": iteration_count,
-                }),
-            )
-            .await;
-            stop_reason = "cost_cap_exceeded".into();
-            first_guard.get_or_insert("cost_cap_exceeded");
-            break 'turn;
-        }
-        // ── auto-compaction ─────────────────────────────────────────────
-        // Near the context-window limit, fold the early context into a
-        // traceable summary and continue this turn — there is no
-        // context-limit stop (REQUIREMENTS §7.1, MILESTONES M1.8). The
-        // trigger signal is leek's own estimator over the assembled
-        // request: codex's reported `input_tokens` mixes in builtin
-        // web_search volume that compaction cannot shrink, so it cannot
-        // be the trigger (M2.5 — see `docs/dispatches/M2.5-compaction-fix.md`).
-        if compact_trigger > 0 {
-            let ctx_tokens = compaction::estimate_context_tokens(
-                &system,
-                compaction_summary.as_deref(),
-                &chat_messages,
-                &additional_inputs,
-                &tool_specs,
-            );
-            if ctx_tokens >= compact_trigger {
-                // ── PreCompact hook (M2.5) ──────────────────────────────
-                // Advisory: leek logs a block verdict but does not abort
-                // compaction (compaction is a recovery boundary —
-                // skipping it would silently drop tokens).
-                if st.hooks.has_event(HookEvent::PreCompact) {
-                    let _ = st
-                        .hooks
-                        .trigger(
-                            HookEvent::PreCompact,
-                            "auto",
-                            pre_compact_payload(session_id, turn_id, ctx_tokens),
-                        )
-                        .await;
-                }
-                // Compaction's summary call is one LLM call — give it its
-                // own slot in the transcript series.
-                transcript_iter += 1;
-                match compaction::compact(
-                    st,
-                    session_id,
-                    turn_id,
-                    &system,
-                    &tool_specs,
-                    compaction::TurnContext {
-                        summary: &mut compaction_summary,
-                        messages: &mut chat_messages,
-                        tool_dialog: &mut additional_inputs,
-                    },
-                    ctx_tokens,
-                    transcript_iter,
-                    guards.idle_timeout,
-                )
-                .await
-                {
-                    Ok(compaction::Compacted::Done) => {
-                        compaction_count += 1;
-                    }
-                    Ok(compaction::Compacted::Skipped) => {}
-                    Err(e) => {
-                        fatal_error = Some(e.to_string());
-                        stop_reason = "fatal_error".into();
-                        break 'turn;
-                    }
-                }
-            }
-        }
-
-        iteration_count += 1;
-        transcript_iter += 1;
-
-        // ── per-iteration developer hint: wall-clock soft prompt ────────
-        let mut iter_inputs = additional_inputs.clone();
-        if let Some(deadline) = wall_deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
-            if let Some(hint) = guards::soft_deadline_hint(remaining) {
-                iter_inputs.push(serde_json::json!({
-                    "role": "developer",
-                    "content": format!("[本回合剩余约 {remaining} 秒] {hint}"),
-                }));
-            }
-        }
-
-        // Prepend the auto-compaction summary (if any) as a developer-role
-        // context block, ahead of the kept recent messages.
-        let mut iter_messages: Vec<ChatMessage> = Vec::with_capacity(chat_messages.len() + 1);
-        if let Some(summary) = &compaction_summary {
-            iter_messages.push(compaction::summary_message(summary));
-        }
-        iter_messages.extend(chat_messages.iter().cloned());
-
-        let req = ChatRequest {
-            model: MODEL.to_string(),
-            system: system.clone(),
-            messages: iter_messages,
-            tools: tool_specs.clone(),
-            additional_inputs: iter_inputs,
-            reasoning_effort: Some(REASONING_EFFORT.to_string()),
-            verbosity: Some(VERBOSITY.to_string()),
-            web_search: st.web_search,
-            session_id: session_id.to_string(),
-            turn_id: turn_id.to_string(),
-            iteration: transcript_iter,
-        };
-
-        // ── call the model ──────────────────────────────────────────────
-        let mut stream = match st.codex.chat(req).await {
-            Ok(s) => s,
-            Err(e) => {
-                fatal_error = Some(e.to_string());
-                stop_reason = "fatal_error".into();
-                break 'turn;
-            }
-        };
-
-        // ── consume the streamed response (idle-timeout guarded) ────────
-        // `iter_text` is this iteration's assistant text. Whether it is a
-        // Note Trace or the final reply is known only once the stream ends
-        // — did the model also emit tool calls? — so it is classified below.
-        let mut iter_text = String::new();
-        let mut pending: Vec<(String, String, String)> = Vec::new();
-        let mut iter_stop: Option<StopReason> = None;
-        let mut idle_hit = false;
-        'stream: loop {
-            // The idle timer wraps every `next()`: a `Ping` (reasoning
-            // lifecycle event) resets it, so only genuine silence trips it.
-            let item = match guards.idle_timeout {
-                Some(d) => match tokio::time::timeout(d, stream.next()).await {
-                    Ok(item) => item,
-                    Err(_) => {
-                        idle_hit = true;
-                        break 'stream;
-                    }
-                },
-                None => stream.next().await,
-            };
-            let Some(event) = item else { break 'stream };
-            match event {
-                Ok(LlmEvent::TextDelta { text }) => {
-                    iter_text.push_str(&text);
-                    st.emit_ephemeral(
-                        session_id,
-                        events::kind::ASSISTANT_DELTA,
-                        serde_json::json!({
-                            "turn_id": turn_id,
-                            "iteration": iteration_count,
-                            "text": text,
-                        }),
-                    )
-                    .await;
-                }
-                Ok(LlmEvent::FunctionCall {
-                    call_id,
-                    name,
-                    arguments,
-                }) => pending.push((call_id, name, arguments)),
-                Ok(LlmEvent::WebSearch {
-                    call_id,
-                    phase,
-                    action,
-                }) => {
-                    // Provider-side search (M1.9.4): observed, not
-                    // dispatched — normalized to a canvas search artifact.
-                    // The backend reports per-call results on the
-                    // `Completed` frame via the request's
-                    // `include: ["web_search_call.results"]` opt-in
-                    // (MILESTONES decision 2026-05-20). The activity kind
-                    // (`search` / `open_page` / `find_in_page` / unknown)
-                    // is mapped to a variant-specific `data` body — the
-                    // event kind stays `search_lifecycle` so the contract
-                    // is stable.
-                    let canvas_phase = match phase {
-                        WebSearchPhase::Started => events::Phase::Start,
-                        WebSearchPhase::Completed => events::Phase::Completion,
-                    };
-                    let data = build_search_data(action.as_ref());
-                    st.emit(
-                        session_id,
-                        events::kind::SEARCH_LIFECYCLE,
-                        events::CanvasArtifact::search(
-                            turn_id,
-                            iteration_count,
-                            &call_id,
-                            canvas_phase,
-                            data,
-                        )
-                        .into_payload(),
-                    )
-                    .await;
-                }
-                Ok(LlmEvent::Usage(u)) => {
-                    input_tokens += u.input_tokens as u64;
-                    output_tokens += u.output_tokens as u64;
-                    cost_usd += pricing::compute_cost(MODEL, &u);
-                }
-                Ok(LlmEvent::MessageEnd { stop_reason: sr }) => iter_stop = Some(sr),
-                Ok(LlmEvent::Ping) => {}
-                Err(e) => {
-                    fatal_error = Some(e.to_string());
-                    break 'stream;
-                }
-            }
-        }
-
-        if fatal_error.is_some() {
-            // The turn ends here — the partial text is the final reply.
-            final_reply = iter_text;
-            stop_reason = "fatal_error".into();
-            break 'turn;
-        }
-        if idle_hit {
-            final_reply = iter_text;
-            stop_reason = "idle_timeout".into();
-            first_guard.get_or_insert("idle_timeout");
-            break 'turn;
-        }
-
-        // ── no tool calls → the model finished: this text is the reply ──
-        if pending.is_empty() {
-            final_reply = iter_text;
-            stop_reason = match iter_stop {
-                Some(StopReason::MaxTokens) => "max_tokens".into(),
-                _ => "end_turn".into(),
-            };
-            break 'turn;
-        }
-
-        // The iteration also emitted tool calls, so its text is narration
-        // around them — a Note Trace, shown on the canvas, never in the chat
-        // message (REQUIREMENTS §2.3).
-        let note = iter_text.trim();
-        if !note.is_empty() {
-            st.emit(
-                session_id,
-                events::kind::NOTE_TRACE,
-                events::CanvasArtifact::note(turn_id, iteration_count, note).into_payload(),
-            )
-            .await;
-        }
-
-        // ── dispatch tool calls, re-inject results, loop ────────────────
-        let mut doom_hit = false;
-        for (call_id, name, arguments) in pending {
-            tool_call_count += 1;
-
-            if let Some(threshold) = guards.doom_loop_threshold {
-                doom_window.push_back((name.clone(), arguments.clone()));
-                while doom_window.len() > threshold {
-                    doom_window.pop_front();
-                }
-                if guards::detect_doom_loop(&doom_window, threshold) {
-                    doom_hit = true;
-                }
-            }
-
-            let args_value: serde_json::Value =
-                serde_json::from_str(&arguments).unwrap_or(serde_json::Value::Null);
-
-            // Where does this tool's result render? `update_plan` updates the
-            // right-rail Plan widget; every other tool gets a canvas tool
-            // card (REQUIREMENTS §2.4, §2.6). The registry decides — the loop
-            // does not special-case tool names.
-            let to_plan = matches!(
-                tools::ui(&name).map(|u| u.result),
-                Some(tools::ResultArtifact::Plan)
-            );
-
-            // ── PreToolUse hook (M2.5) ─────────────────────────────────
-            // CC parity: a `decision: block` (or exit 2) cancels the call.
-            // We turn a block into a synthetic error outcome the model can
-            // recover from, then skip the actual dispatch.
-            let outcome = if st.hooks.has_event(HookEvent::PreToolUse) {
-                let payload = pre_tool_use_payload(
-                    session_id,
-                    turn_id,
-                    iteration_count,
-                    &call_id,
-                    &name,
-                    &args_value,
-                );
-                match st.hooks.trigger(HookEvent::PreToolUse, &name, payload).await {
-                    HookOutcome::Block { reason } => {
-                        let msg = format!(
-                            "tool '{name}' was blocked by a PreToolUse hook: {reason}"
-                        );
-                        tool_error_count += 1;
-                        st.emit(
-                            session_id,
-                            events::kind::TOOL_LIFECYCLE,
-                            tools::tool_artifact(
-                                turn_id,
-                                iteration_count,
-                                &call_id,
-                                &name,
-                                &args_value,
-                                Some(&tools::ToolOutcome::error(msg.clone())),
-                            )
-                            .into_payload(),
-                        )
-                        .await;
-                        Some(tools::ToolOutcome::error(msg))
-                    }
-                    HookOutcome::Continue => None,
-                }
-            } else {
-                None
-            };
-
-            let outcome = if let Some(o) = outcome {
-                o
-            } else {
-                // Start frame — a canvas tool card only; the plan tool has none.
-                if !to_plan {
-                    st.emit(
-                        session_id,
-                        events::kind::TOOL_LIFECYCLE,
-                        tools::tool_artifact(
-                            turn_id,
-                            iteration_count,
-                            &call_id,
-                            &name,
-                            &args_value,
-                            None,
-                        )
-                        .into_payload(),
-                    )
-                    .await;
-                }
-
-                let o = tools::dispatch(
-                    &st.http, &st.corpus, &st.skills, &name, &args_value,
-                )
-                .await;
-                if o.is_error {
-                    tool_error_count += 1;
-                }
-
-                if to_plan {
-                    // The plan tool is not a canvas card and not a gate. Emit the
-                    // plan only on success — a rejected update leaves it unchanged.
-                    if !o.is_error {
-                        st.emit(
-                            session_id,
-                            events::kind::PLAN_UPDATED,
-                            plan_payload(turn_id, &o),
-                        )
-                        .await;
-                    }
-                } else {
-                    st.emit(
-                        session_id,
-                        events::kind::TOOL_LIFECYCLE,
-                        tools::tool_artifact(
-                            turn_id,
-                            iteration_count,
-                            &call_id,
-                            &name,
-                            &args_value,
-                            Some(&o),
-                        )
-                        .into_payload(),
-                    )
-                    .await;
-                }
-
-                // ── PostToolUse hook (M2.5) — advisory; observe-only ─
-                if st.hooks.has_event(HookEvent::PostToolUse) {
-                    let payload = post_tool_use_payload(
-                        session_id,
-                        turn_id,
-                        iteration_count,
-                        &call_id,
-                        &name,
-                        &args_value,
-                        &o,
-                    );
-                    let _ = st
-                        .hooks
-                        .trigger(HookEvent::PostToolUse, &name, payload)
-                        .await;
-                }
-                o
-            };
-
-            // Re-inject the call and its result so the next iteration sees
-            // the full tool dialog (order matters: call before output). Only
-            // `model_output` reaches the model — the display / debug payloads
-            // are UI-only (REQUIREMENTS §4.2).
-            additional_inputs.push(serde_json::json!({
-                "type": "function_call", "call_id": call_id,
-                "name": name, "arguments": arguments,
-            }));
-            additional_inputs.push(serde_json::json!({
-                "type": "function_call_output", "call_id": call_id,
-                "output": outcome.model_output,
-            }));
-        }
-
-        if doom_hit {
-            stop_reason = "doom_loop".into();
-            first_guard.get_or_insert("doom_loop");
-            break 'turn;
-        }
-    }
+    // ── inner loop (shared with subagents — M2.7) ───────────────────────
+    // The main-agent loop has nothing special inside the model→tool cycle;
+    // it shares one implementation with every subagent loop. The wrapping
+    // around the loop is the only thing that differs (lifecycle hooks,
+    // message persistence, the right-rail / chat surfaces).
+    let outcome = loop_core::run_loop(loop_core::LoopParams {
+        st,
+        session_id,
+        turn_id,
+        parent_turn_id: None,
+        depth: 0,
+        system,
+        messages: chat_messages,
+        tool_specs,
+        allowed_tools: loop_core::ToolAllowlist::All,
+        guards,
+    })
+    .await?;
 
     // ── finalize: assistant message + metrics + lifecycle events ────────
-    let final_text = compose_final_text(&final_reply, &stop_reason, fatal_error.as_deref());
+    let final_text =
+        compose_final_text(&outcome.final_reply, &outcome.stop_reason, outcome.fatal_error.as_deref());
     let assistant = messages::insert(&st.pool, session_id, "assistant", &final_text).await?;
     st.emit(
         session_id,
@@ -656,27 +189,29 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
     )
     .await;
 
-    let ended_at = chrono::Utc::now();
-    let wall_ms = started.elapsed().as_millis() as i64;
     turn_metrics::insert(
         &st.pool,
         &turn_metrics::NewTurnMetrics {
             turn_id,
             session_id,
             model: MODEL,
-            started_at: &started_at.to_rfc3339(),
-            ended_at: &ended_at.to_rfc3339(),
-            wall_clock_ms: wall_ms,
-            iteration_count: iteration_count as i64,
-            tool_call_count: tool_call_count as i64,
-            tool_error_count: tool_error_count as i64,
-            compaction_count: compaction_count as i64,
-            input_tokens: input_tokens as i64,
-            output_tokens: output_tokens as i64,
-            cost_usd,
-            stop_reason: &stop_reason,
-            first_triggered_guard: first_guard,
-            fatal_error: fatal_error.as_deref(),
+            started_at: &outcome.started_at.to_rfc3339(),
+            ended_at: &outcome.ended_at.to_rfc3339(),
+            wall_clock_ms: outcome.wall_clock_ms,
+            iteration_count: outcome.iteration_count as i64,
+            tool_call_count: outcome.tool_call_count as i64,
+            tool_error_count: outcome.tool_error_count as i64,
+            compaction_count: outcome.compaction_count as i64,
+            input_tokens: outcome.input_tokens as i64,
+            output_tokens: outcome.output_tokens as i64,
+            cost_usd: outcome.cost_usd,
+            stop_reason: &outcome.stop_reason,
+            first_triggered_guard: outcome.first_guard,
+            fatal_error: outcome.fatal_error.as_deref(),
+            // The main agent is the root of the turn tree — no parent,
+            // depth 0. M2.7 added these fields; subagents fill them in.
+            parent_turn_id: None,
+            depth: 0,
         },
     )
     .await?;
@@ -686,16 +221,16 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
         events::kind::TURN_METRICS_RECORDED,
         serde_json::json!({
             "turn_id": turn_id,
-            "stop_reason": stop_reason,
-            "first_triggered_guard": first_guard,
-            "iteration_count": iteration_count,
-            "tool_call_count": tool_call_count,
-            "tool_error_count": tool_error_count,
-            "compaction_count": compaction_count,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cost_usd": cost_usd,
-            "wall_clock_ms": wall_ms,
+            "stop_reason": outcome.stop_reason,
+            "first_triggered_guard": outcome.first_guard,
+            "iteration_count": outcome.iteration_count,
+            "tool_call_count": outcome.tool_call_count,
+            "tool_error_count": outcome.tool_error_count,
+            "compaction_count": outcome.compaction_count,
+            "input_tokens": outcome.input_tokens,
+            "output_tokens": outcome.output_tokens,
+            "cost_usd": outcome.cost_usd,
+            "wall_clock_ms": outcome.wall_clock_ms,
             "model": MODEL,
         }),
     )
@@ -707,7 +242,7 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
         serde_json::json!({
             "turn_id": turn_id,
             "message_seq": assistant.seq,
-            "stop_reason": stop_reason,
+            "stop_reason": outcome.stop_reason,
         }),
     )
     .await;
@@ -722,13 +257,19 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
             .trigger(
                 HookEvent::Stop,
                 "",
-                stop_payload(session_id, turn_id, &stop_reason, &final_text),
+                stop_payload(session_id, turn_id, &outcome.stop_reason, &final_text),
             )
             .await;
     }
 
     sessions::touch(&st.pool, session_id).await?;
-    tracing::info!(session_id, turn_id, %stop_reason, iteration_count, "agent turn complete");
+    tracing::info!(
+        session_id,
+        turn_id,
+        stop_reason = %outcome.stop_reason,
+        iteration_count = outcome.iteration_count,
+        "agent turn complete"
+    );
     Ok(())
 }
 
@@ -746,7 +287,7 @@ fn preview(s: &str) -> String {
 /// Build the `plan_updated` payload from `update_plan`'s display payload.
 /// The loop forwards the tool's structured plan to the right-rail widget
 /// (REQUIREMENTS §2.6) verbatim — it does not interpret the plan.
-fn plan_payload(turn_id: &str, outcome: &tools::ToolOutcome) -> serde_json::Value {
+pub(super) fn plan_payload(turn_id: &str, outcome: &tools::ToolOutcome) -> serde_json::Value {
     let display = &outcome.display_payload;
     serde_json::json!({
         "turn_id": turn_id,
@@ -774,7 +315,7 @@ fn web_search_host(url: &str) -> Option<String> {
 /// the activity is only known on completion. Each variant tags its body
 /// with `action_type` so the renderer never guesses the activity from the
 /// presence or absence of fields.
-fn build_search_data(action: Option<&WebSearchAction>) -> serde_json::Value {
+pub(super) fn build_search_data(action: Option<&WebSearchAction>) -> serde_json::Value {
     match action {
         None => serde_json::json!({}),
         Some(WebSearchAction::Search { query, results }) => {
@@ -883,7 +424,7 @@ fn user_prompt_submit_payload(
     })
 }
 
-fn pre_tool_use_payload(
+pub(super) fn pre_tool_use_payload(
     session_id: &str,
     turn_id: &str,
     iteration: usize,
@@ -902,7 +443,7 @@ fn pre_tool_use_payload(
     })
 }
 
-fn post_tool_use_payload(
+pub(super) fn post_tool_use_payload(
     session_id: &str,
     turn_id: &str,
     iteration: usize,
@@ -924,7 +465,7 @@ fn post_tool_use_payload(
     })
 }
 
-fn pre_compact_payload(session_id: &str, turn_id: &str, tokens_before: u32) -> serde_json::Value {
+pub(super) fn pre_compact_payload(session_id: &str, turn_id: &str, tokens_before: u32) -> serde_json::Value {
     serde_json::json!({
         "session_id": session_id,
         "turn_id": turn_id,

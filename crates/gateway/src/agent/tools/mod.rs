@@ -19,6 +19,7 @@
 
 mod corpus_read;
 mod corpus_search;
+mod task;
 mod update_plan;
 mod use_skill;
 mod web_fetch;
@@ -26,6 +27,8 @@ mod web_fetch;
 use std::sync::Arc;
 
 use crate::agent::events::{self, CanvasArtifact, Phase};
+use crate::agents::AgentRegistry;
+use crate::api::AppState;
 use crate::corpus::Corpus;
 use crate::llm::ToolSpec;
 use crate::skills::SkillRegistry;
@@ -95,15 +98,22 @@ pub struct ToolUi {
     pub summary: fn(&serde_json::Value) -> String,
 }
 
-/// The function-tool specs offered to the model this milestone. `use_skill`
-/// is conditional on a non-empty registry — exposing the tool when no skills
-/// are registered would invite the model to call it and fail.
-pub fn specs(skills: &Arc<SkillRegistry>) -> Vec<ToolSpec> {
+/// The function-tool specs offered to the model this milestone.
+///
+/// `use_skill` is conditional on a non-empty skill registry — exposing
+/// it with nothing to load would invite a guaranteed-error call.
+/// `task` is always offered: even when no AGENT.md is registered, the
+/// task tool can fall back to `general-purpose` (the built-in baseline),
+/// so the surface stays stable. The dispatch path still errors loudly
+/// if the named agent is genuinely absent — we don't want the surface
+/// to silently disappear because a user removed an agent file.
+pub fn specs(skills: &Arc<SkillRegistry>, agents: &Arc<AgentRegistry>) -> Vec<ToolSpec> {
     let mut v = vec![
         web_fetch::spec(),
         update_plan::spec(),
         corpus_search::spec(),
         corpus_read::spec(),
+        task::spec(agents),
     ];
     if !skills.is_empty() {
         v.push(use_skill::spec());
@@ -119,20 +129,52 @@ pub fn ui(name: &str) -> Option<ToolUi> {
         "corpus_search" => Some(corpus_search::ui()),
         "corpus_read" => Some(corpus_read::ui()),
         "use_skill" => Some(use_skill::ui()),
+        "task" => Some(task::ui()),
         _ => None,
+    }
+}
+
+/// Per-call context the dispatch path needs, beyond the (skills /
+/// corpus / http) values that have been there since M2.1.
+///
+/// `task` (M2.7) is the one tool that needs the live `AppState`, the
+/// caller's session / turn ids, and the depth-cap context to spawn a
+/// subagent loop. The other tools ignore everything in this struct. We
+/// pass it explicitly so unit tests that don't exercise `task` can
+/// build a minimal struct without a full `AppState`.
+pub struct DispatchCtx<'a> {
+    /// `Some` enables `task`; `None` makes a `task` call error out with
+    /// "task not available in this dispatch context". Tests that don't
+    /// exercise `task` pass `None`.
+    pub st: Option<&'a AppState>,
+    pub session_id: &'a str,
+    pub parent_turn_id: &'a str,
+    /// Depth of the calling turn (main agent = 0, subagent = 1, …).
+    pub parent_depth: u32,
+}
+
+impl<'a> DispatchCtx<'a> {
+    /// Convenience: a context that disables `task` (for unit tests of
+    /// the other tools).
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Self {
+            st: None,
+            session_id: "",
+            parent_turn_id: "",
+            parent_depth: 0,
+        }
     }
 }
 
 /// Dispatch one function call. An unknown name is a structured error, not a
 /// panic — the model gets it back as `function_call_output` and can recover.
-///
-/// The `corpus` arg is the shared read-only knowledge layer (M2.1); only
-/// the corpus tools consume it, but it lives on the dispatch signature
-/// rather than a per-tool closure so the agent loop has one call site.
 pub async fn dispatch(
+    ctx: &DispatchCtx<'_>,
     http: &reqwest::Client,
     corpus: &Arc<Corpus>,
     skills: &Arc<SkillRegistry>,
+    _agents: &Arc<AgentRegistry>,
     name: &str,
     args: &serde_json::Value,
 ) -> ToolOutcome {
@@ -142,6 +184,21 @@ pub async fn dispatch(
         "corpus_search" => corpus_search::run(corpus, args),
         "corpus_read" => corpus_read::run(corpus, args),
         "use_skill" => use_skill::run(skills, args),
+        "task" => match ctx.st {
+            Some(st) => {
+                task::run(
+                    st,
+                    ctx.session_id,
+                    ctx.parent_turn_id,
+                    ctx.parent_depth,
+                    args,
+                )
+                .await
+            }
+            None => ToolOutcome::error(
+                "task: tool not available in this dispatch context (no AppState bound)".to_string(),
+            ),
+        },
         other => ToolOutcome::error(format!(
             "unknown tool '{other}' — it is not in the available tool set"
         )),
@@ -222,10 +279,14 @@ mod tests {
         let http = reqwest::Client::new();
         let corpus = Arc::new(Corpus::empty());
         let skills = Arc::new(SkillRegistry::default());
+        let agents = Arc::new(AgentRegistry::default());
+        let ctx = DispatchCtx::for_test();
         let out = futures::executor::block_on(dispatch(
+            &ctx,
             &http,
             &corpus,
             &skills,
+            &agents,
             "nope",
             &serde_json::Value::Null,
         ));
@@ -236,7 +297,8 @@ mod tests {
     #[test]
     fn use_skill_tool_is_only_advertised_when_registry_non_empty() {
         let empty = Arc::new(SkillRegistry::default());
-        let names: Vec<_> = specs(&empty).into_iter().map(|s| s.name).collect();
+        let agents = Arc::new(AgentRegistry::default());
+        let names: Vec<_> = specs(&empty, &agents).into_iter().map(|s| s.name).collect();
         assert!(!names.contains(&"use_skill".to_string()));
 
         let mut map = std::collections::HashMap::new();
@@ -252,9 +314,27 @@ mod tests {
             },
         );
         let with_one = Arc::new(SkillRegistry::new(map));
-        let names: Vec<_> = specs(&with_one).into_iter().map(|s| s.name).collect();
+        let names: Vec<_> = specs(&with_one, &agents)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
         assert!(names.contains(&"use_skill".to_string()));
         assert!(ui("use_skill").is_some());
+    }
+
+    #[test]
+    fn task_tool_is_always_offered() {
+        // Spec §A: the task tool is always advertised — the
+        // default fallback agent `general-purpose` is built-in,
+        // so the surface stays stable across boots.
+        let empty_skills = Arc::new(SkillRegistry::default());
+        let empty_agents = Arc::new(AgentRegistry::default());
+        let names: Vec<_> = specs(&empty_skills, &empty_agents)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(names.contains(&"task".to_string()));
+        assert!(ui("task").is_some());
     }
 
     #[test]
@@ -263,6 +343,7 @@ mod tests {
         assert!(ui("update_plan").is_some());
         assert!(ui("corpus_search").is_some());
         assert!(ui("corpus_read").is_some());
+        assert!(ui("task").is_some());
         assert!(ui("nope").is_none());
         // update_plan renders to the right rail, not a canvas tool card.
         assert_eq!(ui("update_plan").unwrap().result, ResultArtifact::Plan);
@@ -275,6 +356,34 @@ mod tests {
             ui("corpus_read").unwrap().result,
             ResultArtifact::Card("corpus_read")
         );
+        // task tool has a placeholder canvas kind — actual rendering is
+        // the subagent_card emitted via the lifecycle event.
+        assert_eq!(
+            ui("task").unwrap().result,
+            ResultArtifact::Card("task_dispatch")
+        );
+    }
+
+    #[test]
+    fn dispatch_task_without_appstate_returns_error_not_panic() {
+        // Unit tests can call task with `DispatchCtx::for_test()` —
+        // expecting a structured error, not a crash.
+        let http = reqwest::Client::new();
+        let corpus = Arc::new(Corpus::empty());
+        let skills = Arc::new(SkillRegistry::default());
+        let agents = Arc::new(AgentRegistry::default());
+        let ctx = DispatchCtx::for_test();
+        let out = futures::executor::block_on(dispatch(
+            &ctx,
+            &http,
+            &corpus,
+            &skills,
+            &agents,
+            "task",
+            &serde_json::json!({ "input": "hi" }),
+        ));
+        assert!(out.is_error);
+        assert!(out.model_output.contains("not available"));
     }
 
     #[test]
