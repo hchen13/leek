@@ -333,9 +333,79 @@ skills/sample/SKILL.md         # frontmatter + body
 
 ---
 
-## 第六段:M2.7 Subagent(等 worker 完成后追加)
+## 第六段:M2.7 Subagent(task 工具 + AGENT.md + subagent_card)
 
-T22-T26 占位 — 等 M2.7 worker subagent 实施完成后由 PM 填充具体 case(`task` 工具 + AGENT.md + subagent_card + nested depth + parent_turn_id)。
+### T22 · `GET /api/v1/agents` 看 builtin 列表
+
+**操作**:`curl http://localhost:8964/api/v1/agents | jq`
+
+**预期**:返 2 个 builtin agent —— `general-purpose`(全工具)+ `corpus-expert`(allowed_tools: corpus_search + corpus_read),source_layer=`builtin`。启动日志含 `M2.7 runtime loaded: 2 agents from builtin/user/.leek/agents agents=2`。
+
+**看点**:`/api/v1/agents/general-purpose` 返完整 metadata + body(AGENT.md 全文)。
+
+---
+
+### T23 · 委派 corpus-expert(单层 subagent)
+
+**prompt**:
+
+```
+用 task 委派 corpus-expert 在 corpus 里查 "circle of competence" 的权威说法,综合各文档给一份带 cite 的答案。
+```
+
+**预期**:
+- 主 agent canvas 出 **subagent_card**:`委派给 corpus-expert · depth 1 · subagent 运行中...`
+- 卡片底部 "展开内部" 按钮 → 看到 subagent 内部 corpus_search × N + corpus_read × N 工具调用列表(**不平铺到主 canvas**)
+- subagent 完成 → 卡片显示 `subagent 结果` text preview + meta:N 次迭代 / N 工具调用 / $X.XXXX / Y.Ys
+- chat 最终答案 cite 出 corpus path(来自 subagent digest)
+
+**看点**:`SELECT turn_id, parent_turn_id, depth FROM turn_metrics ORDER BY ts;` 看到 2 行,主 turn(`parent_turn_id=NULL, depth=0`) + subagent turn(`parent_turn_id=<主 turn>, depth=1`)。
+
+---
+
+### T24 · subagent 嵌套(depth=2)
+
+**prompt**:
+
+```
+用 task 委派 general-purpose 做一件事:让 general-purpose 自己再 task 委派 corpus-expert 去查 "margin of safety" 的 corpus 定义,然后 general-purpose 把结果总结给我。
+```
+
+**预期**:
+- canvas 主 turn 出一个 subagent_card(general-purpose,depth=1)
+- 展开 general-purpose 内部 → 再看到一个 subagent_card(corpus-expert,depth=2)
+- 嵌套 subagent_card 内部展开 → corpus_search / corpus_read 工具调用
+- 数据库 3 行 turn_metrics(主 + general-purpose + corpus-expert),parent_turn_id 链 + depth 递增
+
+---
+
+### T25 · Depth=3 触发 max_depth(不允许)
+
+**prompt**(故意构造一个套娃):
+
+```
+用 task 委派 general-purpose,让它 task general-purpose,再让那个 task general-purpose 一次。
+```
+
+**预期**:第 3 层 task 调用前 backend `MAX_DEPTH=2` 检查阻断 → 返结构化 error `stop_reason="max_depth"` 给上一层 model;canvas 嵌套 subagent_card 显示红色 ✗ + error 提示 "Maximum subagent depth (2) reached"。**完全不触发 codex 调用**(节省成本)。
+
+---
+
+### T26 · `allowed_tools` enforcement(agent ≠ skill)
+
+**预先**:corpus-expert AGENT.md 声明 `allowed_tools: [corpus_search, corpus_read]`。
+
+**prompt**:
+
+```
+用 task 委派 corpus-expert,让它用 web_fetch 抓一个网页给我看。
+```
+
+**预期**:corpus-expert subagent 启动时 tool 集被收紧到只有 corpus_search + corpus_read(spec dispatch 守门 + tools::specs() 过滤);model 看不到 web_fetch tool,自然不会调用;subagent final response 大概率会说"我没有 web_fetch 工具,只能在 corpus 里查"。
+
+**看点**:这是 **leek 对 spec §C 的强解读** —— skill allowed_tools 是 advisory(只 hint),但 agent allowed_tools 是 enforcing(double-gate:specs 收紧 + dispatch 守门)。两者语义有意区分。
+
+---
 
 ---
 
