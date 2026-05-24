@@ -6,13 +6,18 @@
 // its panel by the event's `surface`. This shell owns sessions, the message
 // list, the SSE wiring, and the cross-panel "focus a canvas card" action.
 
-import { createSignal, For, onCleanup, Show } from "solid-js";
+import { createMemo, createSignal, For, onCleanup, Show } from "solid-js";
 
 import { Canvas } from "./Canvas";
 import { Chat } from "./Chat";
+import { CorpusBrain } from "./CorpusBrain";
 import { PlanWidget } from "./PlanWidget";
 import { createWorkbench } from "./store";
 import type { EventRow, Message, Session } from "./types";
+
+/** Tab identity for the right column (canvas vs corpus brain) — they
+ *  share the same space so each takes the full panel when active. */
+type RightTab = "canvas" | "brain";
 
 // SSE event kinds to subscribe to — a subscription detail only. Which panel
 // an event lands in is decided by its `surface`, never by this list.
@@ -37,6 +42,7 @@ export default function App() {
   const [sending, setSending] = createSignal(false);
   const [showFailed, setShowFailed] = createSignal(false);
   const [highlight, setHighlight] = createSignal<string | null>(null);
+  const [rightTab, setRightTab] = createSignal<RightTab>("canvas");
 
   const wb = createWorkbench();
   let stream: EventSource | undefined;
@@ -140,6 +146,19 @@ export default function App() {
     window.setTimeout(() => setHighlight((h) => (h === artifactId ? null : h)), 2200);
   };
 
+  // Badge above the "脑图" tab — count of wikis the agent is touching
+  // right now plus those already used in the current turn. Lets the
+  // user notice corpus activity without leaving Canvas.
+  const brainBadge = createMemo(() => {
+    const a = wb.activation();
+    if (!a.currentTurn) return 0;
+    let n = 0;
+    for (const ref of a.byNode.values()) {
+      if (ref.liveTurns.has(a.currentTurn) || ref.completedTurns.has(a.currentTurn)) n += 1;
+    }
+    return n;
+  });
+
   onCleanup(() => stream?.close());
   void loadSessions();
 
@@ -183,13 +202,42 @@ export default function App() {
             send={(t) => void send(t)}
             focusCard={focusCard}
           />
-          <Canvas
-            turns={() => wb.state.turns}
-            messages={messages}
-            showFailed={showFailed}
-            setShowFailed={setShowFailed}
-            highlight={highlight}
-          />
+          <section class="right-rail">
+            <nav class="right-tabs">
+              <button
+                classList={{ "right-tab": true, active: rightTab() === "canvas" }}
+                onClick={() => setRightTab("canvas")}
+              >
+                Canvas
+              </button>
+              <button
+                classList={{ "right-tab": true, active: rightTab() === "brain" }}
+                onClick={() => setRightTab("brain")}
+              >
+                脑图
+                <Show when={brainBadge() > 0}>
+                  <span class="right-tab-badge">{brainBadge()}</span>
+                </Show>
+              </button>
+            </nav>
+            <Show
+              when={rightTab() === "canvas"}
+              fallback={
+                <CorpusBrain
+                  activation={wb.activation}
+                  sessionId={current}
+                />
+              }
+            >
+              <Canvas
+                turns={() => wb.state.turns}
+                messages={messages}
+                showFailed={showFailed}
+                setShowFailed={setShowFailed}
+                highlight={highlight}
+              />
+            </Show>
+          </section>
           <PlanWidget plan={() => wb.state.plan} />
         </Show>
       </main>

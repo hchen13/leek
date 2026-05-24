@@ -114,3 +114,65 @@ export type Plan = {
   steps: PlanStep[];
   explanation: string | null;
 };
+
+// ── Corpus Brain (M2.1) ──────────────────────────────────────────────
+
+/** One wiki page in the corpus brain. Mirrors `corpus::GraphNode`. */
+export type BrainNode = {
+  id: string;
+  title: string;
+  tier: string;
+  type: string;
+  tags: string[];
+  confidence: string;
+  slug: string;
+  directory_path: string;
+};
+
+/** Shared-tag edge between two wiki pages (`weight = |shared tags|`). */
+export type BrainEdge = {
+  source: string;
+  target: string;
+  weight: number;
+  shared_tags: string[];
+};
+
+/** The full corpus brain graph payload — `/api/v1/corpus/graph`. */
+export type BrainGraph = {
+  nodes: BrainNode[];
+  edges: BrainEdge[];
+  stats: {
+    node_count: number;
+    edge_count: number;
+    weight_histogram: Record<string, number>;
+  };
+};
+
+/** Where a wiki sits in the agent-usage timeline (REQUIREMENTS §2.5):
+ *
+ *   live        | a corpus tool is calling this id RIGHT NOW
+ *   turn        | the current turn finished a call against this id
+ *   session     | an earlier turn of this session used this id
+ *   historical  | a prior session used this id (persisted)
+ */
+export type ActivationLevel = "live" | "turn" | "session" | "historical";
+
+/** Per-node activation record. `liveTurns` is what a Start frame adds;
+ *  Completion moves the entry from `liveTurns` into `completedTurns`. */
+export type NodeActivationRef = {
+  liveTurns: Set<string>;
+  completedTurns: Set<string>;
+};
+
+/** Aggregated activation state owned by the workbench store. */
+export type Activation = {
+  /** Per-node ref counts — see `NodeActivationRef`. */
+  byNode: Map<string, NodeActivationRef>;
+  /** The most recent turn the store has seen any activity on. The brain
+   *  uses this to distinguish "this turn" from "earlier in the session". */
+  currentTurn: string | null;
+  /** Node ids loaded from sessionStorage on session open — wikis used in
+   *  ANY prior session. The store seeds this and updates it on session
+   *  switch / unload. */
+  historical: Set<string>;
+};

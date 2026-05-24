@@ -135,7 +135,17 @@ async fn serve(vault_path: &Path, corpus_root: &Path, port: u16) -> Result<()> {
         corpus.len(),
         corpus_root.display()
     );
+    // Build the Corpus Brain wiki graph (M2.1) — wiki nodes + shared-tag
+    // edges (weight ≥ 2). One pass at startup; the corpus is not hot
+    // reloaded, so the graph is fresh for the gateway's lifetime.
+    let corpus_graph = corpus.build_graph();
+    tracing::info!(
+        nodes = corpus_graph.nodes.len(),
+        edges = corpus_graph.edges.len(),
+        "corpus brain graph built"
+    );
     let corpus = Arc::new(corpus);
+    let corpus_graph = Arc::new(corpus_graph);
 
     let state = api::AppState {
         pool: vault.pool,
@@ -145,6 +155,7 @@ async fn serve(vault_path: &Path, corpus_root: &Path, port: u16) -> Result<()> {
         config,
         web_search,
         corpus,
+        corpus_graph,
     };
 
     let app = api::router(state);

@@ -1,5 +1,6 @@
 //! HTTP / SSE API — Axum router, shared state, error type.
 
+pub mod corpus;
 pub mod events;
 pub mod health;
 pub mod messages;
@@ -17,7 +18,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::bus::EventBus;
 use crate::config::Config;
-use crate::corpus::Corpus;
+use crate::corpus::{Corpus, CorpusGraph};
 use crate::llm::codex::CodexClient;
 use crate::vault::events::Event;
 
@@ -44,6 +45,10 @@ pub struct AppState {
     /// path — the gateway boots without the knowledge layer rather than
     /// abort on a missing root.
     pub corpus: Arc<Corpus>,
+    /// Precomputed wiki graph for the Corpus Brain UI (M2.1). Built once
+    /// from `corpus` at startup; the corpus is not hot-reloaded so the
+    /// graph is permanently fresh for the gateway's lifetime.
+    pub corpus_graph: Arc<CorpusGraph>,
 }
 
 impl AppState {
@@ -144,6 +149,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/sessions/{id}/transcripts/{turn_id}/{iteration}/response",
             get(transcripts::response_stream),
         )
+        // M2.1: Corpus Brain — wiki graph + edge weights for the right-rail
+        // visualisation. One-shot, no streaming; the graph is static for the
+        // gateway's lifetime.
+        .route("/api/v1/corpus/graph", get(corpus::graph))
         .layer(cors)
         .with_state(state)
 }

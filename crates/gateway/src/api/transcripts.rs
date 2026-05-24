@@ -116,6 +116,8 @@ mod tests {
         .await
         .unwrap();
         let codex = CodexClient::new(vault.pool.clone(), crate::vault::LOCAL_USER).unwrap();
+        let corpus = std::sync::Arc::new(crate::corpus::Corpus::empty());
+        let corpus_graph = std::sync::Arc::new(corpus.build_graph());
         AppState {
             pool: vault.pool,
             bus: EventBus::new(),
@@ -123,7 +125,8 @@ mod tests {
             http: reqwest::Client::new(),
             config: std::sync::Arc::new(RwLock::new(Config::default())),
             web_search: false,
-            corpus: std::sync::Arc::new(crate::corpus::Corpus::empty()),
+            corpus,
+            corpus_graph,
         }
     }
 

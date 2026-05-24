@@ -13,8 +13,10 @@
 //! embeddings deferred).
 
 mod bm25;
+pub mod graph;
 mod loader;
 
+pub use graph::{weight_histogram, CorpusGraph};
 pub use loader::{Document, Hit};
 
 use std::path::Path;
@@ -88,6 +90,13 @@ impl Corpus {
     /// from `corpus_root` (e.g. `sources/principles/munger/circle.md`).
     pub fn read(&self, id: &str) -> Option<Document<'_>> {
         self.docs.iter().find(|d| d.id == id).map(Document::from)
+    }
+
+    /// Build the wiki-only graph for the Corpus Brain UI (M2.1). The
+    /// corpus is not hot-reloaded, so a caller usually wraps the result
+    /// in `Arc` once at startup and shares it via `AppState`.
+    pub fn build_graph(&self) -> CorpusGraph {
+        CorpusGraph::build(&self.docs)
     }
 }
 

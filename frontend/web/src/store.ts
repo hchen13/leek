@@ -3,13 +3,25 @@
 // One entry point, `applyEvent`, routes each event by its `payload.surface`
 // (REQUIREMENTS §8.2): the surface decides the panel, never a hardcoded
 // kind→panel map. Within a surface, the kind selects how the event updates
-// state. The store holds canvas turns, the plan, and the streaming-reply
-// reconciliation state; the chat message list itself stays in `App` (loaded
-// over REST, refreshed on `message_created`).
+// state. The store holds canvas turns, the plan, the streaming-reply
+// reconciliation state, and (M2.1) the Corpus Brain activation snapshot.
+// The chat message list itself stays in `App` (loaded over REST, refreshed
+// on `message_created`).
 
+import { createSignal } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 
-import type { Artifact, EventRow, Phase, Plan, PlanStep, Surface, Turn } from "./types";
+import type {
+  Activation,
+  Artifact,
+  EventRow,
+  NodeActivationRef,
+  Phase,
+  Plan,
+  PlanStep,
+  Surface,
+  Turn,
+} from "./types";
 
 export type WorkbenchState = {
   /** Canvas sections, in first-seen (chronological) turn order. */
@@ -98,12 +110,114 @@ function mergeData(art: Artifact, kind: Artifact["kind"], data: Record<string, u
   // nothing yet and waits for Completed.
 }
 
+/** Pull the wiki ids a `tool_lifecycle` event references — empty when
+ *  the tool isn't a corpus tool, or its payload doesn't carry usable ids.
+ *  `corpus_read.display_payload.id` is a single string;
+ *  `corpus_search.display_payload.hits[].id` is an array.
+ *
+ *  Exported because the activation state machine is unit-tested in
+ *  `tests/activation.test.mjs` against synthetic event payloads. */
+export function corpusIdsFromEvent(ev: EventRow): string[] {
+  const data = (ev.payload.data ?? {}) as Record<string, unknown>;
+  const tool = String(data.tool ?? "");
+  const dp = (data.display_payload ?? {}) as Record<string, unknown>;
+  if (tool === "corpus_read") {
+    const id = dp.id;
+    return typeof id === "string" && id ? [id] : [];
+  }
+  if (tool === "corpus_search") {
+    const hits = Array.isArray(dp.hits) ? (dp.hits as Array<Record<string, unknown>>) : [];
+    return hits.map((h) => String(h.id ?? "")).filter((s) => s.length > 0);
+  }
+  return [];
+}
+
+/** Compute a node's activation level from the snapshot. Exported for
+ *  unit tests; the CorpusBrain component carries its own copy because
+ *  it also handles the "no activation" case. */
+export function activationLevelOf(
+  activation: Activation,
+  nodeId: string,
+): "live" | "turn" | "session" | "historical" | null {
+  const ref = activation.byNode.get(nodeId);
+  if (!ref) return activation.historical.has(nodeId) ? "historical" : null;
+  if (activation.currentTurn && ref.liveTurns.has(activation.currentTurn)) return "live";
+  if (activation.currentTurn && ref.completedTurns.has(activation.currentTurn)) return "turn";
+  if (ref.completedTurns.size > 0) return "session";
+  return activation.historical.has(nodeId) ? "historical" : null;
+}
+
+/** Key under which session-historical wiki activations are persisted.
+ *  Per-session keying so unrelated sessions don't blur each other's
+ *  history. The store seeds the current session's set from `<all priors>`
+ *  on construction so a returning user sees their wiki past. */
+const HISTORY_STORAGE_KEY = "leek.brain.historical.v1";
+
+function loadHistorical(): Set<string> {
+  try {
+    const raw = sessionStorage.getItem(HISTORY_STORAGE_KEY);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw) as unknown;
+    if (!Array.isArray(arr)) return new Set();
+    return new Set(arr.filter((v): v is string => typeof v === "string"));
+  } catch {
+    return new Set();
+  }
+}
+
+function saveHistorical(s: Set<string>) {
+  try {
+    sessionStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify([...s]));
+  } catch {
+    // sessionStorage may be full / disabled — degrade silently.
+  }
+}
+
 export function createWorkbench() {
   const [state, setState] = createStore<WorkbenchState>({ ...EMPTY, noted: {}, turns: [] });
 
+  // Activation snapshot. The brain reads via `activation()` and we
+  // re-set the whole signal on each mutation (`Map`/`Set` mutations
+  // don't fire Solid reactivity). Cheap — at most a few thousand entries.
+  const initialActivation: Activation = {
+    byNode: new Map(),
+    currentTurn: null,
+    historical: loadHistorical(),
+  };
+  const [activation, setActivation] = createSignal<Activation>(initialActivation);
+
+  function updateActivation(mutate: (a: Activation) => void) {
+    const next: Activation = {
+      byNode: new Map(activation().byNode),
+      currentTurn: activation().currentTurn,
+      historical: new Set(activation().historical),
+    };
+    mutate(next);
+    setActivation(next);
+  }
+
+  /** Roll the current session's used-wiki ids into the persisted
+   *  "historical" pool. Called on session switch / unload. */
+  function rollOverToHistorical() {
+    const a = activation();
+    if (a.byNode.size === 0) return;
+    const merged = new Set(a.historical);
+    for (const id of a.byNode.keys()) merged.add(id);
+    saveHistorical(merged);
+  }
+
   /** Clear all state — called when switching sessions. */
   function reset() {
+    // The current session's activations roll into history before we drop
+    // them — that's how a wiki used in session N appears as "historical"
+    // when the user comes back to session M.
+    rollOverToHistorical();
     setState({ turns: [], plan: null, streaming: null, noted: {} });
+    setActivation({
+      byNode: new Map(),
+      currentTurn: null,
+      historical: loadHistorical(),
+    });
   }
 
   /** Find a turn in the draft, creating it if this is its first event. */
@@ -155,6 +269,39 @@ export function createWorkbench() {
         }
       }),
     );
+
+    // Corpus Brain activation (M2.1) — tool_lifecycle for corpus_search /
+    // corpus_read advances the per-node state machine. We deliberately
+    // also process replayed (history) events: the brain shows session-
+    // wide usage, and history replay is the only way that information
+    // exists when an old session is re-opened.
+    if (ev.kind !== "tool_lifecycle") return;
+    const ids = corpusIdsFromEvent(ev);
+    if (ids.length === 0) return;
+    updateActivation((a) => {
+      a.currentTurn = turnId;
+      for (const id of ids) {
+        const ref: NodeActivationRef = a.byNode.get(id) ?? {
+          liveTurns: new Set(),
+          completedTurns: new Set(),
+        };
+        // Clone the inner sets so the previous activation snapshot the
+        // brain may still be reading isn't mutated out from under it.
+        const next: NodeActivationRef = {
+          liveTurns: new Set(ref.liveTurns),
+          completedTurns: new Set(ref.completedTurns),
+        };
+        if (phase === "start") {
+          next.liveTurns.add(turnId);
+        } else {
+          // completion OR error — both end the "live" state. An error
+          // still counts as a use of the wiki: the agent asked for it.
+          next.liveTurns.delete(turnId);
+          next.completedTurns.add(turnId);
+        }
+        a.byNode.set(id, next);
+      }
+    });
   }
 
   function applyChat(ev: EventRow) {
@@ -199,6 +346,15 @@ export function createWorkbench() {
   function applyLifecycle(ev: EventRow) {
     const turnId = String(ev.payload.turn_id ?? "");
     if (!turnId) return;
+    // Brain activation: assistant_done settles `currentTurn` to the
+    // just-finished turn so the brain's "this turn" highlight follows
+    // the user's most recent question even if no tool was called this
+    // turn. The next corpus_* event of the next turn will move it on.
+    if (ev.kind === "assistant_done" || ev.kind === "turn_metrics_recorded") {
+      updateActivation((a) => {
+        a.currentTurn = turnId;
+      });
+    }
     setState(
       produce((d: WorkbenchState) => {
         const turn = ensureTurn(d, turnId);
@@ -240,7 +396,7 @@ export function createWorkbench() {
     // guessed from the kind.
   }
 
-  return { state, applyEvent, reset };
+  return { state, applyEvent, reset, activation };
 }
 
 export type Workbench = ReturnType<typeof createWorkbench>;
