@@ -277,6 +277,7 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             web_search: false,
             corpus: Arc::new(crate::corpus::Corpus::empty()),
+            corpus_graph: Arc::new(crate::corpus::Corpus::empty().build_graph()),
         };
         TestState { st, _scratch: ScratchDir { path: dir }, _env: env }
     }
