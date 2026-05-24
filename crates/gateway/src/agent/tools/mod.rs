@@ -20,6 +20,7 @@
 mod corpus_read;
 mod corpus_search;
 mod update_plan;
+mod use_skill;
 mod web_fetch;
 
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use std::sync::Arc;
 use crate::agent::events::{self, CanvasArtifact, Phase};
 use crate::corpus::Corpus;
 use crate::llm::ToolSpec;
+use crate::skills::SkillRegistry;
 
 /// Outcome of running one tool call — the three result surfaces of
 /// REQUIREMENTS §4.2, produced by a single execution.
@@ -42,7 +44,7 @@ pub struct ToolOutcome {
 
 impl ToolOutcome {
     /// A successful run, with the three result surfaces given explicitly.
-    fn ok(
+    pub(super) fn ok(
         model_output: impl Into<String>,
         display_payload: serde_json::Value,
         debug_payload: serde_json::Value,
@@ -58,7 +60,7 @@ impl ToolOutcome {
     /// A failed run. The message is the same across all three surfaces — an
     /// error is not business data, so there is nothing to keep apart: the
     /// model sees it to recover, the card shows it.
-    fn error(message: impl Into<String>) -> Self {
+    pub(super) fn error(message: impl Into<String>) -> Self {
         let message = message.into();
         Self {
             display_payload: serde_json::json!({ "error": message.clone() }),
@@ -93,14 +95,20 @@ pub struct ToolUi {
     pub summary: fn(&serde_json::Value) -> String,
 }
 
-/// The function-tool specs offered to the model this milestone.
-pub fn specs() -> Vec<ToolSpec> {
-    vec![
+/// The function-tool specs offered to the model this milestone. `use_skill`
+/// is conditional on a non-empty registry — exposing the tool when no skills
+/// are registered would invite the model to call it and fail.
+pub fn specs(skills: &Arc<SkillRegistry>) -> Vec<ToolSpec> {
+    let mut v = vec![
         web_fetch::spec(),
         update_plan::spec(),
         corpus_search::spec(),
         corpus_read::spec(),
-    ]
+    ];
+    if !skills.is_empty() {
+        v.push(use_skill::spec());
+    }
+    v
 }
 
 /// UI metadata for a tool, or `None` for an unknown name.
@@ -110,6 +118,7 @@ pub fn ui(name: &str) -> Option<ToolUi> {
         "update_plan" => Some(update_plan::ui()),
         "corpus_search" => Some(corpus_search::ui()),
         "corpus_read" => Some(corpus_read::ui()),
+        "use_skill" => Some(use_skill::ui()),
         _ => None,
     }
 }
@@ -123,6 +132,7 @@ pub fn ui(name: &str) -> Option<ToolUi> {
 pub async fn dispatch(
     http: &reqwest::Client,
     corpus: &Arc<Corpus>,
+    skills: &Arc<SkillRegistry>,
     name: &str,
     args: &serde_json::Value,
 ) -> ToolOutcome {
@@ -131,6 +141,7 @@ pub async fn dispatch(
         "update_plan" => update_plan::run(args),
         "corpus_search" => corpus_search::run(corpus, args),
         "corpus_read" => corpus_read::run(corpus, args),
+        "use_skill" => use_skill::run(skills, args),
         other => ToolOutcome::error(format!(
             "unknown tool '{other}' — it is not in the available tool set"
         )),
@@ -192,7 +203,7 @@ pub fn tool_artifact(
 }
 
 /// Trim a value to a short single-line snippet for a tool `summary`.
-fn summary_snippet(s: &str) -> String {
+pub(super) fn summary_snippet(s: &str) -> String {
     const MAX: usize = 40;
     let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.chars().count() <= MAX {
@@ -210,14 +221,40 @@ mod tests {
     fn dispatch_unknown_tool_is_a_structured_error() {
         let http = reqwest::Client::new();
         let corpus = Arc::new(Corpus::empty());
+        let skills = Arc::new(SkillRegistry::default());
         let out = futures::executor::block_on(dispatch(
             &http,
             &corpus,
+            &skills,
             "nope",
             &serde_json::Value::Null,
         ));
         assert!(out.is_error);
         assert!(out.model_output.contains("unknown tool"));
+    }
+
+    #[test]
+    fn use_skill_tool_is_only_advertised_when_registry_non_empty() {
+        let empty = Arc::new(SkillRegistry::default());
+        let names: Vec<_> = specs(&empty).into_iter().map(|s| s.name).collect();
+        assert!(!names.contains(&"use_skill".to_string()));
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "alpha".to_string(),
+            crate::skills::Skill {
+                name: "alpha".into(),
+                description: "d".into(),
+                allowed_tools: vec![],
+                body: "b".into(),
+                source_layer: crate::skills::SkillLayer::Builtin,
+                disable_model_invocation: false,
+            },
+        );
+        let with_one = Arc::new(SkillRegistry::new(map));
+        let names: Vec<_> = specs(&with_one).into_iter().map(|s| s.name).collect();
+        assert!(names.contains(&"use_skill".to_string()));
+        assert!(ui("use_skill").is_some());
     }
 
     #[test]

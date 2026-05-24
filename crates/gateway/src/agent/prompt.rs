@@ -1,20 +1,25 @@
 //! System-prompt builder — assembled most-stable-first
 //! (ARCHITECTURE §4.1, best KV-cache reuse).
 //!
-//! Order (M2):
+//! Order (M2.5):
 //!   IDENTITY  →  OPERATING  →  SEEK_VERIFICATION_DISCIPLINE  →
-//!   CORPUS_ORIENTATION  →  # 可用工具
+//!   CORPUS_ORIENTATION  →  # 可用工具  →  # 可用 Skills
 //!
 //! The identity (who leek is) is fixed text. The operating note (how the
 //! loop works) is short and tactical. The verification-discipline section
 //! is leek's invariant: facts get searched before they get answered. The
 //! corpus orientation tells the model how to think about its
 //! knowledge-base — what corpus is for, how to query it. The tool roster
-//! is last (it's the most volatile section, and the model also gets each
-//! tool's full schema via the API tools array — so prompt prose is just
-//! orientation, not the source of truth).
+//! is next (the model also gets each tool's full schema via the API tools
+//! array — so prompt prose is just orientation, not the source of truth).
+//!
+//! Last is the skill index: skills are softer than tools — opt-in, lazy
+//! recipes the model loads on demand via `use_skill`. The bodies stay out
+//! of the prompt; only one-line descriptions go in (M2.5 research notes
+//! §2 — Claude Code parity).
 
 use crate::llm::ToolSpec;
+use crate::skills::SkillRegistry;
 
 /// leek's identity — most stable section, always first.
 const IDENTITY: &str = include_str!("../../../../harness/identity.md");
@@ -48,7 +53,7 @@ const SEEK_VERIFICATION_DISCIPLINE: &str = "\
 
 /// Build the system prompt. Sections are joined with blank lines so
 /// each one reads as a distinct frame to the model.
-pub fn build_system_prompt(tools: &[ToolSpec]) -> String {
+pub fn build_system_prompt(tools: &[ToolSpec], skills: &SkillRegistry) -> String {
     let mut p = String::with_capacity(4096);
     p.push_str(IDENTITY.trim());
     p.push_str("\n\n");
@@ -70,6 +75,19 @@ pub fn build_system_prompt(tools: &[ToolSpec]) -> String {
                 t.name,
                 first_line(&t.description)
             ));
+        }
+    }
+
+    let visible = skills.model_visible();
+    if !visible.is_empty() {
+        p.push_str("\n\n# 可用 Skills\n\n");
+        p.push_str(
+            "懒加载式专业上下文。需要某个专题的完整指南时，调 use_skill 工具，\
+             把对应 skill 的 markdown body 加进当前 turn 的 context；之后的迭代都能看到。\n\n",
+        );
+        for s in visible {
+            p.push_str(&s.index_line());
+            p.push('\n');
         }
     }
     p
@@ -94,31 +112,47 @@ fn first_line(desc: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skills::{Skill, SkillLayer, SkillRegistry};
+    use std::collections::HashMap;
+
+    fn empty_skills() -> SkillRegistry {
+        SkillRegistry::default()
+    }
+
+    fn one_skill_registry(name: &str, desc: &str, hidden: bool) -> SkillRegistry {
+        let mut m = HashMap::new();
+        m.insert(
+            name.to_string(),
+            Skill {
+                name: name.into(),
+                description: desc.into(),
+                allowed_tools: vec![],
+                body: "body".into(),
+                source_layer: SkillLayer::Builtin,
+                disable_model_invocation: hidden,
+            },
+        );
+        SkillRegistry::new(m)
+    }
 
     #[test]
     fn prompt_has_identity_and_operating() {
-        let p = build_system_prompt(&[]);
+        let p = build_system_prompt(&[], &empty_skills());
         assert!(p.contains("leek"));
         assert!(p.contains("运行方式"));
     }
 
     #[test]
     fn prompt_includes_corpus_orientation() {
-        // M2.3 — the orientation file's signature phrase appears verbatim
-        // in the assembled prompt.
-        let p = build_system_prompt(&[]);
+        let p = build_system_prompt(&[], &empty_skills());
         assert!(p.contains("corpus orientation"));
         assert!(p.contains("双轴"));
-        // From the orientation doc — confirms `include_str!` actually
-        // pulled the file in, not just a hard-coded blurb.
         assert!(p.contains("principles → knowledge → sources"));
     }
 
     #[test]
     fn prompt_has_seek_verification_discipline() {
-        // M2.4 — the verification-discipline section is present with
-        // its signature phrasing.
-        let p = build_system_prompt(&[]);
+        let p = build_system_prompt(&[], &empty_skills());
         assert!(p.contains("求证纪律"));
         assert!(p.contains("先搜后答"));
         assert!(p.contains("web_search"));
@@ -126,21 +160,25 @@ mod tests {
 
     #[test]
     fn prompt_section_order_is_stable_first() {
-        // IDENTITY → OPERATING → DISCIPLINE → CORPUS_ORIENTATION → tools.
-        let p = build_system_prompt(&[ToolSpec {
+        // IDENTITY → OPERATING → DISCIPLINE → CORPUS_ORIENTATION → tools → skills.
+        let tools = vec![ToolSpec {
             name: "web_fetch".into(),
             description: "Fetch a URL.".into(),
             parameters: serde_json::json!({}),
-        }]);
+        }];
+        let skills = one_skill_registry("alpha", "alpha skill", false);
+        let p = build_system_prompt(&tools, &skills);
         let i_identity = p.find("leek").unwrap();
         let i_operating = p.find("运行方式").unwrap();
         let i_discipline = p.find("求证纪律").unwrap();
         let i_corpus = p.find("corpus orientation").unwrap();
         let i_tools = p.find("# 可用工具").unwrap();
+        let i_skills = p.find("# 可用 Skills").unwrap();
         assert!(i_identity < i_operating);
         assert!(i_operating < i_discipline);
         assert!(i_discipline < i_corpus);
         assert!(i_corpus < i_tools);
+        assert!(i_tools < i_skills, "skills index must come after tools (it's softer)");
     }
 
     #[test]
@@ -150,8 +188,30 @@ mod tests {
             description: "Fetch a URL as text. Useful for verification.".into(),
             parameters: serde_json::json!({}),
         }];
-        let p = build_system_prompt(&tools);
+        let p = build_system_prompt(&tools, &empty_skills());
         assert!(p.contains("# 可用工具"));
         assert!(p.contains("`web_fetch`"));
+    }
+
+    #[test]
+    fn prompt_lists_skills_when_registry_non_empty() {
+        let p = build_system_prompt(&[], &one_skill_registry("corpus-research", "corpus research how-to", false));
+        assert!(p.contains("# 可用 Skills"));
+        assert!(p.contains("`corpus-research`"));
+        assert!(p.contains("corpus research how-to"));
+    }
+
+    #[test]
+    fn prompt_skips_skill_section_when_only_hidden_skills() {
+        // disable-model-invocation: true skills must not show up in the index.
+        let p = build_system_prompt(&[], &one_skill_registry("hidden", "hidden one", true));
+        assert!(!p.contains("# 可用 Skills"));
+        assert!(!p.contains("`hidden`"));
+    }
+
+    #[test]
+    fn prompt_skips_skill_section_when_registry_empty() {
+        let p = build_system_prompt(&[], &empty_skills());
+        assert!(!p.contains("# 可用 Skills"));
     }
 }

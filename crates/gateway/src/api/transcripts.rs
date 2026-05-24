@@ -127,6 +127,8 @@ mod tests {
             web_search: false,
             corpus,
             corpus_graph,
+            skills: std::sync::Arc::new(crate::skills::SkillRegistry::default()),
+            hooks: std::sync::Arc::new(crate::hooks::HookEngine::default()),
         }
     }
 

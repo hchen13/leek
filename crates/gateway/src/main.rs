@@ -9,7 +9,10 @@ mod api;
 mod bus;
 mod config;
 mod corpus;
+mod hooks;
 mod llm;
+mod plugins;
+mod skills;
 mod vault;
 
 use std::net::SocketAddr;
@@ -147,6 +150,22 @@ async fn serve(vault_path: &Path, corpus_root: &Path, port: u16) -> Result<()> {
     let corpus = Arc::new(corpus);
     let corpus_graph = Arc::new(corpus_graph);
 
+    // ── M2.5: skills / hooks / plugins ─────────────────────────────────
+    // Three skill layers (built-in / user / project) plus any skills
+    // bundled by plugins (registered at the user layer). Hooks come from
+    // the user config + any plugin hooks bundle. Failures are warn + skip
+    // — a malformed skill or plugin must never block startup.
+    let m25 = load_m25_runtime();
+    tracing::info!(
+        skills = m25.skill_count,
+        plugins = m25.plugin_count,
+        hook_events = m25.hook_event_count,
+        "M2.5 runtime loaded: {} skills, {} plugins, hooks for {} events",
+        m25.skill_count,
+        m25.plugin_count,
+        m25.hook_event_count
+    );
+
     let state = api::AppState {
         pool: vault.pool,
         bus: bus::EventBus::new(),
@@ -156,6 +175,8 @@ async fn serve(vault_path: &Path, corpus_root: &Path, port: u16) -> Result<()> {
         web_search,
         corpus,
         corpus_graph,
+        skills: m25.skills,
+        hooks: m25.hooks,
     };
 
     let app = api::router(state);
@@ -233,4 +254,84 @@ async fn store_tokens(pool: &sqlx::SqlitePool, tokens: &llm::oauth::CodexTokens)
         &tokens.expires_at.to_rfc3339(),
     )
     .await
+}
+
+/// What the M2.5 loader produces at startup: a flat `Arc` per shared
+/// runtime structure for the `AppState`.
+struct M25Runtime {
+    skills: Arc<skills::SkillRegistry>,
+    hooks: Arc<hooks::HookEngine>,
+    skill_count: usize,
+    plugin_count: usize,
+    hook_event_count: usize,
+}
+
+/// Resolve the three skill layers, load plugins from `~/.leek/plugins/`
+/// (and `<cwd>/.leek/plugins/`), parse `~/.leek/config.json` hooks, then
+/// merge everything into one registry + one hook engine.
+///
+/// Failures at any layer warn + skip — the gateway must boot even if the
+/// user's plugin or config is malformed.
+fn load_m25_runtime() -> M25Runtime {
+    use skills::SkillLayer;
+
+    // Plugins first: each plugin contributes a (skills dir, layer) slot
+    // and a hooks file (loaded into the engine below).
+    let plugin_roots = vec![
+        skills::expand_home("~/.leek/plugins/"),
+        std::path::PathBuf::from(".leek/plugins"),
+    ];
+    let (loaded_plugins, plugin_errs) = plugins::load_all(&plugin_roots);
+    for e in &plugin_errs {
+        tracing::warn!(error = %e, "plugin load error");
+    }
+
+    // Skill layers, low-priority first. Plugin skills register at the
+    // user layer (after the user dir, so an explicit user override still
+    // wins). The project layer comes last so it overrides everything.
+    let builtin = skills::builtin_skills_dir();
+    let user = skills::user_skills_dir();
+    let project = std::path::PathBuf::from(".leek/skills");
+
+    let mut layers: Vec<(&std::path::Path, SkillLayer)> = Vec::new();
+    layers.push((builtin.as_path(), SkillLayer::Builtin));
+    layers.push((user.as_path(), SkillLayer::User));
+    for p in &loaded_plugins {
+        if let Some(dir) = &p.skills_dir {
+            layers.push((dir.as_path(), SkillLayer::User));
+        }
+    }
+    layers.push((project.as_path(), SkillLayer::Project));
+
+    let (skill_reg, skill_errs) = skills::load_layered(&layers);
+    for e in &skill_errs {
+        tracing::warn!(error = %e, "skill load error");
+    }
+    let skill_count = skill_reg.len();
+
+    // Hooks: user config + each plugin's hooks bundle, in that order.
+    let mut hook_set = hooks::HookSet::default();
+    let user_config = skills::expand_home("~/.leek/config.json");
+    match hooks::load_user_hooks(&user_config) {
+        Ok(set) => hook_set.merge(set),
+        Err(e) => tracing::warn!(error = %e, path = %user_config.display(), "user hook load error"),
+    }
+    for p in &loaded_plugins {
+        if let Some(hooks_file) = &p.hooks_file {
+            match hooks::load_hooks_file(hooks_file) {
+                Ok(set) => hook_set.merge(set),
+                Err(e) => tracing::warn!(error = %e, plugin = %p.name, "plugin hook load error"),
+            }
+        }
+    }
+    let hook_event_count = hook_set.event_count();
+    let engine = hooks::HookEngine::new(hook_set);
+
+    M25Runtime {
+        skills: Arc::new(skill_reg),
+        hooks: Arc::new(engine),
+        skill_count,
+        plugin_count: loaded_plugins.len(),
+        hook_event_count,
+    }
 }

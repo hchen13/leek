@@ -6,6 +6,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use super::{ApiError, ApiResult, AppState};
+use crate::hooks::HookEvent;
 use crate::vault::sessions;
 
 /// `GET /api/v1/sessions`
@@ -55,6 +56,15 @@ pub async fn rename(
 /// `DELETE /api/v1/sessions/{id}`
 pub async fn remove(State(st): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     if sessions::delete(&st.pool, &id).await? {
+        // ── SessionEnd hook (M2.5) — advisory; deletion has already happened.
+        if st.hooks.has_event(HookEvent::SessionEnd) {
+            let payload = serde_json::json!({
+                "session_id": id,
+                "hook_event_name": "SessionEnd",
+                "session_end_reason": "manual",
+            });
+            let _ = st.hooks.trigger(HookEvent::SessionEnd, "manual", payload).await;
+        }
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found(format!("session '{id}' not found")))

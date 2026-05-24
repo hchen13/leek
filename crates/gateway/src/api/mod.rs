@@ -3,9 +3,12 @@
 pub mod corpus;
 pub mod events;
 pub mod health;
+pub mod hooks;
 pub mod messages;
+pub mod plugins;
 pub mod sessions;
 pub mod settings;
+pub mod skills;
 pub mod transcripts;
 
 use axum::http::StatusCode;
@@ -19,7 +22,9 @@ use std::sync::{Arc, RwLock};
 use crate::bus::EventBus;
 use crate::config::Config;
 use crate::corpus::{Corpus, CorpusGraph};
+use crate::hooks::HookEngine;
 use crate::llm::codex::CodexClient;
+use crate::skills::SkillRegistry;
 use crate::vault::events::Event;
 
 /// Shared, cheaply-cloneable handles for request handlers and agent turns.
@@ -49,6 +54,14 @@ pub struct AppState {
     /// from `corpus` at startup; the corpus is not hot-reloaded so the
     /// graph is permanently fresh for the gateway's lifetime.
     pub corpus_graph: Arc<CorpusGraph>,
+    /// Skill registry (M2.5): three-layer merged set of `SKILL.md` files
+    /// available to this gateway. The system-prompt advertises model-visible
+    /// skills; the model loads bodies on demand via the `use_skill` tool.
+    pub skills: Arc<SkillRegistry>,
+    /// Hook engine (M2.5): user-installed shell hooks attached to agent
+    /// lifecycle events. Triggered by the agent loop at well-defined points
+    /// (PreToolUse, PostToolUse, etc.).
+    pub hooks: Arc<HookEngine>,
 }
 
 impl AppState {
@@ -153,6 +166,11 @@ pub fn router(state: AppState) -> Router {
         // visualisation. One-shot, no streaming; the graph is static for the
         // gateway's lifetime.
         .route("/api/v1/corpus/graph", get(corpus::graph))
+        // M2.5 skill / hook / plugin read-only API.
+        .route("/api/v1/skills", get(skills::list))
+        .route("/api/v1/skills/{name}", get(skills::detail))
+        .route("/api/v1/hooks", get(hooks::list))
+        .route("/api/v1/plugins", get(plugins::list))
         .layer(cors)
         .with_state(state)
 }
