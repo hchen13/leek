@@ -38,6 +38,11 @@ pub mod kind {
     pub const TURN_METRICS_RECORDED: &str = "turn_metrics_recorded";
     pub const COMPACTION_STARTED: &str = "compaction_started";
     pub const COMPACTION_COMPLETED: &str = "compaction_completed";
+    /// M2.6: emitted once when the per-turn USD cost cap trips, *before*
+    /// the loop sets `stop_reason = "cost_cap_exceeded"`. The frontend
+    /// uses this for an in-chat warning bar (see `Chat.tsx`); the
+    /// `assistant_done`'s `stop_reason` is the durable record.
+    pub const TURN_COST_CAPPED: &str = "turn_cost_capped";
     pub const ERROR: &str = "error";
 }
 
@@ -77,6 +82,7 @@ pub fn surface_for(event_kind: &str) -> Surface {
         | kind::TURN_METRICS_RECORDED
         | kind::COMPACTION_STARTED
         | kind::COMPACTION_COMPLETED
+        | kind::TURN_COST_CAPPED
         | kind::ERROR => Surface::Lifecycle,
         _ => Surface::Lifecycle,
     }

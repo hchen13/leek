@@ -7,13 +7,14 @@
 mod agent;
 mod api;
 mod bus;
+mod config;
 mod corpus;
 mod llm;
 mod vault;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -105,7 +106,17 @@ async fn serve(vault_path: &Path, corpus_root: &Path, port: u16) -> Result<()> {
         .connect_timeout(Duration::from_secs(15))
         .build()
         .context("building the shared HTTP client")?;
-    let guards = agent::GuardConfig::from_env();
+    // M2.6: load persisted user settings once at startup. The agent
+    // re-runs `GuardConfig::resolve` at the start of every turn against
+    // this `Arc<RwLock<Config>>`, so a `PATCH /api/v1/settings` reaches
+    // the next turn without a restart.
+    let cfg = config::Config::load();
+    tracing::info!(
+        path = %config::Config::path().display(),
+        "loaded user settings"
+    );
+    let config = Arc::new(RwLock::new(cfg));
+
     // Provider-side web search (M1.9.4) is opt-in: the codex backend gates
     // web search behind its own config, so leek keeps the capability off
     // unless `LEEK_WEB_SEARCH` is set (ARCHITECTURE §12.3 — capability
@@ -131,7 +142,7 @@ async fn serve(vault_path: &Path, corpus_root: &Path, port: u16) -> Result<()> {
         bus: bus::EventBus::new(),
         codex,
         http,
-        guards,
+        config,
         web_search,
         corpus,
     };

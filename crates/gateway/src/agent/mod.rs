@@ -74,7 +74,10 @@ pub async fn run_turn(st: AppState, session_id: String, turn_id: String) {
 }
 
 async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
-    let guards = st.guards;
+    // Snapshot the live settings once per turn — a mid-turn PATCH only
+    // affects the *next* turn, so the guard set stays stable for the
+    // duration of this loop (M2.6).
+    let guards = guards::GuardConfig::resolve(&st.config_snapshot());
     let started = Instant::now();
     let started_at = chrono::Utc::now();
     let wall_deadline = guards.wall_clock.map(|d| started + d);
@@ -157,6 +160,23 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
             break 'turn;
         }
         if guards.cost_cap_usd.map(|c| cost_usd >= c).unwrap_or(false) {
+            // M2.6: emit a dedicated event ahead of the stop_reason so the
+            // frontend can render a "本回合达到预算上限" warning bar without
+            // having to inspect `assistant_done.stop_reason`. The
+            // `assistant_done` event below still carries the same reason —
+            // this one just lets the chat surface react earlier.
+            let cap = guards.cost_cap_usd.unwrap_or(0.0);
+            st.emit(
+                session_id,
+                events::kind::TURN_COST_CAPPED,
+                serde_json::json!({
+                    "turn_id": turn_id,
+                    "cap_usd": cap,
+                    "actual_cost_usd": cost_usd,
+                    "iter_count": iteration_count,
+                }),
+            )
+            .await;
             stop_reason = "cost_cap_exceeded".into();
             first_guard.get_or_insert("cost_cap_exceeded");
             break 'turn;
@@ -194,6 +214,7 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
                     },
                     ctx_tokens,
                     transcript_iter,
+                    guards.idle_timeout,
                 )
                 .await
                 {

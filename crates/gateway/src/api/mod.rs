@@ -4,6 +4,7 @@ pub mod events;
 pub mod health;
 pub mod messages;
 pub mod sessions;
+pub mod settings;
 pub mod transcripts;
 
 use axum::http::StatusCode;
@@ -12,10 +13,10 @@ use axum::routing::{get, patch};
 use axum::{Json, Router};
 use tower_http::cors::{Any, CorsLayer};
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use crate::agent::GuardConfig;
 use crate::bus::EventBus;
+use crate::config::Config;
 use crate::corpus::Corpus;
 use crate::llm::codex::CodexClient;
 use crate::vault::events::Event;
@@ -29,8 +30,12 @@ pub struct AppState {
     pub codex: CodexClient,
     /// HTTP client for client-side tools (the `web_fetch` tool).
     pub http: reqwest::Client,
-    /// Agent-loop safety nets, resolved once at startup.
-    pub guards: GuardConfig,
+    /// Live user settings (M2.6). `Arc<RwLock<Config>>` so the settings
+    /// API can mutate this once a PATCH lands and the next turn's
+    /// `GuardConfig::resolve` picks up the new values — no restart.
+    /// Read happens under a brief lock followed by a `.clone()`; never
+    /// hold the guard across an `.await`.
+    pub config: Arc<RwLock<Config>>,
     /// Whether to offer the provider-side `web_search` tool (M1.9.4).
     /// Resolved from `LEEK_WEB_SEARCH` at startup; off by default.
     pub web_search: bool,
@@ -39,6 +44,23 @@ pub struct AppState {
     /// path — the gateway boots without the knowledge layer rather than
     /// abort on a missing root.
     pub corpus: Arc<Corpus>,
+}
+
+impl AppState {
+    /// Snapshot the current settings under a brief read lock. Callers
+    /// (notably `agent::drive`) take this once at the start of a turn so
+    /// the same values apply throughout that turn — a mid-turn PATCH only
+    /// affects subsequent turns. A poisoned lock falls back to defaults
+    /// rather than panicking so one bad write can't down the server.
+    pub fn config_snapshot(&self) -> Config {
+        match self.config.read() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => {
+                tracing::error!("settings RwLock poisoned; returning defaults for this read");
+                poisoned.into_inner().clone()
+            }
+        }
+    }
 }
 
 impl AppState {
@@ -92,6 +114,10 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(health::handler))
         .route(
+            "/api/v1/settings",
+            get(settings::read).patch(settings::patch),
+        )
+        .route(
             "/api/v1/sessions",
             get(sessions::list).post(sessions::create),
         )
@@ -134,6 +160,15 @@ impl ApiError {
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    /// 400 with a free-form message. The settings PATCH handler also has a
+    /// richer 400 path (`bad_request_with_fields`) for per-field errors.
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
             message: message.into(),
         }
     }

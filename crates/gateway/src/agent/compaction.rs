@@ -102,6 +102,9 @@ pub struct TurnContext<'a> {
 /// `transcript_iter` is the iteration the compaction summary call should
 /// occupy in the F2 `llm_transcripts` archive; the caller allocates it so
 /// every LLM call inside a turn gets a unique row.
+/// `idle_timeout` is the per-turn idle budget the summary call should obey
+/// — the caller (`agent::drive`) already resolved the guard set for this
+/// turn (M2.6), so we just pass the one knob through.
 #[allow(clippy::too_many_arguments)]
 pub async fn compact(
     st: &AppState,
@@ -112,6 +115,7 @@ pub async fn compact(
     ctx: TurnContext<'_>,
     tokens_before: u32,
     transcript_iter: i64,
+    idle_timeout: Option<std::time::Duration>,
 ) -> Result<Compacted> {
     let Some(plan) = plan_split_for(&ctx) else {
         return Ok(Compacted::Skipped);
@@ -131,7 +135,7 @@ pub async fn compact(
     );
     let folded = summarize(
         &st.codex,
-        st.guards.idle_timeout,
+        idle_timeout,
         transcript,
         session_id,
         turn_id,

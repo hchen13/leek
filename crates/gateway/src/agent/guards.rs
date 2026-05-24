@@ -13,13 +13,18 @@
 //! | `doom_loop_threshold`  | 3, on          | leek-original; nobody else has it                                    |
 //! | `auto_compact_threshold` | 0.90, on     | mirrors codex's `(context_window * 9) / 10`                          |
 //!
-//! Until a settings UI exists, every guard is also overridable from the
-//! environment — this is the only knob surface, and it makes the guards
-//! testable. `LEEK_IDLE_TIMEOUT_SECS` / `LEEK_WALL_CLOCK_SECS` accept `0`
-//! to disable.
+//! Resolution order (M2.6): `env var > config file > built-in default`. The
+//! env var stays first so existing CI keeps working and an operator can
+//! override one knob for a single run; the config file (`~/.leek/config.json`,
+//! see `crate::config`) is the persistent user surface; the built-in default
+//! is the fallback. `LEEK_IDLE_TIMEOUT_SECS` / `LEEK_WALL_CLOCK_SECS` (and
+//! their config-file twins `idle_timeout_secs` / `wall_clock_secs`) accept
+//! `0` to disable.
 
 use std::collections::VecDeque;
 use std::time::Duration;
+
+use crate::config::Config;
 
 #[derive(Debug, Clone, Copy)]
 pub struct GuardConfig {
@@ -31,23 +36,46 @@ pub struct GuardConfig {
     pub auto_compact_threshold: f32,
     /// Override for the model context window the auto-compaction trigger is
     /// sized against, in tokens. `None` → use the per-model `pricing` table.
-    /// Set via `LEEK_CONTEXT_WINDOW`, mainly so a test can force a small
-    /// window and trip compaction within a few turns.
+    /// Set via `LEEK_CONTEXT_WINDOW` (or the `context_window` config-file
+    /// field), mainly so a test can force a small window and trip compaction
+    /// within a few turns.
     pub context_window: Option<i64>,
 }
 
 impl GuardConfig {
-    /// Build the guard set: locked defaults, each overridable by env var.
-    pub fn from_env() -> Self {
+    /// Build the guard set from the three layers: built-in defaults, then a
+    /// config-file overlay, then env vars on top. The agent calls this at
+    /// the start of every turn so a PATCH to the settings API takes effect
+    /// without a restart.
+    pub fn resolve(config: &Config) -> Self {
         Self {
-            idle_timeout: duration_env("LEEK_IDLE_TIMEOUT_SECS", 90),
-            wall_clock: duration_env("LEEK_WALL_CLOCK_SECS", 30 * 60),
-            max_iterations: opt_usize_env("LEEK_MAX_ITERATIONS"),
-            cost_cap_usd: opt_f64_env("LEEK_COST_CAP_USD"),
-            doom_loop_threshold: doom_threshold_env(),
-            auto_compact_threshold: f32_env("LEEK_AUTO_COMPACT_THRESHOLD", 0.90),
-            context_window: opt_usize_env("LEEK_CONTEXT_WINDOW").map(|n| n as i64),
+            idle_timeout: duration_layered(
+                "LEEK_IDLE_TIMEOUT_SECS",
+                config.idle_timeout_secs,
+                90,
+            ),
+            wall_clock: duration_layered(
+                "LEEK_WALL_CLOCK_SECS",
+                config.wall_clock_secs,
+                30 * 60,
+            ),
+            max_iterations: opt_usize_layered("LEEK_MAX_ITERATIONS", config.max_iterations),
+            cost_cap_usd: opt_f64_layered("LEEK_COST_CAP_USD", config.cost_cap_usd),
+            doom_loop_threshold: doom_threshold_layered(config.doom_loop_threshold),
+            auto_compact_threshold: f32_layered(
+                "LEEK_AUTO_COMPACT_THRESHOLD",
+                config.auto_compact_threshold,
+                0.90,
+            ),
+            context_window: context_window_layered(config.context_window),
         }
+    }
+
+    /// Build the guard set with no config-file overlay — env vars and
+    /// built-in defaults only. Kept for tests and any code path that
+    /// genuinely has no `Config` handle.
+    pub fn from_env() -> Self {
+        Self::resolve(&Config::default())
     }
 }
 
@@ -57,69 +85,124 @@ impl Default for GuardConfig {
     }
 }
 
-/// On/off guard with a positive-seconds default; env `0` disables it.
-fn duration_env(key: &str, default_secs: u64) -> Option<Duration> {
-    match std::env::var(key) {
-        Err(_) => Some(Duration::from_secs(default_secs)),
-        Ok(v) => match v.trim().parse::<u64>() {
-            Ok(0) => None,
-            Ok(n) => Some(Duration::from_secs(n)),
-            Err(_) => {
-                tracing::warn!(key, raw = %v, "invalid duration env var; using default");
-                Some(Duration::from_secs(default_secs))
-            }
-        },
+/// On/off duration guard. Layering: env > config > default. An env or
+/// config value of `0` disables the guard; an invalid env value logs and
+/// falls through to the config layer.
+fn duration_layered(env_key: &str, config_secs: Option<u64>, default_secs: u64) -> Option<Duration> {
+    if let Some(s) = u64_env(env_key) {
+        return if s == 0 { None } else { Some(Duration::from_secs(s)) };
+    }
+    if let Some(s) = config_secs {
+        return if s == 0 { None } else { Some(Duration::from_secs(s)) };
+    }
+    Some(Duration::from_secs(default_secs))
+}
+
+/// Opt-in iteration cap. Env > config > off; an explicit `0` in the config
+/// is treated as "no cap" (consistent with absence).
+fn opt_usize_layered(env_key: &str, config_value: Option<usize>) -> Option<usize> {
+    if let Some(v) = usize_env(env_key) {
+        return if v > 0 { Some(v) } else { None };
+    }
+    config_value.filter(|&n| n > 0)
+}
+
+/// Opt-in USD cost cap. Env > config > off; both `None` and `Some(0.0)`
+/// mean "guard off" (product decision 2026-05-22: 0 = 不限).
+fn opt_f64_layered(env_key: &str, config_value: Option<f64>) -> Option<f64> {
+    if let Some(v) = f64_env(env_key) {
+        return if v > 0.0 && v.is_finite() { Some(v) } else { None };
+    }
+    config_value.filter(|v| *v > 0.0 && v.is_finite())
+}
+
+/// Doom-loop threshold: env > config > default 3, must be ≥ 2.
+fn doom_threshold_layered(config_value: Option<usize>) -> Option<usize> {
+    if let Some(v) = usize_env("LEEK_DOOM_LOOP_THRESHOLD") {
+        return if v >= 2 {
+            Some(v)
+        } else {
+            tracing::warn!(value = v, "LEEK_DOOM_LOOP_THRESHOLD must be ≥ 2; using 3");
+            Some(3)
+        };
+    }
+    if let Some(v) = config_value {
+        if v >= 2 {
+            return Some(v);
+        }
+        tracing::warn!(value = v, "doom_loop_threshold in config must be ≥ 2; using 3");
+    }
+    Some(3)
+}
+
+/// Auto-compaction trigger fraction: env > config > default, must be in
+/// `(0.0, 1.0]`.
+fn f32_layered(env_key: &str, config_value: Option<f32>, default: f32) -> f32 {
+    if let Some(v) = f32_env(env_key) {
+        if v > 0.0 && v <= 1.0 {
+            return v;
+        }
+        tracing::warn!(key = env_key, value = v, "invalid fraction env var; using config/default");
+    }
+    if let Some(v) = config_value {
+        if v.is_finite() && v > 0.0 && v <= 1.0 {
+            return v;
+        }
+        tracing::warn!(value = v, "invalid auto_compact_threshold in config; using default");
+    }
+    default
+}
+
+/// Optional context-window override: env > config > None (use per-model
+/// table). `0` in either layer means "no override".
+fn context_window_layered(config_value: Option<i64>) -> Option<i64> {
+    if let Some(n) = usize_env("LEEK_CONTEXT_WINDOW") {
+        return if n > 0 { Some(n as i64) } else { None };
+    }
+    config_value.filter(|&n| n > 0)
+}
+
+fn u64_env(key: &str) -> Option<u64> {
+    let v = std::env::var(key).ok()?;
+    match v.trim().parse::<u64>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            tracing::warn!(key, raw = %v, "invalid u64 env var; falling through");
+            None
+        }
     }
 }
 
-/// Opt-in cap: absent or invalid → `None` (guard off).
-fn opt_usize_env(key: &str) -> Option<usize> {
+fn usize_env(key: &str) -> Option<usize> {
     let v = std::env::var(key).ok()?;
     match v.trim().parse::<usize>() {
-        Ok(n) if n > 0 => Some(n),
-        _ => {
-            tracing::warn!(key, raw = %v, "invalid cap env var; guard left off");
+        Ok(n) => Some(n),
+        Err(_) => {
+            tracing::warn!(key, raw = %v, "invalid usize env var; falling through");
             None
         }
     }
 }
 
-/// Opt-in USD cap: absent or invalid → `None` (guard off).
-fn opt_f64_env(key: &str) -> Option<f64> {
+fn f64_env(key: &str) -> Option<f64> {
     let v = std::env::var(key).ok()?;
     match v.trim().parse::<f64>() {
-        Ok(n) if n > 0.0 && n.is_finite() => Some(n),
-        _ => {
-            tracing::warn!(key, raw = %v, "invalid USD cap env var; guard left off");
+        Ok(n) => Some(n),
+        Err(_) => {
+            tracing::warn!(key, raw = %v, "invalid f64 env var; falling through");
             None
         }
     }
 }
 
-/// Doom-loop threshold: default 3, env override must be ≥ 2.
-fn doom_threshold_env() -> Option<usize> {
-    match std::env::var("LEEK_DOOM_LOOP_THRESHOLD") {
-        Err(_) => Some(3),
-        Ok(v) => match v.trim().parse::<usize>() {
-            Ok(n) if n >= 2 => Some(n),
-            _ => {
-                tracing::warn!(raw = %v, "invalid LEEK_DOOM_LOOP_THRESHOLD (need ≥ 2); using 3");
-                Some(3)
-            }
-        },
-    }
-}
-
-fn f32_env(key: &str, default: f32) -> f32 {
-    match std::env::var(key) {
-        Err(_) => default,
-        Ok(v) => match v.trim().parse::<f32>() {
-            Ok(n) if n > 0.0 && n <= 1.0 => n,
-            _ => {
-                tracing::warn!(key, raw = %v, "invalid fraction env var; using default");
-                default
-            }
-        },
+fn f32_env(key: &str) -> Option<f32> {
+    let v = std::env::var(key).ok()?;
+    match v.trim().parse::<f32>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            tracing::warn!(key, raw = %v, "invalid f32 env var; falling through");
+            None
+        }
     }
 }
 
@@ -203,16 +286,132 @@ mod tests {
 
     #[test]
     fn context_window_override_reads_env() {
+        // The resolver layers env over config; this test exercises the
+        // env-only shortcut (`from_env`). It shares `ENV_LOCK` with the
+        // M2.6 layering tests below — otherwise a parallel `set_var` from
+        // another test would race the assertion.
+        let _l = ENV_LOCK.lock().unwrap();
         std::env::remove_var("LEEK_CONTEXT_WINDOW");
         assert_eq!(GuardConfig::from_env().context_window, None);
 
         std::env::set_var("LEEK_CONTEXT_WINDOW", "16000");
         assert_eq!(GuardConfig::from_env().context_window, Some(16_000));
 
-        // Invalid values fall back to None, like the other opt-in env caps.
+        // Invalid values fall through; here there's no config layer either.
         std::env::set_var("LEEK_CONTEXT_WINDOW", "not-a-number");
         assert_eq!(GuardConfig::from_env().context_window, None);
 
         std::env::remove_var("LEEK_CONTEXT_WINDOW");
+    }
+
+    // ── M2.6: env > config > default layering ─────────────────────────────
+    //
+    // These tests touch process-global env state, so they live behind a
+    // mutex — `cargo test` runs them on different threads in one process,
+    // and a parallel `set_var` from a different test would tear them.
+
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Scoped env var guard: restore the previous value on drop.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_uses_built_in_default_when_neither_set() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g1 = EnvGuard::unset("LEEK_IDLE_TIMEOUT_SECS");
+        let _g2 = EnvGuard::unset("LEEK_COST_CAP_USD");
+        let _g3 = EnvGuard::unset("LEEK_AUTO_COMPACT_THRESHOLD");
+
+        let cfg = Config::default();
+        let g = GuardConfig::resolve(&cfg);
+        assert_eq!(g.idle_timeout, Some(Duration::from_secs(90)));
+        assert_eq!(g.cost_cap_usd, None);
+        assert!((g.auto_compact_threshold - 0.90).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resolve_uses_config_when_env_unset() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g1 = EnvGuard::unset("LEEK_IDLE_TIMEOUT_SECS");
+        let _g2 = EnvGuard::unset("LEEK_COST_CAP_USD");
+        let _g3 = EnvGuard::unset("LEEK_AUTO_COMPACT_THRESHOLD");
+
+        let cfg = Config {
+            idle_timeout_secs: Some(45),
+            cost_cap_usd: Some(1.50),
+            auto_compact_threshold: Some(0.75),
+            ..Config::default()
+        };
+        let g = GuardConfig::resolve(&cfg);
+        assert_eq!(g.idle_timeout, Some(Duration::from_secs(45)));
+        assert_eq!(g.cost_cap_usd, Some(1.50));
+        assert!((g.auto_compact_threshold - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resolve_lets_env_override_config() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g1 = EnvGuard::set("LEEK_IDLE_TIMEOUT_SECS", "30");
+        let _g2 = EnvGuard::set("LEEK_COST_CAP_USD", "2.5");
+
+        let cfg = Config {
+            idle_timeout_secs: Some(45),
+            cost_cap_usd: Some(1.50),
+            ..Config::default()
+        };
+        let g = GuardConfig::resolve(&cfg);
+        // env wins over config in both directions.
+        assert_eq!(g.idle_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(g.cost_cap_usd, Some(2.5));
+    }
+
+    #[test]
+    fn resolve_treats_zero_cost_cap_as_disabled() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::unset("LEEK_COST_CAP_USD");
+
+        let cfg = Config { cost_cap_usd: Some(0.0), ..Config::default() };
+        // 0 is the product-defined "off" value (see config.rs).
+        assert_eq!(GuardConfig::resolve(&cfg).cost_cap_usd, None);
+    }
+
+    #[test]
+    fn resolve_zero_seconds_disables_timer_guards() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::unset("LEEK_IDLE_TIMEOUT_SECS");
+        let _g2 = EnvGuard::unset("LEEK_WALL_CLOCK_SECS");
+
+        let cfg = Config {
+            idle_timeout_secs: Some(0),
+            wall_clock_secs: Some(0),
+            ..Config::default()
+        };
+        let g = GuardConfig::resolve(&cfg);
+        assert_eq!(g.idle_timeout, None);
+        assert_eq!(g.wall_clock, None);
     }
 }

@@ -83,14 +83,15 @@ fn raw_response(content_type: &'static str, bytes: Vec<u8>) -> ApiResult<Respons
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::GuardConfig;
     use crate::bus::EventBus;
+    use crate::config::Config;
     use crate::llm::codex::CodexClient;
     use crate::vault::{llm_transcripts, Vault};
     use axum::body::to_bytes;
     // `IntoResponse` is only used by the 404 case below — kept local so the
     // non-test build doesn't see an unused-import warning.
     use axum::response::IntoResponse;
+    use std::sync::RwLock;
 
     /// Spin up an isolated vault on a uuid-named temp file and bolt an
     /// `AppState` around it. The state's codex client never makes a network
@@ -120,7 +121,7 @@ mod tests {
             bus: EventBus::new(),
             codex,
             http: reqwest::Client::new(),
-            guards: GuardConfig::default(),
+            config: std::sync::Arc::new(RwLock::new(Config::default())),
             web_search: false,
             corpus: std::sync::Arc::new(crate::corpus::Corpus::empty()),
         }
