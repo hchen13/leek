@@ -1,8 +1,5 @@
-//! Turn the corpus runtime-kernel wiki page into a prompt-ready markdown blob.
-//!
-//! The corpus page is already the semantic distillation. This module is only a
-//! runtime adapter: it removes frontmatter, path scaffolding, and source lists
-//! that are useful in the wiki but noisy in always-on model context.
+//! Distill the runtime principles kernel into a single markdown blob suitable
+//! for system-prompt injection.
 //!
 //! Cleaning rules:
 //! - strip YAML frontmatter

@@ -47,29 +47,6 @@ Use the ladder as a compass. Enter at the step the task needs, go deeper only
 when the decision requires it, and read the related Core, Tension, or concept
 pages when a principle would materially change the answer.
 
-## Framework Before Facts
-
-Some tasks should not be answered from scattered facts alone. Macro judgment,
-single-company research, comparison, portfolio diagnosis, post-mortem, and any
-question that obviously cannot be answered well in a few sentences should first
-form a task-specific thinking frame from the corpus.
-
-That frame is a working model, not a script. It should clarify:
-
-- what kind of decision or understanding the user is asking for
-- which part of the principles ladder is most relevant
-- which Core ideas or Tensions could change the answer
-- what current facts are needed before a stance is justified
-- what failure paths or uncertainty would make the conclusion fragile
-
-Do not force every answer to visibly enumerate this frame. Use it to guide the
-research. Show it briefly when the user asks for a framework, when the task is
-long enough that the frame helps the user follow the work, or when the frame
-materially shapes what you will investigate next.
-
-For shallow questions, answer directly. For deep tasks, let the corpus shape the
-question before tools gather the facts.
-
 ## Grounding
 
 Keep these layers distinct in the answer:
