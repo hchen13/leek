@@ -220,6 +220,7 @@ export default function App() {
             send={(t) => void send(t)}
             focusCard={focusCard}
             openSettings={() => setShowSettings(true)}
+            sessionId={current}
           />
           <section class="right-rail">
             <nav class="right-tabs">

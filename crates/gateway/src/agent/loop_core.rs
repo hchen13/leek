@@ -23,10 +23,12 @@
 //! safety net the main agent has.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use futures::StreamExt;
+use tokio::sync::Notify;
 
 use crate::api::AppState;
 use crate::hooks::{HookEvent, HookOutcome};
@@ -69,6 +71,12 @@ pub struct LoopParams<'a> {
     /// Guard config. Always resolved by the caller from the live settings
     /// snapshot so a subagent shares the same caps as the parent turn.
     pub guards: GuardConfig,
+    /// M3.2: per-turn user-abort notifier. `Some` for the main agent —
+    /// the loop polls it in the inner `select!` alongside the stream
+    /// item and the idle-timeout. `None` for a subagent: a user clicks
+    /// abort on the *turn*, not on a particular subagent, and the abort
+    /// drops the parent loop which in turn drops the subagent task.
+    pub abort_signal: Option<Arc<Notify>>,
 }
 
 /// Which tools the inner loop is willing to dispatch. Constructed once
@@ -153,6 +161,35 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
 
     'turn: loop {
         // ── pre-iteration guards (identical to main-agent loop) ─────────
+        // M3.2: an abort that fired between iters (e.g. while tool
+        // dispatch was running, which we don't `select!` over) is
+        // observable here as a notify that was already armed. We can't
+        // `notified()` without awaiting, so we check the slot's removal
+        // via the registry; if the registry has been emptied externally
+        // (it isn't currently — but this is the place to add it), we
+        // honor that. The endpoint never empties the slot, so today we
+        // pre-empt by polling the notify with a zero-timeout to consume
+        // a pending wake. Cheap (Notify is a per-task atomic + waker).
+        if let Some(notify) = &p.abort_signal {
+            // Future::poll_ready style — `tokio::time::timeout(ZERO, _)`
+            // is a clean way to "check, then move on" without spinning a
+            // separate task. A `Ready` result means the notify was
+            // already permitted (`notify_one` had been called before we
+            // got here), and we bail.
+            if tokio::time::timeout(std::time::Duration::ZERO, notify.notified())
+                .await
+                .is_ok()
+            {
+                tracing::info!(
+                    session_id = p.session_id,
+                    turn_id = p.turn_id,
+                    iteration = iteration_count,
+                    "turn aborted by user (between iters)"
+                );
+                stop_reason = "user_aborted".into();
+                break 'turn;
+            }
+        }
         if wall_deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
             stop_reason = "wall_clock_exceeded".into();
             first_guard.get_or_insert("wall_clock_exceeded");
@@ -305,16 +342,53 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
         // offending URL for diagnostics so the assistant_done payload can
         // explain itself if anyone digs into the transcript.
         let mut codex_abort: Option<(String, String, u32)> = None;
+        // M3.2: set when the user-abort `Notify` fires inside the stream
+        // poll. Like `idle_hit`, we set the flag and break the stream so
+        // the post-stream cleanup runs once on its own path. Only the
+        // main agent registers an abort signal — a subagent sees `None`
+        // and falls into the simpler stream-only path.
+        let mut user_aborted = false;
         'stream: loop {
-            let item = match p.guards.idle_timeout {
-                Some(d) => match tokio::time::timeout(d, stream.next()).await {
+            // The poll fans out to three sources: a stream item, the
+            // optional idle timeout, and the optional user-abort notify.
+            // We `select!` only when at least one of the latter two is
+            // active; otherwise we keep the bare `stream.next().await`
+            // so a turn with neither guard nor abort signal stays cheap.
+            let item = match (p.guards.idle_timeout, &p.abort_signal) {
+                (Some(d), Some(notify)) => {
+                    tokio::select! {
+                        biased;
+                        _ = notify.notified() => {
+                            user_aborted = true;
+                            break 'stream;
+                        }
+                        res = tokio::time::timeout(d, stream.next()) => match res {
+                            Ok(item) => item,
+                            Err(_) => {
+                                idle_hit = true;
+                                break 'stream;
+                            }
+                        }
+                    }
+                }
+                (Some(d), None) => match tokio::time::timeout(d, stream.next()).await {
                     Ok(item) => item,
                     Err(_) => {
                         idle_hit = true;
                         break 'stream;
                     }
                 },
-                None => stream.next().await,
+                (None, Some(notify)) => {
+                    tokio::select! {
+                        biased;
+                        _ = notify.notified() => {
+                            user_aborted = true;
+                            break 'stream;
+                        }
+                        item = stream.next() => item,
+                    }
+                }
+                (None, None) => stream.next().await,
             };
             let Some(event) = item else { break 'stream };
             match event {
@@ -456,6 +530,26 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
             final_reply = iter_text;
             stop_reason = "idle_timeout".into();
             first_guard.get_or_insert("idle_timeout");
+            break 'turn;
+        }
+        // M3.2: user clicked abort mid-stream. We drop `stream` by
+        // letting it fall out of scope at loop end (the codex client
+        // closes the upstream HTTP connection on drop), keep whatever
+        // text we'd already accumulated this iter for the partial reply
+        // (the finalize path appends a stop note), and break the turn.
+        // No first_guard — abort is user-triggered, not a guard trip,
+        // so the metrics row reads as `stop_reason=user_aborted,
+        // first_triggered_guard=null` and a downstream dashboard can
+        // tell user aborts apart from guard hits.
+        if user_aborted {
+            tracing::info!(
+                session_id = p.session_id,
+                turn_id = p.turn_id,
+                iteration = iteration_count,
+                "turn aborted by user (mid-stream)"
+            );
+            final_reply = iter_text;
+            stop_reason = "user_aborted".into();
             break 'turn;
         }
         // M3.1: codex builtin web_search hit the abort threshold. Bail with
@@ -853,5 +947,96 @@ mod tests {
         // After Abort, subsequent observations are silent — loop has
         // already broken the stream and set stop_reason.
         assert!(tracker.observe(&a, &u).is_none());
+    }
+
+    /// M3.2: pin the select! shape used by the per-iter stream poll —
+    /// when the user-abort notify fires before the next stream item, we
+    /// break the stream with `user_aborted=true` (the loop then turns
+    /// that into `stop_reason="user_aborted"`). Mirrors the inner block
+    /// of `run_loop`'s `(None, Some(notify))` arm with a synthetic mpsc
+    /// "stream" — the real stream type is a `BoxStream` from `codex`
+    /// that we cannot easily synthesize, but the select! arm shape is
+    /// the part we changed and the part that can break.
+    #[tokio::test]
+    async fn user_abort_wins_select_over_pending_stream() {
+        use tokio::sync::mpsc;
+        let (_tx, mut rx) = mpsc::channel::<Result<LlmEvent>>(8);
+        let notify = Arc::new(Notify::new());
+        let notify_for_fire = notify.clone();
+
+        // Fire the abort after a short delay so the `select!` is
+        // already armed when notify_one() lands.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            notify_for_fire.notify_one();
+        });
+
+        let mut user_aborted = false;
+        let mut item_seen = false;
+        tokio::select! {
+            biased;
+            _ = notify.notified() => {
+                user_aborted = true;
+            }
+            item = rx.recv() => {
+                item_seen = item.is_some();
+            }
+        }
+
+        assert!(user_aborted, "notify should have won the select");
+        assert!(!item_seen, "no stream item was sent");
+    }
+
+    /// M3.2: when a stream item is already pending and the notify hasn't
+    /// fired, the stream arm wins. Verifies the `biased` ordering does NOT
+    /// starve normal stream items — `biased` only matters when multiple
+    /// arms are simultaneously ready; here only `recv()` is ready.
+    #[tokio::test]
+    async fn pending_stream_item_wins_when_notify_idle() {
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::channel::<Result<LlmEvent>>(8);
+        let notify = Arc::new(Notify::new());
+
+        tx.send(Ok(LlmEvent::Ping)).await.unwrap();
+
+        let mut user_aborted = false;
+        let mut got_ping = false;
+        tokio::select! {
+            biased;
+            _ = notify.notified() => {
+                user_aborted = true;
+            }
+            item = rx.recv() => {
+                got_ping = matches!(item, Some(Ok(LlmEvent::Ping)));
+            }
+        }
+
+        assert!(!user_aborted, "notify never fired");
+        assert!(got_ping, "the pre-sent Ping should have been received");
+    }
+
+    /// M3.2: between-iter abort check. The pre-iter probe uses a zero
+    /// timeout on `notified()` to consume an already-armed wake without
+    /// awaiting. Pin that shape — if `notify_one()` was called before
+    /// the probe, the probe returns Ok immediately and the loop bails.
+    #[tokio::test]
+    async fn zero_timeout_probe_catches_already_armed_notify() {
+        let notify = Arc::new(Notify::new());
+        notify.notify_one();
+        let armed = tokio::time::timeout(std::time::Duration::ZERO, notify.notified())
+            .await
+            .is_ok();
+        assert!(armed, "an already-permitted notify must resolve under ZERO timeout");
+    }
+
+    /// And the negative case: with no prior `notify_one`, the probe must
+    /// time out (the loop continues into the next iter, as intended).
+    #[tokio::test]
+    async fn zero_timeout_probe_skips_when_notify_idle() {
+        let notify = Arc::new(Notify::new());
+        let armed = tokio::time::timeout(std::time::Duration::ZERO, notify.notified())
+            .await
+            .is_ok();
+        assert!(!armed, "an unarmed notify must NOT resolve under ZERO timeout");
     }
 }

@@ -9,6 +9,7 @@
 import { createSignal, For, Show } from "solid-js";
 
 import { renderMarkdown } from "./markdown";
+import { TurnStatusPill } from "./TurnStatusPill";
 import type { Message, Turn } from "./types";
 
 type Streaming = { turnId: string; iteration: number; text: string };
@@ -23,6 +24,10 @@ type ChatProps = {
   focusCard: (artifactId: string, isError: boolean) => void;
   /** M2.6: clicked from the cost-cap warning bar's "打开 Settings →" link. */
   openSettings: () => void;
+  /** M3.2: current session id, plumbed down so the status pill's abort
+   *  button can POST to the right endpoint. `null` only on the empty
+   *  fallback screen — when no session is selected the pill is hidden. */
+  sessionId: () => string | null;
 };
 
 type SummaryStatus = "running" | "ok" | "error";
@@ -220,6 +225,12 @@ export function Chat(props: ChatProps) {
           </div>
         </Show>
       </div>
+
+      {/* M3.2: reasoning status pill — between the messages and the
+          composer, only visible while a turn is in flight. Provides the
+          "agent is alive" signal during long reasoning + builtin
+          web_search phases, plus the abort affordance. */}
+      <TurnStatusPill turn={() => runningTurn() ?? null} sessionId={props.sessionId} />
 
       <form
         class="composer"

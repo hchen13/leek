@@ -242,6 +242,128 @@ h2 {
   white-space: nowrap;
 }
 
+/* ── M3.2 reasoning status pill (between messages and composer) ────────
+   Lives between the message list and the composer; visible only while
+   a turn is running. Calm / warm / hot color rungs based on time since
+   last canvas event (NOT total elapsed) — a long but eventful turn
+   stays calm. We avoid red on purpose; long reasoning is slow, not
+   broken. Composer's top border drops to 0 when the pill is present
+   (the pill itself draws the boundary), but to keep the CSS simple we
+   leave the composer border on and the pill draws its own dividers. */
+.turn-pill {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel);
+  font-size: 15px;
+  line-height: 1.4;
+  color: var(--text);
+  transition: background 240ms ease, border-color 240ms ease;
+}
+.turn-pill.pill-calm {
+  background: var(--panel);
+}
+.turn-pill.pill-warm {
+  background: rgba(251, 191, 36, 0.07);
+  border-top-color: rgba(251, 191, 36, 0.30);
+  border-bottom-color: rgba(251, 191, 36, 0.20);
+}
+.turn-pill.pill-hot {
+  background: rgba(251, 191, 36, 0.14);
+  border-top-color: rgba(251, 191, 36, 0.55);
+  border-bottom-color: rgba(251, 191, 36, 0.35);
+}
+.pill-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.pill-spinner {
+  display: inline-block;
+  color: var(--muted);
+  font-size: 16px;
+  animation: pill-spin 2.4s linear infinite;
+  flex: 0 0 auto;
+}
+.turn-pill.pill-warm .pill-spinner,
+.turn-pill.pill-hot .pill-spinner {
+  color: var(--run);
+}
+@keyframes pill-spin {
+  to { transform: rotate(360deg); }
+}
+.pill-text {
+  flex: 1;
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.pill-iter {
+  font-weight: 600;
+  color: var(--text);
+}
+.pill-sep {
+  color: var(--muted);
+  opacity: 0.5;
+}
+.pill-elapsed,
+.pill-activity {
+  color: var(--muted);
+}
+.turn-pill.pill-warm .pill-elapsed,
+.turn-pill.pill-warm .pill-activity,
+.turn-pill.pill-hot .pill-elapsed,
+.turn-pill.pill-hot .pill-activity {
+  color: var(--text);
+}
+.pill-abort {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 5px;
+  font: inherit;
+  font-size: 14px;
+  padding: 4px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 160ms ease, border-color 160ms ease, background 160ms ease;
+}
+.pill-abort:hover {
+  color: var(--text);
+  border-color: var(--blue-soft);
+}
+.turn-pill.pill-warm .pill-abort,
+.turn-pill.pill-hot .pill-abort {
+  border-color: rgba(251, 191, 36, 0.55);
+  color: var(--run);
+}
+.turn-pill.pill-warm .pill-abort:hover,
+.turn-pill.pill-hot .pill-abort:hover {
+  background: rgba(251, 191, 36, 0.16);
+  color: #fde68a;
+}
+.pill-abort:disabled {
+  cursor: progress;
+  opacity: 0.65;
+}
+.pill-tail {
+  color: var(--muted);
+  font-size: 14px;
+  padding-left: 26px;
+  line-height: 1.45;
+}
+.turn-pill.pill-hot .pill-tail {
+  color: var(--text);
+}
+
 .composer {
   display: flex;
   gap: 8px;

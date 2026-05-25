@@ -14,11 +14,14 @@ pub mod transcripts;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use tower_http::cors::{Any, CorsLayer};
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+
+use tokio::sync::Notify;
 
 use crate::agents::AgentRegistry;
 use crate::bus::EventBus;
@@ -29,6 +32,15 @@ use crate::llm::codex::CodexClient;
 use crate::skills::SkillRegistry;
 use crate::vault::events::Event;
 use crate::vendors::VendorRegistry;
+
+/// M3.2: per-turn user-abort registry. The agent loop registers an
+/// `Arc<Notify>` keyed by `turn_id` on entry and drops the entry on
+/// exit; the `POST .../abort` endpoint looks it up and calls
+/// `notify_one()` to wake the loop. A separate `Arc` is held by the
+/// loop itself (so a `remove()` racing with `notify_one()` cannot
+/// invalidate the wake). `RwLock` (std) is fine — both ops are
+/// short and never await with the guard held.
+pub type AbortRegistry = Arc<RwLock<HashMap<String, Arc<Notify>>>>;
 
 /// Shared, cheaply-cloneable handles for request handlers and agent turns.
 #[derive(Clone)]
@@ -75,6 +87,8 @@ pub struct AppState {
     /// EastMoney) used by the A-share research tools. Vendor identity is
     /// hidden from the model — see `vendors/` module docs.
     pub vendors: Arc<VendorRegistry>,
+    /// M3.2: per-turn user-abort registry. See `AbortRegistry` docs.
+    pub abort_signals: AbortRegistry,
 }
 
 impl AppState {
@@ -121,6 +135,43 @@ impl AppState {
         };
         self.bus.publish(session_id, event).await;
     }
+
+    /// M3.2: register an abort-signal slot for a running turn. The agent
+    /// loop calls this on entry and holds the returned `Arc<Notify>` so a
+    /// concurrent `remove_abort_signal` can't drop the wake out from under
+    /// it. A poisoned lock falls back to a fresh notify (the abort path is
+    /// best-effort — the user can still ride out the turn the slow way).
+    pub fn register_abort_signal(&self, turn_id: &str) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        match self.abort_signals.write() {
+            Ok(mut map) => {
+                map.insert(turn_id.to_string(), notify.clone());
+            }
+            Err(poisoned) => {
+                tracing::error!("abort_signals RwLock poisoned; abort for this turn disabled");
+                let mut map = poisoned.into_inner();
+                map.insert(turn_id.to_string(), notify.clone());
+            }
+        }
+        notify
+    }
+
+    /// M3.2: drop the abort-signal slot when the turn exits. Called by the
+    /// agent loop in its tail block so a turn that finished naturally is
+    /// not abortable anymore (a stale `POST .../abort` then 404s — which is
+    /// what the frontend wants too, since the pill is already gone).
+    pub fn remove_abort_signal(&self, turn_id: &str) {
+        if let Ok(mut map) = self.abort_signals.write() {
+            map.remove(turn_id);
+        }
+    }
+
+    /// M3.2: look up a turn's abort notifier. The endpoint calls this and
+    /// fires `notify_one()` on a hit; a miss means the turn already exited
+    /// (or was never registered) and the endpoint returns 404.
+    pub fn lookup_abort_signal(&self, turn_id: &str) -> Option<Arc<Notify>> {
+        self.abort_signals.read().ok()?.get(turn_id).cloned()
+    }
 }
 
 /// Stamp an event payload with its workbench surface (M1.9.1), from the one
@@ -159,6 +210,13 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/sessions/{id}/messages",
             get(messages::list).post(messages::post),
+        )
+        // M3.2: user-triggered abort of a running turn. Looks the turn's
+        // notify slot up in `AppState::abort_signals`; 204 on a successful
+        // wake, 404 if the turn has already exited.
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/abort",
+            post(sessions::abort_turn),
         )
         .route("/api/v1/sessions/{id}/events", get(events::history))
         .route("/stream/sessions/{id}/events", get(events::stream))

@@ -21,6 +21,7 @@ import type {
   PlanStep,
   Surface,
   Turn,
+  TurnActivity,
 } from "./types";
 
 export type WorkbenchState = {
@@ -51,6 +52,19 @@ function canvasKind(eventKind: string): Artifact["kind"] | null {
     return "codex_duplicate_warning";
   }
   return null;
+}
+
+/** M3.2: pull a user-facing tool name out of a `tool_lifecycle.start`
+ *  data blob for the reasoning status pill. Falls back to `tool` (the
+ *  internal name like `corpus_search`) when `display_name` is absent —
+ *  the right thing for a tool the spec hasn't gotten around to giving a
+ *  pretty label; better than showing "工具" with no clue which one. */
+function pickToolDisplay(data: Record<string, unknown>): string {
+  const display = data.display_name;
+  if (typeof display === "string" && display.length > 0) return display;
+  const tool = data.tool;
+  if (typeof tool === "string" && tool.length > 0) return tool;
+  return "工具";
 }
 
 /** Extract host from a URL for the warning chip; null on parse failure. */
@@ -268,6 +282,16 @@ export function createWorkbench() {
       metrics: null,
       error: null,
       costCap: null,
+      // M3.2: anchor the elapsed-time counter at first-sighting of the
+      // turn. The user-prompt `message_created` is the first event the
+      // store sees for a turn (`applyChat` calls into `applyLifecycle`
+      // for it? — no: the user-prompt has no turn_id; the first event
+      // that carries a turn_id is `tool_lifecycle` / `assistant_delta`
+      // / `assistant_done` / `note_trace`). For replayed turns the
+      // anchor is "first replay" — irrelevant because replay only sees
+      // finished turns, and the pill is gated on `status === "running"`.
+      startedAtMs: Date.now(),
+      activity: null,
     });
     return d.turns[d.turns.length - 1];
   }
@@ -431,6 +455,27 @@ export function createWorkbench() {
           art.iteration = iteration;
           mergeData(art, kind, data);
         }
+
+        // M3.2: roll the reasoning-pill activity to the latest canvas
+        // signal. A `start` frame is the strongest "agent is doing X
+        // right now" — we set the activity. A `completion` / `error`
+        // frame means the activity finished; clearing the pill back to
+        // null would re-show "正在思考" between iters, which is honest
+        // (the agent IS thinking until the next event), so we DO clear.
+        // The next iter's tool/search/delta event re-sets it.
+        if (kind === "tool" || kind === "search") {
+          if (phase === "start") {
+            turn.activity =
+              kind === "tool"
+                ? { kind: "tool", displayName: pickToolDisplay(data) }
+                : { kind: "search" };
+          } else if (turn.activity?.kind === kind) {
+            turn.activity = null;
+          }
+        }
+        // Note frames don't shift the pill — a note is the agent's own
+        // narration, which the chat already shows; the pill should
+        // keep reading the tool / search that's still in flight.
       }),
     );
 
@@ -485,11 +530,26 @@ export function createWorkbench() {
           } else {
             d.streaming.text += text;
           }
+          // M3.2: any delta means the agent is now writing the answer.
+          // The pill flips to "正在写回答" until the next iter starts a
+          // tool / search.
+          const turn = ensureTurn(d, turnId);
+          turn.activity = { kind: "delta" };
         }),
       );
     } else if (ev.kind === "message_created" && ev.payload.role === "assistant") {
       // The final reply is persisted — drop the optimistic bubble.
       setState("streaming", null);
+    } else if (ev.kind === "message_created" && ev.payload.role === "user") {
+      // M3.2: the gateway emits `user_seq + turn_id` in the
+      // `messages.post` 202 response; the SSE message_created for the
+      // user role does NOT carry the turn_id (it's a chat-message
+      // event, not a turn event). The store has no way to associate
+      // "this user message → that turn" from the event alone, so the
+      // anchor for the pill is set lazily in `ensureTurn` (when the
+      // first turn-bearing event arrives). That introduces ~ms-to-1s
+      // of clock drift between the user pressing send and the pill
+      // appearing — fine; the gap is smaller than the polling rate.
     }
   }
 
@@ -529,6 +589,10 @@ export function createWorkbench() {
           if (ev.payload.message_seq != null) {
             turn.messageSeq = Number(ev.payload.message_seq);
           }
+          // M3.2: clear pill activity — done turns don't show the pill,
+          // but keep the field tidy so a debugger / future view doesn't
+          // see a stale "writing reply" state on a closed turn.
+          turn.activity = null;
         } else if (ev.kind === "turn_metrics_recorded") {
           turn.metrics = {
             iterationCount: Number(ev.payload.iteration_count ?? 0),

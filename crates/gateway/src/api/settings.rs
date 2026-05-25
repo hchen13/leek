@@ -301,6 +301,7 @@ mod tests {
             hooks: Arc::new(crate::hooks::HookEngine::default()),
             agents: Arc::new(crate::agents::AgentRegistry::default()),
             vendors: Arc::new(crate::vendors::VendorRegistry::for_test()),
+            abort_signals: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
         TestState { st, _scratch: ScratchDir { path: dir }, _env: env }
     }

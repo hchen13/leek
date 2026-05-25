@@ -195,6 +195,11 @@ pub async fn spawn(
         tool_specs,
         allowed_tools,
         guards,
+        // M3.2: subagents are NOT independently user-abortable. The user
+        // clicks abort on the parent turn; the parent's `select!` wakes,
+        // its `'turn` loop breaks, and the spawn future is dropped — which
+        // drops the subagent's stream and ends its loop cooperatively.
+        abort_signal: None,
     };
 
     // `loop_core::run_loop` may indirectly call `task::run` → `spawn` →
@@ -627,6 +632,7 @@ mod tests {
             hooks: Arc::new(HookEngine::default()),
             agents: Arc::new(AgentRegistry::default()),
             vendors: Arc::new(VendorRegistry::for_test()),
+            abort_signals: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 }

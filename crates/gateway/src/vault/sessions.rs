@@ -54,6 +54,17 @@ pub async fn create(pool: &SqlitePool, id: &str, title: Option<&str>) -> Result<
     get(pool, id).await
 }
 
+/// True iff a session with `id` exists. Used by handlers that need to
+/// distinguish "the path's session does not exist" (a typed 404) from
+/// the resource-level miss they're really checking for.
+pub async fn exists(pool: &SqlitePool, id: &str) -> Result<bool> {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM sessions WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
 /// Insert an untitled session if `id` is not already present.
 pub async fn ensure(pool: &SqlitePool, id: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();

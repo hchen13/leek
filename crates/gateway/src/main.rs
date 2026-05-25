@@ -207,6 +207,9 @@ async fn serve(vault_path: &Path, corpus_root: &Path, port: u16) -> Result<()> {
         hooks: m25.hooks,
         agents: agents_arc,
         vendors: vendors_arc,
+        // M3.2: per-turn user-abort registry. Starts empty; the agent
+        // loop populates / clears entries per turn.
+        abort_signals: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     let app = api::router(state);

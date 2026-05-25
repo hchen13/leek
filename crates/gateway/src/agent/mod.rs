@@ -157,6 +157,19 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
     let tool_specs = tools::specs(&st.skills, &st.agents);
     let system = prompt::build_system_prompt(&tool_specs, &st.skills, &st.agents);
 
+    // ── M3.2: register a user-abort signal slot for this turn. The slot
+    // lives in `AppState::abort_signals`; the `POST .../abort` endpoint
+    // looks it up by `turn_id` and fires `notify_one()`. We hold the
+    // `Arc<Notify>` ourselves (an `_AbortGuard` removes the slot on
+    // drop even if the loop panics — leaking would let a future endpoint
+    // call hit a notify nobody is listening on, plus accumulate slots
+    // forever for long-lived processes).
+    let abort_signal = st.register_abort_signal(turn_id);
+    let _abort_guard = AbortGuard {
+        st,
+        turn_id: turn_id.to_string(),
+    };
+
     // ── inner loop (shared with subagents — M2.7) ───────────────────────
     // The main-agent loop has nothing special inside the model→tool cycle;
     // it shares one implementation with every subagent loop. The wrapping
@@ -173,6 +186,7 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
         tool_specs,
         allowed_tools: loop_core::ToolAllowlist::All,
         guards,
+        abort_signal: Some(abort_signal),
     })
     .await?;
 
@@ -397,7 +411,29 @@ fn stop_note(stop_reason: &str) -> Option<&'static str> {
         "codex_duplicate_abort" => {
             Some("检测到 codex 内置 web_search 重复 open 同一 URL，本回合中止。")
         }
+        // M3.2: user clicked 强制停止本回合. Honest, short — the abort
+        // button is right there in the UI so the user already knows
+        // they did it; this note exists so the persisted assistant
+        // message reads as something other than an empty bubble.
+        "user_aborted" => Some("本回合已被你手动停止。"),
         _ => Some("本回合提前结束。"),
+    }
+}
+
+/// M3.2: drop guard that removes a turn's abort-signal slot when the
+/// agent loop exits — including panic / early-return paths. Without
+/// this, a panic in `drive` after registration would leak the slot
+/// forever, and a stale endpoint call could fire a notify on an
+/// `Arc<Notify>` no future is listening on (harmless, but the slot
+/// itself never gets reclaimed).
+struct AbortGuard<'a> {
+    st: &'a crate::api::AppState,
+    turn_id: String,
+}
+
+impl<'a> Drop for AbortGuard<'a> {
+    fn drop(&mut self) {
+        self.st.remove_abort_signal(&self.turn_id);
     }
 }
 

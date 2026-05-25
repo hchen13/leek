@@ -141,7 +141,30 @@ export type Turn = {
   error: string | null;
   /** Set when the per-turn cost cap tripped (M2.6). */
   costCap: TurnCostCap | null;
+  /** M3.2 wall-clock anchor for the reasoning status pill — the
+   *  client-side timestamp at which the user-prompt `message_created`
+   *  for this turn was applied. Used to compute "elapsed Xs / Ym" in
+   *  the pill without a server round trip per second. The store sets
+   *  this when it first encounters a `turn_id` (on any inbound event
+   *  for the turn); a turn with no user-prompt event still gets a
+   *  monotonically sensible anchor. */
+  startedAtMs: number | null;
+  /** M3.2 latest activity kind for the pill state-machine: the most
+   *  recent canvas event we saw for this turn. The pill text reads off
+   *  this — `tool` shows "正在调用 <name>", `search` shows "正在搜索
+   *  网页", `delta` shows "正在写回答", and `null` (no canvas activity
+   *  yet) falls through to the time-based "agent 正在思考" / "深度思考
+   *  中" rungs. */
+  activity: TurnActivity | null;
 };
+
+/** M3.2 reasoning-pill activity kinds. The store narrows the
+ *  free-form event stream into this small enum so the pill renderer
+ *  is a pure function of `(activity, elapsedMs)`. */
+export type TurnActivity =
+  | { kind: "tool"; displayName: string }
+  | { kind: "search" }
+  | { kind: "delta" };
 
 export type PlanStep = {
   step: string;
