@@ -62,7 +62,7 @@ const FIELDS: FieldSpec[] = [
   {
     key: "idle_timeout_secs",
     label: "Stream 空闲超时 (秒)",
-    hint: "默认 90；0 = 关闭。SSE 长时间没字节就 abort 当前 iteration。",
+    hint: "默认 180 (M3.6 加倍,xhigh + 长 tool turn 经常超 90s silence);0 = 关闭。SSE 长时间没字节就 abort 当前 iteration。",
     unit: "秒",
     step: "1",
   },
@@ -111,7 +111,7 @@ const FIELDS: FieldSpec[] = [
   {
     key: "builtin_url_abort_threshold",
     label: "Codex 内置 search 重复 URL 中止阈值",
-    hint: "同一 (action_type, URL) open ≥ 该次数时, 强制 abort 当前 iter, stop_reason=codex_duplicate_abort。默认 7, 0 = 关闭(只 warn 不 abort)。",
+    hint: "同一 (action_type, URL) open ≥ 该次数时, 强制 abort 当前 iter, stop_reason=codex_duplicate_abort。默认 0 = 关闭(M3.6 改默认: 只 warn 不 abort, 避免合法多角度重读权威源时被强杀)。",
     unit: "次",
     step: "1",
   },
@@ -270,35 +270,25 @@ export function Settings(props: SettingsProps) {
     await patchAndRefresh(body);
   };
 
-  /** Reset = set every field back to the gateway's built-in default. The
-   *  backend `Config::merge` only overwrites fields where the patch is
-   *  `Some`, so a `null` patch is a no-op — we cannot "clear" a stored
-   *  value through PATCH. Instead we PATCH the defaults explicitly, which
-   *  is observationally identical for the resolver (a stored `cost_cap_usd
-   *  = 0` and an unstored one both disable the cap).
-   *
-   *  `max_iterations` and `context_window` have no "0 = unset" idiom —
-   *  the validator rejects 0 for both — so we send them as `null` (a
-   *  no-op if the user had set them) and tell the user to clear them by
-   *  hand if needed. The defaults below match
-   *  `gateway::agent::guards::resolve`'s built-ins. */
+  /** Reset = 清空所有 stored fields, 让 GuardConfig::resolve 回 built-in
+   *  default。M3.6 后,后端 `Config::merge` 用 `Option<Option<T>>` 区分
+   *  "absent"(noop) vs "explicit null"(clear),所以发 `null` 真的能清。
+   *  reset 等价于 fresh install:idle=180s、abort=0、cost cap off 等都
+   *  回 guards.rs 的 built-in default。 */
   const reset = async () => {
-    if (
-      !confirm(
-        "将所有字段重置为内置默认值。\n" +
-          "注意：max_iterations 与 context_window 无法通过 reset 清除（后端 merge 不支持清空字段），" +
-          "如已设置请手动留空并保存单独字段。",
-      )
-    )
-      return;
+    if (!confirm("将所有字段重置为内置默认值,清空 config.json 中所有已存储字段。")) return;
+    // M3.6: "reset" 现在用 explicit null 真正清字段(merge 接受 null=clear);
+    // 后端 GuardConfig::resolve 会回到 built-in default(idle=180s, abort=0 等)。
     const body: Record<string, number | null> = {
-      cost_cap_usd: 0, // 0 = disabled (same as unset)
-      idle_timeout_secs: 90,
-      wall_clock_secs: 1800,
-      doom_loop_threshold: 3,
-      auto_compact_threshold: 0.9,
-      max_iterations: null, // backend merge ignores null; advised in confirm()
+      cost_cap_usd: null,
+      idle_timeout_secs: null,
+      wall_clock_secs: null,
+      doom_loop_threshold: null,
+      auto_compact_threshold: null,
+      max_iterations: null,
       context_window: null,
+      builtin_url_warn_threshold: null,
+      builtin_url_abort_threshold: null,
     };
     await patchAndRefresh(body);
   };

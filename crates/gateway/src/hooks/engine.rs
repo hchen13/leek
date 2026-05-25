@@ -5,33 +5,66 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use super::config::{HookConfig, HookSet};
 use super::outcome::{HookEvent, HookOutcome};
 
 /// The runtime entry point used by the agent loop. Holds the merged
-/// hook set; cheap to clone via `Arc` in `AppState`.
+/// hook set behind an internal `RwLock` so the settings API can
+/// hot-swap it after a PATCH without restarting the gateway (M3.6 §D).
+/// `AppState.hooks` is still `Arc<HookEngine>` — callers don't notice
+/// the swap.
 #[derive(Debug, Default)]
 pub struct HookEngine {
-    set: HookSet,
+    /// `RwLock` (std, not tokio) is fine — every access takes the lock
+    /// briefly and `set.matching` returns owned references via clone, so
+    /// the guard never crosses an `.await`. Poisoned lock falls back to
+    /// "no hooks installed" semantics so one bad reload can't down the
+    /// agent loop.
+    set: RwLock<HookSet>,
 }
 
 impl HookEngine {
     pub fn new(set: HookSet) -> Self {
-        Self { set }
+        Self { set: RwLock::new(set) }
     }
 
     /// `true` if any hook is registered for this event. Used by the
     /// agent loop to skip payload building when nobody's listening.
     pub fn has_event(&self, event: HookEvent) -> bool {
-        self.set.has_event(event)
+        match self.set.read() {
+            Ok(g) => g.has_event(event),
+            Err(_) => false,
+        }
     }
 
-    /// Borrow the underlying `HookSet` — used by the read-only
-    /// `GET /api/v1/hooks` endpoint.
-    pub fn set(&self) -> &HookSet {
-        &self.set
+    /// Snapshot the underlying `HookSet` for the read-only
+    /// `GET /api/v1/hooks` endpoint. Cheap clone — `HookSet` is a
+    /// `HashMap` of small descriptors.
+    pub fn snapshot(&self) -> HookSet {
+        match self.set.read() {
+            Ok(g) => g.clone(),
+            Err(_) => HookSet::default(),
+        }
+    }
+
+    /// M3.6 §D: atomically replace the registered hooks with a freshly
+    /// loaded set. The settings PATCH endpoint calls this after writing
+    /// `~/.leek/config.json` so the next tool dispatch picks up the new
+    /// hook list — no gateway restart. Poisoned lock is treated as if
+    /// it weren't poisoned (we install the new set anyway), since the
+    /// previous content is being replaced wholesale.
+    pub fn replace(&self, new_set: HookSet) {
+        match self.set.write() {
+            Ok(mut g) => *g = new_set,
+            Err(poisoned) => {
+                tracing::warn!("HookEngine RwLock poisoned; recovering with fresh reload");
+                let mut g = poisoned.into_inner();
+                *g = new_set;
+            }
+        }
     }
 
     /// Trigger every hook registered for `event` whose matcher fires for
@@ -51,19 +84,29 @@ impl HookEngine {
         target: &str,
         payload: serde_json::Value,
     ) -> HookOutcome {
-        let matches = self.set.matching(event, target);
+        // Snapshot the matching handlers under a brief read lock, then
+        // drop the guard before any await — both because tokio's runtime
+        // doesn't allow std-mutex guards across await points and so a
+        // long-running hook doesn't keep the reload path blocked.
+        let matches: Vec<HookConfig> = match self.set.read() {
+            Ok(g) => g
+                .matching(event, target)
+                .into_iter()
+                .map(|(_, h)| h.clone())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
         if matches.is_empty() {
             return HookOutcome::Continue;
         }
         // Run hooks on a blocking-thread pool so a long-running shell
         // command doesn't stall the tokio reactor. Iterate serially —
         // ordering matters for "first block wins".
-        for (_, hook) in matches {
+        for hook in matches {
             let payload_str = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
-            let hook_clone = hook.clone();
             let event_name = event.as_str();
             let outcome = tokio::task::spawn_blocking(move || {
-                run_one_hook(&hook_clone, &payload_str, event_name)
+                run_one_hook(&hook, &payload_str, event_name)
             })
             .await
             .unwrap_or_else(|e| {

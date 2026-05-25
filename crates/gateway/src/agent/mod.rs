@@ -188,6 +188,8 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
         allowed_tools: loop_core::ToolAllowlist::All,
         guards,
         abort_signal: Some(abort_signal),
+        // Main agent inherits the env-resolved capability flag.
+        web_search: st.web_search,
     })
     .await?;
 

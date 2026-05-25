@@ -1638,6 +1638,151 @@ mod tests {
         assert!(events[0]["turn_id"].is_null());
     }
 
+    // ─── M3.6 §B: provider_retry_attempt is actually persisted ────────────
+    //
+    // The pre-M3.6 worker reported `fatal_reason.retry_attempts > 0` but
+    // the events stream surfaced zero `provider_retry_attempt` rows in
+    // production — frontend's "重试中 (2/5)" pill never lit up. The
+    // captured-Vec tests above only prove the in-process notify closure
+    // ran; this test wires the **real production notify path**
+    // (AppState::emit) and checks that the row actually lands in the
+    // vault.events durable log so `events::list` (and the SSE stream) can
+    // hand it to the frontend.
+
+    use crate::api::AppState;
+
+    async fn test_app_state() -> AppState {
+        use crate::agents::AgentRegistry;
+        use crate::bus::EventBus;
+        use crate::config::Config;
+        use crate::corpus::Corpus;
+        use crate::hooks::HookEngine;
+        use crate::llm::codex::CodexClient;
+        use crate::skills::SkillRegistry;
+        use crate::vault::Vault;
+        use crate::vendors::VendorRegistry;
+        use std::sync::{Arc as StdArc, RwLock};
+
+        let path = std::env::temp_dir().join(format!(
+            "leek-retry-events-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let vault = Vault::open(&path).await.unwrap();
+        let codex = CodexClient::new(vault.pool.clone(), crate::vault::LOCAL_USER).unwrap();
+        let corpus = StdArc::new(Corpus::empty());
+        let corpus_graph = StdArc::new(corpus.build_graph());
+        AppState {
+            pool: vault.pool,
+            bus: EventBus::new(),
+            codex,
+            http: reqwest::Client::new(),
+            config: StdArc::new(RwLock::new(Config::default())),
+            web_search: false,
+            corpus,
+            corpus_graph,
+            skills: StdArc::new(SkillRegistry::default()),
+            hooks: StdArc::new(HookEngine::default()),
+            agents: StdArc::new(AgentRegistry::default()),
+            vendors: StdArc::new(VendorRegistry::for_test()),
+            abort_signals: StdArc::new(RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// End-to-end: production-shaped notifier (the same closure the real
+    /// `call_codex_with_retry` builds) actually persists every
+    /// `provider_retry_attempt` to the events durable log — `events::list`
+    /// then returns one row per retry attempt, which is what the SSE
+    /// stream + `GET /api/v1/sessions/{id}/events` surface to the
+    /// frontend.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn provider_retry_attempt_event_is_persisted() {
+        // Multi-thread runtime so the production notifier closure (which
+        // requires `Send + 'static`) satisfies its bounds, matching the
+        // real `call_codex_with_retry` setup. We don't use `pause` here
+        // because the retry budget is virtualized through the scripted
+        // closure; the only sleep is BACKOFFS[0] = 1s which we ride out.
+        let st = test_app_state().await;
+        let session_id = "s-retry-events-test";
+        let turn_id = "t-retry-events";
+        // Bring the SQLite session row into existence — the events table
+        // FKs onto sessions(id). Use the vault helpers directly so this
+        // test stays free of the SQL.
+        crate::vault::sessions::create(&st.pool, session_id, Some("retry events test"))
+            .await
+            .unwrap();
+
+        // Real production notifier. Same shape as `call_codex_with_retry`
+        // builds: clone the state into the closure, hand it to `AppState::emit`
+        // → `vault::events::insert` → SSE bus.
+        let session_owned = session_id.to_string();
+        let state_clone = st.clone();
+        let notify = move |payload: serde_json::Value| {
+            let state = state_clone.clone();
+            let session = session_owned.clone();
+            Box::pin(async move {
+                state
+                    .emit(&session, events::kind::PROVIDER_RETRY_ATTEMPT, payload)
+                    .await;
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        };
+
+        // Drive retry_call with a fail-once-then-succeed scripted closure
+        // so the production notifier fires exactly once (before the 2nd
+        // attempt). Backoff is the real 1s — we let it sleep.
+        let attempts: Arc<std::sync::atomic::AtomicU32> = Arc::new(0.into());
+        let attempts_for_call = attempts.clone();
+        let result: Result<&'static str> = retry_call(
+            notify,
+            session_id,
+            Some(turn_id),
+            1,
+            move |_req| {
+                let attempts = attempts_for_call.clone();
+                async move {
+                    let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if n == 1 {
+                        Err(anyhow::Error::new(CodexCallError::Http {
+                            status: 503,
+                            body_excerpt: "service unavailable".into(),
+                        }))
+                    } else {
+                        Ok("ok")
+                    }
+                }
+            },
+            stub_req(),
+        )
+        .await;
+        assert_eq!(result.unwrap(), "ok");
+
+        // The durable events log MUST contain exactly one
+        // `provider_retry_attempt` row, with the right payload shape.
+        let rows = crate::vault::events::list(&st.pool, session_id, None, 100)
+            .await
+            .unwrap();
+        let retry_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == events::kind::PROVIDER_RETRY_ATTEMPT)
+            .collect();
+        assert_eq!(
+            retry_rows.len(),
+            1,
+            "expected one provider_retry_attempt row in events; got rows: {:?}",
+            rows.iter().map(|r| &r.kind).collect::<Vec<_>>()
+        );
+        let row = retry_rows[0];
+        // Payload carries the canonical fields, plus the `surface` stamp
+        // that AppState::emit applies for every event.
+        assert_eq!(row.payload["session_id"], session_id);
+        assert_eq!(row.payload["turn_id"], turn_id);
+        assert_eq!(row.payload["attempt"], 2);
+        assert_eq!(row.payload["max_attempts"], MAX_ATTEMPTS);
+        assert_eq!(row.payload["kind"], "codex_http_5xx");
+        // Lifecycle (not canvas) — the frontend renders the retry badge
+        // on the running turn's status pill, not as a canvas card.
+        assert_eq!(row.payload["surface"], "lifecycle");
+    }
+
     /// Verify that `initial_attempts_used > 1` consumes the shared budget:
     /// if the initial-call retry path used 3 attempts to even get a
     /// stream, only `MAX_ATTEMPTS - 3 = 2` mid-stream retries remain.

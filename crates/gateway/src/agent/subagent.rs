@@ -182,7 +182,24 @@ pub async fn spawn(
         content: input.to_string(),
     }];
 
-    let guards = GuardConfig::resolve(&st.config_snapshot());
+    // Start from the main agent's guard set, then layer the subagent's
+    // AGENT.md overrides on top (M3.6 §E). Today only `cost_cap_usd`
+    // is overridable per subagent — see `apply_agent_overrides`.
+    let mut guards = GuardConfig::resolve(&st.config_snapshot());
+    apply_agent_overrides(&mut guards, &agent);
+
+    // M3.6 §F: enforce the AGENT.md allow-list against codex's builtin
+    // web_search tool. The model-facing tool surface above already
+    // filtered our custom tools to `agent.allowed_tools`, but the codex
+    // backend offers `web_search` as a *built-in* tool that lives outside
+    // the leek tool surface — without this override, a `corpus-expert`
+    // subagent with `allowed_tools: [corpus_search, corpus_read]` would
+    // still happily hit `web_search` via the builtin. We pass the
+    // request-level capability flag down so loop_core's ChatRequest
+    // omits the builtin tool. The main agent's setting (st.web_search)
+    // is the ceiling — a subagent never gets a capability the main
+    // agent doesn't have.
+    let web_search = st.web_search && subagent_web_search_allowed(&agent);
 
     let params = LoopParams {
         st,
@@ -200,6 +217,7 @@ pub async fn spawn(
         // its `'turn` loop breaks, and the spawn future is dropped — which
         // drops the subagent's stream and ends its loop cooperatively.
         abort_signal: None,
+        web_search,
     };
 
     // `loop_core::run_loop` may indirectly call `task::run` → `spawn` →
@@ -314,6 +332,51 @@ pub async fn spawn(
         cost_usd: outcome.cost_usd,
         wall_clock_ms: outcome.wall_clock_ms,
         is_error,
+    }
+}
+
+/// M3.6 §F: should this subagent's loop offer codex's builtin
+/// `web_search` tool? Returns `true` when the agent's `allowed_tools`
+/// is empty (full surface) OR when it explicitly names a web-shaped
+/// tool. Returns `false` when the allow-list is set and excludes web,
+/// e.g. `corpus-expert`'s `[corpus_search, corpus_read]`.
+///
+/// Matching is by substring against a small set of known web tool
+/// names — `web_search` and `web_fetch` (leek-side custom). A future
+/// `web_*` tool will need to be added here when it ships. We
+/// deliberately do not try to parse codex's tool catalog here: the
+/// allow-list is the user's contract with the model, and `web_*` is
+/// the convention the loader uses to recognize web-tool intent.
+pub fn subagent_web_search_allowed(agent: &AgentDef) -> bool {
+    // Empty list = full surface — preserve main-agent semantics.
+    if agent.allowed_tools.is_empty() {
+        return true;
+    }
+    // Otherwise: any tool whose name contains "web" counts as "allows
+    // web access". `web_search` (codex builtin) and `web_fetch` (leek
+    // custom) are the two we have today; a `web_pdf_extract` or
+    // similar would also match without an update here.
+    agent
+        .allowed_tools
+        .iter()
+        .any(|t| t.starts_with("web_") || t == "web_search" || t == "web_fetch")
+}
+
+/// M3.6 §E: layer per-subagent overrides from `AgentDef` onto the main
+/// agent's `GuardConfig`. Today only `cost_cap_usd` is overridable — a
+/// deep-dive worker can carry a $5 budget while a quick-screen worker
+/// is locked to $0.20, both independent of the user's main-agent cap.
+/// `0.0` is normalized to "no cap" so the spec's "0 = unlimited"
+/// product idiom (settings, config file) holds end-to-end. `NaN` /
+/// negative are similarly treated as "no cap" — the loader already
+/// drops those, but this function is the last line of defense.
+pub fn apply_agent_overrides(guards: &mut GuardConfig, agent: &AgentDef) {
+    if let Some(cap) = agent.cost_cap_usd {
+        guards.cost_cap_usd = if cap > 0.0 && cap.is_finite() {
+            Some(cap)
+        } else {
+            None
+        };
     }
 }
 
@@ -506,6 +569,109 @@ mod tests {
         assert_eq!(p, "line one line two line three");
     }
 
+    fn mk_agent(name: &str, cost_cap_usd: Option<f64>) -> AgentDef {
+        AgentDef {
+            name: name.into(),
+            description: "desc".into(),
+            allowed_tools: vec![],
+            system_prompt: "body".into(),
+            model: None,
+            cost_cap_usd,
+            source_layer: crate::agents::AgentLayer::Builtin,
+        }
+    }
+
+    fn baseline_guards() -> GuardConfig {
+        // Start from a sentinel cap so the override path is observable.
+        let mut g = GuardConfig::from_env();
+        g.cost_cap_usd = Some(99.0);
+        g
+    }
+
+    #[test]
+    fn agent_override_replaces_main_cost_cap() {
+        // M3.6 §E: AGENT.md `cost_cap_usd: 5.0` must replace whatever
+        // cap the main agent's `GuardConfig` carries — the subagent
+        // gets its own budget, not the user's settings cap.
+        let agent = mk_agent("deep-review", Some(5.0));
+        let mut guards = baseline_guards();
+        apply_agent_overrides(&mut guards, &agent);
+        assert_eq!(guards.cost_cap_usd, Some(5.0));
+    }
+
+    #[test]
+    fn agent_override_zero_disables_cap() {
+        // The product idiom: cost_cap_usd = 0 (or 0.0) means "no cap",
+        // mirroring the user-facing settings file. AGENT.md follows
+        // the same convention end-to-end.
+        let agent = mk_agent("unlimited", Some(0.0));
+        let mut guards = baseline_guards();
+        apply_agent_overrides(&mut guards, &agent);
+        assert_eq!(guards.cost_cap_usd, None);
+    }
+
+    #[test]
+    fn agent_override_absent_keeps_main_cap() {
+        // `cost_cap_usd` not declared in the frontmatter (None) →
+        // subagent inherits whatever the main agent had set.
+        let agent = mk_agent("inherit", None);
+        let mut guards = baseline_guards();
+        apply_agent_overrides(&mut guards, &agent);
+        assert_eq!(guards.cost_cap_usd, Some(99.0), "main cap must survive");
+    }
+
+    #[test]
+    fn web_search_allowed_for_empty_allowlist() {
+        // Empty allow-list = "full surface" semantics. A subagent
+        // declared without `allowed_tools` keeps everything the main
+        // agent has, including codex builtin web_search.
+        let agent = mk_agent("general", None);
+        assert!(super::subagent_web_search_allowed(&agent));
+    }
+
+    #[test]
+    fn web_search_allowed_when_web_tool_listed() {
+        // `web_search` or `web_fetch` in the allow-list opts the
+        // subagent into web access.
+        let mut a = mk_agent("with-search", None);
+        a.allowed_tools = vec!["web_search".into(), "corpus_search".into()];
+        assert!(super::subagent_web_search_allowed(&a));
+
+        let mut b = mk_agent("with-fetch", None);
+        b.allowed_tools = vec!["web_fetch".into()];
+        assert!(super::subagent_web_search_allowed(&b));
+    }
+
+    #[test]
+    fn web_search_blocked_when_allowlist_excludes_web() {
+        // The corpus-expert case: allow-list set, no web tool named.
+        // The builtin must be turned off so codex doesn't quietly
+        // ignore the AGENT.md restriction.
+        let mut agent = mk_agent("corpus-expert", None);
+        agent.allowed_tools = vec!["corpus_search".into(), "corpus_read".into()];
+        assert!(!super::subagent_web_search_allowed(&agent));
+    }
+
+    #[test]
+    fn web_search_allowed_for_future_web_prefix_tool() {
+        // The matcher is `web_*`-prefixed so a future
+        // `web_pdf_extract` etc. doesn't need a code change here.
+        let mut agent = mk_agent("future", None);
+        agent.allowed_tools = vec!["web_pdf_extract".into()];
+        assert!(super::subagent_web_search_allowed(&agent));
+    }
+
+    #[test]
+    fn agent_override_negative_falls_back_to_no_cap() {
+        // Defensive: the loader already strips bad values, but if a
+        // future path constructs an AgentDef in code with a negative
+        // cap, treat it as "no cap" rather than honoring the bug.
+        let agent = mk_agent("negative", Some(-3.0));
+        let mut guards = baseline_guards();
+        apply_agent_overrides(&mut guards, &agent);
+        assert_eq!(guards.cost_cap_usd, None);
+    }
+
     #[test]
     fn resolve_returns_loaded_agent() {
         let mut m = std::collections::HashMap::new();
@@ -517,6 +683,7 @@ mod tests {
                 allowed_tools: vec![],
                 system_prompt: "body".into(),
                 model: None,
+                cost_cap_usd: None,
                 source_layer: crate::agents::AgentLayer::Builtin,
             },
         );
@@ -536,6 +703,7 @@ mod tests {
                 allowed_tools: vec![],
                 system_prompt: "body".into(),
                 model: None,
+                cost_cap_usd: None,
                 source_layer: crate::agents::AgentLayer::Builtin,
             },
         );

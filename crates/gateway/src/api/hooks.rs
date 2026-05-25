@@ -14,7 +14,10 @@ use super::{ApiResult, AppState};
 /// Shape the engine's `HookSet` into a JSON object the frontend can
 /// render in Settings.
 pub async fn list(State(st): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
-    let set = st.hooks.set();
+    // Snapshot under the engine's internal lock — the registered hooks
+    // can change at any moment when the settings PATCH endpoint hot-
+    // reloads them (M3.6 §D); this read is independent.
+    let set = st.hooks.snapshot();
     let mut events = Vec::new();
     for (event, matchers) in &set.by_event {
         let mut entries = Vec::new();

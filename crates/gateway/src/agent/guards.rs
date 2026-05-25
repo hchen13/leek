@@ -6,12 +6,16 @@
 //!
 //! | guard                  | default        | rationale                                                            |
 //! |------------------------|----------------|----------------------------------------------------------------------|
-//! | `idle_timeout`         | 90 s, on       | mirrors claude-code `CLAUDE_STREAM_IDLE_TIMEOUT_MS=90000`             |
+//! | `idle_timeout`         | 180 s, on      | M3.6: doubled from 90s — xhigh reasoning + 20+ tool turns regularly  |
+//! |                        |                | go silent past 90s in the wild; T31b deep-dive prompts fataled.      |
 //! | `wall_clock`           | 30 min, on     | claude-code removed a 5-min version as a bug; this is an edge ceiling |
 //! | `max_iterations`       | none, opt-in   | codex / claude-code do not enforce one                               |
 //! | `cost_cap_usd`         | none, opt-in   | codex does not track cost                                            |
 //! | `doom_loop_threshold`  | 3, on          | leek-original; nobody else has it                                    |
 //! | `auto_compact_threshold` | 0.90, on     | mirrors codex's `(context_window * 9) / 10`                          |
+//! | `builtin_url_warn_threshold`  | 3, on   | warn at 3 repeats of the same `(action, url)` from codex builtin     |
+//! | `builtin_url_abort_threshold` | 0, off  | M3.6: disabled by default — the main agent reading the same PDF 7    |
+//! |                        |                | times under a long deep-dive is legitimate; abort killed real work.   |
 //!
 //! Resolution order (M2.6): `env var > config file > built-in default`. The
 //! env var stays first so existing CI keeps working and an operator can
@@ -49,8 +53,10 @@ pub struct GuardConfig {
     /// (absolute count). When the same `(action_type, url)` is observed
     /// this many times the loop aborts the current iter with
     /// `stop_reason = "codex_duplicate_abort"`. `0` disables abort (the
-    /// loop will keep warning indefinitely). Default 7. Env override:
-    /// `LEEK_BUILTIN_URL_ABORT_THRESHOLD`.
+    /// loop will keep warning indefinitely). **M3.6 default: 0 (off)** —
+    /// the prior 7-repeat ceiling killed long deep-dive prompts that
+    /// legitimately re-opened the same authoritative source under
+    /// different angles. Env override: `LEEK_BUILTIN_URL_ABORT_THRESHOLD`.
     pub builtin_url_abort_threshold: u32,
 }
 
@@ -64,7 +70,13 @@ impl GuardConfig {
             idle_timeout: duration_layered(
                 "LEEK_IDLE_TIMEOUT_SECS",
                 config.idle_timeout_secs,
-                90,
+                // M3.6: 180s. xhigh reasoning + 20+ tool turns regularly
+                // exceed 90s of silence between SSE chunks; the prior 90s
+                // default kept fataling long deep-dive prompts (T31b PM
+                // critical). 180s gives the model enough rope to finish a
+                // long tool batch without giving up on a genuinely stuck
+                // stream.
+                180,
             ),
             wall_clock: duration_layered(
                 "LEEK_WALL_CLOCK_SECS",
@@ -88,7 +100,12 @@ impl GuardConfig {
             builtin_url_abort_threshold: u32_layered(
                 "LEEK_BUILTIN_URL_ABORT_THRESHOLD",
                 config.builtin_url_abort_threshold,
-                7,
+                // M3.6: 0 (disabled). The prior 7-repeat abort killed
+                // legitimate deep-dive turns where the agent re-opened the
+                // same authoritative source under different angles. The
+                // warn surface (default 3) stays on, so duplicates remain
+                // visible without taking the user's answer hostage.
+                0,
             ),
         }
     }
@@ -391,7 +408,9 @@ mod tests {
 
         let cfg = Config::default();
         let g = GuardConfig::resolve(&cfg);
-        assert_eq!(g.idle_timeout, Some(Duration::from_secs(90)));
+        // M3.6: 180s built-in default (doubled from 90s for xhigh
+        // reasoning + long-tool-batch turns; see resolve() comment).
+        assert_eq!(g.idle_timeout, Some(Duration::from_secs(180)));
         assert_eq!(g.cost_cap_usd, None);
         assert!((g.auto_compact_threshold - 0.90).abs() < 1e-6);
     }
@@ -450,7 +469,9 @@ mod tests {
 
         let g = GuardConfig::resolve(&Config::default());
         assert_eq!(g.builtin_url_warn_threshold, 3);
-        assert_eq!(g.builtin_url_abort_threshold, 7);
+        // M3.6: abort disabled by default (was 7) — warn still on so
+        // duplicates are visible; abort no longer kills deep-dive turns.
+        assert_eq!(g.builtin_url_abort_threshold, 0);
     }
 
     #[test]

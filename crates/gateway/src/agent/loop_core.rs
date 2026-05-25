@@ -79,6 +79,17 @@ pub struct LoopParams<'a> {
     /// abort on the *turn*, not on a particular subagent, and the abort
     /// drops the parent loop which in turn drops the subagent task.
     pub abort_signal: Option<Arc<Notify>>,
+    /// M3.6 §F: whether to offer the codex-builtin `web_search` tool on
+    /// this loop's `ChatRequest`. Main agent: caller passes
+    /// `st.web_search` (env-resolved at startup). Subagent: caller
+    /// computes from the agent's `allowed_tools` — if the AGENT.md
+    /// allow-list does not name a web tool (`web_search` / `web_fetch`),
+    /// the wrapper passes `false` to enforce the restriction end-to-end.
+    /// Pre-M3.6 the loop read `p.st.web_search` directly and silently
+    /// gave every subagent the same web-search capability as the main
+    /// agent, defeating AGENT.md allow-lists like `corpus-expert`'s
+    /// `[corpus_search, corpus_read]`.
+    pub web_search: bool,
 }
 
 /// Which tools the inner loop is willing to dispatch. Constructed once
@@ -348,7 +359,8 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
             additional_inputs: iter_inputs,
             reasoning_effort: Some(super::REASONING_EFFORT.to_string()),
             verbosity: Some(super::VERBOSITY.to_string()),
-            web_search: p.st.web_search,
+            // M3.6 §F: loop-level override — see LoopParams.web_search.
+            web_search: p.web_search,
             session_id: p.session_id.to_string(),
             turn_id: p.turn_id.to_string(),
             iteration: transcript_iter,

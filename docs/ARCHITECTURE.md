@@ -252,15 +252,18 @@ corpus-expert，主 agent 再据此 `update_plan`。
 `rebuild` 分支落地的 M1 工作为实现提供参考，但在 rebuild-clean
 更干净的底盘上重做一遍。
 
-| 原语                | 默认值                  | 作用域           | 备注                                                                                  |
-|---------------------|-------------------------|-------------------|---------------------------------------------------------------------------------------|
-| Idle timeout        | 90 秒，默认开           | per-stream        | 对齐 CC 的 `CLAUDE_STREAM_IDLE_TIMEOUT_MS=90000`。主要的响应性保护。                  |
-| Wall-clock 上限     | 30 分钟，默认开         | per-turn          | 硬取消。剩 10/5/2/1 分钟时插软提示（leek 自创）。                                     |
-| Iteration cap       | None，opt-in            | per-turn          | codex / CC 都不强制。给高级用户用；默认不开。                                         |
-| Cost cap            | None，opt-in            | per-turn          | 用 per-model 价格表算的美元上限。                                                     |
-| Doom-loop detector  | N=3，默认开             | per-turn          | 同样的 `(tool_name, args)` 连续 ≥ N 次 → 中止。                                       |
-| Auto-compaction     | 90%，默认开             | per-turn/session  | 到阈值时摘要压缩旧上下文并继续。这是上下文接近上限时的唯一设计行为；不做停 turn 的护栏。 |
-| Per-turn metrics    | 默认开                  | per-turn          | 每个 turn 一行：stop_reason、tokens、cost、first_triggered_guard、iteration。         |
+| 原语                       | 默认值                  | 作用域           | 备注                                                                                  |
+|----------------------------|-------------------------|-------------------|---------------------------------------------------------------------------------------|
+| Idle timeout               | **180 秒，默认开** (M3.6) | per-stream        | 原 90 秒（对齐 CC `CLAUDE_STREAM_IDLE_TIMEOUT_MS=90000`），但 xhigh reasoning + 20+ tool turn 经常超 90s silence 把长 prompt 强 fatal。M3.6 加倍到 180s。 |
+| Wall-clock 上限            | 30 分钟，默认开         | per-turn          | 硬取消。剩 10/5/2/1 分钟时插软提示（leek 自创）。                                     |
+| Iteration cap              | None，opt-in            | per-turn          | codex / CC 都不强制。给高级用户用；默认不开。                                         |
+| Cost cap                   | None，opt-in            | per-turn          | 用 per-model 价格表算的美元上限。**M3.6: subagent 可在 AGENT.md frontmatter `cost_cap_usd` 字段独立覆盖**——只对该 subagent loop 生效。 |
+| Doom-loop detector         | N=3，默认开             | per-turn          | 同样的 `(tool_name, args)` 连续 ≥ N 次 → 中止。                                       |
+| Auto-compaction            | 90%，默认开             | per-turn/session  | 到阈值时摘要压缩旧上下文并继续。这是上下文接近上限时的唯一设计行为；不做停 turn 的护栏。 |
+| Codex builtin URL warn     | N=3，默认开             | per-turn          | 同一 `(action, url)` ≥ N 次 → canvas warn + next-iter hint。                          |
+| Codex builtin URL abort    | **0，默认关闭** (M3.6)  | per-turn          | 原 N=7 自动 abort，但 deep-dive 多角度重读权威源是合法行为，强杀让用户拿不到答案。M3.6 默认关掉，只 warn；用户仍可 PATCH `builtin_url_abort_threshold` 重新启用。 |
+| Provider retry             | 5 次（1 + 4 retry），默认开 | per-codex-call   | M3.5：1s/5s/15s/30s 指数 backoff，5xx / connection_failed / 流中 timeout 自动重试，每次 retry 前 emit `provider_retry_attempt` lifecycle event。 |
+| Per-turn metrics           | 默认开                  | per-turn          | 每个 turn 一行：stop_reason、tokens、cost、first_triggered_guard、iteration。         |
 
 Subagent 的 loop **全部**复用这些。一个挂掉的 subagent 不能污染
 父级 UX——保护是统一的。

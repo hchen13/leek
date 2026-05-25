@@ -165,8 +165,11 @@ impl Config {
     }
 
     /// Merge a partial document onto this one — every `Some` in `patch`
-    /// overwrites the corresponding field, `None` leaves it alone. This is
-    /// the operation behind `PATCH /api/v1/settings`.
+    /// overwrites the corresponding field, `None` leaves it alone. Kept
+    /// for compatibility with internal call sites and the test suite; the
+    /// public settings PATCH endpoint uses [`Config::merge_patch`] so
+    /// `"field": null` clears the field instead of silently noop'ing.
+    #[allow(dead_code)]
     pub fn merge(&mut self, patch: Config) {
         if patch.idle_timeout_secs.is_some() {
             self.idle_timeout_secs = patch.idle_timeout_secs;
@@ -197,6 +200,51 @@ impl Config {
         }
         if patch.builtin_url_abort_threshold.is_some() {
             self.builtin_url_abort_threshold = patch.builtin_url_abort_threshold;
+        }
+    }
+
+    /// M3.6: PATCH-style merge that distinguishes **absent** field
+    /// (JSON does not mention it → noop) from **explicit null** (JSON
+    /// `"field": null` → clear the field, falling back to the resolver's
+    /// built-in default). The body of `PATCH /api/v1/settings` deserializes
+    /// into `ConfigPatch` via `double_option`, so the handler can call
+    /// this without losing the distinction.
+    ///
+    /// Pre-M3.6 the settings API used [`Config::merge`], which treated
+    /// `None` as "leave alone" and gave the user no way to clear a stored
+    /// value: PATCH `{"cost_cap_usd": null}` was a silent no-op. The
+    /// frontend's "Reset to default" button needs the clear semantics to
+    /// roll back a fresh-install user's whole stored doc to defaults.
+    pub fn merge_patch(&mut self, patch: ConfigPatch) {
+        if let Some(v) = patch.idle_timeout_secs {
+            self.idle_timeout_secs = v;
+        }
+        if let Some(v) = patch.wall_clock_secs {
+            self.wall_clock_secs = v;
+        }
+        if let Some(v) = patch.max_iterations {
+            self.max_iterations = v;
+        }
+        if let Some(v) = patch.cost_cap_usd {
+            self.cost_cap_usd = v;
+        }
+        if let Some(v) = patch.doom_loop_threshold {
+            self.doom_loop_threshold = v;
+        }
+        if let Some(v) = patch.auto_compact_threshold {
+            self.auto_compact_threshold = v;
+        }
+        if let Some(v) = patch.context_window {
+            self.context_window = v;
+        }
+        if let Some(v) = patch.tushare_token {
+            self.tushare_token = v;
+        }
+        if let Some(v) = patch.builtin_url_warn_threshold {
+            self.builtin_url_warn_threshold = v;
+        }
+        if let Some(v) = patch.builtin_url_abort_threshold {
+            self.builtin_url_abort_threshold = v;
         }
     }
 
@@ -267,6 +315,111 @@ impl ConfigFieldError {
     }
 }
 
+/// M3.6 PATCH-shape twin of [`Config`]. Every field is `Option<Option<T>>`
+/// using `double_option` so the deserializer can tell apart three states:
+///
+/// | JSON                            | Rust                  | merge effect      |
+/// |---------------------------------|-----------------------|-------------------|
+/// | field absent                    | `None`                | leave alone       |
+/// | `"field": null`                 | `Some(None)`          | **clear** field    |
+/// | `"field": <value>`              | `Some(Some(v))`       | set to `v`        |
+///
+/// `deny_unknown_fields` mirrors `Config` so a misspelled field 400s
+/// instead of silently going through.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConfigPatch {
+    #[serde(deserialize_with = "double_option", default)]
+    pub idle_timeout_secs: Option<Option<u64>>,
+    #[serde(deserialize_with = "double_option", default)]
+    pub wall_clock_secs: Option<Option<u64>>,
+    #[serde(deserialize_with = "double_option", default)]
+    pub max_iterations: Option<Option<usize>>,
+    #[serde(deserialize_with = "double_option", default)]
+    pub cost_cap_usd: Option<Option<f64>>,
+    #[serde(deserialize_with = "double_option", default)]
+    pub doom_loop_threshold: Option<Option<usize>>,
+    #[serde(deserialize_with = "double_option", default)]
+    pub auto_compact_threshold: Option<Option<f32>>,
+    #[serde(deserialize_with = "double_option", default)]
+    pub context_window: Option<Option<i64>>,
+    #[serde(deserialize_with = "double_option", default)]
+    pub tushare_token: Option<Option<String>>,
+    #[serde(deserialize_with = "double_option", default)]
+    pub builtin_url_warn_threshold: Option<Option<u32>>,
+    #[serde(deserialize_with = "double_option", default)]
+    pub builtin_url_abort_threshold: Option<Option<u32>>,
+}
+
+impl ConfigPatch {
+    /// Same numeric-range checks as [`Config::validate`], but only for
+    /// fields explicitly set to a value (`Some(Some(_))`). A field
+    /// cleared by explicit null (`Some(None)`) skips validation — clearing
+    /// a stored field cannot be "invalid". Absent fields obviously skip.
+    pub fn validate(&self) -> Result<(), Vec<ConfigFieldError>> {
+        let mut errs = Vec::new();
+        if let Some(Some(cap)) = self.cost_cap_usd {
+            if !cap.is_finite() || cap < 0.0 {
+                errs.push(ConfigFieldError::new(
+                    "cost_cap_usd",
+                    "must be a non-negative number (0 disables the cap)",
+                ));
+            }
+        }
+        if let Some(Some(n)) = self.max_iterations {
+            if n == 0 {
+                errs.push(ConfigFieldError::new(
+                    "max_iterations",
+                    "must be ≥ 1 (omit the field to disable the cap)",
+                ));
+            }
+        }
+        if let Some(Some(n)) = self.doom_loop_threshold {
+            if n < 2 {
+                errs.push(ConfigFieldError::new(
+                    "doom_loop_threshold",
+                    "must be ≥ 2",
+                ));
+            }
+        }
+        if let Some(Some(t)) = self.auto_compact_threshold {
+            if !t.is_finite() || t <= 0.0 || t > 1.0 {
+                errs.push(ConfigFieldError::new(
+                    "auto_compact_threshold",
+                    "must be in (0.0, 1.0]",
+                ));
+            }
+        }
+        if let Some(Some(n)) = self.context_window {
+            if n <= 0 {
+                errs.push(ConfigFieldError::new(
+                    "context_window",
+                    "must be ≥ 1 (omit the field to use the model default)",
+                ));
+            }
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(errs)
+        }
+    }
+}
+
+/// serde shim — make `T` deserialize into `Option<Option<T>>` such that
+/// a missing key stays `None`, an explicit `null` becomes `Some(None)`,
+/// and any other value becomes `Some(Some(v))`. This is the standard
+/// "JSON Merge Patch" workaround for distinguishing absent / null /
+/// present in serde-json (which otherwise collapses absent and null
+/// into the same `None`).
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
 /// `$HOME` resolution that works on every platform we ship for without
 /// pulling in `dirs` — std doesn't expose a stable home_dir, but the env
 /// vars below are conventional and available everywhere we run.
@@ -289,6 +442,15 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialize every test that touches `LEEK_CONFIG_DIR` (a process-global
+    /// env var). Without this, two `scoped()` calls on different threads
+    /// race: thread A sets the dir, thread B overwrites it, A's `cfg.save()`
+    /// then writes to B's path and B's `cfg.load()` reads the wrong file.
+    /// (Pre-M3.6 the suite was flaky for exactly this reason; M3.6 makes it
+    /// deterministic by enforcing serial execution at the scoping helper.)
+    static CONFIG_DIR_LOCK: Mutex<()> = Mutex::new(());
 
     /// Point `Config::path()` at a uuid-named scratch dir for the lifetime
     /// of one test. Returns the dir + a guard that restores the previous
@@ -296,6 +458,10 @@ mod tests {
     struct ScopedConfigDir {
         _dir: tempdir::TempDir,
         prev: Option<String>,
+        // The lock outlives the env-var manipulation: while we hold it,
+        // no other config test can see (or overwrite) our LEEK_CONFIG_DIR.
+        // `Option` so Drop can take ownership without `Default::default()`.
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
     impl Drop for ScopedConfigDir {
         fn drop(&mut self) {
@@ -303,6 +469,7 @@ mod tests {
                 Some(v) => std::env::set_var("LEEK_CONFIG_DIR", v),
                 None => std::env::remove_var("LEEK_CONFIG_DIR"),
             }
+            // _lock drops here, releasing the mutex.
         }
     }
 
@@ -335,10 +502,16 @@ mod tests {
     }
 
     fn scoped() -> ScopedConfigDir {
+        // Acquire the shared lock FIRST; the env-var manipulation below
+        // must happen with no other config test in flight. If a previous
+        // test panicked the lock would be poisoned — recover by extracting
+        // the guard, since the env var is the only shared state we care
+        // about and we restore it on drop.
+        let lock = CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempdir::TempDir::new("leek-config-test").unwrap();
         let prev = std::env::var("LEEK_CONFIG_DIR").ok();
         std::env::set_var("LEEK_CONFIG_DIR", dir.path());
-        ScopedConfigDir { _dir: dir, prev }
+        ScopedConfigDir { _dir: dir, prev, _lock: lock }
     }
 
     #[test]
@@ -446,6 +619,103 @@ mod tests {
         assert!(fields.contains(&"auto_compact_threshold"));
         assert!(fields.contains(&"max_iterations"));
         assert!(fields.contains(&"context_window"));
+    }
+
+    // ── M3.6: ConfigPatch null=clear ──────────────────────────────────
+
+    #[test]
+    fn patch_absent_field_is_noop() {
+        let patch: ConfigPatch = serde_json::from_str("{}").unwrap();
+        assert_eq!(patch.cost_cap_usd, None);
+
+        let mut base = Config { cost_cap_usd: Some(2.0), ..Config::default() };
+        base.merge_patch(patch);
+        // Absent → leave alone.
+        assert_eq!(base.cost_cap_usd, Some(2.0));
+    }
+
+    #[test]
+    fn patch_explicit_null_clears_field() {
+        // The whole reason ConfigPatch exists — the previous Config::merge
+        // collapsed absent and null and dropped the user's "clear this"
+        // intent on the floor.
+        let patch: ConfigPatch =
+            serde_json::from_str(r#"{"cost_cap_usd": null}"#).unwrap();
+        assert_eq!(patch.cost_cap_usd, Some(None));
+
+        let mut base = Config { cost_cap_usd: Some(2.0), ..Config::default() };
+        base.merge_patch(patch);
+        // Explicit null → cleared back to None.
+        assert_eq!(base.cost_cap_usd, None);
+    }
+
+    #[test]
+    fn patch_value_sets_field() {
+        let patch: ConfigPatch =
+            serde_json::from_str(r#"{"cost_cap_usd": 1.5}"#).unwrap();
+        assert_eq!(patch.cost_cap_usd, Some(Some(1.5)));
+
+        let mut base = Config::default();
+        base.merge_patch(patch);
+        assert_eq!(base.cost_cap_usd, Some(1.5));
+    }
+
+    #[test]
+    fn patch_clears_multiple_fields_at_once() {
+        // The "Reset to default" path: send `null` for every field.
+        let patch: ConfigPatch = serde_json::from_str(
+            r#"{
+                "cost_cap_usd": null,
+                "idle_timeout_secs": null,
+                "builtin_url_abort_threshold": null
+            }"#,
+        )
+        .unwrap();
+
+        let mut base = Config {
+            cost_cap_usd: Some(2.0),
+            idle_timeout_secs: Some(45),
+            builtin_url_abort_threshold: Some(15),
+            // Untouched fields stay put.
+            wall_clock_secs: Some(60),
+            ..Config::default()
+        };
+        base.merge_patch(patch);
+        assert_eq!(base.cost_cap_usd, None);
+        assert_eq!(base.idle_timeout_secs, None);
+        assert_eq!(base.builtin_url_abort_threshold, None);
+        // Field not in the patch is left alone.
+        assert_eq!(base.wall_clock_secs, Some(60));
+    }
+
+    #[test]
+    fn patch_unknown_field_rejected_at_parse() {
+        let res: Result<ConfigPatch, _> =
+            serde_json::from_str(r#"{"max_cost_usd_per_turn": 1.0}"#);
+        // deny_unknown_fields on ConfigPatch must fire — otherwise a
+        // typo'd field would silently noop and confuse the user.
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn patch_validate_rejects_negative_cost_cap() {
+        let patch: ConfigPatch =
+            serde_json::from_str(r#"{"cost_cap_usd": -1.0}"#).unwrap();
+        let errs = patch.validate().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "cost_cap_usd");
+    }
+
+    #[test]
+    fn patch_validate_accepts_explicit_null() {
+        // Clearing a field via explicit null is always valid — it sends
+        // the resolver back to its built-in default, which is by
+        // construction in range.
+        let patch: ConfigPatch = serde_json::from_str(
+            r#"{"cost_cap_usd": null, "max_iterations": null}"#,
+        )
+        .unwrap();
+        assert!(patch.validate().is_ok());
     }
 
     #[test]

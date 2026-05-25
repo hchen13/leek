@@ -47,6 +47,14 @@ pub struct AgentDef {
     /// CC's `subagents.<name>.model` field but the subagent loop ignores
     /// it (the model is still the constant in `agent::mod`).
     pub model: Option<String>,
+    /// M3.6 §E: optional per-subagent USD cost cap. Read from the
+    /// `cost_cap_usd` frontmatter field. When set, the subagent loop's
+    /// `GuardConfig.cost_cap_usd` is overridden to this value for that
+    /// loop only — the main agent's cap (settings-driven) is untouched.
+    /// `0.0` is normalized to "no cap" (mirrors the user-facing settings
+    /// idiom from `crate::config`). `None` = no per-subagent override
+    /// → inherit the main agent's cap.
+    pub cost_cap_usd: Option<f64>,
     /// Discovery layer this agent was loaded from.
     pub source_layer: AgentLayer,
 }
@@ -104,6 +112,7 @@ mod tests {
             allowed_tools: vec![],
             system_prompt: "system prompt".into(),
             model: None,
+            cost_cap_usd: None,
             source_layer: layer,
         }
     }

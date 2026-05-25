@@ -178,6 +178,7 @@ mod tests {
                 allowed_tools: vec![],
                 system_prompt: "body".into(),
                 model: None,
+                cost_cap_usd: None,
                 source_layer: AgentLayer::Builtin,
             },
         );

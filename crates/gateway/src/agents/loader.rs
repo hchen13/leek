@@ -153,6 +153,28 @@ fn load_one(dir: &Path, agent_md: &Path, layer: AgentLayer) -> Result<AgentDef, 
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    // M3.6 §E: per-subagent cost cap (USD per loop). A bad value warns
+    // and falls through to `None` (= inherit the main agent's cap) so
+    // one bad frontmatter line doesn't take the subagent out of
+    // service. `0` is preserved (the resolver treats it as "no cap").
+    let cost_cap_usd = frontmatter.get("cost_cap_usd").and_then(|raw| {
+        let s = raw.trim();
+        if s.is_empty() {
+            return None;
+        }
+        match s.parse::<f64>() {
+            Ok(v) if v.is_finite() && v >= 0.0 => Some(v),
+            _ => {
+                tracing::warn!(
+                    path = %agent_md.display(),
+                    value = s,
+                    "AGENT.md cost_cap_usd is not a non-negative finite number — ignoring"
+                );
+                None
+            }
+        }
+    });
+
     let system_prompt = body.trim().to_string();
     if system_prompt.is_empty() {
         return Err(AgentLoadError {
@@ -167,6 +189,7 @@ fn load_one(dir: &Path, agent_md: &Path, layer: AgentLayer) -> Result<AgentDef, 
         allowed_tools,
         system_prompt: system_prompt.into(),
         model,
+        cost_cap_usd,
         source_layer: layer,
     })
 }
@@ -358,6 +381,75 @@ mod tests {
         let (reg, errs) = load_layered(&[(root.as_path(), AgentLayer::Builtin)]);
         assert!(reg.is_empty());
         assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn cost_cap_usd_frontmatter_loads() {
+        // M3.6 §E: AGENT.md may carry an optional `cost_cap_usd` field
+        // (USD per loop). Loader parses it into `AgentDef.cost_cap_usd`;
+        // an absent field stays None (= inherit the main agent's cap).
+        let root = temp_root("cost-cap");
+        write_agent(
+            &root,
+            "capped",
+            "---\ndescription: capped agent\ncost_cap_usd: 0.50\n---\nbody",
+        );
+        write_agent(&root, "uncapped", "---\ndescription: no cap\n---\nbody");
+        let (reg, errs) = load_layered(&[(root.as_path(), AgentLayer::Builtin)]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(reg.get("capped").unwrap().cost_cap_usd, Some(0.50));
+        assert_eq!(reg.get("uncapped").unwrap().cost_cap_usd, None);
+    }
+
+    #[test]
+    fn cost_cap_usd_invalid_value_falls_through_to_none() {
+        // Bad value warns + ignores — one typo must not take the
+        // subagent out of service.
+        let root = temp_root("cost-cap-bad");
+        write_agent(
+            &root,
+            "bad",
+            "---\ndescription: bad cost cap\ncost_cap_usd: not-a-number\n---\nbody",
+        );
+        write_agent(
+            &root,
+            "neg",
+            "---\ndescription: negative cap\ncost_cap_usd: -1.0\n---\nbody",
+        );
+        let (reg, errs) = load_layered(&[(root.as_path(), AgentLayer::Builtin)]);
+        // The agent still loads — only `cost_cap_usd` is dropped.
+        assert!(errs.is_empty(), "agent should still load: {errs:?}");
+        assert_eq!(reg.get("bad").unwrap().cost_cap_usd, None);
+        assert_eq!(reg.get("neg").unwrap().cost_cap_usd, None);
+    }
+
+    #[test]
+    fn shipped_builtin_agents_have_cost_caps() {
+        // M3.6 §E ships per-subagent caps on every built-in worker so
+        // a default-config user can rely on quick-screen never running
+        // away into a multi-dollar tab. The values are spec-fixed
+        // (dispatch §E): if any of them drift, both spec + this test
+        // need an update.
+        let dir = builtin_agents_dir();
+        if !dir.exists() {
+            return;
+        }
+        let (reg, _errs) = load_layered(&[(dir.as_path(), AgentLayer::Builtin)]);
+        let expect: &[(&str, f64)] = &[
+            ("quick-screen", 0.20),
+            ("deep-review", 5.00),
+            ("comparison", 3.00),
+            ("general-purpose", 2.00),
+            ("corpus-expert", 1.50),
+        ];
+        for (name, cap) in expect {
+            let got = reg.get(name).and_then(|a| a.cost_cap_usd);
+            assert_eq!(
+                got,
+                Some(*cap),
+                "built-in {name} should carry cost_cap_usd = {cap}",
+            );
+        }
     }
 
     #[test]
