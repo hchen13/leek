@@ -31,6 +31,12 @@ use std::collections::{HashMap, HashSet};
 /// 每 turn 创建一个, lifetime 跟着 turn 走. observe() 每个
 /// `search_lifecycle` completion event 调一次; drain_for_inject() 在 iter
 /// 结束、下个 iter 拼 input 之前调一次.
+///
+/// M3.5: 增加 `is_subagent` 标志. subagent loop (e.g. deep-review) 反复
+/// open 同一 PDF 多 chunks 是正常深度调研行为, **不应**被 codex_duplicate_abort
+/// 强杀. 当 `is_subagent == true` 且 abort 阈值跨过时, observe() 把 Abort
+/// 降级成 Warn (caller 应 emit 一条 warning event 提示 user 看见, 但不打断
+/// stream / loop). 主 agent (`is_subagent == false`) 行为不变.
 #[derive(Debug)]
 pub struct BuiltinTracker {
     /// `(action_type, url)` → 累计计数.
@@ -38,13 +44,18 @@ pub struct BuiltinTracker {
     /// 已 emit 过 Warn 信号的 key (clear 在每次 drain_for_inject 之后, 这样下
     /// 个 iter 若同 URL 再触发还能再次 inject).
     warned: HashSet<(String, String)>,
-    /// 已 abort 过的标记, 防多次触发(同 turn 内 abort 只发生一次).
+    /// 已 abort 过的标记, 防多次触发(同 turn 内 abort 只发生一次). subagent
+    /// 模式下从不进入 `Abort` 状态, 这个字段恒为 false (Warn 触发不算 abort).
     aborted: bool,
     /// 跨过该阈值 → emit Warn (≥ 阈值时触发, 仅一次/per drain cycle).
     /// `0` = 关闭 warn.
     warn_threshold: u32,
     /// 跨过该阈值 → emit Abort. `0` = 关闭 abort.
     abort_threshold: u32,
+    /// M3.5 subagent 旁路: true → abort 信号降级为 warn (loop 继续跑).
+    /// 这个 flag 是 spec §D 的实现选项 1 — 在 BuiltinTracker 层硬编码,
+    /// caller 端无需做特殊处理(只要照常 emit 收到的 signal).
+    is_subagent: bool,
 }
 
 /// Tracker observe() 的返回值: 告诉 caller 要 emit 什么动作.
@@ -69,13 +80,26 @@ pub enum TrackerSignal {
 
 impl BuiltinTracker {
     /// `warn` / `abort` 是 absolute counts (≥ 阈值即触发). `0` 关闭对应判定.
+    /// 主 agent 调用; subagent 用 [`Self::new_subagent`] 创建以降级 abort.
     pub fn new(warn: u32, abort: u32) -> Self {
+        Self::new_inner(warn, abort, false)
+    }
+
+    /// M3.5 subagent 版本: 阈值定义同 `new`, 但 abort 信号在 observe()
+    /// 内部被降级为 Warn (loop 继续跑). 解决 T31 deep-review subagent
+    /// 反复 read 同一 PDF chunks 被误杀的 bug. 用于 subagent.rs::spawn().
+    pub fn new_subagent(warn: u32, abort: u32) -> Self {
+        Self::new_inner(warn, abort, true)
+    }
+
+    fn new_inner(warn: u32, abort: u32, is_subagent: bool) -> Self {
         Self {
             url_counts: HashMap::new(),
             warned: HashSet::new(),
             aborted: false,
             warn_threshold: warn,
             abort_threshold: abort,
+            is_subagent,
         }
     }
 
@@ -101,7 +125,25 @@ impl BuiltinTracker {
         let count = *entry;
 
         // Abort 优先: 同一 observe 只返一个 signal, abort 覆盖 warn.
+        // M3.5: subagent 模式下把 abort 降级成 warn — deep-review 反复
+        // 读同一 PDF chunks 是正常深度调研, 不应被强杀. 主 agent 行为不变.
         if self.abort_threshold > 0 && count >= self.abort_threshold {
+            if self.is_subagent {
+                // 降级: 只 emit Warn 一次 (与正常 warn 一样在 warned 集合
+                // 里登记), 但携带 abort_threshold 让 caller 知道这是个
+                // "本来要 abort 但因为是 subagent 给放行" 的边界状态. 不
+                // 改 self.aborted (保持 false) — subagent 可以继续 observe.
+                if !self.warned.contains(&key) {
+                    self.warned.insert(key.clone());
+                    return Some(TrackerSignal::Warn {
+                        action_type: key.0,
+                        url: key.1,
+                        count,
+                    });
+                }
+                // 之前已 Warn 过, 这次不再 Warn (一直到 drain_for_inject).
+                return None;
+            }
             self.aborted = true;
             return Some(TrackerSignal::Abort {
                 action_type: key.0,
@@ -349,5 +391,95 @@ mod tests {
         // 下个 iter 同 URL 再 open 一次 — count → 3, 应该 Warn.
         let sig = t.observe("open_page", "https://a.com/x");
         assert!(matches!(sig, Some(TrackerSignal::Warn { count: 3, .. })));
+    }
+
+    // ─── M3.5 subagent abort-downgrade tests ──────────────────────────────
+
+    #[test]
+    fn subagent_abort_threshold_downgrades_to_warn() {
+        // T31 fix: a subagent that hits the abort threshold gets a Warn
+        // signal back instead of Abort, and `aborted()` stays false (the
+        // caller's stream/loop continues). Spec §D.
+        let mut t = BuiltinTracker::new_subagent(2, 3);
+        // First observe — under both thresholds → None.
+        assert!(t.observe("open_page", "https://a.com/x.pdf").is_none());
+        // Second observe — at warn threshold → Warn (count=2).
+        let sig = t.observe("open_page", "https://a.com/x.pdf").unwrap();
+        assert!(matches!(sig, TrackerSignal::Warn { count: 2, .. }));
+        // Third observe — at abort threshold, BUT subagent → downgrade.
+        // The warn key was already warned this iter so this observe is
+        // silent (the warn-dedupe is shared with the abort-downgrade
+        // path, since it's all routed through `warned` now).
+        let sig = t.observe("open_page", "https://a.com/x.pdf");
+        assert!(sig.is_none(), "second warn this iter is deduped: {sig:?}");
+        assert!(!t.aborted(), "subagent must not enter aborted state");
+        // Further observes also stay silent until drain.
+        let sig = t.observe("open_page", "https://a.com/x.pdf");
+        assert!(sig.is_none());
+        assert!(!t.aborted());
+
+        // After drain, the URL is no longer warned — next observe of the
+        // same URL crosses abort threshold *fresh* and emits Warn again.
+        let _ = t.drain_for_inject();
+        let sig = t.observe("open_page", "https://a.com/x.pdf").unwrap();
+        // count is now 5, well above abort threshold (3). Downgraded.
+        assert!(matches!(sig, TrackerSignal::Warn { count: 5, .. }));
+        assert!(!t.aborted());
+    }
+
+    #[test]
+    fn subagent_warn_threshold_still_emits_warn() {
+        // Subagent: a warn-only crossing (count below abort) still emits
+        // Warn as usual — only the abort layer is downgraded.
+        let mut t = BuiltinTracker::new_subagent(2, 10);
+        assert!(t.observe("open_page", "https://b.com").is_none());
+        let sig = t.observe("open_page", "https://b.com").unwrap();
+        assert!(matches!(sig, TrackerSignal::Warn { count: 2, .. }));
+        assert!(!t.aborted());
+    }
+
+    #[test]
+    fn main_agent_abort_still_fires() {
+        // Regression: the M3.1 main-agent path must keep returning Abort
+        // when the threshold is crossed. M3.5 only changes the subagent
+        // codepath.
+        let mut t = BuiltinTracker::new(2, 3);
+        let _ = t.observe("open_page", "https://a.com");
+        let _ = t.observe("open_page", "https://a.com");
+        let sig = t.observe("open_page", "https://a.com").unwrap();
+        match sig {
+            TrackerSignal::Abort { count, .. } => assert_eq!(count, 3),
+            other => panic!("expected Abort, got {other:?}"),
+        }
+        assert!(t.aborted());
+    }
+
+    #[test]
+    fn subagent_extended_deep_review_replay_no_abort() {
+        // T31 replay: deep-review reads the same PDF 11 times across iters.
+        // Pre-M3.5: aborted at iter 11. Post-M3.5: only the first warning
+        // fires per iter; the tracker never enters aborted state, the loop
+        // continues, and the user sees one warning chip rather than a
+        // fatal stop.
+        let mut t = BuiltinTracker::new_subagent(3, 7);
+        let url = "https://static.cninfo.com.cn/finalpage/666.PDF";
+        let mut warns = 0u32;
+        // 11 observations of the same URL spread across iters. Drain at
+        // each iter boundary to mimic real loop behavior.
+        for iter in 0..11 {
+            // 1 open per iter — total count walks 1..=11.
+            if let Some(TrackerSignal::Warn { .. }) = t.observe("open_page", url) {
+                warns += 1;
+            }
+            // Iter boundary: drain (= what loop_core does before next iter).
+            if iter % 2 == 0 {
+                let _ = t.drain_for_inject();
+            }
+        }
+        // Never aborted — the whole point of the M3.5 fix.
+        assert!(!t.aborted(), "subagent must not abort across 11 reads");
+        // Some warnings did fire (at least once after each drain when
+        // count was >= threshold) but no Abort signal ever returned.
+        assert!(warns >= 1, "at least one warn should have surfaced");
     }
 }

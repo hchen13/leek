@@ -31,10 +31,13 @@
 //!
 //! ## Backoff
 //!
-//! Fixed exponential: 1s / 4s / 16s. No jitter (single-client gateway —
-//! the herd concern doesn't apply). No per-turn budget — every iter gets
-//! a fresh 3-attempt allowance, since iter-N's failure is uncorrelated
-//! with iter-(N-1)'s success.
+//! Pre-M3.5: 1s / 4s exponential, 3 total attempts (1 initial + 2 retries).
+//! M3.5 widened to 1s / 5s / 15s / 30s / 60s, 5 total attempts: live network
+//! bursts long enough that the 5s second slot saved a real PM-critical turn
+//! (T31b 长电科技 deep dive). No jitter (single-client gateway — the herd
+//! concern doesn't apply). No per-turn budget — every iter gets a fresh
+//! 5-attempt allowance, since iter-N's failure is uncorrelated with
+//! iter-(N-1)'s success.
 //!
 //! ## Event surface
 //!
@@ -47,6 +50,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures::stream::BoxStream;
+use futures::StreamExt;
 
 use crate::agent::events;
 use crate::agent::fatal::FatalReason;
@@ -54,24 +58,36 @@ use crate::api::AppState;
 use crate::llm::codex::{CodexCallError, CodexClient};
 use crate::llm::{ChatRequest, LlmEvent};
 
-/// Hard cap on attempts including the initial call. `3` means the
-/// initial call plus two retries. Spec-defined; not user-tunable in
-/// M3.4 (no settings field, no env var) — the value already absorbs
-/// the realistic transient burst rate the user has hit live.
-pub const MAX_ATTEMPTS: u32 = 3;
+/// Hard cap on attempts including the initial call. `5` means the
+/// initial call plus four retries. Spec-defined (M3.5); not user-tunable
+/// (no settings field, no env var) — the value reflects the live network
+/// burst pattern the user has hit on PM-critical prompts. The spec says
+/// "5 attempts, 4 backoff slots" — we honor the smaller of the two
+/// consistent readings of the dispatch (the 5th 60s slot would only be
+/// used if MAX_ATTEMPTS were 6; we stay at 5 per the literal "3 → 5").
+pub const MAX_ATTEMPTS: u32 = 5;
 
 /// Backoff sleep before *retry* attempt `n` (0-indexed: index 0 is the
-/// sleep before the 2nd attempt, index 1 before the 3rd). One slot
+/// sleep before the 2nd attempt, …, index 3 before the 5th). One slot
 /// shorter than `MAX_ATTEMPTS` — the initial attempt has no preceding
 /// sleep.
 ///
-/// 1s catches the bulk of single-second blips without measurable user
-/// pain; 4s gives the codex backend a moment to recover from a real
-/// burst; 16s is the last-ditch attempt before we tell the user it
-/// really is down. Total worst-case wait before fataling: 21 seconds,
-/// still well under the M3.3 substantive-idle budget (60s default).
-pub const BACKOFFS: [Duration; (MAX_ATTEMPTS as usize) - 1] =
-    [Duration::from_secs(1), Duration::from_secs(4)];
+/// M3.5 widened from the M3.4 `[1s, 4s]` pair:
+/// - 1s: bulk of single-second blips, no measurable user pain.
+/// - 5s: real-burst recovery (codex side glitches lasting a few seconds).
+/// - 15s: codex side restart / backend brownout, retry once it recovers.
+/// - 30s: last-ditch for a longer wedge before we tell the user.
+///
+/// Total worst-case wait before fataling: 1 + 5 + 15 + 30 = 51 seconds of
+/// sleep, on top of however long each attempt's request actually runs.
+/// The user sees recovery progress via `provider_retry_attempt` events,
+/// so 51s of total backoff is acceptable for a transient network burst.
+pub const BACKOFFS: [Duration; (MAX_ATTEMPTS as usize) - 1] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+];
 
 /// `codex_stream_silent` is special: a long-reasoning iter can wedge
 /// once and then resume. The spec asks for a single iter-level retry on
@@ -268,6 +284,348 @@ pub async fn call_codex_with_retry(
         req,
     )
     .await
+}
+
+/// M3.5: same wrapper as `call_codex_with_retry`, but the returned stream
+/// itself retries mid-flight on a retryable SSE-layer error
+/// (`CodexStreamTimeout` / `CodexStreamDecodeError` / mid-stream
+/// `CodexConnectionFailed` / `CodexHttp5xx`). The initial-call retry and
+/// the stream-mid retry share one budget — `MAX_ATTEMPTS` across both —
+/// so a turn cannot run away with a 10-attempt sequence by failing once
+/// at connect and then four times at SSE.
+///
+/// ### Partial-state safety
+///
+/// A stream-mid error can only trigger a retry if **no substantive
+/// `LlmEvent` has been yielded yet from any inner stream**. "Substantive"
+/// is `LlmEvent::is_substantive` — text deltas, function calls, web
+/// search frames, usage, message_end. `Ping` does not block retry (the
+/// codex stream emits Pings continuously during long reasoning, and the
+/// T31b failure happened mid-reasoning while only Pings were flowing).
+///
+/// Why the gate: once any substantive event has been yielded the caller
+/// (agent loop) has already acted on it — text was streamed to the chat
+/// bubble, a tool call was dispatched, usage was counted. A retry would
+/// re-emit the same content from a fresh stream, causing duplicate tool
+/// dispatches, double-counted Usage tokens, and a flickering chat bubble.
+/// We choose to surface the error as fatal in that case rather than risk
+/// downstream corruption. In the realistic failure pattern (T31b
+/// "reading SSE chunk → operation timed out" mid-reasoning), only Pings
+/// have flowed, so the gate passes and retry runs.
+///
+/// ### Usage double-count
+///
+/// `Usage` is emitted by the codex backend as part of `response.completed`
+/// — it lands at the **end** of the response, never mid-stream. A
+/// successful retry produces one `Usage` event (from the new stream). A
+/// failed-mid-stream attempt that the wrapper restarts produces no
+/// `Usage`. Hence: no double-counting even without explicit
+/// deduplication — the partial-state gate above guarantees that a stream
+/// which already emitted Usage is past the retry point.
+pub async fn call_codex_with_stream_retry(
+    state: &AppState,
+    codex: &CodexClient,
+    session_id: &str,
+    turn_id: Option<&str>,
+    iteration: i64,
+    req: ChatRequest,
+) -> Result<BoxStream<'static, Result<LlmEvent>>> {
+    // First, get the initial stream via the initial-call retry path (5xx /
+    // connection_failed before any byte arrives). If the budget is
+    // exhausted here the wrapper bails the way `call_codex_with_retry`
+    // does — RetryExhausted carrying the per-call attempt count.
+    let (initial_stream, attempts_used_for_initial) =
+        match call_codex_with_initial_retry_counted(
+            state,
+            codex,
+            session_id,
+            turn_id,
+            iteration,
+            req.clone(),
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(e) => return Err(e),
+        };
+
+    // Build the retry-wrapping stream. Production notifier (SSE bus + event
+    // log) and production reconnect (`codex.chat(req)`) plug into the
+    // pure state machine `stream_retry_wrap`. Tests use the same state
+    // machine with scripted closures (see `tests::stream_retry_*`).
+    let state_clone = state.clone();
+    let codex_clone = codex.clone();
+    let session_id_owned = session_id.to_string();
+    let req_for_reconnect = req.clone();
+
+    let notify = move |payload: serde_json::Value| {
+        let state = state_clone.clone();
+        let session = session_id_owned.clone();
+        Box::pin(async move {
+            state
+                .emit(&session, events::kind::PROVIDER_RETRY_ATTEMPT, payload)
+                .await;
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    };
+    let reconnect = move || {
+        let codex = codex_clone.clone();
+        let req = req_for_reconnect.clone();
+        Box::pin(async move { codex.chat(req).await }) as std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<BoxStream<'static, Result<LlmEvent>>>,
+                    > + Send,
+            >,
+        >
+    };
+
+    Ok(stream_retry_wrap(
+        initial_stream,
+        attempts_used_for_initial,
+        session_id.to_string(),
+        turn_id.map(|s| s.to_string()),
+        iteration,
+        notify,
+        reconnect,
+    ))
+}
+
+/// Pure state machine for the stream-retry path — separated from the
+/// production notifier / reconnect so tests can drive it with scripted
+/// streams + a capture closure. Returns the wrapped stream.
+///
+/// `initial_attempts_used` is how many attempts the initial-call retry
+/// path already consumed (1 if the very first POST succeeded; higher if
+/// it retried before the SSE bytes started). The stream-mid retry shares
+/// the same `MAX_ATTEMPTS` budget.
+fn stream_retry_wrap<N, NFut, R, RFut>(
+    initial_stream: BoxStream<'static, Result<LlmEvent>>,
+    initial_attempts_used: u32,
+    session_id: String,
+    turn_id: Option<String>,
+    iteration: i64,
+    mut notify: N,
+    mut reconnect: R,
+) -> BoxStream<'static, Result<LlmEvent>>
+where
+    N: FnMut(serde_json::Value) -> NFut + Send + 'static,
+    NFut: std::future::Future<Output = ()> + Send + 'static,
+    R: FnMut() -> RFut + Send + 'static,
+    RFut: std::future::Future<Output = Result<BoxStream<'static, Result<LlmEvent>>>>
+        + Send
+        + 'static,
+{
+    // Start the stats from however many attempts the initial call used.
+    let initial_stats = {
+        let mut s = RetryStats::first_attempt();
+        for _ in 1..initial_attempts_used {
+            s.record_retry();
+        }
+        s
+    };
+
+    let wrapped = async_stream::stream! {
+        let mut stream = initial_stream;
+        let mut stats = initial_stats;
+        // Latch: true once any non-Ping event has been yielded to the
+        // caller. Once true, a stream-mid error is fatal — retrying
+        // would re-emit content the agent loop has already acted on
+        // (duplicate tool dispatches, double-counted Usage, …).
+        let mut substantive_seen = false;
+        loop {
+            match stream.next().await {
+                Some(Ok(ev)) => {
+                    if ev.is_substantive() {
+                        substantive_seen = true;
+                    }
+                    yield Ok(ev);
+                }
+                Some(Err(e)) => {
+                    let reason = FatalReason::from_stream_error(&e);
+                    let retryable = is_stream_kind_retryable(&reason);
+                    let has_budget = stats.attempts_made < MAX_ATTEMPTS;
+                    if !retryable || substantive_seen || !has_budget {
+                        // Surface the error to the caller. If we ran any
+                        // retries, wrap it in RetryExhausted so the loop's
+                        // lift_retry_attempts stamps the final count onto
+                        // the FatalReason.
+                        if stats.attempts_made > 1 {
+                            yield Err(wrap_stream_err_with_retry(
+                                &reason,
+                                stats.attempts_made,
+                            ));
+                        } else {
+                            yield Err(e);
+                        }
+                        return;
+                    }
+
+                    // Retry: emit event, sleep backoff, reconnect.
+                    let backoff_index = (stats.attempts_made - 1) as usize;
+                    let backoff = BACKOFFS[backoff_index];
+                    let next_attempt = stats.attempts_made + 1; // 1-indexed
+                    let stamped =
+                        reason.clone().with_retry_attempts(stats.attempts_made);
+                    let payload = build_retry_event(
+                        &session_id,
+                        turn_id.as_deref(),
+                        iteration,
+                        next_attempt,
+                        backoff,
+                        &stamped,
+                    );
+                    notify(payload).await;
+                    tokio::time::sleep(backoff).await;
+                    stats.record_retry();
+
+                    match reconnect().await {
+                        Ok(s) => {
+                            stream = s;
+                        }
+                        Err(call_err) => {
+                            yield Err(wrap_initial_call_err_with_retry(
+                                call_err,
+                                stats.attempts_made,
+                            ));
+                            return;
+                        }
+                    }
+                }
+                None => return,
+            }
+        }
+    };
+
+    Box::pin(wrapped)
+}
+
+/// Wrap a stream-side anyhow error in a `RetryExhausted` carrier so the
+/// agent loop's `lift_retry_attempts` stamps the FatalReason with the
+/// correct `attempts_made` count. The cause inside RetryExhausted is a
+/// fabricated `CodexCallError::Connection` whose `detail` reflects the
+/// stream-side classification (we don't actually have a CodexCallError
+/// for a mid-stream timeout, but the agent loop's `classify_anyhow`
+/// will land on `FatalReason::from_stream_error` via the cause chain).
+fn wrap_stream_err_with_retry(reason: &FatalReason, attempts_made: u32) -> anyhow::Error {
+    // We need both:
+    //   (a) the original-style stream error so `classify_anyhow` →
+    //       `from_stream_error` recognizes its kind (the string heuristic
+    //       in classify_anyhow looks for "reading SSE chunk" etc.);
+    //   (b) a `RetryExhausted` somewhere in the chain so
+    //       `lift_retry_attempts` finds the count.
+    //
+    // We carry both by wrapping a synthetic message-shaped error with a
+    // RetryExhausted carrying a fake Connection cause. The agent loop's
+    // path is: classify_anyhow sees the top-level anyhow message →
+    // matches "reading SSE chunk" if present → builds the correct kind;
+    // lift_retry_attempts walks the chain → finds RetryExhausted → stamps
+    // the count. Done.
+    //
+    // The message format mirrors what `parse_sse_stream` emits so
+    // `from_stream_error` lands on the same kind. The cause chain has
+    // RetryExhausted, then the synthetic Connection (so error_to_call_error
+    // can also find it if some other path does a downcast walk).
+    let detail = format!("{} (after {attempts_made} attempts)", reason.detail());
+    let cause = CodexCallError::Connection { detail: detail.clone() };
+    let exhausted = RetryExhausted {
+        cause,
+        attempts_made,
+    };
+    // Use the original kind's leading marker string so `from_stream_error`
+    // re-classifies into the same kind (preserves "reading SSE chunk" for
+    // stream_timeout / connection_failed, "non-UTF-8 in SSE event" for
+    // decode_error, etc.).
+    let head = stream_kind_message_head(reason);
+    anyhow::Error::new(exhausted).context(format!("{head}: {detail}"))
+}
+
+/// Same as `wrap_stream_err_with_retry` but the underlying failure was a
+/// fresh initial POST that failed during retry — we have a real
+/// `CodexCallError` to wrap in `RetryExhausted` directly.
+fn wrap_initial_call_err_with_retry(err: anyhow::Error, attempts_made: u32) -> anyhow::Error {
+    let Some(call_err) = err_to_call_error(&err) else {
+        return err;
+    };
+    anyhow::Error::new(RetryExhausted {
+        cause: call_err,
+        attempts_made,
+    })
+}
+
+/// Re-derive the error-message prefix that `parse_sse_stream` would have
+/// emitted for `reason`. Lets us re-build an error whose top-level message
+/// hits the same `from_stream_error` classifier on the way back through
+/// the agent loop.
+fn stream_kind_message_head(reason: &FatalReason) -> &'static str {
+    match reason {
+        FatalReason::CodexStreamTimeout { .. } | FatalReason::CodexConnectionFailed { .. } => {
+            "reading SSE chunk"
+        }
+        FatalReason::CodexStreamDecodeError { .. } => "non-UTF-8 in SSE event",
+        _ => "stream error",
+    }
+}
+
+/// Which stream-side FatalReason kinds should the wrapper restart the
+/// chat call for? `CodexMalformed` is not in the set — a true malformed
+/// reply is a leek-side bug and a retry would just paper over it.
+/// `CodexStreamSilent` is not in the set — silent is detected by the loop
+/// (idle timeout), not by the stream itself; and silent retry needs the
+/// per-iter state rollback that the spec defers (see SILENT_RETRY_BUDGET).
+fn is_stream_kind_retryable(reason: &FatalReason) -> bool {
+    matches!(
+        reason,
+        FatalReason::CodexStreamTimeout { .. }
+            | FatalReason::CodexStreamDecodeError { .. }
+            | FatalReason::CodexConnectionFailed { .. }
+            | FatalReason::CodexHttp5xx { .. }
+    )
+}
+
+/// Like `call_codex_with_retry`, but also returns how many attempts the
+/// initial-call retry consumed — needed by `call_codex_with_stream_retry`
+/// so the stream-mid retry budget continues from where the initial-call
+/// retry left off (the two share one MAX_ATTEMPTS budget).
+async fn call_codex_with_initial_retry_counted(
+    state: &AppState,
+    codex: &CodexClient,
+    session_id: &str,
+    turn_id: Option<&str>,
+    iteration: i64,
+    req: ChatRequest,
+) -> Result<(BoxStream<'static, Result<LlmEvent>>, u32)> {
+    let session_id_owned = session_id.to_string();
+    let state_clone = state.clone();
+    let notify = move |payload: serde_json::Value| {
+        let state = state_clone.clone();
+        let session_id = session_id_owned.clone();
+        Box::pin(async move {
+            state
+                .emit(&session_id, events::kind::PROVIDER_RETRY_ATTEMPT, payload)
+                .await;
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    };
+    let attempts_used = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let attempts_used_for_call = attempts_used.clone();
+
+    let stream = retry_call(
+        notify,
+        session_id,
+        turn_id,
+        iteration,
+        |attempt_req| {
+            let codex = codex.clone();
+            let attempts_used = attempts_used_for_call.clone();
+            async move {
+                attempts_used.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                codex.chat(attempt_req).await
+            }
+        },
+        req,
+    )
+    .await?;
+    let used = attempts_used.load(std::sync::atomic::Ordering::Relaxed);
+    Ok((stream, used))
 }
 
 /// Generic retry loop. Factored out of `call_codex_with_retry` so unit
@@ -509,15 +867,18 @@ mod tests {
 
     #[test]
     fn backoff_schedule_is_exponential() {
-        // Two retry slots → two backoffs. The values are spec-fixed; if
+        // M3.5: five attempts → four backoffs. The values are spec-fixed;
         // a future change shifts them, the test catches it deliberately.
-        assert_eq!(BACKOFFS.len(), 2);
+        assert_eq!(MAX_ATTEMPTS, 5);
+        assert_eq!(BACKOFFS.len(), (MAX_ATTEMPTS as usize) - 1);
         assert_eq!(BACKOFFS[0], Duration::from_secs(1));
-        assert_eq!(BACKOFFS[1], Duration::from_secs(4));
-        // Total worst-case wait before fatal: 1 + 4 = 5s of sleep on
-        // top of three actual codex calls.
+        assert_eq!(BACKOFFS[1], Duration::from_secs(5));
+        assert_eq!(BACKOFFS[2], Duration::from_secs(15));
+        assert_eq!(BACKOFFS[3], Duration::from_secs(30));
+        // Total worst-case wait before fatal: 51s of sleep on top of
+        // five actual codex calls.
         let total: Duration = BACKOFFS.iter().copied().sum();
-        assert_eq!(total, Duration::from_secs(5));
+        assert_eq!(total, Duration::from_secs(1 + 5 + 15 + 30));
     }
 
     #[test]
@@ -703,10 +1064,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn connection_failed_exhausts_all_three_attempts() {
+    async fn connection_failed_exhausts_all_attempts() {
         tokio::time::pause();
-        // All 3 calls fail with connection_failed → RetryExhausted with
-        // attempts_made = 3. Two retry events emitted (attempt 2 + 3).
+        // M3.5: all 5 calls fail with connection_failed → RetryExhausted
+        // with attempts_made = MAX_ATTEMPTS. Four retry events emitted
+        // (before attempts 2 / 3 / 4 / 5).
         let attempts: Rc<RefCell<u32>> = Rc::new(RefCell::new(0));
         let attempts_for_call = attempts.clone();
         let (notify, captured) = capture_notifier();
@@ -733,7 +1095,7 @@ mod tests {
         assert_eq!(*attempts.borrow(), MAX_ATTEMPTS);
 
         // Final error is RetryExhausted carrying the underlying
-        // Connection error + attempts_made = 3.
+        // Connection error + attempts_made = MAX_ATTEMPTS.
         let err = result.unwrap_err();
         let ex = err
             .downcast_ref::<RetryExhausted>()
@@ -741,24 +1103,32 @@ mod tests {
         assert_eq!(ex.attempts_made, MAX_ATTEMPTS);
         assert!(matches!(ex.cause, CodexCallError::Connection { .. }));
 
-        // Two retry events emitted (before attempts 2 and 3 — never
-        // before attempt 1, never *after* the last failure).
+        // MAX_ATTEMPTS - 1 retry events emitted (one before each retry,
+        // never before the initial call, never after the last failure).
         let events = captured.borrow();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["attempt"], 2);
-        assert_eq!(events[0]["backoff_ms"], 1000);
-        assert_eq!(events[1]["attempt"], 3);
-        assert_eq!(events[1]["backoff_ms"], 4000);
-        // Both event kinds are codex_connection_failed.
-        assert_eq!(events[0]["kind"], "codex_connection_failed");
-        assert_eq!(events[1]["kind"], "codex_connection_failed");
+        assert_eq!(events.len() as u32, MAX_ATTEMPTS - 1);
+        // Walk the events: attempt 2 with BACKOFFS[0], attempt 3 with
+        // BACKOFFS[1], …
+        for (idx, event) in events.iter().enumerate() {
+            assert_eq!(event["attempt"], (idx as u32 + 2));
+            assert_eq!(
+                event["backoff_ms"],
+                BACKOFFS[idx].as_millis() as u64,
+            );
+            assert_eq!(event["kind"], "codex_connection_failed");
+        }
 
-        // The lifted FatalReason carries retry_attempts = 3 → hint card
-        // shows "已自动重试 2 次, 仍失败".
+        // The lifted FatalReason carries retry_attempts = MAX_ATTEMPTS →
+        // hint shows "已自动重试 (MAX_ATTEMPTS-1) 次, 仍失败".
         let reason = FatalReason::from_call_error(&ex.cause);
         let lifted = lift_retry_attempts(&err, reason);
         assert_eq!(lifted.retry_attempts(), MAX_ATTEMPTS);
-        assert!(lifted.hint().contains("已自动重试 2 次"));
+        let expected_note = format!("已自动重试 {} 次", MAX_ATTEMPTS - 1);
+        assert!(
+            lifted.hint().contains(&expected_note),
+            "hint was: {}",
+            lifted.hint(),
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -924,5 +1294,392 @@ mod tests {
         // Second retry event reflects the connection failure.
         assert_eq!(events[1]["kind"], "codex_connection_failed");
         assert_eq!(events[1]["attempt"], 3);
+    }
+
+    // ─── M3.5 stream_retry_wrap integration tests ─────────────────────────
+    //
+    // These drive `stream_retry_wrap` with synthetic streams + scripted
+    // `reconnect` closures. Backoff sleeps are virtualized via
+    // `tokio::time::pause`. Uses Arc<Mutex> rather than Rc<RefCell> so
+    // the captures satisfy `Send + 'static` on the closure bounds.
+
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    /// Build a stream of `Result<LlmEvent>` from a Vec, in order.
+    fn scripted_stream(
+        items: Vec<Result<LlmEvent>>,
+    ) -> BoxStream<'static, Result<LlmEvent>> {
+        Box::pin(futures::stream::iter(items))
+    }
+
+    /// Test-side reconnect-future type — aliased so the helper signatures
+    /// stay readable under clippy's `type_complexity` threshold.
+    type ReconnectFut = std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<BoxStream<'static, Result<LlmEvent>>>,
+                > + Send,
+        >,
+    >;
+
+    /// A failing reconnect closure — always returns the given error.
+    fn reconnect_always_err(
+        err_msg: &'static str,
+    ) -> impl FnMut() -> ReconnectFut {
+        move || {
+            Box::pin(async move {
+                Err(anyhow::Error::new(CodexCallError::Connection {
+                    detail: err_msg.to_string(),
+                }))
+            })
+        }
+    }
+
+    /// A scripted reconnect — returns each scripted stream in sequence.
+    /// Wraps the queue in Arc<Mutex> so the closure can mutate across
+    /// calls. Once exhausted, returns an empty Ok stream (would normally
+    /// be unreachable in tests).
+    fn reconnect_with(
+        scripts: Vec<Vec<Result<LlmEvent>>>,
+    ) -> impl FnMut() -> ReconnectFut {
+        let queue: Arc<Mutex<std::collections::VecDeque<Vec<Result<LlmEvent>>>>> =
+            Arc::new(Mutex::new(scripts.into_iter().collect()));
+        move || {
+            let queue = queue.clone();
+            Box::pin(async move {
+                let next = queue.lock().unwrap().pop_front();
+                Ok(match next {
+                    Some(items) => scripted_stream(items),
+                    None => scripted_stream(vec![]),
+                })
+            })
+        }
+    }
+
+    /// Send-safe notifier: pushes payloads onto a shared Vec under a
+    /// std Mutex. Multi-threaded runtime accommodates the closure's
+    /// `Send + 'static` requirement.
+    type SendNotifierFut =
+        std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    fn send_notifier() -> (
+        impl FnMut(serde_json::Value) -> SendNotifierFut + Send + 'static,
+        Arc<Mutex<Vec<serde_json::Value>>>,
+    ) {
+        let captured: Arc<Mutex<Vec<serde_json::Value>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let captured_for = captured.clone();
+        let notify = move |payload: serde_json::Value| {
+            let captured = captured_for.clone();
+            Box::pin(async move {
+                captured.lock().unwrap().push(payload);
+            }) as SendNotifierFut
+        };
+        (notify, captured)
+    }
+
+    /// Helper: build a stream-side error whose top-level message hits
+    /// `from_stream_error` as a timeout (the T31b crash signature).
+    fn timeout_err() -> anyhow::Error {
+        anyhow::anyhow!("operation timed out").context("reading SSE chunk")
+    }
+
+    /// Helper: build a stream-side error that lands as `codex_malformed`
+    /// (e.g. `provider returned an error event`). Non-retryable.
+    fn malformed_err() -> anyhow::Error {
+        anyhow::anyhow!("provider returned an error event: bogus")
+    }
+
+    /// M3.5 spec test §A:
+    /// SSE stream 中段 timeout → retry 触发,第 2 次成功.
+    /// Initial stream yields a Ping then a timeout; reconnect produces a
+    /// stream with a TextDelta + completion. Wrapper transparently
+    /// recovers; caller sees Ping, then TextDelta, then end-of-stream.
+    /// One `provider_retry_attempt` event captured.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_retry_recovers_on_second_attempt() {
+        tokio::time::pause();
+        let initial = scripted_stream(vec![
+            Ok(LlmEvent::Ping),
+            Err(timeout_err()),
+        ]);
+        let reconnect = reconnect_with(vec![vec![
+            Ok(LlmEvent::TextDelta {
+                text: "recovered".into(),
+            }),
+            Ok(LlmEvent::MessageEnd {
+                stop_reason: crate::llm::StopReason::EndTurn,
+            }),
+        ]]);
+        let (notify, captured) = send_notifier();
+
+        let mut wrapped = stream_retry_wrap(
+            initial,
+            1,
+            "s-1".into(),
+            Some("t-1".into()),
+            1,
+            notify,
+            reconnect,
+        );
+
+        let mut yielded: Vec<LlmEvent> = Vec::new();
+        while let Some(item) = wrapped.next().await {
+            yielded.push(item.expect("no errors should leak"));
+        }
+        assert_eq!(yielded.len(), 3);
+        assert!(matches!(yielded[0], LlmEvent::Ping));
+        match &yielded[1] {
+            LlmEvent::TextDelta { text } => assert_eq!(text, "recovered"),
+            other => panic!("expected TextDelta, got {other:?}"),
+        }
+        assert!(matches!(yielded[2], LlmEvent::MessageEnd { .. }));
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["attempt"], 2);
+        assert_eq!(events[0]["kind"], "codex_stream_timeout");
+        assert_eq!(events[0]["backoff_ms"], 1000);
+        assert_eq!(events[0]["session_id"], "s-1");
+        assert_eq!(events[0]["turn_id"], "t-1");
+    }
+
+    /// M3.5 spec test §A:
+    /// SSE stream 5 次都 timeout → 最终 fatal kind=CodexStreamTimeout.
+    /// Every attempt times out — initial + 4 reconnects, total MAX_ATTEMPTS.
+    /// Caller sees `MAX_ATTEMPTS - 1` retry events captured, then a final
+    /// Err carrying RetryExhausted with attempts_made == MAX_ATTEMPTS.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_retry_exhausts_after_max_attempts() {
+        tokio::time::pause();
+        let initial = scripted_stream(vec![
+            Ok(LlmEvent::Ping),
+            Err(timeout_err()),
+        ]);
+        // Four reconnects, each also a timeout right after a Ping. Total
+        // attempts: 1 initial + 4 reconnect = MAX_ATTEMPTS.
+        let scripts: Vec<Vec<Result<LlmEvent>>> = (0..(MAX_ATTEMPTS - 1))
+            .map(|_| vec![Ok(LlmEvent::Ping), Err(timeout_err())])
+            .collect();
+        let reconnect = reconnect_with(scripts);
+        let (notify, captured) = send_notifier();
+
+        let mut wrapped = stream_retry_wrap(
+            initial,
+            1,
+            "s-1".into(),
+            Some("t-1".into()),
+            1,
+            notify,
+            reconnect,
+        );
+
+        let mut errors: Vec<anyhow::Error> = Vec::new();
+        let mut pings_seen = 0u32;
+        while let Some(item) = wrapped.next().await {
+            match item {
+                Ok(LlmEvent::Ping) => pings_seen += 1,
+                Ok(other) => panic!("unexpected event {other:?}"),
+                Err(e) => errors.push(e),
+            }
+        }
+        // One Ping per attempt is yielded (the script puts Ping → timeout).
+        assert_eq!(pings_seen, MAX_ATTEMPTS);
+
+        // Exactly one final error.
+        assert_eq!(errors.len(), 1);
+        let err = errors.remove(0);
+        let exhausted = err
+            .downcast_ref::<RetryExhausted>()
+            .expect("final error must be RetryExhausted");
+        assert_eq!(exhausted.attempts_made, MAX_ATTEMPTS);
+
+        // The lifted FatalReason carries the stream_timeout kind + the
+        // exhausted attempt count.
+        let stream_reason = FatalReason::from_stream_error(&err);
+        let lifted = lift_retry_attempts(&err, stream_reason);
+        assert_eq!(lifted.kind(), "codex_stream_timeout");
+        assert_eq!(lifted.retry_attempts(), MAX_ATTEMPTS);
+        let expected_note = format!("已自动重试 {} 次", MAX_ATTEMPTS - 1);
+        assert!(
+            lifted.hint().contains(&expected_note),
+            "hint was: {}",
+            lifted.hint()
+        );
+
+        // `MAX_ATTEMPTS - 1` retry events captured: one per retry attempt.
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len() as u32, MAX_ATTEMPTS - 1);
+        for (idx, event) in events.iter().enumerate() {
+            assert_eq!(event["kind"], "codex_stream_timeout");
+            assert_eq!(event["attempt"], (idx as u32 + 2));
+            assert_eq!(
+                event["backoff_ms"],
+                BACKOFFS[idx].as_millis() as u64,
+            );
+        }
+    }
+
+    /// Substantive event yielded BEFORE the failure → no retry, the
+    /// caller sees the error as-is. This guards against the double-emit
+    /// risk: once a tool call has been dispatched, retrying would re-emit
+    /// it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_retry_skipped_after_substantive_event() {
+        tokio::time::pause();
+        let initial = scripted_stream(vec![
+            Ok(LlmEvent::Ping),
+            Ok(LlmEvent::TextDelta { text: "hi".into() }),
+            Err(timeout_err()),
+        ]);
+        let reconnect = reconnect_always_err("must not be called");
+        let (notify, captured) = send_notifier();
+
+        let mut wrapped = stream_retry_wrap(
+            initial,
+            1,
+            "s-1".into(),
+            Some("t-1".into()),
+            1,
+            notify,
+            reconnect,
+        );
+
+        let mut events_seen: Vec<LlmEvent> = Vec::new();
+        let mut final_err: Option<anyhow::Error> = None;
+        while let Some(item) = wrapped.next().await {
+            match item {
+                Ok(ev) => events_seen.push(ev),
+                Err(e) => {
+                    final_err = Some(e);
+                    break;
+                }
+            }
+        }
+        // Both Ping and TextDelta yielded before the failure.
+        assert_eq!(events_seen.len(), 2);
+        assert!(matches!(events_seen[0], LlmEvent::Ping));
+        assert!(matches!(events_seen[1], LlmEvent::TextDelta { .. }));
+        // The error is the raw stream error (no retry happened).
+        let err = final_err.expect("must have errored");
+        assert!(err.downcast_ref::<RetryExhausted>().is_none());
+        // No retry events captured — we never attempted retry.
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    /// Non-retryable kind (`codex_malformed`) is surfaced immediately
+    /// even with no substantive output yet.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_retry_skipped_for_malformed_kind() {
+        tokio::time::pause();
+        let initial = scripted_stream(vec![
+            Ok(LlmEvent::Ping),
+            Err(malformed_err()),
+        ]);
+        let reconnect = reconnect_always_err("must not be called");
+        let (notify, captured) = send_notifier();
+
+        let mut wrapped = stream_retry_wrap(
+            initial,
+            1,
+            "s-1".into(),
+            Some("t-1".into()),
+            1,
+            notify,
+            reconnect,
+        );
+
+        let mut got_err = false;
+        while let Some(item) = wrapped.next().await {
+            if item.is_err() {
+                got_err = true;
+                break;
+            }
+        }
+        assert!(got_err);
+        assert!(captured.lock().unwrap().is_empty(), "no retries expected");
+    }
+
+    /// Decode error (`non-UTF-8 in SSE event`) is retryable — the
+    /// wrapper restarts the chat call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_retry_recovers_from_decode_error() {
+        tokio::time::pause();
+        let initial = scripted_stream(vec![Err(anyhow::anyhow!(
+            "non-UTF-8 in SSE event"
+        ))]);
+        let reconnect = reconnect_with(vec![vec![Ok(LlmEvent::TextDelta {
+            text: "ok".into(),
+        })]]);
+        let (notify, captured) = send_notifier();
+
+        let mut wrapped = stream_retry_wrap(
+            initial,
+            1,
+            "s-1".into(),
+            None, // compaction-summary style call (turn_id null)
+            7,
+            notify,
+            reconnect,
+        );
+
+        let mut deltas = 0;
+        while let Some(item) = wrapped.next().await {
+            if matches!(item.unwrap(), LlmEvent::TextDelta { .. }) {
+                deltas += 1;
+            }
+        }
+        assert_eq!(deltas, 1);
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["kind"], "codex_stream_decode_error");
+        // turn_id absent (null) — compaction path.
+        assert!(events[0]["turn_id"].is_null());
+    }
+
+    /// Verify that `initial_attempts_used > 1` consumes the shared budget:
+    /// if the initial-call retry path used 3 attempts to even get a
+    /// stream, only `MAX_ATTEMPTS - 3 = 2` mid-stream retries remain.
+    /// Specifically, a stream-mid timeout with `initial_attempts_used = 4`
+    /// must retry exactly once (one slot left) and then fatal.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_retry_shares_budget_with_initial_call() {
+        tokio::time::pause();
+        let initial = scripted_stream(vec![Err(timeout_err())]);
+        // Two reconnect attempts available, but the wrapper should only
+        // call reconnect once (4 already used + 1 retry = MAX_ATTEMPTS).
+        let attempts_seen: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let attempts_seen_for = attempts_seen.clone();
+        let reconnect = move || -> ReconnectFut {
+            let attempts_seen = attempts_seen_for.clone();
+            Box::pin(async move {
+                *attempts_seen.lock().unwrap() += 1;
+                Ok(scripted_stream(vec![Err(timeout_err())]))
+            })
+        };
+        let (notify, captured) = send_notifier();
+
+        let mut wrapped = stream_retry_wrap(
+            initial,
+            4, // initial-call retry already used 4 attempts
+            "s-1".into(),
+            Some("t-1".into()),
+            1,
+            notify,
+            reconnect,
+        );
+
+        while let Some(item) = wrapped.next().await {
+            // Consume; we only care about the structural assertions
+            // below.
+            let _ = item;
+        }
+        // Only one reconnect attempt — 4 (initial) + 1 (retry) = 5 = MAX.
+        assert_eq!(*attempts_seen.lock().unwrap(), 1);
+        // One retry event emitted.
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["attempt"], 5); // attempt-about-to-run is 5.
     }
 }

@@ -157,10 +157,23 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
     // M3.1: per-turn duplicate-URL tracker for codex-builtin web_search.
     // L2 abort + L3 next-iter inject — the only leak path leek can plug
     // for codex server-side builtin tools (see `builtin_governance`).
-    let mut builtin_tracker = BuiltinTracker::new(
-        p.guards.builtin_url_warn_threshold,
-        p.guards.builtin_url_abort_threshold,
-    );
+    //
+    // M3.5: subagent loops use `new_subagent`, which downgrades the abort
+    // signal into a warn (deep-review reading the same PDF in chunks
+    // across 10+ iters is normal depth-of-research behavior, not a
+    // runaway — T31 was killed at iter 11 by the abort threshold). Main
+    // agent keeps the original abort behavior.
+    let mut builtin_tracker = if p.parent_turn_id.is_some() {
+        BuiltinTracker::new_subagent(
+            p.guards.builtin_url_warn_threshold,
+            p.guards.builtin_url_abort_threshold,
+        )
+    } else {
+        BuiltinTracker::new(
+            p.guards.builtin_url_warn_threshold,
+            p.guards.builtin_url_abort_threshold,
+        )
+    };
 
     let stop_reason: String;
     let mut first_guard: Option<&'static str> = None;
@@ -341,19 +354,22 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
             iteration: transcript_iter,
         };
 
-        // M3.4: initial-call retry (5xx / connection) is wrapped inside
-        // call_codex_with_retry below. The wrapper emits
+        // M3.4: initial-call retry (5xx / connection) wrapped inside
+        // `call_codex_with_*_retry`. The wrapper emits
         // `provider_retry_attempt` events transparently and stamps the
         // final RetryExhausted error with the attempt count, which
         // classify_anyhow + lift_retry_attempts lift into the
-        // FatalReason. Stream-side silent retry is **not** done at this
-        // layer: a silent re-run would re-emit canvas events and
-        // double-count any Usage tokens that landed before the silence,
-        // and the existing M3.3 substantive-idle path already surfaces
-        // a kind-specific hint card that points the user at the
-        // composer for a manual re-send. Silent-retry is documented as
-        // a follow-up (see retry::SILENT_RETRY_BUDGET).
-        let mut stream = match retry::call_codex_with_retry(
+        // FatalReason.
+        //
+        // M3.5: the wrapper is now `call_codex_with_stream_retry`, which
+        // **also** retries when the SSE stream itself errors mid-flight
+        // (`reading SSE chunk → operation timed out` — the T31b
+        // failure mode). The mid-stream retry only fires if no
+        // substantive event has been yielded yet, so duplicate tool
+        // dispatches and double-counted Usage tokens are impossible by
+        // construction. Substantive-idle silent retry stays deferred
+        // (per spec §E and retry::SILENT_RETRY_BUDGET docs).
+        let mut stream = match retry::call_codex_with_stream_retry(
             p.st,
             &p.st.codex,
             p.session_id,
@@ -595,10 +611,19 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
                 Ok(LlmEvent::Ping) => {}
                 Err(e) => {
                     // M3.3: classify SSE-side errors — `reading SSE chunk`
-                    // (connection died mid-stream) becomes connection_failed;
-                    // anything else is malformed (parse failure / provider
-                    // returned error event).
+                    // (connection died mid-stream) becomes connection_failed
+                    // or stream_timeout (M3.5 split); anything else is
+                    // malformed (parse failure / provider returned error
+                    // event) or stream_decode_error (UTF-8 / JSON split
+                    // failure, transient).
+                    //
+                    // M3.5: the stream-retry wrapper may have already
+                    // retried this; if so it wrapped the error in a
+                    // `RetryExhausted` carrier. Lift that count onto the
+                    // FatalReason so the hint reads "已自动重试 N 次,
+                    // 仍失败".
                     let reason = FatalReason::from_stream_error(&e);
+                    let reason = retry::lift_retry_attempts(&e, reason);
                     fatal_error = Some(reason.detail());
                     fatal_reason = Some(reason);
                     break 'stream;

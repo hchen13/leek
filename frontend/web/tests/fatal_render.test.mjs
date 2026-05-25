@@ -165,4 +165,112 @@ function shouldShowFatalCard(turn) {
   assert.equal(parseFatalReason(nully), null);
 }
 
+// ── M3.5 retry button + new kinds ────────────────────────────────────
+
+/** Mirrors Chat.tsx::priorUserContent — given an assistant message
+ *  sequence, walks back through `messages` and returns the content of
+ *  the most recent preceding `role === "user"` message. Returns null
+ *  if no user message precedes. */
+function priorUserContent(messages, assistantSeq) {
+  const idx = messages.findIndex((m) => m.seq === assistantSeq);
+  if (idx <= 0) return null;
+  for (let i = idx - 1; i >= 0; i--) {
+    if (messages[i].role === "user") return messages[i].content;
+  }
+  return null;
+}
+
+// 9. priorUserContent returns the immediately-preceding user message —
+//    the normal turn shape (user → assistant).
+{
+  const msgs = [
+    { seq: 1, role: "user", content: "What is X?" },
+    { seq: 2, role: "assistant", content: "" /* fatal turn — empty reply */ },
+  ];
+  assert.equal(priorUserContent(msgs, 2), "What is X?");
+}
+
+// 10. priorUserContent skips assistant messages and finds the prior user
+//     in a multi-turn session.
+{
+  const msgs = [
+    { seq: 1, role: "user", content: "first" },
+    { seq: 2, role: "assistant", content: "ok" },
+    { seq: 3, role: "user", content: "second" },
+    { seq: 4, role: "assistant", content: "" /* fatal */ },
+  ];
+  assert.equal(priorUserContent(msgs, 4), "second");
+}
+
+// 11. priorUserContent returns null when no user message precedes (an
+//     unusual shape — but the renderer should hide the retry button
+//     rather than crash on null).
+{
+  const msgs = [{ seq: 1, role: "assistant", content: "orphan" }];
+  assert.equal(priorUserContent(msgs, 1), null);
+}
+
+// 12. priorUserContent returns null when the assistant seq is not found
+//     (defensive — store could in principle race the message list).
+{
+  const msgs = [
+    { seq: 1, role: "user", content: "x" },
+    { seq: 2, role: "assistant", content: "y" },
+  ];
+  assert.equal(priorUserContent(msgs, 999), null);
+}
+
+// 13. M3.5 new fatal kinds — CodexStreamTimeout (T31b crash signature).
+{
+  const payload = {
+    stop_reason: "fatal_error",
+    fatal_reason: {
+      kind: "codex_stream_timeout",
+      detail: "codex SSE 流中段超时：reading SSE chunk → operation timed out",
+      hint:
+        "codex SSE 流中段超时（reading SSE chunk → timed out），通常网络抖动 / codex 临时过载，重试可恢复。（已自动重试 4 次，仍失败）",
+    },
+  };
+  const fr = parseFatalReason(payload);
+  assert.ok(fr);
+  assert.equal(fr.kind, "codex_stream_timeout");
+  assert.match(fr.hint, /中段超时/);
+  assert.match(fr.hint, /已自动重试 4 次/);
+}
+
+// 14. M3.5 new fatal kinds — CodexStreamDecodeError (transient UTF-8 / JSON
+//     split on a chunk boundary).
+{
+  const payload = {
+    stop_reason: "fatal_error",
+    fatal_reason: {
+      kind: "codex_stream_decode_error",
+      detail: "codex SSE 流解码失败：non-UTF-8 in SSE event",
+      hint: "codex SSE 流字节损坏 / 分块边界异常，重试通常能拿到一份干净的 stream。",
+    },
+  };
+  const fr = parseFatalReason(payload);
+  assert.ok(fr);
+  assert.equal(fr.kind, "codex_stream_decode_error");
+  assert.match(fr.hint, /干净的 stream/);
+}
+
+// 15. Retry button enablement: the helper resolves a prior user content
+//     for the assistant message, so the button is shown. Disabled until
+//     `sending = false`. Sanity assertion only — JSX-level test would
+//     require a full component harness, but the contract here is that
+//     priorUserContent + the parent's `sending` callback are the inputs.
+{
+  const msgs = [
+    { seq: 10, role: "user", content: "Long deep-dive prompt" },
+    { seq: 11, role: "assistant", content: "" },
+  ];
+  const content = priorUserContent(msgs, 11);
+  assert.equal(content, "Long deep-dive prompt");
+  const sending = false;
+  // Mirror the renderer's disabled binding.
+  const buttonDisabled = sending;
+  assert.equal(buttonDisabled, false);
+}
+
 console.log("fatal_render tests passed");

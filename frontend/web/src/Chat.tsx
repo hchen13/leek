@@ -145,20 +145,53 @@ export function Chat(props: ChatProps) {
     );
   };
 
-  /** M3.3: render the typed fatal-reason hint card for a turn that died
-   *  on the codex side (HTTP error / connection / malformed) or sat
-   *  silent past the idle budget. Yellow-bordered (the majority of
-   *  these are "retry usually fixes it" — not red-alert fatal). The
-   *  hint copy is owned by the backend (`FatalReason::hint`); the card
-   *  is a dumb renderer.
+  /** M3.5: walk back from the assistant message at `seq` and return the
+   *  content of the most recent preceding `role === "user"` message.
+   *  That's the prompt we re-send when the user clicks "重试本回合" —
+   *  the same content the user originally typed for this turn. Returns
+   *  null if no user message precedes (shouldn't happen in a normal
+   *  turn — the assistant always replies to a user — but the renderer
+   *  hides the retry button rather than crash on an unexpected shape).
+   */
+  const priorUserContent = (assistantSeq: number): string | null => {
+    const msgs = props.messages();
+    // Find by sequence — messages are kept in `seq` order in the array.
+    const idx = msgs.findIndex((m) => m.seq === assistantSeq);
+    if (idx <= 0) return null;
+    for (let i = idx - 1; i >= 0; i--) {
+      if (msgs[i].role === "user") return msgs[i].content;
+    }
+    return null;
+  };
+
+  /** M3.3 / M3.5: render the typed fatal-reason hint card for a turn that
+   *  died on the codex side (HTTP error / connection / malformed /
+   *  stream timeout / decode error) or sat silent past the idle budget.
+   *  Yellow-bordered (most are "retry usually fixes it" — not red-alert
+   *  fatal). The hint copy is owned by the backend (`FatalReason::hint`);
+   *  the card is a dumb renderer.
+   *
+   *  M3.5 adds two actions:
+   *    - "🔄 重试本回合" → re-posts the prior user message as a new
+   *      message in the same session (same effect as the user copy-
+   *      pasting and re-sending, but one click). Disabled while another
+   *      turn is sending.
+   *    - "继续提问 (跳过)" → no-op visual, the user can just keep
+   *      typing in the composer; the button is a hint that this is OK.
    *
    *  Placed after the assistant message — same slot as the cost-cap bar
    *  — so the reading order is "model said X, then this is why it
    *  stopped". A turn that hits both the cost cap AND a fatal would
    *  show both; today the loop can only hit one. */
-  const renderFatalCard = (turn: Turn | undefined) => {
+  const renderFatalCard = (turn: Turn | undefined, assistantSeq: number) => {
     if (!turn || !shouldShowFatalCard(turn)) return null;
     const fr = turn.fatalReason!;
+    const retryContent = () => priorUserContent(assistantSeq);
+    const onRetry = () => {
+      const content = retryContent();
+      if (!content) return;
+      props.send(content);
+    };
     return (
       <div class="fatal-hint-card" role="alert">
         <div class="fatal-hint-icon" aria-hidden="true">
@@ -170,6 +203,20 @@ export function Chat(props: ChatProps) {
             <span class="fatal-hint-kind">{fr.kind}</span>
             <span class="fatal-hint-detail-text">{fr.detail}</span>
           </p>
+          <div class="fatal-hint-actions">
+            <Show when={retryContent() != null}>
+              <button
+                class="fatal-hint-retry"
+                onClick={onRetry}
+                disabled={props.sending()}
+                type="button"
+                title="把上一条 user 消息原样再发一次"
+              >
+                🔄 重试本回合
+              </button>
+            </Show>
+            <span class="fatal-hint-skip">继续提问 (跳过) →</span>
+          </div>
         </div>
       </div>
     );
@@ -238,12 +285,16 @@ export function Chat(props: ChatProps) {
                   assistant message so it reads as a postscript to the
                   reply that the cap forced to stop early. */}
               <Show when={m.role === "assistant"}>{renderCostCapBar(turnForMessage(m.seq))}</Show>
-              {/* M3.3: typed fatal-reason hint card — same slot. Renders
-                  for fatal_error stops (HTTP / connection / malformed)
-                  and idle_timeout (substantive-only idle detector trip
-                  → codex_stream_silent). Empty / null payload short-
-                  circuits inside the renderer. */}
-              <Show when={m.role === "assistant"}>{renderFatalCard(turnForMessage(m.seq))}</Show>
+              {/* M3.3 / M3.5: typed fatal-reason hint card — same slot.
+                  Renders for fatal_error stops (HTTP / connection /
+                  malformed / stream timeout / decode error) and
+                  idle_timeout (substantive-only idle detector trip →
+                  codex_stream_silent). M3.5 adds the "重试本回合" button
+                  that re-sends the prior user message. The `m.seq`
+                  parameter lets the renderer find that prior message. */}
+              <Show when={m.role === "assistant"}>
+                {renderFatalCard(turnForMessage(m.seq), m.seq)}
+              </Show>
             </>
           )}
         </For>

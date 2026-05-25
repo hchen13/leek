@@ -983,6 +983,39 @@ h2 {
   flex: 1;
   word-break: break-word;
 }
+/* M3.5: retry action row. The "重试本回合" button is a primary action —
+   the most common response to one of these cards — so it gets a solid
+   background; "继续提问 (跳过)" is a hint to keep typing in the composer
+   and reads as inline ghost text, not a button. */
+.fatal-hint-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+.fatal-hint-retry {
+  appearance: none;
+  border: 1px solid rgba(251, 191, 36, 0.55);
+  background: rgba(251, 191, 36, 0.18);
+  color: var(--text);
+  padding: 4px 12px;
+  font-size: 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.fatal-hint-retry:hover:not(:disabled) {
+  background: rgba(251, 191, 36, 0.28);
+}
+.fatal-hint-retry:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.fatal-hint-skip {
+  color: var(--muted, #94a3b8);
+  font-size: 13px;
+}
 
 /* ── M2.6 sidebar gear + settings modal ────────────────────────────────
    The gear is a tiny ghost button next to the L.E.E.K logo. The modal

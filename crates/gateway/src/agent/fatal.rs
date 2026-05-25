@@ -76,6 +76,29 @@ pub enum FatalReason {
     /// user cannot do anything about this; the hint tells them it is a leek
     /// or codex bug worth reporting with the turn id.
     CodexMalformed { detail: String },
+    /// M3.5: the SSE stream wedged mid-flight — bytes started arriving from
+    /// codex (so `Http` / `Connection` already passed) but a subsequent
+    /// `bytes_stream().next()` returned a reqwest "operation timed out" or
+    /// connection-reset error. Concretely this is the T31b crash: the
+    /// initial POST succeeded, reasoning Pings flowed, then mid-thinking
+    /// the read wedged. Distinguished from `CodexConnectionFailed` (which
+    /// covers initial-call DNS / TCP / TLS) so the chat hint reads "stream
+    /// 中段超时" instead of "无法连接 codex". `retry_attempts` counts the
+    /// same retry path as `CodexHttp5xx`.
+    CodexStreamTimeout {
+        detail: String,
+        retry_attempts: u32,
+    },
+    /// M3.5: bytes arrived but did not decode — partial multibyte UTF-8 at
+    /// a chunk boundary the parser could not reassemble, or a JSON
+    /// envelope that fails to parse, etc. Distinct from `CodexMalformed`
+    /// because malformed is "leek can't process this; report a bug"
+    /// while stream_decode is "transient byte corruption; retry usually
+    /// fixes it". `retry_attempts` counts the same retry path.
+    CodexStreamDecodeError {
+        detail: String,
+        retry_attempts: u32,
+    },
     /// Anything else — e.g. an internal storage error swallowed inside the
     /// loop. Kept as a fallback so an unclassified failure still gets a hint
     /// card instead of a raw stack-trace blob.
@@ -91,6 +114,8 @@ impl FatalReason {
             FatalReason::CodexHttp5xx { .. } => "codex_http_5xx",
             FatalReason::CodexStreamSilent { .. } => "codex_stream_silent",
             FatalReason::CodexConnectionFailed { .. } => "codex_connection_failed",
+            FatalReason::CodexStreamTimeout { .. } => "codex_stream_timeout",
+            FatalReason::CodexStreamDecodeError { .. } => "codex_stream_decode_error",
             FatalReason::CodexMalformed { .. } => "codex_malformed",
             FatalReason::Unknown { .. } => "unknown",
         }
@@ -125,6 +150,12 @@ impl FatalReason {
             }
             FatalReason::CodexConnectionFailed { detail, .. } => {
                 format!("无法连接 codex：{detail}")
+            }
+            FatalReason::CodexStreamTimeout { detail, .. } => {
+                format!("codex SSE 流中段超时：{detail}")
+            }
+            FatalReason::CodexStreamDecodeError { detail, .. } => {
+                format!("codex SSE 流解码失败：{detail}")
             }
             FatalReason::CodexMalformed { detail } => {
                 format!("codex 返回格式异常：{detail}")
@@ -161,6 +192,16 @@ impl FatalReason {
             }
             FatalReason::CodexConnectionFailed { retry_attempts, .. } => {
                 let base = "无法连接 codex 服务（DNS / 网络），检查网络后重试。";
+                with_retry_note(base, *retry_attempts)
+            }
+            FatalReason::CodexStreamTimeout { retry_attempts, .. } => {
+                let base = "codex SSE 流中段超时（reading SSE chunk → timed out），\
+                            通常网络抖动 / codex 临时过载，重试可恢复。";
+                with_retry_note(base, *retry_attempts)
+            }
+            FatalReason::CodexStreamDecodeError { retry_attempts, .. } => {
+                let base = "codex SSE 流字节损坏 / 分块边界异常，\
+                            重试通常能拿到一份干净的 stream。";
                 with_retry_note(base, *retry_attempts)
             }
             FatalReason::CodexMalformed { .. } => {
@@ -202,7 +243,9 @@ impl FatalReason {
             | FatalReason::Unknown { .. } => 1,
             FatalReason::CodexHttp5xx { retry_attempts, .. }
             | FatalReason::CodexStreamSilent { retry_attempts, .. }
-            | FatalReason::CodexConnectionFailed { retry_attempts, .. } => *retry_attempts,
+            | FatalReason::CodexConnectionFailed { retry_attempts, .. }
+            | FatalReason::CodexStreamTimeout { retry_attempts, .. }
+            | FatalReason::CodexStreamDecodeError { retry_attempts, .. } => *retry_attempts,
         }
     }
 
@@ -244,7 +287,9 @@ impl FatalReason {
         match &mut self {
             FatalReason::CodexHttp5xx { retry_attempts, .. }
             | FatalReason::CodexStreamSilent { retry_attempts, .. }
-            | FatalReason::CodexConnectionFailed { retry_attempts, .. } => {
+            | FatalReason::CodexConnectionFailed { retry_attempts, .. }
+            | FatalReason::CodexStreamTimeout { retry_attempts, .. }
+            | FatalReason::CodexStreamDecodeError { retry_attempts, .. } => {
                 *retry_attempts = attempts;
             }
             _ => {}
@@ -265,19 +310,50 @@ impl FatalReason {
     /// user to retry / check the network, so the floor is acceptable.
     pub fn from_stream_error(err: &anyhow::Error) -> FatalReason {
         let msg = err.to_string();
+        let chain = trimmed_error_chain(err);
         // The byte-stream side wraps its source as `reading SSE chunk`
-        // (see `parse_sse_stream` in responses.rs). Treat that as a
-        // connection problem — the bytes failed to flow.
+        // (see `parse_sse_stream` in responses.rs). M3.5: distinguish
+        // operation-timeout (the T31b crash — bytes flowing then wedged)
+        // from a clean connection drop. Both are still retryable at the
+        // stream-retry layer; the typed split is so the chat hint card
+        // can read "stream 中段超时" (CodexStreamTimeout) vs "无法连接"
+        // (CodexConnectionFailed, which historically meant "could not
+        // reach codex at all" — initial-call DNS/TCP/TLS — and now
+        // continues to cover stream-side drops that aren't timeouts).
         if msg.starts_with("reading SSE chunk") {
+            let lowered = chain.to_lowercase();
+            if lowered.contains("operation timed out")
+                || lowered.contains("timed out")
+                || lowered.contains("timeout")
+            {
+                return FatalReason::CodexStreamTimeout {
+                    detail: chain,
+                    retry_attempts: 1,
+                };
+            }
             return FatalReason::CodexConnectionFailed {
-                detail: trimmed_error_chain(err),
+                detail: chain,
                 // First-failure default — the retry wrapper bumps this
                 // via `with_retry_attempts` if it actually retried.
                 retry_attempts: 1,
             };
         }
+        // M3.5: a UTF-8 / JSON decode failure on bytes that *did* arrive is
+        // a transient decode error (chunk-boundary corruption, garbled
+        // multibyte split) — typically a retry produces a clean stream. We
+        // keep CodexMalformed for "we got bytes leek's parser truly does
+        // not know what to do with" (a new event type the codex backend
+        // ships, a `response.failed` explicit error event, etc.).
+        if msg.starts_with("non-UTF-8 in SSE event")
+            || msg.starts_with("parsing SSE data as JSON")
+        {
+            return FatalReason::CodexStreamDecodeError {
+                detail: chain,
+                retry_attempts: 1,
+            };
+        }
         FatalReason::CodexMalformed {
-            detail: trimmed_error_chain(err),
+            detail: chain,
         }
     }
 
@@ -379,20 +455,92 @@ mod tests {
 
     #[test]
     fn malformed_keeps_chain_in_detail() {
+        // M3.5: `parsing SSE data as JSON` + `non-UTF-8 in SSE event` are
+        // now both transient `stream_decode_error` (retry usually fixes
+        // them). True `codex_malformed` is reserved for shapes the
+        // classifier doesn't recognize — e.g. a new event_type or an
+        // explicit `provider returned an error event` payload.
         let inner = anyhow!("non-UTF-8 in SSE event");
         let outer = inner.context("parsing SSE data as JSON");
         let r = FatalReason::from_stream_error(&outer);
-        assert_eq!(r.kind(), "codex_malformed");
+        assert_eq!(r.kind(), "codex_stream_decode_error");
         // chain is rendered with → separator
         assert!(r.detail().contains("→"));
+
+        // Anything outside the known retryable / decode signatures
+        // continues to land on `codex_malformed`.
+        let unknown = anyhow!("provider returned an error event: foo");
+        let r = FatalReason::from_stream_error(&unknown);
+        assert_eq!(r.kind(), "codex_malformed");
     }
 
     #[test]
     fn reading_sse_chunk_routes_to_connection_failed() {
+        // A non-timeout transport drop (e.g. `error sending request`) keeps
+        // the historical CodexConnectionFailed classification. M3.5 only
+        // peels out the timeout subset into its own kind.
         let inner = anyhow!("error sending request");
         let outer = inner.context("reading SSE chunk");
         let r = FatalReason::from_stream_error(&outer);
         assert_eq!(r.kind(), "codex_connection_failed");
+    }
+
+    #[test]
+    fn reading_sse_chunk_timed_out_routes_to_stream_timeout() {
+        // M3.5: the T31b crash signature — `operation timed out` inside
+        // the reading-SSE-chunk context. Must classify as the typed
+        // stream_timeout so the chat hint reads "stream 中段超时" and
+        // (more importantly) so the stream-retry wrapper recognizes it
+        // as retryable.
+        let inner = anyhow!("operation timed out");
+        let outer = inner.context("reading SSE chunk");
+        let r = FatalReason::from_stream_error(&outer);
+        assert_eq!(r.kind(), "codex_stream_timeout");
+        assert!(r.detail().contains("timed out"));
+        assert!(r.hint().contains("超时"));
+    }
+
+    #[test]
+    fn non_utf8_routes_to_stream_decode_error() {
+        // A UTF-8 split at a chunk boundary — transient, retryable, not
+        // a leek-side bug. Keep CodexMalformed reserved for "leek can't
+        // parse this; report it".
+        let inner = anyhow!("non-UTF-8 in SSE event");
+        let r = FatalReason::from_stream_error(&inner);
+        assert_eq!(r.kind(), "codex_stream_decode_error");
+    }
+
+    #[test]
+    fn json_parse_routes_to_stream_decode_error() {
+        // A JSON envelope that fails to parse mid-stream is also a transient
+        // decode error (likely a chunk-boundary split or a partial envelope
+        // delivered mid-frame).
+        let inner = anyhow!("parsing SSE data as JSON: foo");
+        let r = FatalReason::from_stream_error(&inner);
+        assert_eq!(r.kind(), "codex_stream_decode_error");
+    }
+
+    #[test]
+    fn stream_timeout_carries_retry_attempts() {
+        let r = FatalReason::CodexStreamTimeout {
+            detail: "reading SSE chunk → operation timed out".into(),
+            retry_attempts: 3,
+        };
+        assert_eq!(r.retry_attempts(), 3);
+        assert!(r.hint().contains("已自动重试 2 次"));
+        // payload carries the count for the frontend.
+        assert_eq!(r.to_payload()["retry_attempts"], 3);
+        assert_eq!(r.to_payload()["kind"], "codex_stream_timeout");
+    }
+
+    #[test]
+    fn stream_decode_error_carries_retry_attempts() {
+        let r = FatalReason::CodexStreamDecodeError {
+            detail: "non-UTF-8 in SSE event".into(),
+            retry_attempts: 5,
+        };
+        assert_eq!(r.retry_attempts(), 5);
+        assert!(r.hint().contains("已自动重试 4 次"));
     }
 
     #[test]
