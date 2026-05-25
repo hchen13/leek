@@ -522,7 +522,47 @@ skills/sample/SKILL.md         # frontmatter + body
 
 ---
 
-## 跑完之后(M0–M3 全部 33 条)
+## 第八段:M3.1 codex builtin web_search 治理(duplicate URL 检测 + 干预)
+
+### T34 · 重复 URL 实时 warning + 下个 iter inject + 高阈值 abort
+
+**背景**:M3 deep-review 实测踩雷,同一 PDF 被 codex 内部 `open_page` × 9 次,leek 5 个 guards 全部失效(只管 leek-side dispatch)。M3.1 加 `BuiltinTracker` per-turn 监测 codex builtin `search/open_page/find_in_page` 的 `(action_type, url)` 重复,跨阈值 emit warning + inject 提示到下个 iter + 高阈值强 abort。
+
+**预先(Settings 调到容易触发的低阈值)**:打开 Settings 改:
+- `Codex 内置 search 重复 URL 警告阈值` = `2`
+- `Codex 内置 search 重复 URL 中止阈值` = `3`
+
+保存。
+
+**prompt**(强迫模型反复访问同一资源):
+
+```
+帮我深度复盘伯克希尔哈撒韦(BRK.A)的最近 3 年业绩。务必尽可能详细地从 https://en.wikipedia.org/wiki/Berkshire_Hathaway 这一页面反复抓取所有相关数据,我要看你 cite 每一条具体数字。
+```
+
+**预期**:
+1. **iter 1-2**:模型调 codex builtin web_search,反复 open `en.wikipedia.org/wiki/Berkshire_Hathaway`
+2. **第 2 次同 URL 完成 → canvas 出黄色 warning chip**:`⚠ codex 重复 open en.wikipedia.org/... (open_page · 第 2 次) — 已提示模型停止`
+3. **第 3 次同 URL 完成 → canvas 出红色 abort chip + chat 出现**:`[检测到 codex 内置 web_search 重复 open 同一 URL,本回合中止。]`
+4. **turn 立刻 stop**,`stop_reason="codex_duplicate_abort"`,`first_triggered_guard="codex_duplicate_abort"`
+
+**看点**:
+- 抓 `transcripts/{turn}/2/request` 的 input 数组,**第 2 个 iter 应该看到 developer-role inject message**:
+  ```
+  ⚠ 在前面的 iteration 中, 你重复调用了 codex 内置 web_search 的同一资源 (action_type + URL):
+  - [open_page] https://en.wikipedia.org/wiki/Berkshire_Hathaway (2 次)
+  这通常意味着你已经从这些资源获取了足够信息 (或它们没有你需要的内容). 请基于已有信息得出结论, 不要再 search 或 open 同一 URL, 进入综合 + 输出阶段.
+  ```
+- `turn_metrics_recorded.stop_reason == "codex_duplicate_abort"`
+- `events.json` 包含 2 条 `codex_duplicate_url_warning`(seq 顺序:第 2 次 warn / 第 3 次 abort)
+
+**通过条件**:warning 实时显示 + inject message 在 iter 2 input 中可见 + abort 在第 3 次同 URL 触发 + chat 看到中止说明。
+
+**注**:跑完恢复默认阈值(warn=3, abort=7)再做后续测试。
+
+---
+
+## 跑完之后(M0–M3 全部 34 条)
 
 - 想看 raw LLM 层(F2 归档):`curl http://localhost:8964/api/v1/sessions/{id}/transcripts`
 - 想 reset:删 vault.db + 删 `~/.leek/config.json`(M2.6 settings)
