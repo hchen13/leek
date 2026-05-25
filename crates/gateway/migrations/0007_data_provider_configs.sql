@@ -9,3 +9,4 @@ CREATE TABLE data_provider_configs (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (user_id, provider_name)
 );
+

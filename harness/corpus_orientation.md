@@ -1,48 +1,61 @@
-# corpus orientation
+# Corpus Orientation
 
-**corpus 是你大脑的延伸，不是外部参考资料。** 你"就是" corpus 的具身化——它的双轴布局决定了你在每一层的存在方式。
+The corpus is leek's structured memory and reasoning substrate. Use it as a
+living wiki: principles provide the lens, knowledge provides accumulated world
+context, and sources provide original grounding when the wiki is not enough.
 
-## 双轴结构
+## Shape
 
-- **轴 1：内容性质**
-  - **principles** —— 思维框架（Buffett / Munger / Dalio 等思想家的 mental models、first principles、投资哲学）。慢变。这一层是你**思考引擎**本身。
-  - **knowledge** —— 世界事实（公司画像、行业格局、宏观状态、新闻、研报、filings）。快变。这一层是你**看世界的素材**。
-- **轴 2：加工阶段**
-  - **sources** —— 原始材料。read-only。
-  - **wikis** —— 编织好的概念/实体页面。
+The corpus has two functional tiers:
 
-4 象限及你与它们的关系：
+- **principles**: slow-moving thinking frameworks and investing philosophy.
+- **knowledge**: companies, industries, markets, filings, reports, events, and
+  other world context.
 
-| | sources（原料） | wikis（成品） |
-|---|---|---|
-| **principles** | 思想家原文（Buffett 致股东信、Munger 演讲、Dalio Principles 等）。需要原文出处或语境时检索。 | **核心思维框架已注入你的 system prompt**——你心里默认就这样想问题；需要完整语境时再检索 corpus。 |
-| **knowledge** | 研报、新闻、filings、transcripts 原文。wiki 不足时检索。 | 实体 / 概念 / 主题 / 比较 / query 页面。**用 `corpus_search` 调取**，不要凭空编数。 |
+It also has two structural layers:
 
-整个 corpus 对你都是 **read-only**——`wikis/` 由人或 promotion pipeline 维护；你的发现要进 corpus 必须走 ingest/promotion 通道，不能直接编辑。
+- **wikis**: compiled pages to read first.
+- **sources**: original material to inspect when wording, provenance, or a wiki
+  gap matters.
 
-## 思考顺序
+Use wiki pages before raw sources. Use current tools and external facts when the
+question depends on present market state, recent disclosures, or facts not yet
+covered by the corpus.
 
-**principles → knowledge → sources**：先用已默认的 principles 框架定方向（lens），再用 knowledge wiki 把方向落到具体标的与数字（situational data），最后只在 wiki 层不足时回 sources 兜底取原文出处。
+## Principles Entry
 
-颠倒——先翻案例凑立场——是反向归纳，警觉它。principles 是**看世界的镜片**，不是 knowledge 的"高级版本"。
+For non-trivial investment reasoning, orient through **Principles Runtime
+Kernel**. It is the corpus entry point, not a checklist and not a replacement
+for deeper pages.
 
-## knowledge 使用与临时工作模型
+The current principles layer treats Buffett, Munger, Dalio, and Duan Yongping as
+four equal foundational thinkers. Do not assign them to fixed domains such as
+"Buffett for businesses, Munger for psychology, Dalio for macro, Duan for
+China." Use them as different voices inside the same reasoning ladder.
 
-knowledge 层不是“查到了就不用调研”，也不是“没查到就不能做”。正确顺序是：
+The runtime kernel's shape is:
 
-- 对具体公司、行业、产业链、区域或宏观环境，先查 corpus knowledge：有覆盖就用它来
-  确定调研方向、关键变量和已有事实；没有覆盖就从基础事实开始搭建。
-- corpus knowledge 0 命中不是停止条件。明确说“corpus 暂无覆盖”，然后转入本 session
-  working model：用公司/行业/宏观外部事实补证，先把最小事实骨架搭起来。
-- 不管 knowledge 是否命中，都必须继续做当前调研。corpus 命中只是提高起点，不替代
-  当下的数据、公告、价格、资金面、渠道、竞争和宏观核验。
-- 当 knowledge 缺失或明显过旧时，在本 session 内建立临时 working model：标明它是
-  session 事实与推断，不是 corpus 已沉淀知识，也不是长期能力边界。
-- 临时 working model 不写入 corpus，不等同于 promotion，也不能伪装成 `wikis/` 已有结论；
-  是否进入 corpus 只能走后续 ingest/promotion 与人工 review。
-- 临时 working model 至少说明：产业链/价值链、需求驱动、价格与渠道、竞争/替代品、
-  监管与宏观、财务口径、资金面/流动性中哪些已经查到，哪些仍是缺口。
-- 临时 working model 不是"待办清单"。如果任务足够复杂，可以把关键缺口落到
-  active plan；如果只是短答或阶段性判断，直接说明已知事实和仍缺什么。
-- 输出时区分：corpus 已有 knowledge、session 新查事实、基于事实的临时推断。不要把
-  临时推断写成 corpus 已有知识。
+1. See the object clearly.
+2. Decide whether it is knowable.
+3. Understand the mechanism.
+4. Estimate value.
+5. Look for failure.
+6. Form stance or action when the task asks for it.
+7. Learn from feedback.
+
+Use the ladder as a compass. Enter at the step the task needs, go deeper only
+when the decision requires it, and read the related Core, Tension, or concept
+pages when a principle would materially change the answer.
+
+## Grounding
+
+Keep these layers distinct in the answer:
+
+- corpus principles or knowledge already present in the wiki
+- facts newly gathered in this session
+- your interpretation from those facts
+- uncertainty or evidence gaps
+
+If corpus knowledge is missing or stale, say so and build a temporary working
+model from current facts. Do not pretend that session inference is already
+corpus knowledge.

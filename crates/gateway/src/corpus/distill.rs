@@ -20,12 +20,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-const RUNTIME_KERNEL_PAGES: &[&str] = &[
-    "wikis/principles/concepts/principles-runtime-kernel.md",
-    "wikis/principles/entities/warren-buffett.md",
-    "wikis/principles/entities/charlie-munger.md",
-    "wikis/principles/entities/ray-dalio.md",
-];
+const RUNTIME_KERNEL_PAGES: &[&str] = &["wikis/principles/concepts/principles-runtime-kernel.md"];
 
 /// Strip the leading YAML frontmatter block `---\n...\n---\n?` if present.
 fn strip_frontmatter(text: &str) -> &str {
@@ -90,6 +85,8 @@ fn clean_page(raw: &str) -> String {
         "## Related Concepts",
         "## Related",
         "## Corpus 覆盖范围",
+        "## 思想演变",
+        "## 典型案例",
         "## 开放问题",
         "## Open Questions",
     ] {
@@ -154,11 +151,12 @@ pub fn distill(corpus_root: &Path) -> Result<(String, DistillReport)> {
     ));
     out.push_str(
         "This is the compact operating kernel you start every investment \
-         conversation with. It is distilled from four corpus wiki pages: the \
-         runtime kernel plus Warren Buffett, Charlie Munger, and Ray Dalio \
-         entity pages. Use it as the default reasoning protocol; use \
-         `corpus_search` when the task needs a specific concept page, source \
-         quote, knowledge page, company fact, or current-world evidence.\n\n---\n\n",
+         conversation with. It is distilled from the corpus runtime kernel: \
+         the 7-step reasoning ladder, Core propositions, and productive \
+         tensions shared by Buffett, Munger, Dalio, and Duan Yongping. Use it \
+         as an orientation layer; use `corpus_search` and `corpus_read` when \
+         the task needs a specific concept page, source quote, knowledge page, \
+         company fact, or current-world evidence.\n\n---\n\n",
     );
     for (slug, body) in &pages {
         let title = slug.replace('-', " ");
