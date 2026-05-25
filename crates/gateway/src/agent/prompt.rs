@@ -179,6 +179,7 @@ mod tests {
                 system_prompt: "body".into(),
                 model: None,
                 cost_cap_usd: None,
+                reasoning_effort: None,
                 source_layer: AgentLayer::Builtin,
             },
         );

@@ -313,6 +313,9 @@ export type SettingsConfig = {
   builtin_url_warn_threshold?: number | null;
   /** M3.1 codex builtin web_search duplicate-URL abort threshold. */
   builtin_url_abort_threshold?: number | null;
+  /** M3.7 main-agent reasoning effort
+   *  (`minimal`/`low`/`medium`/`high`/`xhigh`). Default `medium`. */
+  reasoning_effort?: string | null;
 };
 
 /** One field's effective value + env-override flag. The value is `null`
@@ -340,6 +343,9 @@ export type SettingsResponse = {
     builtin_url_warn_threshold: EffectiveField;
     /** M3.1 codex builtin web_search duplicate-URL abort threshold. */
     builtin_url_abort_threshold: EffectiveField;
+    /** M3.7 main-agent reasoning effort
+     *  (`minimal`/`low`/`medium`/`high`/`xhigh`). */
+    reasoning_effort: { value: string | null; overridden_by_env: boolean };
     web_search: { value: boolean; overridden_by_env: boolean };
   };
   config_path: string;

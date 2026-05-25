@@ -55,6 +55,14 @@ pub struct AgentDef {
     /// idiom from `crate::config`). `None` = no per-subagent override
     /// → inherit the main agent's cap.
     pub cost_cap_usd: Option<f64>,
+    /// M3.7: optional per-subagent reasoning effort override. Read from
+    /// the `reasoning_effort` frontmatter field; must be one of
+    /// `minimal`/`low`/`medium`/`high`/`xhigh`. Invalid values are
+    /// dropped (warn-and-skip) so a typo never reaches codex. When set,
+    /// the subagent loop's `GuardConfig.reasoning_effort` is overridden
+    /// for that loop only — the main agent's value (Settings-driven)
+    /// is untouched. `None` = inherit whatever the main agent uses.
+    pub reasoning_effort: Option<String>,
     /// Discovery layer this agent was loaded from.
     pub source_layer: AgentLayer,
 }
@@ -113,6 +121,7 @@ mod tests {
             system_prompt: "system prompt".into(),
             model: None,
             cost_cap_usd: None,
+            reasoning_effort: None,
             source_layer: layer,
         }
     }

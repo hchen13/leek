@@ -135,6 +135,17 @@ System prompt 组装顺序（每节都可选）。**顺序原则：越普适、�
 未来加 memory / 用户 mandate 层时会插在第 4 之后（最易变、最不
 通用），不影响前面 1–4 的 cache prefix。
 
+**主 agent reasoning effort（M3.7）。** 主 agent 默认
+`reasoning_effort = medium`（`agent::REASONING_EFFORT_DEFAULT`）。
+xhigh + codex builtin web_search 反复抓 PDF 是 codex 上游 stream 不
+稳的主要触发因素（T31b PM 6 跑只 1 PASS）；medium 让主 agent 更
+"轻"行动，复杂 prompt 鼓励模型走 `task` 委派给 deep-review subagent
+（它在自己隔离 context 里依然 xhigh，见 §4.2.1）。User 可在
+Settings / `LEEK_REASONING_EFFORT` 调整主 agent 的 effort，5 个值：
+minimal / low / medium / high / xhigh。Subagent 通过 AGENT.md
+frontmatter `reasoning_effort` 字段独立覆盖；内置 worker 的值：
+`deep-review = xhigh`、`comparison = high`、其它 = medium。
+
 明确**不进** system prompt 的内容：
 
 - 不写"什么时候用哪个工具"的说明文。工具的选择依据是注册表里每个
@@ -181,6 +192,8 @@ frontmatter 里 description 的写法也不一样：
 description: <一句话描述这个 agent 能做什么委派工作>
 allowed_tools: [...]      # 可选；不给等于全工具集
 model: <override>         # 可选；codex OAuth 单 model 时无视
+cost_cap_usd: <number>    # 可选（M3.6 §E）；该 subagent loop 的 USD 上限；0 = 不限
+reasoning_effort: <value> # 可选（M3.7 §C）；minimal / low / medium / high / xhigh；不给 = 继承主 agent
 ---
 
 <markdown body — 直接作为 subagent 的 system prompt>
@@ -263,6 +276,7 @@ corpus-expert，主 agent 再据此 `update_plan`。
 | Codex builtin URL warn     | N=3，默认开             | per-turn          | 同一 `(action, url)` ≥ N 次 → canvas warn + next-iter hint。                          |
 | Codex builtin URL abort    | **0，默认关闭** (M3.6)  | per-turn          | 原 N=7 自动 abort，但 deep-dive 多角度重读权威源是合法行为，强杀让用户拿不到答案。M3.6 默认关掉，只 warn；用户仍可 PATCH `builtin_url_abort_threshold` 重新启用。 |
 | Provider retry             | 5 次（1 + 4 retry），默认开 | per-codex-call   | M3.5：1s/5s/15s/30s 指数 backoff，5xx / connection_failed / 流中 timeout 自动重试，每次 retry 前 emit `provider_retry_attempt` lifecycle event。 |
+| Reasoning effort           | **medium，默认开，user-tunable** (M3.7) | per-turn | 主 agent 默认 medium（原 xhigh 触发 codex 长 stream 不稳，T31b 6 跑只 1 PASS）。5 个值 minimal/low/medium/high/xhigh，可在 Settings 或 `LEEK_REASONING_EFFORT` 调；subagent 通过 AGENT.md `reasoning_effort` frontmatter 独立覆盖（内置 deep-review = xhigh，comparison = high，其余 medium）。 |
 | Per-turn metrics           | 默认开                  | per-turn          | 每个 turn 一行：stop_reason、tokens、cost、first_triggered_guard、iteration。         |
 
 Subagent 的 loop **全部**复用这些。一个挂掉的 subagent 不能污染

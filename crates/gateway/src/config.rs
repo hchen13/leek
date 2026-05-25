@@ -84,6 +84,13 @@ pub struct Config {
     /// with `stop_reason = "codex_duplicate_abort"`. `0` disables abort
     /// (warn-only). Default 7.
     pub builtin_url_abort_threshold: Option<u32>,
+    /// M3.7: main-agent reasoning effort. One of
+    /// `minimal`/`low`/`medium`/`high`/`xhigh`. `None` falls back to the
+    /// built-in default (medium — see `agent::REASONING_EFFORT_DEFAULT`).
+    /// Subagent overrides come from the AGENT.md `reasoning_effort`
+    /// frontmatter field (see `agents::AgentDef`); this field only
+    /// affects the main agent's loop.
+    pub reasoning_effort: Option<String>,
 }
 
 impl Config {
@@ -201,6 +208,9 @@ impl Config {
         if patch.builtin_url_abort_threshold.is_some() {
             self.builtin_url_abort_threshold = patch.builtin_url_abort_threshold;
         }
+        if patch.reasoning_effort.is_some() {
+            self.reasoning_effort = patch.reasoning_effort;
+        }
     }
 
     /// M3.6: PATCH-style merge that distinguishes **absent** field
@@ -245,6 +255,9 @@ impl Config {
         }
         if let Some(v) = patch.builtin_url_abort_threshold {
             self.builtin_url_abort_threshold = v;
+        }
+        if let Some(v) = patch.reasoning_effort {
+            self.reasoning_effort = v;
         }
     }
 
@@ -293,12 +306,27 @@ impl Config {
                 ));
             }
         }
+        if let Some(ref effort) = self.reasoning_effort {
+            if !is_valid_reasoning_effort(effort) {
+                errs.push(ConfigFieldError::new(
+                    "reasoning_effort",
+                    "must be one of: minimal, low, medium, high, xhigh",
+                ));
+            }
+        }
         if errs.is_empty() {
             Ok(())
         } else {
             Err(errs)
         }
     }
+}
+
+/// M3.7: validate a `reasoning_effort` string against the 5-value
+/// whitelist codex accepts. Shared between [`Config::validate`] and
+/// [`ConfigPatch::validate`] so the rule has one source of truth.
+pub(crate) fn is_valid_reasoning_effort(s: &str) -> bool {
+    matches!(s, "minimal" | "low" | "medium" | "high" | "xhigh")
 }
 
 /// One field-level error from `Config::validate`. Surfaced to the user via
@@ -349,6 +377,8 @@ pub struct ConfigPatch {
     pub builtin_url_warn_threshold: Option<Option<u32>>,
     #[serde(deserialize_with = "double_option", default)]
     pub builtin_url_abort_threshold: Option<Option<u32>>,
+    #[serde(deserialize_with = "double_option", default)]
+    pub reasoning_effort: Option<Option<String>>,
 }
 
 impl ConfigPatch {
@@ -395,6 +425,14 @@ impl ConfigPatch {
                 errs.push(ConfigFieldError::new(
                     "context_window",
                     "must be ≥ 1 (omit the field to use the model default)",
+                ));
+            }
+        }
+        if let Some(Some(ref effort)) = self.reasoning_effort {
+            if !is_valid_reasoning_effort(effort) {
+                errs.push(ConfigFieldError::new(
+                    "reasoning_effort",
+                    "must be one of: minimal, low, medium, high, xhigh",
                 ));
             }
         }
@@ -704,6 +742,59 @@ mod tests {
         let errs = patch.validate().unwrap_err();
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].field, "cost_cap_usd");
+    }
+
+    // ── M3.7: reasoning_effort validation ────────────────────────────
+
+    #[test]
+    fn validate_accepts_each_whitelisted_effort() {
+        for effort in ["minimal", "low", "medium", "high", "xhigh"] {
+            let cfg = Config {
+                reasoning_effort: Some(effort.into()),
+                ..Config::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "effort '{effort}' must pass validation",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_reasoning_effort() {
+        let cfg = Config {
+            reasoning_effort: Some("nuclear".into()),
+            ..Config::default()
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "reasoning_effort");
+    }
+
+    #[test]
+    fn patch_validate_rejects_unknown_reasoning_effort() {
+        let patch: ConfigPatch =
+            serde_json::from_str(r#"{"reasoning_effort": "ultra"}"#).unwrap();
+        let errs = patch.validate().unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "reasoning_effort");
+    }
+
+    #[test]
+    fn patch_null_clears_reasoning_effort() {
+        // Symmetric with the other null-clears tests above — the "Reset
+        // to default" path must be able to drop a stored effort back to
+        // None so the resolver re-applies the built-in default.
+        let patch: ConfigPatch =
+            serde_json::from_str(r#"{"reasoning_effort": null}"#).unwrap();
+        assert_eq!(patch.reasoning_effort, Some(None));
+
+        let mut base = Config {
+            reasoning_effort: Some("xhigh".into()),
+            ..Config::default()
+        };
+        base.merge_patch(patch);
+        assert_eq!(base.reasoning_effort, None);
     }
 
     #[test]

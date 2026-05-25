@@ -175,6 +175,27 @@ fn load_one(dir: &Path, agent_md: &Path, layer: AgentLayer) -> Result<AgentDef, 
         }
     });
 
+    // M3.7: optional `reasoning_effort` frontmatter override. Bad value
+    // warns + drops to `None` (the subagent inherits the main agent's
+    // effort) so one typo doesn't take the worker out of service. The
+    // whitelist mirrors the Config validator.
+    let reasoning_effort = frontmatter.get("reasoning_effort").and_then(|raw| {
+        let s = raw.trim();
+        if s.is_empty() {
+            return None;
+        }
+        if crate::config::is_valid_reasoning_effort(s) {
+            Some(s.to_string())
+        } else {
+            tracing::warn!(
+                path = %agent_md.display(),
+                value = s,
+                "AGENT.md reasoning_effort is not one of minimal/low/medium/high/xhigh — ignoring"
+            );
+            None
+        }
+    });
+
     let system_prompt = body.trim().to_string();
     if system_prompt.is_empty() {
         return Err(AgentLoadError {
@@ -190,6 +211,7 @@ fn load_one(dir: &Path, agent_md: &Path, layer: AgentLayer) -> Result<AgentDef, 
         system_prompt: system_prompt.into(),
         model,
         cost_cap_usd,
+        reasoning_effort,
         source_layer: layer,
     })
 }
@@ -448,6 +470,73 @@ mod tests {
                 got,
                 Some(*cap),
                 "built-in {name} should carry cost_cap_usd = {cap}",
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_frontmatter_loads_when_whitelisted() {
+        // M3.7: AGENT.md `reasoning_effort: xhigh` lands on `AgentDef`.
+        let root = temp_root("effort-ok");
+        write_agent(
+            &root,
+            "deep",
+            "---\ndescription: deep agent\nreasoning_effort: xhigh\n---\nbody",
+        );
+        let (reg, errs) = load_layered(&[(root.as_path(), AgentLayer::Builtin)]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            reg.get("deep").unwrap().reasoning_effort.as_deref(),
+            Some("xhigh"),
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_invalid_value_falls_through_to_none() {
+        // Bad value warns + drops to None so the worker still loads.
+        let root = temp_root("effort-bad");
+        write_agent(
+            &root,
+            "weird",
+            "---\ndescription: bad effort\nreasoning_effort: ultra\n---\nbody",
+        );
+        let (reg, errs) = load_layered(&[(root.as_path(), AgentLayer::Builtin)]);
+        assert!(errs.is_empty(), "agent should still load: {errs:?}");
+        assert!(reg.get("weird").unwrap().reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_absent_field_is_none() {
+        let root = temp_root("effort-absent");
+        write_agent(&root, "a", "---\ndescription: no effort\n---\nbody");
+        let (reg, _) = load_layered(&[(root.as_path(), AgentLayer::Builtin)]);
+        assert!(reg.get("a").unwrap().reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn shipped_builtin_agents_have_expected_reasoning_efforts() {
+        // M3.7 ships per-subagent effort overrides so deep-review stays
+        // at xhigh even after the main-agent default drops to medium.
+        // Spec-fixed values (dispatch §C): if any drift, both spec + this
+        // test need an update.
+        let dir = builtin_agents_dir();
+        if !dir.exists() {
+            return;
+        }
+        let (reg, _errs) = load_layered(&[(dir.as_path(), AgentLayer::Builtin)]);
+        let expect: &[(&str, &str)] = &[
+            ("deep-review", "xhigh"),
+            ("comparison", "high"),
+            ("quick-screen", "medium"),
+            ("corpus-expert", "medium"),
+            ("general-purpose", "medium"),
+        ];
+        for (name, effort) in expect {
+            let got = reg.get(name).and_then(|a| a.reasoning_effort.as_deref());
+            assert_eq!(
+                got,
+                Some(*effort),
+                "built-in {name} should carry reasoning_effort = {effort}",
             );
         }
     }

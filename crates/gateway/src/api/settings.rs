@@ -193,6 +193,14 @@ fn effective_body(_cfg: &Config, eff: &GuardConfig) -> serde_json::Value {
             "value": eff.builtin_url_abort_threshold,
             "overridden_by_env": env_set("LEEK_BUILTIN_URL_ABORT_THRESHOLD"),
         },
+        // M3.7: main-agent reasoning effort (medium default). The UI
+        // renders a 5-value dropdown off this. `value` is always one
+        // of minimal/low/medium/high/xhigh — the layered resolver
+        // already normalized whatever the user / env wrote.
+        "reasoning_effort": {
+            "value": eff.reasoning_effort.clone(),
+            "overridden_by_env": env_set("LEEK_REASONING_EFFORT"),
+        },
         // The config file says nothing about web_search (a capability flag,
         // not a guard) — but exposing the effective value here is helpful
         // for the UI, even when there is no editable field for it.
@@ -320,6 +328,7 @@ mod tests {
             "LEEK_WEB_SEARCH",
             "LEEK_BUILTIN_URL_WARN_THRESHOLD",
             "LEEK_BUILTIN_URL_ABORT_THRESHOLD",
+            "LEEK_REASONING_EFFORT",
         ]);
         std::env::set_var("LEEK_CONFIG_DIR", &dir);
 
@@ -579,6 +588,100 @@ mod tests {
                 .command
                 .contains("seeded"),
             "reload should bring in the new command"
+        );
+    }
+
+    // ── M3.7: reasoning_effort plumbing ──────────────────────────────
+
+    #[tokio::test]
+    async fn get_reports_medium_reasoning_effort_default() {
+        let _l = TEST_LOCK.lock().await;
+        let st = fixture().await;
+        let resp = read(State(st.st.clone())).await.unwrap().0;
+        // Fresh-default: medium, not env-overridden.
+        assert_eq!(resp["effective"]["reasoning_effort"]["value"], "medium");
+        assert_eq!(
+            resp["effective"]["reasoning_effort"]["overridden_by_env"],
+            false
+        );
+        // No stored value yet — config field is null.
+        assert!(resp["config"]["reasoning_effort"].is_null());
+    }
+
+    #[tokio::test]
+    async fn patch_sets_reasoning_effort_and_resolver_picks_it_up() {
+        let _l = TEST_LOCK.lock().await;
+        let st = fixture().await;
+        let (_status, resp) = patch(
+            State(st.st.clone()),
+            Json(json!({ "reasoning_effort": "xhigh" })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.0["config"]["reasoning_effort"], "xhigh");
+        // Effective resolves to the same value since no env var is set.
+        assert_eq!(resp.0["effective"]["reasoning_effort"]["value"], "xhigh");
+        // Snapshot agrees: the next turn's `GuardConfig::resolve` will
+        // read the stored xhigh.
+        assert_eq!(
+            st.st.config_snapshot().reasoning_effort.as_deref(),
+            Some("xhigh"),
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_rejects_invalid_reasoning_effort() {
+        let _l = TEST_LOCK.lock().await;
+        let st = fixture().await;
+        let err = patch(
+            State(st.st.clone()),
+            Json(json!({ "reasoning_effort": "ultra" })),
+        )
+        .await
+        .unwrap_err();
+        let parsed: serde_json::Value = serde_json::from_str(&err.message).unwrap();
+        assert_eq!(parsed["kind"], "validation_failed");
+        let errs = parsed["errors"].as_array().unwrap();
+        assert!(errs.iter().any(|e| e["field"] == "reasoning_effort"));
+        // Stored value untouched.
+        assert!(st.st.config_snapshot().reasoning_effort.is_none());
+    }
+
+    #[tokio::test]
+    async fn patch_null_clears_stored_reasoning_effort() {
+        let _l = TEST_LOCK.lock().await;
+        let st = fixture().await;
+        let _ = patch(
+            State(st.st.clone()),
+            Json(json!({ "reasoning_effort": "high" })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            st.st.config_snapshot().reasoning_effort.as_deref(),
+            Some("high"),
+        );
+        let (_s, resp) = patch(
+            State(st.st.clone()),
+            Json(json!({ "reasoning_effort": null })),
+        )
+        .await
+        .unwrap();
+        assert!(resp.0["config"]["reasoning_effort"].is_null());
+        // Effective falls back to the built-in default.
+        assert_eq!(resp.0["effective"]["reasoning_effort"]["value"], "medium");
+    }
+
+    #[tokio::test]
+    async fn get_reports_env_override_for_reasoning_effort() {
+        let _l = TEST_LOCK.lock().await;
+        let st = fixture().await;
+        std::env::set_var("LEEK_REASONING_EFFORT", "low");
+        let resp = read(State(st.st.clone())).await.unwrap().0;
+        assert_eq!(resp["effective"]["reasoning_effort"]["value"], "low");
+        assert_eq!(
+            resp["effective"]["reasoning_effort"]["overridden_by_env"],
+            true
         );
     }
 

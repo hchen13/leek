@@ -180,6 +180,12 @@ export function Settings(props: SettingsProps) {
     for (const f of FIELDS) next[f.key] = draftOf(resp.config, f.key);
     // M3 vendor token (string field, not in FIELDS — handled inline)
     next.tushare_token = resp.config.tushare_token ?? "";
+    // M3.7 reasoning_effort (string field with enum, not in FIELDS).
+    // Empty string in the draft = "follow built-in default", same as null
+    // on the wire. We do NOT auto-fill from `effective` here — that would
+    // turn a "fresh install" into "user has explicitly chosen medium",
+    // making the reset button confusing.
+    next.reasoning_effort = resp.config.reasoning_effort ?? "";
     setDraft(next);
   };
 
@@ -221,6 +227,13 @@ export function Settings(props: SettingsProps) {
     const tokCurrent = cfg.tushare_token ?? null;
     if (tokDraft !== tokCurrent) {
       out.tushare_token = tokDraft;
+    }
+    // M3.7 reasoning_effort — enum string field, separate handling.
+    const reRaw = (d.reasoning_effort ?? "").trim();
+    const reDraft = reRaw === "" ? null : reRaw;
+    const reCurrent = cfg.reasoning_effort ?? null;
+    if (reDraft !== reCurrent) {
+      out.reasoning_effort = reDraft;
     }
     return out;
   };
@@ -279,7 +292,8 @@ export function Settings(props: SettingsProps) {
     if (!confirm("将所有字段重置为内置默认值,清空 config.json 中所有已存储字段。")) return;
     // M3.6: "reset" 现在用 explicit null 真正清字段(merge 接受 null=clear);
     // 后端 GuardConfig::resolve 会回到 built-in default(idle=180s, abort=0 等)。
-    const body: Record<string, number | null> = {
+    // M3.7: reasoning_effort 也一并 null-clear,回 "medium" built-in。
+    const body: Record<string, number | string | null> = {
       cost_cap_usd: null,
       idle_timeout_secs: null,
       wall_clock_secs: null,
@@ -289,6 +303,7 @@ export function Settings(props: SettingsProps) {
       context_window: null,
       builtin_url_warn_threshold: null,
       builtin_url_abort_threshold: null,
+      reasoning_effort: null,
     };
     await patchAndRefresh(body);
   };
@@ -381,6 +396,45 @@ export function Settings(props: SettingsProps) {
                 </div>
               )}
             </For>
+
+            {/* M3.7 主 agent reasoning effort — enum string, separate dropdown.
+                medium 是 leek 推荐 default(deep-review subagent 仍 xhigh 不受此影响)。 */}
+            <div class="settings-field" data-field="reasoning_effort">
+              <label class="settings-label" for="settings-reasoning_effort">
+                主 agent reasoning effort
+              </label>
+              <select
+                id="settings-reasoning_effort"
+                class="settings-input"
+                value={draft().reasoning_effort ?? ""}
+                disabled={saving()}
+                onInput={(e) => {
+                  setDraft({ ...draft(), reasoning_effort: e.currentTarget.value });
+                }}
+              >
+                <option value="">(默认: medium)</option>
+                <option value="minimal">minimal</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+                <option value="xhigh">xhigh</option>
+              </select>
+              <div class="settings-hint">
+                xhigh 让 agent 更深思但容易撞 codex 长 stream 不稳;medium 是 leek 推荐 default;low/minimal 让简单问题快答。deep-review subagent 仍以 xhigh 跑(在自己的独立 context 里),不受此设置影响。
+              </div>
+              <div class="settings-effective">
+                <span class="settings-eff-label">当前生效:</span>
+                <span class="settings-eff-value">
+                  {String(data()?.effective?.reasoning_effort?.value ?? "medium")}
+                </span>
+                <Show when={data()?.effective?.reasoning_effort?.overridden_by_env}>
+                  <span class="settings-env-badge" title="LEEK_REASONING_EFFORT 环境变量优先于此字段">⚠ 被环境变量 override</span>
+                </Show>
+              </div>
+              <Show when={errorFor("reasoning_effort")}>
+                <div class="settings-field-err">{errorFor("reasoning_effort")}</div>
+              </Show>
+            </div>
 
             {/* M3 vendor 凭证 section — single string field, separate from numeric FIELDS */}
             <div class="settings-field" data-field="tushare_token">

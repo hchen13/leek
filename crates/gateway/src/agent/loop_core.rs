@@ -134,6 +134,21 @@ pub struct LoopOutcome {
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub ended_at: chrono::DateTime<chrono::Utc>,
     pub wall_clock_ms: i64,
+    /// M3.7 §D: every `TextDelta` the model yielded across the **whole
+    /// turn** — accumulated across iterations, not just the final
+    /// (potentially fatal) iter. `final_reply` only carries the *last*
+    /// iter's text, which is empty when a fatal error kills the very
+    /// stream that was about to write the answer. `yielded_assistant_text`
+    /// is the fault-tolerant fallback: when fatal + final_reply empty
+    /// but yielded is not, the composer surfaces yielded with a footnote
+    /// hint so the user does not lose minutes of accumulated reasoning
+    /// to a single codex stream hiccup.
+    ///
+    /// Substantive = `TextDelta` only, intentionally narrower than
+    /// `LlmEvent::is_substantive` (which also covers tool calls and
+    /// search frames). A tool_call gives us nothing we can show the
+    /// user as a partial answer.
+    pub yielded_assistant_text: String,
 }
 
 /// Drive the inner loop. Caller owns lifecycle bookkeeping around it —
@@ -155,6 +170,15 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
 
     let mut additional_inputs: Vec<serde_json::Value> = Vec::new();
     let mut final_reply = String::new();
+    // M3.7 §D: turn-level accumulator for every `TextDelta` the model
+    // emitted across all iters. The fault-tolerant final composer uses
+    // this when the final iter died mid-stream — the user gets the
+    // partial answer the model had already written, plus a hint, instead
+    // of an empty "本回合调用失败" bubble. Kept turn-local (separate from
+    // `iter_text` below) so the fallback survives across iters too —
+    // a turn that wrote 2000 chars across 8 iters then fataled in iter
+    // 9 still surfaces every byte.
+    let mut yielded_assistant_text = String::new();
     let mut iteration_count: usize = 0;
     let mut transcript_iter: i64 = 0;
     let mut tool_call_count: usize = 0;
@@ -357,7 +381,11 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
             messages: iter_messages,
             tools: p.tool_specs.clone(),
             additional_inputs: iter_inputs,
-            reasoning_effort: Some(super::REASONING_EFFORT.to_string()),
+            // M3.7: the effort lives on the guard config now — main
+            // agent reads the layered (env > config > built-in) value,
+            // subagent reads it after `apply_agent_overrides` swapped
+            // in the AGENT.md per-loop override.
+            reasoning_effort: Some(p.guards.reasoning_effort.clone()),
             verbosity: Some(super::VERBOSITY.to_string()),
             // M3.6 §F: loop-level override — see LoopParams.web_search.
             web_search: p.web_search,
@@ -501,6 +529,10 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
             match event {
                 Ok(LlmEvent::TextDelta { text }) => {
                     iter_text.push_str(&text);
+                    // M3.7 §D: also append to the turn-level accumulator
+                    // so the fault-tolerant final has something to surface
+                    // when a fatal kills the stream mid-write.
+                    yielded_assistant_text.push_str(&text);
                     // Subagent deltas would clobber the main agent's chat
                     // streaming bubble — suppress them entirely (we still
                     // accumulate text locally for the final result). Main
@@ -938,6 +970,7 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
         started_at,
         ended_at,
         wall_clock_ms,
+        yielded_assistant_text,
     })
 }
 

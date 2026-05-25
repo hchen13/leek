@@ -362,14 +362,21 @@ pub fn subagent_web_search_allowed(agent: &AgentDef) -> bool {
         .any(|t| t.starts_with("web_") || t == "web_search" || t == "web_fetch")
 }
 
-/// M3.6 §E: layer per-subagent overrides from `AgentDef` onto the main
-/// agent's `GuardConfig`. Today only `cost_cap_usd` is overridable — a
-/// deep-dive worker can carry a $5 budget while a quick-screen worker
-/// is locked to $0.20, both independent of the user's main-agent cap.
-/// `0.0` is normalized to "no cap" so the spec's "0 = unlimited"
-/// product idiom (settings, config file) holds end-to-end. `NaN` /
-/// negative are similarly treated as "no cap" — the loader already
-/// drops those, but this function is the last line of defense.
+/// M3.6 §E + M3.7 §C: layer per-subagent overrides from `AgentDef`
+/// onto the main agent's `GuardConfig`. Today two fields are
+/// overridable:
+///
+/// - `cost_cap_usd` — a deep-dive worker can carry a $5 budget while
+///   a quick-screen worker is locked to $0.20, both independent of
+///   the user's main-agent cap. `0.0` is normalized to "no cap" so
+///   the spec's "0 = unlimited" product idiom (settings, config file)
+///   holds end-to-end. `NaN` / negative are similarly treated as
+///   "no cap" — the loader already drops those, but this function
+///   is the last line of defense.
+/// - `reasoning_effort` — `deep-review` keeps xhigh even after the
+///   main agent drops to medium (its isolated context can afford
+///   the depth). The loader validates the whitelist; a `None` here
+///   means "inherit whatever the main agent currently uses".
 pub fn apply_agent_overrides(guards: &mut GuardConfig, agent: &AgentDef) {
     if let Some(cap) = agent.cost_cap_usd {
         guards.cost_cap_usd = if cap > 0.0 && cap.is_finite() {
@@ -377,6 +384,14 @@ pub fn apply_agent_overrides(guards: &mut GuardConfig, agent: &AgentDef) {
         } else {
             None
         };
+    }
+    if let Some(effort) = agent.reasoning_effort.as_deref() {
+        // Loader already validated against the whitelist; defensive
+        // double-check guards against a future code path that builds an
+        // AgentDef in memory and skips the loader.
+        if crate::config::is_valid_reasoning_effort(effort) {
+            guards.reasoning_effort = effort.to_string();
+        }
     }
 }
 
@@ -577,6 +592,7 @@ mod tests {
             system_prompt: "body".into(),
             model: None,
             cost_cap_usd,
+            reasoning_effort: None,
             source_layer: crate::agents::AgentLayer::Builtin,
         }
     }
@@ -662,6 +678,44 @@ mod tests {
     }
 
     #[test]
+    fn agent_override_replaces_main_reasoning_effort() {
+        // M3.7 §C: AGENT.md `reasoning_effort: xhigh` must swap whatever
+        // the main agent's resolver produced — that's how `deep-review`
+        // stays at xhigh even after the main agent drops to medium.
+        let mut agent = mk_agent("deep-review", None);
+        agent.reasoning_effort = Some("xhigh".into());
+        let mut guards = baseline_guards();
+        // sanity-check the baseline so the override is observable
+        guards.reasoning_effort = "medium".into();
+        apply_agent_overrides(&mut guards, &agent);
+        assert_eq!(guards.reasoning_effort, "xhigh");
+    }
+
+    #[test]
+    fn agent_override_absent_keeps_main_reasoning_effort() {
+        // No `reasoning_effort` declared → subagent inherits whatever
+        // the main agent currently uses (the main loop's resolved value).
+        let agent = mk_agent("inherit", None);
+        let mut guards = baseline_guards();
+        guards.reasoning_effort = "low".into();
+        apply_agent_overrides(&mut guards, &agent);
+        assert_eq!(guards.reasoning_effort, "low", "main effort must survive");
+    }
+
+    #[test]
+    fn agent_override_invalid_reasoning_effort_ignored() {
+        // Defensive: the loader strips bad values, but a code path that
+        // builds an AgentDef in memory with an unknown effort must not
+        // poison the codex request — the override falls through.
+        let mut agent = mk_agent("malformed", None);
+        agent.reasoning_effort = Some("ultra".into());
+        let mut guards = baseline_guards();
+        guards.reasoning_effort = "medium".into();
+        apply_agent_overrides(&mut guards, &agent);
+        assert_eq!(guards.reasoning_effort, "medium");
+    }
+
+    #[test]
     fn agent_override_negative_falls_back_to_no_cap() {
         // Defensive: the loader already strips bad values, but if a
         // future path constructs an AgentDef in code with a negative
@@ -684,6 +738,7 @@ mod tests {
                 system_prompt: "body".into(),
                 model: None,
                 cost_cap_usd: None,
+                reasoning_effort: None,
                 source_layer: crate::agents::AgentLayer::Builtin,
             },
         );
@@ -704,6 +759,7 @@ mod tests {
                 system_prompt: "body".into(),
                 model: None,
                 cost_cap_usd: None,
+                reasoning_effort: None,
                 source_layer: crate::agents::AgentLayer::Builtin,
             },
         );

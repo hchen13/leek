@@ -30,7 +30,11 @@ use std::time::Duration;
 
 use crate::config::Config;
 
-#[derive(Debug, Clone, Copy)]
+// M3.7 dropped `Copy` — the new `reasoning_effort: String` field carries
+// heap data. All call sites used `GuardConfig` by value or `&GuardConfig`
+// already; the only behavioral change is that explicit cloning now goes
+// through `.clone()` instead of the implicit copy.
+#[derive(Debug, Clone)]
 pub struct GuardConfig {
     pub idle_timeout: Option<Duration>,
     pub wall_clock: Option<Duration>,
@@ -58,6 +62,14 @@ pub struct GuardConfig {
     /// legitimately re-opened the same authoritative source under
     /// different angles. Env override: `LEEK_BUILTIN_URL_ABORT_THRESHOLD`.
     pub builtin_url_abort_threshold: u32,
+    /// M3.7: main-agent reasoning effort passed into every codex
+    /// `ChatRequest.reasoning_effort` field. One of
+    /// `minimal`/`low`/`medium`/`high`/`xhigh`. Default `medium`
+    /// (see `agent::REASONING_EFFORT_DEFAULT`). Env override:
+    /// `LEEK_REASONING_EFFORT` — invalid values fall through to the
+    /// config layer, then the built-in default. Subagents can override
+    /// per-loop via `apply_agent_overrides` from AGENT.md frontmatter.
+    pub reasoning_effort: String,
 }
 
 impl GuardConfig {
@@ -106,6 +118,16 @@ impl GuardConfig {
                 // warn surface (default 3) stays on, so duplicates remain
                 // visible without taking the user's answer hostage.
                 0,
+            ),
+            reasoning_effort: reasoning_effort_layered(
+                config.reasoning_effort.as_deref(),
+                // M3.7: medium is the new built-in. xhigh stays available
+                // (Settings dropdown / `LEEK_REASONING_EFFORT=xhigh`) but
+                // codex stream stability under xhigh + heavy builtin
+                // search is fragile enough that the safer default ships
+                // off. The deep-review subagent still runs at xhigh on
+                // its isolated context.
+                super::REASONING_EFFORT_DEFAULT,
             ),
         }
     }
@@ -199,6 +221,35 @@ fn context_window_layered(config_value: Option<i64>) -> Option<i64> {
         return if n > 0 { Some(n as i64) } else { None };
     }
     config_value.filter(|&n| n > 0)
+}
+
+/// M3.7: layered string knob for `reasoning_effort`. Env > config >
+/// default; invalid values at either layer fall through (with a warn)
+/// so one typo never reaches the codex `ChatRequest`. Whitelist comes
+/// from `config::is_valid_reasoning_effort` so the rule has a single
+/// source of truth between the settings API and the resolver.
+fn reasoning_effort_layered(config_value: Option<&str>, default: &str) -> String {
+    if let Ok(raw) = std::env::var("LEEK_REASONING_EFFORT") {
+        let trimmed = raw.trim();
+        if crate::config::is_valid_reasoning_effort(trimmed) {
+            return trimmed.to_string();
+        }
+        tracing::warn!(
+            value = trimmed,
+            "LEEK_REASONING_EFFORT must be one of minimal/low/medium/high/xhigh; falling through"
+        );
+    }
+    if let Some(v) = config_value {
+        let trimmed = v.trim();
+        if crate::config::is_valid_reasoning_effort(trimmed) {
+            return trimmed.to_string();
+        }
+        tracing::warn!(
+            value = trimmed,
+            "reasoning_effort in config is not a valid value; using default"
+        );
+    }
+    default.to_string()
 }
 
 /// `u32` knob with env > config > default. `0` in env / config is preserved
@@ -505,6 +556,74 @@ mod tests {
         let g = GuardConfig::resolve(&cfg);
         assert_eq!(g.builtin_url_warn_threshold, 0);
         assert_eq!(g.builtin_url_abort_threshold, 0);
+    }
+
+    // ── M3.7: reasoning_effort layering ───────────────────────────────
+
+    #[test]
+    fn resolve_uses_medium_reasoning_effort_default() {
+        // The headline M3.7 change — fresh-default ships at `medium`,
+        // not `xhigh`. A user upgrade onto an existing config file with
+        // no `reasoning_effort` field gets the new default automatically.
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::unset("LEEK_REASONING_EFFORT");
+        let g = GuardConfig::resolve(&Config::default());
+        assert_eq!(g.reasoning_effort, "medium");
+    }
+
+    #[test]
+    fn resolve_config_overrides_default_reasoning_effort() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::unset("LEEK_REASONING_EFFORT");
+        let cfg = Config {
+            reasoning_effort: Some("xhigh".into()),
+            ..Config::default()
+        };
+        let g = GuardConfig::resolve(&cfg);
+        assert_eq!(g.reasoning_effort, "xhigh");
+    }
+
+    #[test]
+    fn resolve_env_overrides_config_reasoning_effort() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::set("LEEK_REASONING_EFFORT", "low");
+        let cfg = Config {
+            reasoning_effort: Some("xhigh".into()),
+            ..Config::default()
+        };
+        let g = GuardConfig::resolve(&cfg);
+        assert_eq!(g.reasoning_effort, "low");
+    }
+
+    #[test]
+    fn resolve_falls_through_invalid_env_reasoning_effort() {
+        // A typo in the env var (e.g. `LEEK_REASONING_EFFORT=hgh`) must
+        // not poison the codex request — fall through to the config /
+        // default rather than ship "hgh" as the effort.
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::set("LEEK_REASONING_EFFORT", "ultra");
+        let cfg = Config {
+            reasoning_effort: Some("high".into()),
+            ..Config::default()
+        };
+        let g = GuardConfig::resolve(&cfg);
+        // Env value invalid → config layer wins.
+        assert_eq!(g.reasoning_effort, "high");
+    }
+
+    #[test]
+    fn resolve_falls_through_invalid_config_reasoning_effort() {
+        // A bad value stored in the config (loaded from disk by a
+        // hand-edited file that bypassed the API validator) must also
+        // fall through rather than reach codex.
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::unset("LEEK_REASONING_EFFORT");
+        let cfg = Config {
+            reasoning_effort: Some("super-mega".into()),
+            ..Config::default()
+        };
+        let g = GuardConfig::resolve(&cfg);
+        assert_eq!(g.reasoning_effort, "medium");
     }
 
     #[test]

@@ -41,12 +41,21 @@ use crate::hooks::{HookEvent, HookOutcome};
 use crate::llm::{ChatMessage, Role, WebSearchAction};
 use crate::vault::{messages, sessions, turn_metrics};
 
-/// The model leek runs on, with its fixed M1 inference settings. There is no
-/// settings surface yet, so the main-agent values are constants: XHigh
-/// reasoning (the synthesizing agent gets the biggest thinking budget), Low
-/// verbosity. A tuning surface is a later milestone.
+/// The model leek runs on, with its fixed M1 inference settings. Verbosity
+/// stays a constant (Low — leek answers are kept tight regardless of the
+/// thinking budget the model spends getting there). Reasoning effort moved
+/// to the layered settings surface in M3.7: `REASONING_EFFORT_DEFAULT` is
+/// the built-in fallback (medium), and `GuardConfig.reasoning_effort`
+/// carries the layered value (env > config > default). Subagents can
+/// override per-loop via AGENT.md frontmatter (see `agents::AgentDef`).
+///
+/// The default dropped from `xhigh` to `medium` after T31b: xhigh + codex
+/// builtin web_search reading the same PDF 7+ times kept tripping codex's
+/// upstream HTTP/2 stream errors. `medium` is "good enough" for most
+/// research turns and pushes harder prompts toward `task` delegation —
+/// the deep-review subagent stays at xhigh on its own isolated context.
 pub(super) const MODEL: &str = "gpt-5.5";
-pub(super) const REASONING_EFFORT: &str = "xhigh";
+pub(super) const REASONING_EFFORT_DEFAULT: &str = "medium";
 pub(super) const VERBOSITY: &str = "low";
 
 /// Cap on session history loaded as a turn's starting context. A turn whose
@@ -202,6 +211,10 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
         &outcome.stop_reason,
         outcome.fatal_error.as_deref(),
         outcome.fatal_reason.as_ref(),
+        // M3.7 §D: turn-level accumulator for the fault-tolerant rescue
+        // when a fatal kills the stream mid-write. See `compose_final_text`
+        // for the conditions under which it's surfaced.
+        &outcome.yielded_assistant_text,
     );
     let assistant = messages::insert(&st.pool, session_id, "assistant", &final_text).await?;
     st.emit(
@@ -407,11 +420,22 @@ pub(super) fn build_search_data(action: Option<&WebSearchAction>) -> serde_json:
 /// its hint (actionable, kind-specific) instead of the raw fatal-error string.
 /// The chat hint card on the frontend is the primary surface; this string is
 /// the fallback (history pages, search index, terminal grep).
+///
+/// M3.7 §D: `yielded` is the turn-level accumulator of every `TextDelta`
+/// the model emitted across all iters (see `LoopOutcome.yielded_assistant_text`).
+/// When a fatal kills the stream mid-write **and** the final iter never
+/// finalized its `iter_text` into `text`, we surface `yielded` plus a
+/// retry-or-tune footnote — so the user sees minutes of accumulated reasoning
+/// instead of an empty failure bubble. Skipped when `text` already has body
+/// (the iter completed before fatal, so iter_text is the right source) or
+/// when `yielded` is empty (the fatal struck before any text — nothing to
+/// salvage, fall back to the hint-only message).
 fn compose_final_text(
     text: &str,
     stop_reason: &str,
     fatal: Option<&str>,
     reason: Option<&fatal::FatalReason>,
+    yielded: &str,
 ) -> String {
     let body = text.trim();
     if stop_reason == "fatal_error" {
@@ -420,11 +444,21 @@ fn compose_final_text(
         let err: String = reason
             .map(|r| r.hint())
             .unwrap_or_else(|| fatal.unwrap_or("未知错误").to_string());
-        return if body.is_empty() {
-            format!("本回合调用失败：{err}")
-        } else {
-            format!("{body}\n\n[本回合中断：{err}]")
-        };
+        if !body.is_empty() {
+            return format!("{body}\n\n[本回合中断：{err}]");
+        }
+        // M3.7 §D: fault-tolerant rescue. iter_text was empty (fatal
+        // killed the iter before it finalized), but the turn-level
+        // accumulator may have caught prior-iter text — surface it with
+        // an actionable footnote so the user can read the partial answer
+        // and decide whether to retry or drop reasoning effort.
+        let salvaged = yielded.trim();
+        if !salvaged.is_empty() {
+            return format!(
+                "{salvaged}\n\n[本回合中断：codex 服务返回 stream error,可在下方点击\"重试本回合\"或调整 Settings 中 reasoning effort 后重试 — {err}]"
+            );
+        }
+        return format!("本回合调用失败：{err}");
     }
     // For non-fatal stops with a typed reason (today: idle_timeout →
     // CodexStreamSilent), prefer the reason's hint over the static
@@ -581,28 +615,28 @@ mod tests {
     #[test]
     fn final_text_plain_on_natural_end() {
         assert_eq!(
-            compose_final_text("答案。", "end_turn", None, None),
+            compose_final_text("答案。", "end_turn", None, None, ""),
             "答案。"
         );
     }
 
     #[test]
     fn final_text_appends_guard_note() {
-        let out = compose_final_text("部分分析…", "wall_clock_exceeded", None, None);
+        let out = compose_final_text("部分分析…", "wall_clock_exceeded", None, None, "");
         assert!(out.starts_with("部分分析…"));
         assert!(out.contains("wall-clock"));
     }
 
     #[test]
     fn final_text_is_never_empty_on_guard_stop() {
-        let out = compose_final_text("", "idle_timeout", None, None);
+        let out = compose_final_text("", "idle_timeout", None, None, "");
         assert!(!out.is_empty());
         assert!(out.contains("idle timeout"));
     }
 
     #[test]
     fn final_text_reports_fatal_error() {
-        let out = compose_final_text("", "fatal_error", Some("HTTP 401"), None);
+        let out = compose_final_text("", "fatal_error", Some("HTTP 401"), None, "");
         assert!(out.contains("HTTP 401"));
     }
 
@@ -616,7 +650,7 @@ mod tests {
             body_excerpt: "service unavailable".into(),
             retry_attempts: 1,
         };
-        let out = compose_final_text("", "fatal_error", Some("anyhow chain"), Some(&reason));
+        let out = compose_final_text("", "fatal_error", Some("anyhow chain"), Some(&reason), "");
         assert!(out.contains("稍后重试"));
         // The hint takes precedence over the raw `fatal` string
         assert!(!out.contains("anyhow chain"));
@@ -631,9 +665,79 @@ mod tests {
             silent_secs: 90,
             retry_attempts: 1,
         };
-        let out = compose_final_text("", "idle_timeout", None, Some(&reason));
+        let out = compose_final_text("", "idle_timeout", None, Some(&reason), "");
         assert!(out.contains("90"));
         assert!(out.contains("静默"));
+    }
+
+    // ── M3.7 §D: fault-tolerant final ─────────────────────────────────
+
+    #[test]
+    fn final_text_surfaces_yielded_text_on_fatal_when_iter_text_empty() {
+        // The headline M3.7 §D rescue path. iter_text is empty (the iter
+        // that fataled never finalized any text), but the turn-level
+        // accumulator caught 1200 chars of prior-iter writing — surface
+        // those, plus a footnote with the retry / settings hint.
+        let yielded = "## 长电科技复盘\n\n基本面看起来还不错…(很多内容)\n\n";
+        let reason = fatal::FatalReason::CodexConnectionFailed {
+            detail: "HTTP/2 stream error".into(),
+            retry_attempts: 5,
+        };
+        let out =
+            compose_final_text("", "fatal_error", Some("upstream"), Some(&reason), yielded);
+        // The accumulated prose flows through verbatim.
+        assert!(out.contains("长电科技复盘"));
+        assert!(out.contains("基本面"));
+        // The footnote carries the actionable hint AND the structured
+        // reason hint (chained at the tail).
+        assert!(out.contains("stream error"));
+        assert!(out.contains("重试本回合"));
+        assert!(out.contains("reasoning effort"));
+        // No empty-fallback string.
+        assert!(!out.contains("本回合调用失败"));
+    }
+
+    #[test]
+    fn final_text_skips_yielded_when_iter_text_already_has_content() {
+        // When iter_text DOES have a body, prefer it — it's the answer
+        // the failing iter was producing, and is at least as complete as
+        // (often more complete than) the turn-level accumulator's
+        // contribution before this iter. The composer must use the
+        // iter_text branch unchanged (body + bracketed reason).
+        let reason = fatal::FatalReason::CodexHttp5xx {
+            status: 503,
+            body_excerpt: "x".into(),
+            retry_attempts: 1,
+        };
+        let out = compose_final_text(
+            "completed analysis text",
+            "fatal_error",
+            None,
+            Some(&reason),
+            "older partial",
+        );
+        assert!(out.starts_with("completed analysis text"));
+        // The rescue footnote with "重试本回合" must NOT fire — we use
+        // the plain "[本回合中断：...]" tail because iter_text won.
+        assert!(!out.contains("重试本回合"));
+        // The standard fatal hint is appended.
+        assert!(out.contains("稍后重试"));
+    }
+
+    #[test]
+    fn final_text_hint_only_when_zero_yielded() {
+        // When fatal struck before any text was ever yielded (reasoning
+        // phase or first iter failed instantly), there's nothing to
+        // salvage — fall back to the hint-only "本回合调用失败" message
+        // so the user still gets an honest report.
+        let reason = fatal::FatalReason::CodexHttp4xx {
+            status: 401,
+            body_excerpt: "auth".into(),
+        };
+        let out = compose_final_text("", "fatal_error", Some("Unauthorized"), Some(&reason), "");
+        assert!(out.contains("本回合调用失败"));
+        // No rescue footnote, no prior text.
+        assert!(!out.contains("重试本回合"));
     }
 
     #[test]
