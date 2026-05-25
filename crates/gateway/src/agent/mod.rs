@@ -25,6 +25,7 @@ mod compaction;
 #[cfg(test)]
 mod compaction_replay_test;
 pub mod events;
+mod fatal;
 mod guards;
 mod loop_core;
 mod prompt;
@@ -191,8 +192,15 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
     .await?;
 
     // ── finalize: assistant message + metrics + lifecycle events ────────
-    let final_text =
-        compose_final_text(&outcome.final_reply, &outcome.stop_reason, outcome.fatal_error.as_deref());
+    // M3.3: hand the typed FatalReason to the composer so the persisted
+    // message can use the kind-specific hint ("稍后重试" / "codex 静默 N 秒"
+    // / etc.) instead of the bare anyhow string.
+    let final_text = compose_final_text(
+        &outcome.final_reply,
+        &outcome.stop_reason,
+        outcome.fatal_error.as_deref(),
+        outcome.fatal_reason.as_ref(),
+    );
     let assistant = messages::insert(&st.pool, session_id, "assistant", &final_text).await?;
     st.emit(
         session_id,
@@ -203,6 +211,11 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
         }),
     )
     .await;
+
+    // M3.3: split the typed fatal_reason into its column-shaped pieces so the
+    // borrow checker is happy across the insert call.
+    let fatal_reason_kind = outcome.fatal_reason.as_ref().map(|r| r.kind().to_string());
+    let fatal_reason_detail = outcome.fatal_reason.as_ref().map(|r| r.detail());
 
     turn_metrics::insert(
         &st.pool,
@@ -223,6 +236,8 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
             stop_reason: &outcome.stop_reason,
             first_triggered_guard: outcome.first_guard,
             fatal_error: outcome.fatal_error.as_deref(),
+            fatal_reason_kind: fatal_reason_kind.as_deref(),
+            fatal_reason_detail: fatal_reason_detail.as_deref(),
             // The main agent is the root of the turn tree — no parent,
             // depth 0. M2.7 added these fields; subagents fill them in.
             parent_turn_id: None,
@@ -251,16 +266,21 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
     )
     .await;
 
-    st.emit(
-        session_id,
-        events::kind::ASSISTANT_DONE,
-        serde_json::json!({
-            "turn_id": turn_id,
-            "message_seq": assistant.seq,
-            "stop_reason": outcome.stop_reason,
-        }),
-    )
-    .await;
+    // M3.3: include the structured `fatal_reason` payload so Chat.tsx can
+    // render an actionable hint card (kind / detail / hint) instead of the
+    // generic "本回合调用失败：POST to the codex Responses endpoint" string.
+    // Populated on every fatal_error stop AND on idle_timeout stops (the
+    // substantive-only idle detector trips with a CodexStreamSilent reason).
+    let mut done_payload = serde_json::json!({
+        "turn_id": turn_id,
+        "message_seq": assistant.seq,
+        "stop_reason": outcome.stop_reason,
+    });
+    if let Some(reason) = outcome.fatal_reason.as_ref() {
+        done_payload["fatal_reason"] = reason.to_payload();
+    }
+    st.emit(session_id, events::kind::ASSISTANT_DONE, done_payload)
+        .await;
 
     // ── Stop hook (M2.5) ────────────────────────────────────────────────
     // Advisory: turn already ended, so a block verdict only logs. The
@@ -380,20 +400,42 @@ pub(super) fn build_search_data(action: Option<&WebSearchAction>) -> serde_json:
 /// still produces a user-visible message — the partial text (if any) plus an
 /// honest note about why it stopped (harness-engineering ch.8: no silent
 /// empty result).
-fn compose_final_text(text: &str, stop_reason: &str, fatal: Option<&str>) -> String {
+///
+/// M3.3: when a typed `FatalReason` is available, the persisted message uses
+/// its hint (actionable, kind-specific) instead of the raw fatal-error string.
+/// The chat hint card on the frontend is the primary surface; this string is
+/// the fallback (history pages, search index, terminal grep).
+fn compose_final_text(
+    text: &str,
+    stop_reason: &str,
+    fatal: Option<&str>,
+    reason: Option<&fatal::FatalReason>,
+) -> String {
     let body = text.trim();
     if stop_reason == "fatal_error" {
-        let err = fatal.unwrap_or("未知错误");
+        // Prefer the typed reason — its hint is user-friendly Chinese
+        // ("稍后重试"), the raw fatal is the anyhow chain ("HTTP 503: …").
+        let err: String = reason
+            .map(|r| r.hint())
+            .unwrap_or_else(|| fatal.unwrap_or("未知错误").to_string());
         return if body.is_empty() {
             format!("本回合调用失败：{err}")
         } else {
             format!("{body}\n\n[本回合中断：{err}]")
         };
     }
-    match (body.is_empty(), stop_note(stop_reason)) {
-        (true, Some(note)) => format!("[{note}]"),
+    // For non-fatal stops with a typed reason (today: idle_timeout →
+    // CodexStreamSilent), prefer the reason's hint over the static
+    // stop_note — it carries the silent_secs number so the user can see
+    // exactly which threshold tripped.
+    let note: Option<String> = reason
+        .filter(|_| stop_reason == "idle_timeout")
+        .map(|r| r.hint())
+        .or_else(|| stop_note(stop_reason).map(str::to_string));
+    match (body.is_empty(), note) {
+        (true, Some(n)) => format!("[{n}]"),
         (true, None) => "（本回合模型没有输出文本。）".to_string(),
-        (false, Some(note)) => format!("{body}\n\n[{note}]"),
+        (false, Some(n)) => format!("{body}\n\n[{n}]"),
         (false, None) => body.to_string(),
     }
 }
@@ -536,27 +578,56 @@ mod tests {
 
     #[test]
     fn final_text_plain_on_natural_end() {
-        assert_eq!(compose_final_text("答案。", "end_turn", None), "答案。");
+        assert_eq!(
+            compose_final_text("答案。", "end_turn", None, None),
+            "答案。"
+        );
     }
 
     #[test]
     fn final_text_appends_guard_note() {
-        let out = compose_final_text("部分分析…", "wall_clock_exceeded", None);
+        let out = compose_final_text("部分分析…", "wall_clock_exceeded", None, None);
         assert!(out.starts_with("部分分析…"));
         assert!(out.contains("wall-clock"));
     }
 
     #[test]
     fn final_text_is_never_empty_on_guard_stop() {
-        let out = compose_final_text("", "idle_timeout", None);
+        let out = compose_final_text("", "idle_timeout", None, None);
         assert!(!out.is_empty());
         assert!(out.contains("idle timeout"));
     }
 
     #[test]
     fn final_text_reports_fatal_error() {
-        let out = compose_final_text("", "fatal_error", Some("HTTP 401"));
+        let out = compose_final_text("", "fatal_error", Some("HTTP 401"), None);
         assert!(out.contains("HTTP 401"));
+    }
+
+    #[test]
+    fn final_text_uses_fatal_reason_hint_when_present() {
+        // M3.3: when a typed FatalReason is available, the persisted
+        // assistant message uses its actionable hint ("稍后重试") instead
+        // of the raw anyhow string.
+        let reason = fatal::FatalReason::CodexHttp5xx {
+            status: 503,
+            body_excerpt: "service unavailable".into(),
+        };
+        let out = compose_final_text("", "fatal_error", Some("anyhow chain"), Some(&reason));
+        assert!(out.contains("稍后重试"));
+        // The hint takes precedence over the raw `fatal` string
+        assert!(!out.contains("anyhow chain"));
+    }
+
+    #[test]
+    fn final_text_idle_timeout_uses_silent_hint_when_present() {
+        // M3.3: idle_timeout + CodexStreamSilent reason → the persisted
+        // message carries the silent_secs number so the user can see
+        // exactly which threshold tripped.
+        let reason = fatal::FatalReason::CodexStreamSilent { silent_secs: 90 };
+        let out = compose_final_text("", "idle_timeout", None, Some(&reason));
+        assert!(out.contains("90"));
+        assert!(out.contains("静默"));
     }
 
     #[test]

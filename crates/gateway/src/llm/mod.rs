@@ -111,9 +111,11 @@ pub enum LlmEvent {
     /// The response finished.
     MessageEnd { stop_reason: StopReason },
     /// A recognized-but-uninteresting SSE event (reasoning lifecycle,
-    /// argument deltas, …). Carries no content; the agent loop only uses
-    /// it to keep the idle-timeout timer alive while the model is working
-    /// silently.
+    /// argument deltas, …). Carries no content; the agent loop classifies
+    /// these as **heartbeat** — they do NOT reset the idle-timeout budget
+    /// (M3.3). Pre-M3.3 every byte reset the timer, so a long silent
+    /// reasoning phase that emitted only reasoning_summary lifecycle
+    /// frames could hold the loop open indefinitely.
     Ping,
     /// A provider-side web search (M1.9.4). The provider runs the search
     /// itself; the loop does not dispatch or re-inject anything — it only
@@ -129,6 +131,24 @@ pub enum LlmEvent {
         phase: WebSearchPhase,
         action: Option<WebSearchAction>,
     },
+}
+
+impl LlmEvent {
+    /// M3.3: is this event a "substantive" sign of progress that should
+    /// reset the idle-timeout budget? Everything except `Ping` is — text
+    /// landing, a tool call, a search step, the usage / end-of-response
+    /// markers — they all mean the codex backend just gave the loop
+    /// something to act on.
+    ///
+    /// `Ping` covers lifecycle frames (response.in_progress / reasoning
+    /// summary deltas / argument deltas / message.added / …) — those
+    /// flow steadily during long silent reasoning and used to mask a
+    /// genuinely stuck stream. Treating them as heartbeat lets the idle
+    /// guard fire when codex stops making real progress, even if it is
+    /// still emitting bytes.
+    pub fn is_substantive(&self) -> bool {
+        !matches!(self, LlmEvent::Ping)
+    }
 }
 
 /// Lifecycle phase of a provider-side web search.

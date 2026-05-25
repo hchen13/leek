@@ -235,6 +235,12 @@ pub async fn spawn(
     };
 
     // ── persist turn_metrics with parent linkage ────────────────────
+    // M3.3: the subagent loop produces the same typed FatalReason as the
+    // main agent; persist its kind / detail so a subagent dive in the
+    // workbench shows the same hint as the main turn would.
+    let fatal_reason_kind = outcome.fatal_reason.as_ref().map(|r| r.kind().to_string());
+    let fatal_reason_detail = outcome.fatal_reason.as_ref().map(|r| r.detail());
+
     if let Err(e) = turn_metrics::insert(
         &st.pool,
         &turn_metrics::NewTurnMetrics {
@@ -254,6 +260,8 @@ pub async fn spawn(
             stop_reason: &outcome.stop_reason,
             first_triggered_guard: outcome.first_guard,
             fatal_error: outcome.fatal_error.as_deref(),
+            fatal_reason_kind: fatal_reason_kind.as_deref(),
+            fatal_reason_detail: fatal_reason_detail.as_deref(),
             parent_turn_id: Some(parent_turn_id),
             depth: spawn_depth as i64,
         },

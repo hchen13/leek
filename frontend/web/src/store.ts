@@ -282,6 +282,7 @@ export function createWorkbench() {
       metrics: null,
       error: null,
       costCap: null,
+      fatalReason: null,
       // M3.2: anchor the elapsed-time counter at first-sighting of the
       // turn. The user-prompt `message_created` is the first event the
       // store sees for a turn (`applyChat` calls into `applyLifecycle`
@@ -593,6 +594,23 @@ export function createWorkbench() {
           // but keep the field tidy so a debugger / future view doesn't
           // see a stale "writing reply" state on a closed turn.
           turn.activity = null;
+          // M3.3: extract the structured fatal_reason hint payload —
+          // populated for fatal_error stops AND for idle_timeout stops
+          // (the substantive-only idle detector trips with
+          // codex_stream_silent). Three fields — kind / detail / hint —
+          // exactly as the backend ships them.
+          const fr = ev.payload.fatal_reason;
+          if (fr && typeof fr === "object") {
+            const obj = fr as Record<string, unknown>;
+            const kind = obj.kind != null ? String(obj.kind) : "";
+            const detail = obj.detail != null ? String(obj.detail) : "";
+            const hint = obj.hint != null ? String(obj.hint) : "";
+            // Guard against empty payload — only populate if at least
+            // the kind survived (the renderer keys off kind).
+            if (kind) {
+              turn.fatalReason = { kind, detail, hint };
+            }
+          }
         } else if (ev.kind === "turn_metrics_recorded") {
           turn.metrics = {
             iterationCount: Number(ev.payload.iteration_count ?? 0),

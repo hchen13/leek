@@ -1,0 +1,33 @@
+-- L.E.E.K vault — M3.3 schema delta (typed fatal-error reasons).
+--
+-- M3.3 splits the M1 `fatal_error` column (a single anyhow string,
+-- everything from "POST to the codex Responses endpoint" to a JSON parse
+-- failure) into a typed kind + a human-readable detail. The motivation,
+-- per docs/dispatches/M3.3-failure-ux.md: when a turn dies, the user
+-- needs to know whether it was the network, codex, or a leek bug — the
+-- raw anyhow chain does not say. Adding two columns now (rather than
+-- parsing the legacy string at read time) means a workbench dashboard
+-- that filters / counts by failure kind can do it with a `GROUP BY`
+-- instead of a regex scan. Per ARCHITECTURE §6 ("每张新增字段都必须说明
+-- 为什么当前阶段必须加入"):
+--
+--   turn_metrics.fatal_reason_kind   — stable enum string, e.g.
+--     `codex_http_5xx` / `codex_http_4xx` / `codex_stream_silent` /
+--     `codex_connection_failed` / `codex_malformed` / `unknown`. NULL
+--     whenever the loop did not set a typed reason (most stop_reasons
+--     are not fatal). The vocabulary lives in agent/fatal.rs::FatalReason.
+--
+--   turn_metrics.fatal_reason_detail — the redacted, truncated body
+--     excerpt + status (HTTP errors) or the silent_secs / connection
+--     detail (stream errors). What the assistant message + chat hint
+--     card render off; NULL when kind is NULL.
+--
+-- Both columns are also populated for idle_timeout stops (the new
+-- substantive-only idle detector trips with a CodexStreamSilent reason)
+-- so the chat surface can render the same hint card regardless of
+-- whether the stop_reason is `fatal_error` or `idle_timeout`. The
+-- semantics column-wide: "if this stop should show a hint card, these
+-- fields carry its kind + detail."
+
+ALTER TABLE turn_metrics ADD COLUMN fatal_reason_kind TEXT;
+ALTER TABLE turn_metrics ADD COLUMN fatal_reason_detail TEXT;

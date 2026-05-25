@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -23,6 +23,47 @@ use crate::vault::{auth_tokens, llm_transcripts};
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 /// Refresh the access token once it is within this many seconds of expiry.
 const REFRESH_SKEW_SECS: i64 = 120;
+/// Cap on the HTTP-error body excerpt the client surfaces to the fatal-reason
+/// classifier. Long enough to carry a useful codex error message, short enough
+/// that a runaway HTML 503 page doesn't bloat the assistant_done payload or
+/// the `turn_metrics.fatal_error` column.
+const MAX_ERROR_BODY_CHARS: usize = 200;
+
+/// M3.3: typed failure mode for the initial codex POST (or the connect /
+/// TLS / DNS step that precedes it). Surfaced as an `anyhow::Error` so the
+/// existing error plumbing keeps working — the agent loop downcasts to this
+/// enum to classify the failure into a user-facing `FatalReason`.
+#[derive(Debug, Clone)]
+pub enum CodexCallError {
+    /// codex replied with a non-2xx status; the excerpt is the (redacted,
+    /// truncated) response body. `status` distinguishes 4xx (caller fault —
+    /// auth / oversize prompt) from 5xx (codex side trouble — usually a
+    /// retry candidate).
+    Http { status: u16, body_excerpt: String },
+    /// The HTTP request never produced a response — DNS lookup failed, TCP
+    /// connect refused, TLS handshake errored, connection reset, etc. The
+    /// `detail` is the reqwest error chain, redacted of Bearer tokens.
+    Connection { detail: String },
+}
+
+impl std::fmt::Display for CodexCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CodexCallError::Http { status, body_excerpt } => {
+                if body_excerpt.is_empty() {
+                    write!(f, "codex backend returned HTTP {status}")
+                } else {
+                    write!(f, "codex backend returned HTTP {status}: {body_excerpt}")
+                }
+            }
+            CodexCallError::Connection { detail } => {
+                write!(f, "could not reach codex backend: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CodexCallError {}
 
 /// The concrete codex client. Cheap to `clone` — everything inside is shared.
 #[derive(Clone)]
@@ -103,7 +144,7 @@ impl CodexClient {
             }
         };
 
-        let resp = self
+        let resp = match self
             .http
             .post(RESPONSES_URL)
             .header("Authorization", format!("Bearer {access_token}"))
@@ -112,11 +153,26 @@ impl CodexClient {
             .json(&body)
             .send()
             .await
-            .context("POST to the codex Responses endpoint")?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // M3.3: surface a typed `CodexCallError::Connection` so the
+                // agent loop can classify the failure as connection_failed
+                // and render an actionable hint card. `redact()` scrubs the
+                // Bearer token in case reqwest's error chain echoes it
+                // (defensive — it doesn't today).
+                let detail = redact(&format!("{e:#}"));
+                return Err(anyhow::Error::new(CodexCallError::Connection { detail }));
+            }
+        };
 
         let status = resp.status();
         if !status.is_success() {
-            // F2: archive the error body verbatim, then bail as before.
+            // F2: archive the error body verbatim, then bail with a typed
+            // CodexCallError::Http carrying a redacted, truncated excerpt
+            // (the body excerpt lands in `turn_metrics.fatal_error` and on
+            // the `assistant_done` event, so it must not leak tokens /
+            // grow unbounded).
             let text = resp.text().await.unwrap_or_default();
             if let Some(row_id) = row_id {
                 let now = chrono::Utc::now().to_rfc3339();
@@ -132,7 +188,11 @@ impl CodexClient {
                     tracing::warn!(error = %e, row_id, "finalizing failed-request transcript");
                 }
             }
-            bail!("codex backend returned {status}: {}", redact(&text));
+            let body_excerpt = truncate_chars(&redact(&text), MAX_ERROR_BODY_CHARS);
+            return Err(anyhow::Error::new(CodexCallError::Http {
+                status: status.as_u16(),
+                body_excerpt,
+            }));
         }
 
         // F2: tap each chunk into a shared buffer; the buffer accumulates
@@ -298,6 +358,17 @@ impl Drop for TranscriptGuard {
     }
 }
 
+/// UTF-8-safe char truncation. The error body is often JSON or HTML —
+/// slicing by bytes can blow up at a multibyte CJK boundary.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{head}…")
+    }
+}
+
 /// Scrub `Bearer <token>` runs out of a string before it lands in a log
 /// line or an SSE error payload. Defensive — the codex backend does not
 /// echo the Authorization header today, but a leaked live token is costly.
@@ -327,7 +398,7 @@ fn redact(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::redact;
+    use super::{redact, truncate_chars, CodexCallError};
 
     #[test]
     fn redact_scrubs_bearer_tokens() {
@@ -339,5 +410,63 @@ mod tests {
     #[test]
     fn redact_passes_clean_strings() {
         assert_eq!(redact("plain error, no secrets"), "plain error, no secrets");
+    }
+
+    #[test]
+    fn truncate_chars_caps_long_strings() {
+        let out = truncate_chars(&"a".repeat(500), 200);
+        // 200 chars + ellipsis
+        assert_eq!(out.chars().count(), 201);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_chars_passes_short_strings() {
+        assert_eq!(truncate_chars("hi", 200), "hi");
+    }
+
+    #[test]
+    fn truncate_chars_respects_cjk_boundary() {
+        let s = "中".repeat(300);
+        let out = truncate_chars(&s, 100);
+        // 100 CJK chars + ellipsis — slicing by bytes would have panicked.
+        assert_eq!(out.chars().count(), 101);
+    }
+
+    #[test]
+    fn http_error_displays_status_and_body() {
+        let e = CodexCallError::Http {
+            status: 503,
+            body_excerpt: "Service Unavailable".into(),
+        };
+        let s = format!("{e}");
+        assert!(s.contains("503"));
+        assert!(s.contains("Service Unavailable"));
+    }
+
+    #[test]
+    fn connection_error_displays_detail() {
+        let e = CodexCallError::Connection {
+            detail: "dns lookup error: no such host".into(),
+        };
+        let s = format!("{e}");
+        assert!(s.contains("dns"));
+    }
+
+    #[test]
+    fn call_error_round_trips_through_anyhow() {
+        let inner = CodexCallError::Http {
+            status: 401,
+            body_excerpt: "expired".into(),
+        };
+        let anyhow_err = anyhow::Error::new(inner);
+        let downcast = anyhow_err.downcast_ref::<CodexCallError>();
+        match downcast {
+            Some(CodexCallError::Http { status, body_excerpt }) => {
+                assert_eq!(*status, 401);
+                assert_eq!(body_excerpt, "expired");
+            }
+            other => panic!("expected Http variant, got {other:?}"),
+        }
     }
 }

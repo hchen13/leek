@@ -898,6 +898,67 @@ h2 {
   color: #fde68a;
 }
 
+/* ── M3.3 typed fatal-reason hint card ─────────────────────────────────
+   A turn that died on the codex side (HTTP 5xx, dropped connection,
+   silent stream past idle budget, …) used to show only the raw anyhow
+   chain. M3.3 surfaces a typed kind + actionable hint in a structured
+   card here. Yellow accent — same hue as the cost-cap bar — because the
+   most common outcome ("retry usually fixes it") is not a hard fatal.
+   The kind chip is monospace so the user can paste it into a bug
+   report; the detail line carries the codex status + body excerpt for
+   the same reason. */
+.fatal-hint-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 4px 0 2px;
+  padding: 10px 12px;
+  background: rgba(251, 191, 36, 0.10);
+  border: 1px solid rgba(251, 191, 36, 0.45);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 17px;
+  line-height: 1.45;
+}
+.fatal-hint-icon {
+  color: var(--run);
+  font-size: 18px;
+  line-height: 1.25;
+  flex: 0 0 auto;
+}
+.fatal-hint-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.fatal-hint-text {
+  margin: 0;
+  word-break: break-word;
+}
+.fatal-hint-detail {
+  margin: 0;
+  font-size: 14px;
+  color: var(--muted, #94a3b8);
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.fatal-hint-kind {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  padding: 1px 6px;
+  background: rgba(148, 163, 184, 0.12);
+  border-radius: 4px;
+  flex: 0 0 auto;
+}
+.fatal-hint-detail-text {
+  flex: 1;
+  word-break: break-word;
+}
+
 /* ── M2.6 sidebar gear + settings modal ────────────────────────────────
    The gear is a tiny ghost button next to the L.E.E.K logo. The modal
    itself is a centered card on a translucent backdrop — backdrop click

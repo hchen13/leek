@@ -127,6 +127,24 @@ export type TurnCostCap = {
   iterCount: number;
 };
 
+/** M3.3: structured "why this turn died" hint, populated from the
+ *  `assistant_done.fatal_reason` payload. Set for both `fatal_error`
+ *  stops (HTTP / connection / malformed) and `idle_timeout` stops
+ *  (the substantive-only idle detector trips with a
+ *  `codex_stream_silent` kind). `null` for natural ends and other
+ *  guard-only stops (cost_cap / wall_clock / max_iter — those have
+ *  their own bars). The frontend renders this as a yellow-bordered
+ *  hint card after the assistant message.
+ *
+ *  `kind` is a stable enum string (see backend `agent::fatal::FatalReason`):
+ *  `codex_http_5xx` / `codex_http_4xx` / `codex_stream_silent` /
+ *  `codex_connection_failed` / `codex_malformed` / `unknown`. */
+export type TurnFatalReason = {
+  kind: string;
+  detail: string;
+  hint: string;
+};
+
 /** A turn's canvas section plus its lifecycle status. Built from the
  *  `canvas` and `lifecycle` events that carry the turn's `turn_id`. */
 export type Turn = {
@@ -141,6 +159,11 @@ export type Turn = {
   error: string | null;
   /** Set when the per-turn cost cap tripped (M2.6). */
   costCap: TurnCostCap | null;
+  /** M3.3: set when the turn ended fatally or via the substantive-only
+   *  idle detector — the chat surface renders a structured hint card
+   *  off this (kind / detail / hint). `null` for ends with no actionable
+   *  hint (natural / cost_cap / wall_clock / max_iter / user_aborted). */
+  fatalReason: TurnFatalReason | null;
   /** M3.2 wall-clock anchor for the reasoning status pill — the
    *  client-side timestamp at which the user-prompt `message_created`
    *  for this turn was applied. Used to compute "elapsed Xs / Ym" in

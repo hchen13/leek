@@ -80,6 +80,16 @@ function fmtUsd(n: number): string {
   return `$${n.toFixed(2)}`;
 }
 
+/** M3.3: show the fatal-reason hint card iff the turn carries a typed
+ *  reason. Populated for `fatal_error` stops (HTTP / connection /
+ *  malformed) AND for `idle_timeout` (the substantive-only detector
+ *  trips with a `codex_stream_silent` kind). Other guard-only stops
+ *  (cost_cap / wall_clock / max_iter / user_aborted) have their own
+ *  bars or render via the persisted message's tail note. */
+function shouldShowFatalCard(turn: Turn): boolean {
+  return turn.fatalReason != null;
+}
+
 export function Chat(props: ChatProps) {
   const [draft, setDraft] = createSignal("");
   const [expanded, setExpanded] = createSignal<Set<string>>(new Set());
@@ -131,6 +141,36 @@ export function Chat(props: ChatProps) {
         <button class="cost-cap-link" onClick={() => props.openSettings()}>
           打开 Settings →
         </button>
+      </div>
+    );
+  };
+
+  /** M3.3: render the typed fatal-reason hint card for a turn that died
+   *  on the codex side (HTTP error / connection / malformed) or sat
+   *  silent past the idle budget. Yellow-bordered (the majority of
+   *  these are "retry usually fixes it" — not red-alert fatal). The
+   *  hint copy is owned by the backend (`FatalReason::hint`); the card
+   *  is a dumb renderer.
+   *
+   *  Placed after the assistant message — same slot as the cost-cap bar
+   *  — so the reading order is "model said X, then this is why it
+   *  stopped". A turn that hits both the cost cap AND a fatal would
+   *  show both; today the loop can only hit one. */
+  const renderFatalCard = (turn: Turn | undefined) => {
+    if (!turn || !shouldShowFatalCard(turn)) return null;
+    const fr = turn.fatalReason!;
+    return (
+      <div class="fatal-hint-card" role="alert">
+        <div class="fatal-hint-icon" aria-hidden="true">
+          ⚠
+        </div>
+        <div class="fatal-hint-body">
+          <p class="fatal-hint-text">{fr.hint}</p>
+          <p class="fatal-hint-detail">
+            <span class="fatal-hint-kind">{fr.kind}</span>
+            <span class="fatal-hint-detail-text">{fr.detail}</span>
+          </p>
+        </div>
       </div>
     );
   };
@@ -198,6 +238,12 @@ export function Chat(props: ChatProps) {
                   assistant message so it reads as a postscript to the
                   reply that the cap forced to stop early. */}
               <Show when={m.role === "assistant"}>{renderCostCapBar(turnForMessage(m.seq))}</Show>
+              {/* M3.3: typed fatal-reason hint card — same slot. Renders
+                  for fatal_error stops (HTTP / connection / malformed)
+                  and idle_timeout (substantive-only idle detector trip
+                  → codex_stream_silent). Empty / null payload short-
+                  circuits inside the renderer. */}
+              <Show when={m.role === "assistant"}>{renderFatalCard(turnForMessage(m.seq))}</Show>
             </>
           )}
         </For>

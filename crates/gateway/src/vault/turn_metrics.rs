@@ -44,6 +44,16 @@ pub struct NewTurnMetrics<'a> {
     pub stop_reason: &'a str,
     pub first_triggered_guard: Option<&'a str>,
     pub fatal_error: Option<&'a str>,
+    /// M3.3: typed kind of the failure that ended the turn (`codex_http_5xx`,
+    /// `codex_stream_silent`, …). `None` whenever the loop did not classify
+    /// a reason — most stop_reasons are not fatal. The vocabulary lives in
+    /// `agent::fatal::FatalReason`.
+    pub fatal_reason_kind: Option<&'a str>,
+    /// M3.3: human-readable detail for the typed reason — what the chat
+    /// hint card renders and what a future failure-mode dashboard groups
+    /// alongside `fatal_reason_kind`. `None` whenever `fatal_reason_kind`
+    /// is `None`.
+    pub fatal_reason_detail: Option<&'a str>,
     /// M2.7: parent turn id for a subagent row. `None` for main-agent
     /// turns. The parent / child rows are in the same table — observability
     /// walks the tree by following this column.
@@ -61,8 +71,9 @@ pub async fn insert(pool: &SqlitePool, m: &NewTurnMetrics<'_>) -> Result<()> {
             iteration_count, tool_call_count, tool_error_count, compaction_count, \
             input_tokens, output_tokens, cost_usd, \
             stop_reason, first_triggered_guard, fatal_error, \
+            fatal_reason_kind, fatal_reason_detail, \
             parent_turn_id, depth) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(m.turn_id)
     .bind(m.session_id)
@@ -80,6 +91,8 @@ pub async fn insert(pool: &SqlitePool, m: &NewTurnMetrics<'_>) -> Result<()> {
     .bind(m.stop_reason)
     .bind(m.first_triggered_guard)
     .bind(m.fatal_error)
+    .bind(m.fatal_reason_kind)
+    .bind(m.fatal_reason_detail)
     .bind(m.parent_turn_id)
     .bind(m.depth)
     .execute(pool)
@@ -175,6 +188,8 @@ mod tests {
                 stop_reason: "end_turn",
                 first_triggered_guard: None,
                 fatal_error: None,
+                fatal_reason_kind: None,
+                fatal_reason_detail: None,
                 parent_turn_id: None,
                 depth: 0,
             },
@@ -202,6 +217,8 @@ mod tests {
                 stop_reason: "end_turn",
                 first_triggered_guard: None,
                 fatal_error: None,
+                fatal_reason_kind: None,
+                fatal_reason_detail: None,
                 parent_turn_id: Some("parent-turn"),
                 depth: 1,
             },
@@ -246,6 +263,8 @@ mod tests {
                 stop_reason: "end_turn",
                 first_triggered_guard: None,
                 fatal_error: None,
+                fatal_reason_kind: None,
+                fatal_reason_detail: None,
                 parent_turn_id: None,
                 depth: 0,
             },
@@ -257,5 +276,60 @@ mod tests {
         // `list_children` returns an empty vec instead of erroring.
         let kids = list_children(&vault.pool, "solo-turn").await.unwrap();
         assert!(kids.is_empty());
+    }
+
+    /// M3.3: fatal_reason_kind + fatal_reason_detail round-trip through
+    /// the new columns. The chat hint card reads these via SSE
+    /// (assistant_done payload), but the migration's value-add is making
+    /// a workbench "group by failure kind" query trivial — verify the
+    /// columns survive the insert.
+    #[tokio::test]
+    async fn fatal_reason_columns_round_trip() {
+        let vault = test_vault().await;
+        let sess_id = uuid::Uuid::new_v4().to_string();
+        let session = sessions::create(&vault.pool, &sess_id, Some("t"))
+            .await
+            .unwrap();
+
+        insert(
+            &vault.pool,
+            &NewTurnMetrics {
+                turn_id: "fatal-turn",
+                session_id: &session.id,
+                model: "gpt-5.5",
+                started_at: "2026-05-24T00:00:00Z",
+                ended_at: "2026-05-24T00:00:01Z",
+                wall_clock_ms: 1000,
+                iteration_count: 1,
+                tool_call_count: 0,
+                tool_error_count: 0,
+                compaction_count: 0,
+                input_tokens: 100,
+                output_tokens: 0,
+                cost_usd: 0.001,
+                stop_reason: "fatal_error",
+                first_triggered_guard: None,
+                fatal_error: Some("codex backend returned HTTP 503: service unavailable"),
+                fatal_reason_kind: Some("codex_http_5xx"),
+                fatal_reason_detail: Some("codex 返回 HTTP 503：service unavailable"),
+                parent_turn_id: None,
+                depth: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Read the row back with a thin query — we don't have a list
+        // helper, but we have enough plumbing in scope to issue a raw
+        // sqlx query for the two new columns.
+        let row: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT fatal_reason_kind, fatal_reason_detail FROM turn_metrics WHERE turn_id = ?",
+        )
+        .bind("fatal-turn")
+        .fetch_one(&vault.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0.as_deref(), Some("codex_http_5xx"));
+        assert!(row.1.unwrap().contains("503"));
     }
 }

@@ -39,8 +39,10 @@ use crate::llm::{
 use super::builtin_governance::{BuiltinTracker, TrackerSignal};
 use super::compaction;
 use super::events;
+use super::fatal::FatalReason;
 use super::guards::{self, GuardConfig};
 use super::tools;
+use crate::llm::codex::CodexCallError;
 
 /// One run of the inner loop — what the caller hands in.
 pub struct LoopParams<'a> {
@@ -106,6 +108,11 @@ pub struct LoopOutcome {
     pub stop_reason: String,
     pub first_guard: Option<&'static str>,
     pub fatal_error: Option<String>,
+    /// M3.3: typed reason for a `fatal_error` stop. `None` whenever
+    /// `stop_reason != "fatal_error"`. The caller turns it into the
+    /// `turn_metrics.fatal_reason_kind` / `fatal_reason_detail` columns
+    /// and the `assistant_done` `fatal_reason` payload.
+    pub fatal_reason: Option<FatalReason>,
     pub iteration_count: usize,
     pub tool_call_count: usize,
     pub tool_error_count: usize,
@@ -158,6 +165,12 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
     let stop_reason: String;
     let mut first_guard: Option<&'static str> = None;
     let mut fatal_error: Option<String> = None;
+    // M3.3: typed reason for the chat hint card. Set on every fatal exit
+    // (via the typed CodexCallError or stream-error classification), and
+    // also on idle-timeout exits as `CodexStreamSilent` (the substantive-
+    // only idle detector trips when codex has been silent past the budget;
+    // the silent_secs hint helps the user decide whether to retry).
+    let mut fatal_reason: Option<FatalReason> = None;
 
     'turn: loop {
         // ── pre-iteration guards (identical to main-agent loop) ─────────
@@ -268,7 +281,12 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
                     Ok(compaction::Compacted::Done) => compaction_count += 1,
                     Ok(compaction::Compacted::Skipped) => {}
                     Err(e) => {
-                        fatal_error = Some(e.to_string());
+                        // M3.3: compaction internally calls codex.chat,
+                        // so a CodexCallError can land here — classify it
+                        // the same way we classify a top-level chat error.
+                        let reason = classify_anyhow(&e);
+                        fatal_error = Some(reason.detail());
+                        fatal_reason = Some(reason);
                         stop_reason = "fatal_error".into();
                         break 'turn;
                     }
@@ -326,7 +344,12 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
         let mut stream = match p.st.codex.chat(req).await {
             Ok(s) => s,
             Err(e) => {
-                fatal_error = Some(e.to_string());
+                // M3.3: classify the typed CodexCallError so the user gets
+                // a kind-specific hint (codex_http_5xx / 4xx / connection_failed)
+                // instead of "POST to the codex Responses endpoint".
+                let reason = classify_anyhow(&e);
+                fatal_error = Some(reason.detail());
+                fatal_reason = Some(reason);
                 stop_reason = "fatal_error".into();
                 break 'turn;
             }
@@ -348,21 +371,39 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
         // main agent registers an abort signal — a subagent sees `None`
         // and falls into the simpler stream-only path.
         let mut user_aborted = false;
+        // M3.3: substantive-only idle deadline. Pre-M3.3 every byte —
+        // including reasoning_summary lifecycle frames that flow steadily
+        // during long silent reasoning — reset the timer, so a genuinely
+        // stuck codex stream could hold the loop open until the codex
+        // backend itself gave up. Now the deadline is **fixed** by
+        // `LlmEvent::is_substantive`: a substantive event (text / tool /
+        // search / usage / message_end) advances it; a `Ping` (the
+        // heartbeat catch-all) does not. The user-observable budget stays
+        // the same `idle_timeout` knob — only the semantics tighten.
+        let mut idle_deadline: Option<tokio::time::Instant> = p
+            .guards
+            .idle_timeout
+            .map(|d| tokio::time::Instant::now() + d);
         'stream: loop {
             // The poll fans out to three sources: a stream item, the
-            // optional idle timeout, and the optional user-abort notify.
+            // optional idle deadline, and the optional user-abort notify.
             // We `select!` only when at least one of the latter two is
             // active; otherwise we keep the bare `stream.next().await`
             // so a turn with neither guard nor abort signal stays cheap.
-            let item = match (p.guards.idle_timeout, &p.abort_signal) {
-                (Some(d), Some(notify)) => {
+            //
+            // M3.3 key change: use `timeout_at(deadline, …)` instead of
+            // `timeout(duration, …)` so the budget persists across
+            // heartbeat-only polls (Pings just continue the loop without
+            // advancing the deadline).
+            let item = match (idle_deadline, &p.abort_signal) {
+                (Some(deadline), Some(notify)) => {
                     tokio::select! {
                         biased;
                         _ = notify.notified() => {
                             user_aborted = true;
                             break 'stream;
                         }
-                        res = tokio::time::timeout(d, stream.next()) => match res {
+                        res = tokio::time::timeout_at(deadline, stream.next()) => match res {
                             Ok(item) => item,
                             Err(_) => {
                                 idle_hit = true;
@@ -371,13 +412,15 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
                         }
                     }
                 }
-                (Some(d), None) => match tokio::time::timeout(d, stream.next()).await {
-                    Ok(item) => item,
-                    Err(_) => {
-                        idle_hit = true;
-                        break 'stream;
+                (Some(deadline), None) => {
+                    match tokio::time::timeout_at(deadline, stream.next()).await {
+                        Ok(item) => item,
+                        Err(_) => {
+                            idle_hit = true;
+                            break 'stream;
+                        }
                     }
-                },
+                }
                 (None, Some(notify)) => {
                     tokio::select! {
                         biased;
@@ -391,6 +434,17 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
                 (None, None) => stream.next().await,
             };
             let Some(event) = item else { break 'stream };
+            // M3.3: only substantive events (text / tool / search / usage /
+            // message_end) advance the idle deadline; `Ping` does not. The
+            // check is on `Ok(...)` only — an `Err` is about to terminate
+            // the stream anyway, so its deadline status is moot.
+            if let Ok(ref e) = event {
+                if e.is_substantive() {
+                    if let Some(d) = p.guards.idle_timeout {
+                        idle_deadline = Some(tokio::time::Instant::now() + d);
+                    }
+                }
+            }
             match event {
                 Ok(LlmEvent::TextDelta { text }) => {
                     iter_text.push_str(&text);
@@ -515,7 +569,13 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
                 Ok(LlmEvent::MessageEnd { stop_reason: sr }) => iter_stop = Some(sr),
                 Ok(LlmEvent::Ping) => {}
                 Err(e) => {
-                    fatal_error = Some(e.to_string());
+                    // M3.3: classify SSE-side errors — `reading SSE chunk`
+                    // (connection died mid-stream) becomes connection_failed;
+                    // anything else is malformed (parse failure / provider
+                    // returned error event).
+                    let reason = FatalReason::from_stream_error(&e);
+                    fatal_error = Some(reason.detail());
+                    fatal_reason = Some(reason);
                     break 'stream;
                 }
             }
@@ -530,6 +590,16 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
             final_reply = iter_text;
             stop_reason = "idle_timeout".into();
             first_guard.get_or_insert("idle_timeout");
+            // M3.3: when the substantive-only idle detector trips, the
+            // codex stream has been silent (no substantive event) past the
+            // budget. Surface a CodexStreamSilent reason so the chat hint
+            // card tells the user "codex 连接静默 N 秒被超时杀, 重试即可"
+            // instead of the bare "idle timeout" stop_note.
+            if let Some(d) = p.guards.idle_timeout {
+                fatal_reason = Some(FatalReason::CodexStreamSilent {
+                    silent_secs: d.as_secs(),
+                });
+            }
             break 'turn;
         }
         // M3.2: user clicked abort mid-stream. We drop `stream` by
@@ -789,6 +859,7 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
         stop_reason,
         first_guard,
         fatal_error,
+        fatal_reason,
         iteration_count,
         tool_call_count,
         tool_error_count,
@@ -800,6 +871,40 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
         ended_at,
         wall_clock_ms,
     })
+}
+
+/// M3.3: classify an `anyhow::Error` from a codex call (top-level
+/// `codex.chat` or inside `compaction::compact`) into a typed
+/// `FatalReason`. Downcasts to `CodexCallError` if present (the typed
+/// path), else falls back to the SSE-stream string heuristic, and finally
+/// to `Unknown` for anything that does not look like either.
+fn classify_anyhow(err: &anyhow::Error) -> FatalReason {
+    if let Some(call_err) = err.downcast_ref::<CodexCallError>() {
+        return FatalReason::from_call_error(call_err);
+    }
+    // Walk the cause chain — a CodexCallError wrapped by a `.context(...)`
+    // would not be at the head but the cause.
+    for cause in err.chain().skip(1) {
+        if let Some(call_err) = cause.downcast_ref::<CodexCallError>() {
+            return FatalReason::from_call_error(call_err);
+        }
+    }
+    // Fall back to the string heuristic — covers SSE parser bails that the
+    // compaction path can produce too (`provider returned an error event`,
+    // `non-UTF-8 in SSE event`, …). Anything that does not look stream-shaped
+    // becomes Unknown so the user still gets a hint card.
+    let msg = err.to_string();
+    if msg.starts_with("reading SSE chunk")
+        || msg.starts_with("parsing SSE data as JSON")
+        || msg.starts_with("provider returned")
+        || msg.starts_with("non-UTF-8 in SSE event")
+        || msg.contains("output_text.delta")
+        || msg.contains("function_call done")
+        || msg.contains("response.completed")
+    {
+        return FatalReason::from_stream_error(err);
+    }
+    FatalReason::unclassified(err)
 }
 
 /// M3.1: pull the `(action_type, url)` pair from a `search_lifecycle` data
@@ -1038,5 +1143,235 @@ mod tests {
             .await
             .is_ok();
         assert!(!armed, "an unarmed notify must NOT resolve under ZERO timeout");
+    }
+
+    /// M3.3: `LlmEvent::is_substantive` is the predicate that decides
+    /// whether the stream poll advances the idle deadline. Pin every
+    /// variant here so a new event kind (added in some future milestone)
+    /// has to declare its substantiveness explicitly — failing to do so
+    /// either revives the pre-M3.3 keepalive-masks-idle bug (if it
+    /// defaults to substantive) or starves a real progress signal (if it
+    /// defaults to heartbeat). The compiler doesn't help us here —
+    /// `is_substantive` is `!matches!(Ping)` — so this test is the gate.
+    #[test]
+    fn substantive_classification_covers_every_event_kind() {
+        use crate::llm::{StopReason, Usage, WebSearchPhase};
+
+        let text = LlmEvent::TextDelta { text: "x".into() };
+        assert!(text.is_substantive(), "text deltas are progress");
+
+        let call = LlmEvent::FunctionCall {
+            call_id: "c".into(),
+            name: "n".into(),
+            arguments: "{}".into(),
+        };
+        assert!(call.is_substantive(), "function calls are progress");
+
+        let search = LlmEvent::WebSearch {
+            call_id: "s".into(),
+            phase: WebSearchPhase::Started,
+            action: None,
+        };
+        assert!(search.is_substantive(), "web_search frames are progress");
+
+        let usage = LlmEvent::Usage(Usage::default());
+        assert!(usage.is_substantive(), "usage marks end-of-response progress");
+
+        let end = LlmEvent::MessageEnd {
+            stop_reason: StopReason::EndTurn,
+        };
+        assert!(end.is_substantive(), "message end is terminal progress");
+
+        let ping = LlmEvent::Ping;
+        assert!(!ping.is_substantive(), "Ping is heartbeat, not progress");
+    }
+
+    /// M3.3: pin the `timeout_at` semantics the substantive-only idle
+    /// detector relies on — a deadline that has already passed must
+    /// resolve immediately as `Elapsed`, regardless of whether the
+    /// underlying future is ready. This is what the loop counts on when
+    /// it computes `idle_deadline = Instant::now() + idle_timeout` and
+    /// then re-polls across heartbeat-only iterations.
+    #[tokio::test]
+    async fn timeout_at_passes_when_deadline_in_future() {
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::channel::<u32>(8);
+        tx.send(42).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Stream item is ready → completes Ok before the deadline.
+        let res = tokio::time::timeout_at(deadline, rx.recv()).await;
+        assert!(matches!(res, Ok(Some(42))));
+    }
+
+    /// And the negative case — when the deadline has elapsed, `timeout_at`
+    /// fires `Err(Elapsed)` even if no item ever arrives. Tests with real
+    /// time (no tokio test-util feature in this crate) — short deadline
+    /// keeps it well under a second.
+    #[tokio::test]
+    async fn timeout_at_elapses_when_deadline_in_past() {
+        use tokio::sync::mpsc;
+        let (_tx, mut rx) = mpsc::channel::<u32>(8);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+        // No item sent — deadline fires.
+        let res = tokio::time::timeout_at(deadline, rx.recv()).await;
+        assert!(res.is_err(), "deadline must surface as Err");
+    }
+
+    /// M3.3: a stream of nothing-but-Pings that runs past the budget
+    /// must trip the deadline, even though bytes keep arriving. This
+    /// reproduces the pre-M3.3 5-minute-silent bug (codex was emitting
+    /// reasoning_summary frames that the loop parses as `Ping` — every
+    /// one reset the timer). Real-time test with tight intervals so it
+    /// stays sub-second.
+    #[tokio::test]
+    async fn pings_do_not_postpone_idle_deadline() {
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::channel::<Result<LlmEvent>>(64);
+
+        // Spawn a "codex" that emits a Ping every 30ms indefinitely.
+        // Budget below is 100ms — pre-M3.3 (every event resets) this
+        // loop would run forever; M3.3 trips it after ~100ms.
+        tokio::spawn(async move {
+            for _ in 0..50 {
+                if tx.send(Ok(LlmEvent::Ping)).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+        });
+
+        let idle = std::time::Duration::from_millis(100);
+        let mut deadline = tokio::time::Instant::now() + idle;
+        let mut idle_hit = false;
+        let mut pings_seen = 0u32;
+
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(Ok(evt))) => {
+                    // Pre-M3.3: this branch always reset the deadline.
+                    // M3.3 fix: only reset on substantive events.
+                    if evt.is_substantive() {
+                        deadline = tokio::time::Instant::now() + idle;
+                    }
+                    pings_seen += 1;
+                    if pings_seen >= 50 {
+                        break;
+                    }
+                }
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => {
+                    idle_hit = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(idle_hit, "Ping-only stream must trip the idle deadline");
+        // At least one Ping must have landed before the deadline fired —
+        // proves bytes were flowing (pre-M3.3 would have reset off them).
+        assert!(pings_seen >= 1, "at least one Ping should have been seen");
+    }
+
+    /// And the positive case: a stream of substantive events keeps the
+    /// loop alive — text deltas every 30ms don't trip a 100ms budget.
+    /// Mirror the previous test's shape so the only delta is the
+    /// substantiveness of the events.
+    #[tokio::test]
+    async fn substantive_events_keep_idle_deadline_alive() {
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::channel::<Result<LlmEvent>>(64);
+
+        // Emit 6 text deltas, 30ms apart — total ~180ms, but each one
+        // resets the 100ms deadline so the loop drains them all.
+        tokio::spawn(async move {
+            for i in 0..6 {
+                let _ = tx
+                    .send(Ok(LlmEvent::TextDelta {
+                        text: format!("chunk-{i}"),
+                    }))
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+            // Channel closes when tx drops here.
+        });
+
+        let idle = std::time::Duration::from_millis(100);
+        let mut deadline = tokio::time::Instant::now() + idle;
+        let mut idle_hit = false;
+        let mut deltas_seen = 0u32;
+
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(Ok(evt))) => {
+                    if evt.is_substantive() {
+                        deadline = tokio::time::Instant::now() + idle;
+                    }
+                    deltas_seen += 1;
+                }
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => {
+                    idle_hit = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(!idle_hit, "substantive stream should NOT trip the deadline");
+        assert_eq!(deltas_seen, 6, "all 6 deltas should have landed");
+    }
+
+    /// M3.3: mixed substantive + Ping stream — the Pings between text
+    /// deltas don't block the deadline from firing once the substantive
+    /// events stop. This is the realistic codex pattern: a burst of
+    /// reasoning_summary Pings followed by some text deltas, then more
+    /// Pings, then either tool calls or stuck-silent.
+    #[tokio::test]
+    async fn mixed_pings_after_substantive_eventually_idle() {
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::channel::<Result<LlmEvent>>(64);
+
+        tokio::spawn(async move {
+            // Substantive event → deadline reset to now+100ms.
+            tx.send(Ok(LlmEvent::TextDelta { text: "hi".into() }))
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            // Then 50 Pings spaced 5ms apart → ~250ms of heartbeat,
+            // crossing the 100ms idle deadline.
+            for _ in 0..50 {
+                if tx.send(Ok(LlmEvent::Ping)).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+
+        let idle = std::time::Duration::from_millis(100);
+        let mut deadline = tokio::time::Instant::now() + idle;
+        let mut delta_seen = false;
+        let mut ping_count = 0u32;
+        let mut idle_hit = false;
+
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(Ok(evt))) => {
+                    if evt.is_substantive() {
+                        deadline = tokio::time::Instant::now() + idle;
+                        delta_seen = true;
+                    } else {
+                        ping_count += 1;
+                    }
+                }
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => {
+                    idle_hit = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(delta_seen, "the substantive delta should have been received");
+        assert!(idle_hit, "Pings after substantive must still trip idle");
+        assert!(ping_count >= 1, "at least one heartbeat Ping arrived");
     }
 }
