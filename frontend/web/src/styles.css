@@ -379,6 +379,10 @@ h2 {
 .status-dot.running {
   background: var(--run);
 }
+.status-dot.warning {
+  background: var(--run);
+  box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.18);
+}
 .card-name {
   font-weight: 600;
   font-size: 18px;
@@ -456,6 +460,29 @@ h2 {
 .subagent-card {
   border-left: 3px solid var(--blue-soft);
   background: rgba(96, 165, 250, 0.05);
+}
+
+/* M3.1 codex_duplicate_warning chip — yellow tint + left rule so the user
+ * spots it instantly when the model loops codex builtin web_search over
+ * the same URL. `.aborted` variant uses the red error tone instead. */
+.codex-warning-card {
+  border-left: 3px solid var(--run);
+  background: rgba(251, 191, 36, 0.08);
+}
+.codex-warning-card.aborted {
+  border-left-color: var(--err);
+  background: rgba(248, 113, 113, 0.08);
+}
+.card-warning-body {
+  margin-top: 4px;
+  font-size: 14px;
+  color: var(--muted);
+}
+.card-warning-body code {
+  font-family: inherit;
+  background: rgba(255, 255, 255, 0.06);
+  padding: 1px 5px;
+  border-radius: 3px;
 }
 .subagent-result {
   margin-top: 8px;

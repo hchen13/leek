@@ -147,6 +147,14 @@ fn effective_body(_cfg: &Config, eff: &GuardConfig) -> serde_json::Value {
             "value": eff.context_window,
             "overridden_by_env": env_set("LEEK_CONTEXT_WINDOW"),
         },
+        "builtin_url_warn_threshold": {
+            "value": eff.builtin_url_warn_threshold,
+            "overridden_by_env": env_set("LEEK_BUILTIN_URL_WARN_THRESHOLD"),
+        },
+        "builtin_url_abort_threshold": {
+            "value": eff.builtin_url_abort_threshold,
+            "overridden_by_env": env_set("LEEK_BUILTIN_URL_ABORT_THRESHOLD"),
+        },
         // The config file says nothing about web_search (a capability flag,
         // not a guard) — but exposing the effective value here is helpful
         // for the UI, even when there is no editable field for it.
@@ -272,6 +280,8 @@ mod tests {
             "LEEK_AUTO_COMPACT_THRESHOLD",
             "LEEK_CONTEXT_WINDOW",
             "LEEK_WEB_SEARCH",
+            "LEEK_BUILTIN_URL_WARN_THRESHOLD",
+            "LEEK_BUILTIN_URL_ABORT_THRESHOLD",
         ]);
         std::env::set_var("LEEK_CONFIG_DIR", &dir);
 

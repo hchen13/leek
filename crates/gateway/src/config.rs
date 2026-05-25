@@ -74,6 +74,16 @@ pub struct Config {
     /// API never echoes this back masked-or-otherwise — it stays
     /// write-only from the API to avoid leaking via diagnostics.
     pub tushare_token: Option<String>,
+    /// M3.1: per-turn warn threshold for the codex-builtin web_search
+    /// duplicate-URL tracker. The agent emits a canvas warning + injects
+    /// a hint into the next iter once the same `(action_type, url)` has
+    /// been opened ≥ this many times. `0` disables warning. Default 3.
+    pub builtin_url_warn_threshold: Option<u32>,
+    /// M3.1: per-turn abort threshold. When the same `(action_type, url)`
+    /// is opened ≥ this many times the agent aborts the current iter
+    /// with `stop_reason = "codex_duplicate_abort"`. `0` disables abort
+    /// (warn-only). Default 7.
+    pub builtin_url_abort_threshold: Option<u32>,
 }
 
 impl Config {
@@ -181,6 +191,12 @@ impl Config {
         }
         if patch.tushare_token.is_some() {
             self.tushare_token = patch.tushare_token;
+        }
+        if patch.builtin_url_warn_threshold.is_some() {
+            self.builtin_url_warn_threshold = patch.builtin_url_warn_threshold;
+        }
+        if patch.builtin_url_abort_threshold.is_some() {
+            self.builtin_url_abort_threshold = patch.builtin_url_abort_threshold;
         }
     }
 

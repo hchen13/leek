@@ -53,6 +53,7 @@ const STOP_LABELS: Record<string, string> = {
   max_iterations: "迭代上限",
   cost_cap_exceeded: "成本上限",
   doom_loop: "工具循环",
+  codex_duplicate_abort: "codex 重复 URL",
   fatal_error: "出错",
 };
 
@@ -522,6 +523,9 @@ export function Canvas(props: CanvasProps) {
                 }
                 if (innerArt.kind === "search") return renderSearchCard(innerArt);
                 if (innerArt.kind === "subagent") return renderSubagentCard(innerArt);
+                if (innerArt.kind === "codex_duplicate_warning") {
+                  return renderDuplicateWarning(innerArt);
+                }
                 return renderToolCard(innerArt);
               }}
             </For>
@@ -531,10 +535,52 @@ export function Canvas(props: CanvasProps) {
     );
   };
 
+  /** M3.1 codex_duplicate_warning chip. Renders as a yellow info card with
+   *  the URL host + action_type + count, plus an "已 abort 当前 iter" tag
+   *  when the warning event tripped the abort threshold. */
+  const renderDuplicateWarning = (a: Artifact) => {
+    const url = a.warningUrl ?? "";
+    const host = a.warningHost ?? "";
+    const display = host || url;
+    const count = a.warningCount ?? 0;
+    const action = a.warningActionType ?? "?";
+    const aborted = Boolean(a.warningAborted);
+    const note = aborted
+      ? "已强制 abort 当前 iter (codex_duplicate_abort)"
+      : "已提示模型停止重复 open";
+    return (
+      <div
+        id={`card-${a.artifactId}`}
+        classList={{
+          card: true,
+          "codex-warning-card": true,
+          aborted,
+          highlighted: props.highlight() === a.artifactId,
+        }}
+      >
+        <div class="card-head">
+          <span class="status-dot warning" />
+          <span class="card-name">⚠ codex 重复 URL</span>
+          <span class="card-summary">
+            <Show when={url} fallback={display}>
+              <a href={url} target="_blank" rel="noreferrer">
+                {display}
+              </a>
+            </Show>
+          </span>
+        </div>
+        <p class="card-warning-body">
+          <code>{action}</code> · 第 {count} 次 · {note}
+        </p>
+      </div>
+    );
+  };
+
   const renderItem = (item: RenderItem) => {
     if (item.type === "notes") return renderNotes(item.notes);
     const a = item.artifact;
     if (a.kind === "subagent") return renderSubagentCard(a);
+    if (a.kind === "codex_duplicate_warning") return renderDuplicateWarning(a);
     return a.kind === "search" ? renderSearchCard(a) : renderToolCard(a);
   };
 

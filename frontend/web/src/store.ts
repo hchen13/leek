@@ -47,7 +47,19 @@ function canvasKind(eventKind: string): Artifact["kind"] | null {
   if (eventKind === "tool_lifecycle") return "tool";
   if (eventKind === "search_lifecycle") return "search";
   if (eventKind === "subagent_lifecycle") return "subagent";
+  if (eventKind === "codex_duplicate_url_warning") {
+    return "codex_duplicate_warning";
+  }
   return null;
+}
+
+/** Extract host from a URL for the warning chip; null on parse failure. */
+function urlHost(u: string): string | null {
+  try {
+    return new URL(u).host;
+  } catch {
+    return null;
+  }
 }
 
 /** Merge a `CanvasArtifact` frame's `data` into an artifact. Fields absent
@@ -263,6 +275,64 @@ export function createWorkbench() {
   function applyCanvas(ev: EventRow) {
     const kind = canvasKind(ev.kind);
     if (!kind) return;
+
+    // M3.1 codex_duplicate_url_warning: flat payload (no envelope) like
+    // subagent_lifecycle. Each event becomes its own warning chip — the
+    // gateway only fires when the per-(action_type, url) count crosses
+    // the warn threshold, so duplicate events for the same URL within
+    // one drain cycle don't happen.
+    if (kind === "codex_duplicate_warning") {
+      const turnId = String(ev.payload.turn_id ?? "");
+      if (!turnId) return;
+      const parentTurnId =
+        ev.payload.parent_turn_id != null ? String(ev.payload.parent_turn_id) : null;
+      const iteration = Number(ev.payload.iteration ?? 0);
+      const url = String(ev.payload.url ?? "");
+      const actionType = String(ev.payload.action_type ?? "");
+      const count = Number(ev.payload.count ?? 0);
+      const threshold = Number(ev.payload.threshold ?? 0);
+      const aborted = Boolean(ev.payload.abort);
+      // One artifact per warning event — id includes iteration + count
+      // so a repeated trip on the same URL in the next iter gets its
+      // own chip (the count differs).
+      const artifactId = `codex-warn-${turnId}-${iteration}-${actionType}-${count}`;
+      setState(
+        produce((d: WorkbenchState) => {
+          // Route into parent's subagent card when emitted inside a
+          // subagent loop (parent_turn_id present), otherwise the main
+          // turn's artifacts.
+          const targetArtifacts = (() => {
+            if (parentTurnId) {
+              const parentTurn = ensureTurn(d, parentTurnId);
+              const subagentCard = parentTurn.artifacts.find(
+                (a) => a.kind === "subagent" && a.subagentTurnId === turnId,
+              );
+              if (!subagentCard) return null;
+              if (!subagentCard.innerArtifacts) subagentCard.innerArtifacts = [];
+              return subagentCard.innerArtifacts;
+            }
+            const turn = ensureTurn(d, turnId);
+            return turn.artifacts;
+          })();
+          if (!targetArtifacts) return;
+          if (targetArtifacts.some((a) => a.artifactId === artifactId)) return;
+          targetArtifacts.push({
+            artifactId,
+            canvasIdentity: artifactId,
+            kind: "codex_duplicate_warning",
+            iteration,
+            phase: "completion",
+            warningActionType: actionType,
+            warningUrl: url,
+            warningHost: urlHost(url),
+            warningCount: count,
+            warningThreshold: threshold,
+            warningAborted: aborted,
+          });
+        }),
+      );
+      return;
+    }
 
     // M2.7 subagent_lifecycle: the payload IS the data (no envelope —
     // it's emitted via `st.emit(SUBAGENT_LIFECYCLE, data)` not through

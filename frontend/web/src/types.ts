@@ -55,7 +55,7 @@ export type SearchResult = { title: string | null; url: string; host: string | n
 export type Artifact = {
   artifactId: string;
   canvasIdentity: string;
-  kind: "note" | "tool" | "search" | "subagent";
+  kind: "note" | "tool" | "search" | "subagent" | "codex_duplicate_warning";
   iteration: number;
   phase: Phase;
   // note
@@ -95,6 +95,13 @@ export type Artifact = {
   wallClockMs?: number;
   sourceLayer?: string;
   errorMessage?: string;
+  // codex_duplicate_warning (M3.1) — payload is flat (no envelope).
+  warningActionType?: string;
+  warningUrl?: string;
+  warningHost?: string | null;
+  warningCount?: number;
+  warningThreshold?: number;
+  warningAborted?: boolean;
   /** Inner artifacts the subagent emitted — its own tool / note / search
    *  cards (and any nested subagent_card for depth=2). They are routed
    *  here by `parent_turn_id` on the event payload, never flat onto the
@@ -232,6 +239,10 @@ export type SettingsConfig = {
   context_window?: number | null;
   /** M3 vendor token. Optional, masked in UI. */
   tushare_token?: string | null;
+  /** M3.1 codex builtin web_search duplicate-URL warn threshold. */
+  builtin_url_warn_threshold?: number | null;
+  /** M3.1 codex builtin web_search duplicate-URL abort threshold. */
+  builtin_url_abort_threshold?: number | null;
 };
 
 /** One field's effective value + env-override flag. The value is `null`
@@ -255,6 +266,10 @@ export type SettingsResponse = {
     context_window: EffectiveField;
     /** M3 Tushare token (string field, masked in UI). */
     tushare_token: EffectiveField;
+    /** M3.1 codex builtin web_search duplicate-URL warn threshold. */
+    builtin_url_warn_threshold: EffectiveField;
+    /** M3.1 codex builtin web_search duplicate-URL abort threshold. */
+    builtin_url_abort_threshold: EffectiveField;
     web_search: { value: boolean; overridden_by_env: boolean };
   };
   config_path: string;

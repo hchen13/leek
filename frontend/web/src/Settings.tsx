@@ -101,6 +101,20 @@ const FIELDS: FieldSpec[] = [
     unit: "tokens",
     step: "1",
   },
+  {
+    key: "builtin_url_warn_threshold",
+    label: "Codex 内置 search 重复 URL 警告阈值",
+    hint: "同一 (action_type, URL) open ≥ 该次数时, 在 canvas 出 warning 并在下个 iter 给模型 inject 提示。默认 3, 0 = 关闭。",
+    unit: "次",
+    step: "1",
+  },
+  {
+    key: "builtin_url_abort_threshold",
+    label: "Codex 内置 search 重复 URL 中止阈值",
+    hint: "同一 (action_type, URL) open ≥ 该次数时, 强制 abort 当前 iter, stop_reason=codex_duplicate_abort。默认 7, 0 = 关闭(只 warn 不 abort)。",
+    unit: "次",
+    step: "1",
+  },
 ];
 
 /** Parse one input value into the JSON we'd PATCH. Empty string → null

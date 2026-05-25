@@ -52,6 +52,14 @@ pub mod kind {
     /// §2.4 — every spawn lives inside the parent's canvas as its own
     /// card, never flat in the parent's tool stream).
     pub const SUBAGENT_LIFECYCLE: &str = "subagent_lifecycle";
+    /// M3.1: emitted from `loop_core` when the codex-builtin web_search
+    /// hits the per-turn duplicate-URL warn threshold (the BuiltinTracker
+    /// fires a `Warn` signal). Payload schema:
+    /// `{ turn_id, iteration, action_type, url, count, threshold,
+    ///    parent_turn_id?, depth? }`. The frontend renders it as a yellow
+    /// warning chip on the canvas. `parent_turn_id` is present iff the
+    /// warning was triggered inside a subagent loop (M2.7 parity).
+    pub const CODEX_DUPLICATE_URL_WARNING: &str = "codex_duplicate_url_warning";
     pub const ERROR: &str = "error";
 }
 
@@ -88,7 +96,8 @@ pub fn surface_for(event_kind: &str) -> Surface {
         kind::NOTE_TRACE
         | kind::TOOL_LIFECYCLE
         | kind::SEARCH_LIFECYCLE
-        | kind::SUBAGENT_LIFECYCLE => Surface::Canvas,
+        | kind::SUBAGENT_LIFECYCLE
+        | kind::CODEX_DUPLICATE_URL_WARNING => Surface::Canvas,
         kind::PLAN_UPDATED => Surface::RightRail,
         kind::ASSISTANT_DONE
         | kind::TURN_METRICS_RECORDED
@@ -274,6 +283,11 @@ mod tests {
         // M2.7: subagent_lifecycle is a canvas surface — the frontend
         // groups subagent activity under a subagent_card on the canvas.
         assert_eq!(surface_for(kind::SUBAGENT_LIFECYCLE), Surface::Canvas);
+        // M3.1: codex_duplicate_url_warning renders as a canvas warning chip.
+        assert_eq!(
+            surface_for(kind::CODEX_DUPLICATE_URL_WARNING),
+            Surface::Canvas,
+        );
         assert_eq!(surface_for(kind::PLAN_UPDATED), Surface::RightRail);
         assert_eq!(surface_for(kind::TURN_METRICS_RECORDED), Surface::Lifecycle);
         assert_eq!(surface_for(kind::COMPACTION_STARTED), Surface::Lifecycle);

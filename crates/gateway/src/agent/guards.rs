@@ -40,6 +40,18 @@ pub struct GuardConfig {
     /// field), mainly so a test can force a small window and trip compaction
     /// within a few turns.
     pub context_window: Option<i64>,
+    /// M3.1: codex-builtin web_search duplicate-URL warn threshold (absolute
+    /// count). Triggers a `codex_duplicate_url_warning` canvas event + a
+    /// next-iter hint inject. `0` disables warning. Default 3. Env override:
+    /// `LEEK_BUILTIN_URL_WARN_THRESHOLD`.
+    pub builtin_url_warn_threshold: u32,
+    /// M3.1: codex-builtin web_search duplicate-URL abort threshold
+    /// (absolute count). When the same `(action_type, url)` is observed
+    /// this many times the loop aborts the current iter with
+    /// `stop_reason = "codex_duplicate_abort"`. `0` disables abort (the
+    /// loop will keep warning indefinitely). Default 7. Env override:
+    /// `LEEK_BUILTIN_URL_ABORT_THRESHOLD`.
+    pub builtin_url_abort_threshold: u32,
 }
 
 impl GuardConfig {
@@ -68,6 +80,16 @@ impl GuardConfig {
                 0.90,
             ),
             context_window: context_window_layered(config.context_window),
+            builtin_url_warn_threshold: u32_layered(
+                "LEEK_BUILTIN_URL_WARN_THRESHOLD",
+                config.builtin_url_warn_threshold,
+                3,
+            ),
+            builtin_url_abort_threshold: u32_layered(
+                "LEEK_BUILTIN_URL_ABORT_THRESHOLD",
+                config.builtin_url_abort_threshold,
+                7,
+            ),
         }
     }
 
@@ -160,6 +182,27 @@ fn context_window_layered(config_value: Option<i64>) -> Option<i64> {
         return if n > 0 { Some(n as i64) } else { None };
     }
     config_value.filter(|&n| n > 0)
+}
+
+/// `u32` knob with env > config > default. `0` in env / config is preserved
+/// as-is (it's a meaningful "disable" sentinel for the M3.1 builtin
+/// duplicate-URL thresholds).
+fn u32_layered(env_key: &str, config_value: Option<u32>, default: u32) -> u32 {
+    if let Some(n) = u32_env(env_key) {
+        return n;
+    }
+    config_value.unwrap_or(default)
+}
+
+fn u32_env(key: &str) -> Option<u32> {
+    let v = std::env::var(key).ok()?;
+    match v.trim().parse::<u32>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            tracing::warn!(key, raw = %v, "invalid u32 env var; falling through");
+            None
+        }
+    }
 }
 
 fn u64_env(key: &str) -> Option<u64> {
@@ -397,6 +440,50 @@ mod tests {
         let cfg = Config { cost_cap_usd: Some(0.0), ..Config::default() };
         // 0 is the product-defined "off" value (see config.rs).
         assert_eq!(GuardConfig::resolve(&cfg).cost_cap_usd, None);
+    }
+
+    #[test]
+    fn resolve_builtin_url_thresholds_use_defaults() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g1 = EnvGuard::unset("LEEK_BUILTIN_URL_WARN_THRESHOLD");
+        let _g2 = EnvGuard::unset("LEEK_BUILTIN_URL_ABORT_THRESHOLD");
+
+        let g = GuardConfig::resolve(&Config::default());
+        assert_eq!(g.builtin_url_warn_threshold, 3);
+        assert_eq!(g.builtin_url_abort_threshold, 7);
+    }
+
+    #[test]
+    fn resolve_builtin_url_thresholds_env_overrides_config() {
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g1 = EnvGuard::set("LEEK_BUILTIN_URL_WARN_THRESHOLD", "2");
+        let _g2 = EnvGuard::set("LEEK_BUILTIN_URL_ABORT_THRESHOLD", "3");
+
+        let cfg = Config {
+            builtin_url_warn_threshold: Some(10),
+            builtin_url_abort_threshold: Some(20),
+            ..Config::default()
+        };
+        let g = GuardConfig::resolve(&cfg);
+        assert_eq!(g.builtin_url_warn_threshold, 2);
+        assert_eq!(g.builtin_url_abort_threshold, 3);
+    }
+
+    #[test]
+    fn resolve_builtin_url_zero_thresholds_are_preserved() {
+        // 0 在配置 / env 都保留 — tracker 用 0 当 "disable" 哨兵.
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g1 = EnvGuard::unset("LEEK_BUILTIN_URL_WARN_THRESHOLD");
+        let _g2 = EnvGuard::unset("LEEK_BUILTIN_URL_ABORT_THRESHOLD");
+
+        let cfg = Config {
+            builtin_url_warn_threshold: Some(0),
+            builtin_url_abort_threshold: Some(0),
+            ..Config::default()
+        };
+        let g = GuardConfig::resolve(&cfg);
+        assert_eq!(g.builtin_url_warn_threshold, 0);
+        assert_eq!(g.builtin_url_abort_threshold, 0);
     }
 
     #[test]

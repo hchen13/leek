@@ -20,6 +20,7 @@
 //! artifacts — note trace, tool lifecycle, provider search — share one
 //! envelope.
 
+mod builtin_governance;
 mod compaction;
 #[cfg(test)]
 mod compaction_replay_test;
@@ -393,6 +394,9 @@ fn stop_note(stop_reason: &str) -> Option<&'static str> {
         "max_iterations" => Some("达到迭代次数上限（iteration cap），提前结束。"),
         "cost_cap_exceeded" => Some("达到本回合成本上限（cost cap），提前结束。"),
         "doom_loop" => Some("检测到工具调用陷入循环（doom-loop），本回合中止。"),
+        "codex_duplicate_abort" => {
+            Some("检测到 codex 内置 web_search 重复 open 同一 URL，本回合中止。")
+        }
         _ => Some("本回合提前结束。"),
     }
 }
