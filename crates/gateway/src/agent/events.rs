@@ -60,6 +60,20 @@ pub mod kind {
     /// warning chip on the canvas. `parent_turn_id` is present iff the
     /// warning was triggered inside a subagent loop (M2.7 parity).
     pub const CODEX_DUPLICATE_URL_WARNING: &str = "codex_duplicate_url_warning";
+    /// M3.4: emitted from the retry wrapper (`llm::retry`) just before
+    /// each *retry* attempt's backoff sleep — once per retry, never for
+    /// the initial call, never after the final attempt fails. Payload
+    /// schema (see `llm::retry::build_retry_event`):
+    /// `{ session_id, turn_id?, iteration, attempt, max_attempts,
+    ///    backoff_ms, kind, detail }`. `attempt` is 1-indexed and is the
+    /// attempt that is *about to run* (so attempt=2 means "the first
+    /// retry is happening"). The frontend renders it as a transient
+    /// "重试中 (N/3)…" badge on the running turn's status pill — the
+    /// surface is `Lifecycle`, not Canvas, because the retry is a
+    /// turn-level event not a per-iter content card. `turn_id` is null
+    /// for the auto-compaction summary call (it summarizes a turn, but
+    /// is not itself a turn).
+    pub const PROVIDER_RETRY_ATTEMPT: &str = "provider_retry_attempt";
     pub const ERROR: &str = "error";
 }
 
@@ -104,6 +118,7 @@ pub fn surface_for(event_kind: &str) -> Surface {
         | kind::COMPACTION_STARTED
         | kind::COMPACTION_COMPLETED
         | kind::TURN_COST_CAPPED
+        | kind::PROVIDER_RETRY_ATTEMPT
         | kind::ERROR => Surface::Lifecycle,
         _ => Surface::Lifecycle,
     }
@@ -291,6 +306,12 @@ mod tests {
         assert_eq!(surface_for(kind::PLAN_UPDATED), Surface::RightRail);
         assert_eq!(surface_for(kind::TURN_METRICS_RECORDED), Surface::Lifecycle);
         assert_eq!(surface_for(kind::COMPACTION_STARTED), Surface::Lifecycle);
+        // M3.4: provider_retry_attempt is lifecycle (not canvas) — the
+        // frontend renders it as a transient pill badge, not a card.
+        assert_eq!(
+            surface_for(kind::PROVIDER_RETRY_ATTEMPT),
+            Surface::Lifecycle,
+        );
     }
 
     #[test]

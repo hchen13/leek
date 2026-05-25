@@ -30,6 +30,14 @@ use crate::llm::codex::CodexCallError;
 /// goal is a hint card that says either "retry", "fix your token", "check
 /// the network", or "this is a leek bug; report it"; finer-grained reasons
 /// would not change any of those four actions.
+///
+/// M3.4: retryable variants (5xx / connection_failed / stream_silent) carry
+/// `retry_attempts`, the total number of times leek actually called codex
+/// before giving up (1 = no retry was attempted, 3 = MAX_ATTEMPTS exhausted).
+/// `hint()` weaves the count into its message so the user can see "已自动
+/// 重试 3 次, 仍失败" instead of suspecting leek bailed on the first try.
+/// Non-retryable variants (4xx / malformed) intentionally don't carry it —
+/// they were never retried.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FatalReason {
     /// codex returned a 4xx — auth / quota / oversized request / etc. The
@@ -37,16 +45,32 @@ pub enum FatalReason {
     /// tokens; truncated to ~200 chars).
     CodexHttp4xx { status: u16, body_excerpt: String },
     /// codex returned a 5xx — server-side trouble. Retry usually fixes it.
-    CodexHttp5xx { status: u16, body_excerpt: String },
+    /// `retry_attempts` counts initial call + retries that ran (M3.4); 1
+    /// means leek tried once before giving up (no retry path), 3 means
+    /// the full MAX_ATTEMPTS budget was exhausted.
+    CodexHttp5xx {
+        status: u16,
+        body_excerpt: String,
+        retry_attempts: u32,
+    },
     /// The SSE stream went silent past the idle budget — the codex
     /// connection is up but no substantive event has arrived in `silent_secs`
     /// seconds. The user only sees this when the substantive-only idle
-    /// detector trips (M3.3 §B).
-    CodexStreamSilent { silent_secs: u64 },
+    /// detector trips (M3.3 §B). `retry_attempts` counts the silent-retry
+    /// path (M3.4): 1 = no retry, 2 = the single silent-retry budget was
+    /// used and still failed.
+    CodexStreamSilent {
+        silent_secs: u64,
+        retry_attempts: u32,
+    },
     /// Could not reach codex at all — DNS, connect refused, TLS handshake,
     /// connection reset before we got a response. The `detail` is the
-    /// reqwest error chain (no secrets — codex's URL only).
-    CodexConnectionFailed { detail: String },
+    /// reqwest error chain (no secrets — codex's URL only). `retry_attempts`
+    /// counts the same path as `CodexHttp5xx`.
+    CodexConnectionFailed {
+        detail: String,
+        retry_attempts: u32,
+    },
     /// codex replied with bytes that did not parse — broken SSE framing,
     /// unknown JSON envelope, an explicit `response.failed` event, etc. The
     /// user cannot do anything about this; the hint tells them it is a leek
@@ -85,17 +109,21 @@ impl FatalReason {
                     format!("codex 返回 HTTP {status}：{body_excerpt}")
                 }
             }
-            FatalReason::CodexHttp5xx { status, body_excerpt } => {
+            FatalReason::CodexHttp5xx {
+                status,
+                body_excerpt,
+                ..
+            } => {
                 if body_excerpt.is_empty() {
                     format!("codex 返回 HTTP {status}")
                 } else {
                     format!("codex 返回 HTTP {status}：{body_excerpt}")
                 }
             }
-            FatalReason::CodexStreamSilent { silent_secs } => {
+            FatalReason::CodexStreamSilent { silent_secs, .. } => {
                 format!("codex 连接静默 {silent_secs} 秒被超时杀")
             }
-            FatalReason::CodexConnectionFailed { detail } => {
+            FatalReason::CodexConnectionFailed { detail, .. } => {
                 format!("无法连接 codex：{detail}")
             }
             FatalReason::CodexMalformed { detail } => {
@@ -107,6 +135,9 @@ impl FatalReason {
 
     /// Actionable hint shown in the chat card. Tells the user what to do
     /// (retry / check token / etc.) instead of just describing the failure.
+    /// M3.4: retryable variants append "已自动重试 N 次" so the user can
+    /// see leek didn't bail on the first failure — the retries actually
+    /// happened and still failed.
     pub fn hint(&self) -> String {
         match self {
             FatalReason::CodexHttp4xx { .. } => {
@@ -114,17 +145,23 @@ impl FatalReason {
                  建议检查 Settings 里 token 或缩短 prompt 重试。"
                     .to_string()
             }
-            FatalReason::CodexHttp5xx { .. } => {
-                "codex 服务端临时不可用，稍后重试通常能解决。".to_string()
+            FatalReason::CodexHttp5xx { retry_attempts, .. } => {
+                let base = "codex 服务端临时不可用，稍后重试通常能解决。";
+                with_retry_note(base, *retry_attempts)
             }
-            FatalReason::CodexStreamSilent { silent_secs } => {
-                format!(
+            FatalReason::CodexStreamSilent {
+                silent_secs,
+                retry_attempts,
+            } => {
+                let base = format!(
                     "codex 连接静默 {silent_secs} 秒被超时杀，\
                      可能网络抖动 / codex 临时过载，重试即可。"
-                )
+                );
+                with_retry_note(&base, *retry_attempts)
             }
-            FatalReason::CodexConnectionFailed { .. } => {
-                "无法连接 codex 服务（DNS / 网络），检查网络后重试。".to_string()
+            FatalReason::CodexConnectionFailed { retry_attempts, .. } => {
+                let base = "无法连接 codex 服务（DNS / 网络），检查网络后重试。";
+                with_retry_note(base, *retry_attempts)
             }
             FatalReason::CodexMalformed { .. } => {
                 "codex 返回的格式 leek 没处理过，这是 leek 的 bug，\
@@ -138,19 +175,44 @@ impl FatalReason {
     }
 
     /// JSON payload shipped on `assistant_done` for the frontend hint card.
-    /// Three fields — `kind`, `detail`, `hint` — keep the frontend a dumb
-    /// renderer; the backend owns the i18n.
+    /// Four fields — `kind`, `detail`, `hint`, `retry_attempts` — keep the
+    /// frontend a dumb renderer; the backend owns the i18n. The
+    /// `retry_attempts` field is the same number `hint()` already weaves
+    /// into the message; it's surfaced separately so a future frontend can
+    /// render it as a distinct badge (e.g. a "retried 3×" pill) without
+    /// re-parsing the Chinese hint string.
     pub fn to_payload(&self) -> serde_json::Value {
         serde_json::json!({
             "kind": self.kind(),
             "detail": self.detail(),
             "hint": self.hint(),
+            "retry_attempts": self.retry_attempts(),
         })
+    }
+
+    /// Number of times leek actually called codex before giving up. `1`
+    /// means the failure happened on the first attempt and no retry ran
+    /// (non-retryable variant, or retry didn't apply — e.g. 4xx). For
+    /// retryable variants this is the `retry_attempts` field; for the
+    /// rest it's a fixed `1`.
+    pub fn retry_attempts(&self) -> u32 {
+        match self {
+            FatalReason::CodexHttp4xx { .. }
+            | FatalReason::CodexMalformed { .. }
+            | FatalReason::Unknown { .. } => 1,
+            FatalReason::CodexHttp5xx { retry_attempts, .. }
+            | FatalReason::CodexStreamSilent { retry_attempts, .. }
+            | FatalReason::CodexConnectionFailed { retry_attempts, .. } => *retry_attempts,
+        }
     }
 
     /// Classify a typed `CodexCallError` (the failure mode for the initial
     /// HTTP POST / connect, before any SSE bytes have flowed). The
     /// `detail` strings are already redacted by the codex client.
+    /// `retry_attempts = 1` for the retryable variants — `from_call_error`
+    /// is the "first failure" entry point; the retry wrapper bumps the
+    /// count in place via [`with_retry_attempts`] before surfacing the
+    /// final reason.
     pub fn from_call_error(err: &CodexCallError) -> FatalReason {
         match err {
             CodexCallError::Http { status, body_excerpt } => {
@@ -163,13 +225,31 @@ impl FatalReason {
                     FatalReason::CodexHttp5xx {
                         status: *status,
                         body_excerpt: body_excerpt.clone(),
+                        retry_attempts: 1,
                     }
                 }
             }
             CodexCallError::Connection { detail } => FatalReason::CodexConnectionFailed {
                 detail: detail.clone(),
+                retry_attempts: 1,
             },
         }
+    }
+
+    /// Set `retry_attempts` on the retryable variants. No-op on the
+    /// non-retryable ones (a 4xx that somehow flows through the retry
+    /// layer keeps its `1`). Used by the retry wrapper to stamp the final
+    /// FatalReason with the exact number of attempts it made.
+    pub fn with_retry_attempts(mut self, attempts: u32) -> Self {
+        match &mut self {
+            FatalReason::CodexHttp5xx { retry_attempts, .. }
+            | FatalReason::CodexStreamSilent { retry_attempts, .. }
+            | FatalReason::CodexConnectionFailed { retry_attempts, .. } => {
+                *retry_attempts = attempts;
+            }
+            _ => {}
+        }
+        self
     }
 
     /// Classify an error raised inside the SSE stream — either the SSE
@@ -191,6 +271,9 @@ impl FatalReason {
         if msg.starts_with("reading SSE chunk") {
             return FatalReason::CodexConnectionFailed {
                 detail: trimmed_error_chain(err),
+                // First-failure default — the retry wrapper bumps this
+                // via `with_retry_attempts` if it actually retried.
+                retry_attempts: 1,
             };
         }
         FatalReason::CodexMalformed {
@@ -205,6 +288,18 @@ impl FatalReason {
             detail: trimmed_error_chain(err),
         }
     }
+}
+
+/// M3.4: append a "已自动重试 N 次, 仍失败" note to the base hint when at
+/// least one retry actually ran (`attempts >= 2` — the initial call
+/// counts as attempt 1). Skipped on `attempts <= 1` so a never-retried
+/// failure doesn't read as misleading "retried 1 time".
+fn with_retry_note(base: &str, attempts: u32) -> String {
+    if attempts <= 1 {
+        return base.to_string();
+    }
+    let retries = attempts - 1;
+    format!("{base}\n（已自动重试 {retries} 次，仍失败）")
 }
 
 /// Render an anyhow error + its cause chain into a single short string,
@@ -273,7 +368,10 @@ mod tests {
 
     #[test]
     fn silent_carries_seconds_through_to_hint() {
-        let r = FatalReason::CodexStreamSilent { silent_secs: 90 };
+        let r = FatalReason::CodexStreamSilent {
+            silent_secs: 90,
+            retry_attempts: 1,
+        };
         assert_eq!(r.kind(), "codex_stream_silent");
         assert!(r.detail().contains("90"));
         assert!(r.hint().contains("90"));
@@ -302,11 +400,79 @@ mod tests {
         let r = FatalReason::CodexHttp5xx {
             status: 502,
             body_excerpt: "bad gateway".into(),
+            retry_attempts: 1,
         };
         let p = r.to_payload();
         assert_eq!(p["kind"], "codex_http_5xx");
         assert!(p["detail"].as_str().unwrap().contains("502"));
         assert!(p["hint"].as_str().unwrap().contains("稍后重试"));
+        // M3.4: payload also carries the retry_attempts field.
+        assert_eq!(p["retry_attempts"], 1);
+    }
+
+    #[test]
+    fn hint_appends_retry_count_when_retries_actually_ran() {
+        // attempts = 1 → no retry note (the initial call counts as 1).
+        let r1 = FatalReason::CodexHttp5xx {
+            status: 503,
+            body_excerpt: "".into(),
+            retry_attempts: 1,
+        };
+        assert!(
+            !r1.hint().contains("已自动重试"),
+            "attempts=1 should not advertise retries"
+        );
+        // attempts = 3 → "已自动重试 2 次" (retries = attempts - 1).
+        let r3 = FatalReason::CodexHttp5xx {
+            status: 503,
+            body_excerpt: "".into(),
+            retry_attempts: 3,
+        };
+        let h = r3.hint();
+        assert!(h.contains("已自动重试 2 次"), "hint was: {h}");
+        assert!(h.contains("仍失败"));
+    }
+
+    #[test]
+    fn with_retry_attempts_stamps_only_retryable_variants() {
+        let mut r = FatalReason::CodexHttp5xx {
+            status: 502,
+            body_excerpt: "".into(),
+            retry_attempts: 1,
+        };
+        r = r.with_retry_attempts(3);
+        assert_eq!(r.retry_attempts(), 3);
+
+        // Connection — also retryable, gets stamped.
+        let r = FatalReason::CodexConnectionFailed {
+            detail: "dns".into(),
+            retry_attempts: 1,
+        }
+        .with_retry_attempts(2);
+        assert_eq!(r.retry_attempts(), 2);
+
+        // Silent — also retryable; stamped value sticks.
+        let r = FatalReason::CodexStreamSilent {
+            silent_secs: 60,
+            retry_attempts: 1,
+        }
+        .with_retry_attempts(2);
+        assert_eq!(r.retry_attempts(), 2);
+
+        // 4xx — non-retryable; with_retry_attempts is a no-op on it.
+        let r = FatalReason::CodexHttp4xx {
+            status: 401,
+            body_excerpt: "".into(),
+        }
+        .with_retry_attempts(3);
+        assert_eq!(r.retry_attempts(), 1);
+
+        // Malformed — non-retryable.
+        let r = FatalReason::CodexMalformed {
+            detail: "junk".into(),
+        }
+        .with_retry_attempts(3);
+        assert_eq!(r.retry_attempts(), 1);
     }
 
     #[test]
@@ -364,7 +530,10 @@ mod tests {
             ),
             (
                 "Stream silent (90s idle budget tripped)",
-                FatalReason::CodexStreamSilent { silent_secs: 90 },
+                FatalReason::CodexStreamSilent {
+                    silent_secs: 90,
+                    retry_attempts: 2,
+                },
             ),
             (
                 "Malformed SSE (provider returned error event)",

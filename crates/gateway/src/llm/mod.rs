@@ -10,6 +10,7 @@ pub mod codex;
 pub mod oauth;
 pub mod pricing;
 pub mod responses;
+pub mod retry;
 
 /// One chat request to the model. `system` is the system prompt
 /// (Responses API `instructions`); `messages` is the conversation;

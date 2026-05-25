@@ -86,12 +86,35 @@ pub struct TokenStatus {
 
 impl CodexClient {
     pub fn new(pool: SqlitePool, user_id: impl Into<String>) -> Result<Self> {
-        // No total request timeout: a streamed turn legitimately runs for
-        // minutes, and the agent loop's idle-timeout guard owns responsiveness.
-        // A connect timeout still catches a dead network fast.
+        // M3.4: tighten reqwest-level timeouts so a wedged connection cannot
+        // outlive the SSE-side idle detector (M3.3) — and, more importantly,
+        // so an iter that never streams a single byte cannot hang for the
+        // codex backend's own retry budget (~5 min 11s observed live).
+        //
+        //   connect_timeout (30s):  TCP/TLS handshake cap. The pre-M3.4
+        //                           20s value was fine; bumped to 30s for
+        //                           a small DNS-flake margin while still
+        //                           well below the retry's first backoff.
+        //   timeout (300s):         Overall request lifetime cap. xhigh
+        //                           reasoning + builtin search legitimately
+        //                           runs minutes; 5 min per *iter* is the
+        //                           empirical worst case (longest observed
+        //                           xhigh turn was 5m41s across 7 iters,
+        //                           so every iter is well under 5min). This
+        //                           is a hard floor — if codex's own backend
+        //                           wedges, reqwest aborts before the user
+        //                           waits longer than this.
+        //   pool_idle_timeout(60s): Slightly bumped from 15s so codex's
+        //                           keep-alive connections survive the
+        //                           tool-dispatch gap between iters.
+        //
+        // The retry wrapper (see `llm::retry`) sits on top: a reqwest timeout
+        // surfaces as a `CodexCallError::Connection`, the wrapper classifies
+        // it retryable, and the user typically never notices the failure.
         let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(20))
-            .pool_idle_timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(300))
+            .pool_idle_timeout(Duration::from_secs(60))
             .build()
             .context("building HTTP client for codex")?;
         Ok(Self {

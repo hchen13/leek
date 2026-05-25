@@ -145,6 +145,23 @@ export type TurnFatalReason = {
   hint: string;
 };
 
+/** M3.4: latest in-flight provider retry, populated from a
+ *  `provider_retry_attempt` lifecycle event. Set every time the codex
+ *  retry wrapper is about to make a *retry* attempt (never on the
+ *  initial call, never after the final attempt fails). Stays set until
+ *  the next retry, the next iter, or the turn ends. The pill renders
+ *  off this — "重试中 (N/M)…" — so the user sees the gateway actively
+ *  recovering instead of staring at a frozen UI for 21s of backoff.
+ *
+ *  `attempt` is 1-indexed (2 = "second attempt is happening"); `kind`
+ *  is the FatalReason kind that triggered the retry (5xx / connection_failed). */
+export type TurnRetryStatus = {
+  attempt: number;
+  maxAttempts: number;
+  kind: string;
+  backoffMs: number;
+};
+
 /** A turn's canvas section plus its lifecycle status. Built from the
  *  `canvas` and `lifecycle` events that carry the turn's `turn_id`. */
 export type Turn = {
@@ -179,6 +196,13 @@ export type Turn = {
    *  yet) falls through to the time-based "agent 正在思考" / "深度思考
    *  中" rungs. */
   activity: TurnActivity | null;
+  /** M3.4 in-flight provider retry indicator for the pill. `null` when
+   *  no retry is currently in flight (the common case). Set when a
+   *  `provider_retry_attempt` event arrives; cleared when the turn
+   *  ends, or when any substantive progress signal (next iter, next
+   *  canvas activity) lands. The pill renders "重试中 (N/M)…" off
+   *  this and dims the regular activity text. */
+  retry: TurnRetryStatus | null;
 };
 
 /** M3.2 reasoning-pill activity kinds. The store narrows the

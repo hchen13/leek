@@ -161,6 +161,10 @@ export function TurnStatusPill(props: Props) {
         classList={{
           "turn-pill": true,
           [`pill-${urgency()}`]: true,
+          // M3.4: a separate class while a retry is in flight so the
+          // CSS can dim the regular activity text and highlight the
+          // retry indicator instead.
+          "pill-retrying": props.turn()!.retry != null,
         }}
         role="status"
         aria-live="polite"
@@ -172,7 +176,24 @@ export function TurnStatusPill(props: Props) {
             <span class="pill-sep">·</span>
             <span class="pill-elapsed">已用 {fmtElapsed(elapsedMs())}</span>
             <span class="pill-sep">·</span>
-            <span class="pill-activity">{describeActivity(props.turn()!.activity, elapsedMs())}</span>
+            <Show
+              when={props.turn()!.retry != null}
+              fallback={
+                <span class="pill-activity">
+                  {describeActivity(props.turn()!.activity, elapsedMs())}
+                </span>
+              }
+            >
+              <span class="pill-retry" title={describeRetryKind(props.turn()!.retry!.kind)}>
+                重试中 ({props.turn()!.retry!.attempt}/
+                {props.turn()!.retry!.maxAttempts})…
+                <Show when={props.turn()!.retry!.backoffMs > 0}>
+                  <span class="pill-retry-backoff">
+                    {" "}等 {Math.round(props.turn()!.retry!.backoffMs / 1000)} 秒
+                  </span>
+                </Show>
+              </span>
+            </Show>
           </span>
           <button
             class="pill-abort"
@@ -183,7 +204,7 @@ export function TurnStatusPill(props: Props) {
             {aborting() ? "正在停止…" : "强制停止本回合"}
           </button>
         </div>
-        <Show when={urgency() === "hot"}>
+        <Show when={urgency() === "hot" && props.turn()!.retry == null}>
           <div class="pill-tail">
             已经超过 3 分钟没有新事件。codex 内置 web_search 阶段确实可能这么久 ——
             如果你不想等，请点击右上方的中止按钮。
@@ -192,4 +213,20 @@ export function TurnStatusPill(props: Props) {
       </div>
     </Show>
   );
+}
+
+/** M3.4: human-readable tooltip for the retry-kind tag. The pill body
+ *  stays short ("重试中 (N/M)…"); the kind goes on hover so a curious
+ *  user can tell a 5xx burst from a connection blip. */
+function describeRetryKind(kind: string): string {
+  switch (kind) {
+    case "codex_http_5xx":
+      return "codex 服务端返回 5xx，正在重试";
+    case "codex_connection_failed":
+      return "无法连接 codex（DNS / 网络抖动），正在重试";
+    case "codex_stream_silent":
+      return "codex 流静默，正在重试";
+    default:
+      return `provider 错误（${kind}），正在重试`;
+  }
 }

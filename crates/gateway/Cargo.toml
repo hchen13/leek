@@ -29,3 +29,10 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tiktoken-rs = { workspace = true }
+
+[dev-dependencies]
+# M3.4 retry tests need `tokio::time::pause`, which lives behind the
+# `test-util` feature. Adding it as a dev-dependency keeps the
+# production binary lean while letting unit tests virtualize the
+# retry-loop backoff sleeps (1s + 4s) so the suite stays sub-second.
+tokio = { version = "1.47", features = ["full", "test-util"] }

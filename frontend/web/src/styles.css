@@ -364,6 +364,31 @@ h2 {
   color: var(--text);
 }
 
+/* ── M3.4 in-flight provider-retry indicator ───────────────────────────
+   When the codex retry wrapper is mid-attempt, the pill replaces its
+   regular activity text with a "重试中 (N/M)…" tag. The whole pill
+   takes the warm-yellow accent regardless of urgency level — retry is
+   a self-aware "we know things are wrong, working on it" signal, not
+   a frozen-pill panic case (urgency tracks elapsed-since-last-signal
+   and would otherwise still read "calm" because the retry event IS
+   the signal). */
+.turn-pill.pill-retrying {
+  border-color: rgba(251, 191, 36, 0.55);
+  background: rgba(251, 191, 36, 0.12);
+}
+.turn-pill.pill-retrying .pill-spinner {
+  color: var(--run);
+}
+.pill-retry {
+  color: #fde68a;
+  font-weight: 500;
+}
+.pill-retry-backoff {
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 0.95em;
+}
+
 .composer {
   display: flex;
   gap: 8px;

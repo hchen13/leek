@@ -293,6 +293,10 @@ export function createWorkbench() {
       // finished turns, and the pill is gated on `status === "running"`.
       startedAtMs: Date.now(),
       activity: null,
+      // M3.4: no retry in flight initially. Set when a
+      // `provider_retry_attempt` event lands; cleared on activity /
+      // turn end.
+      retry: null,
     });
     return d.turns[d.turns.length - 1];
   }
@@ -470,6 +474,11 @@ export function createWorkbench() {
               kind === "tool"
                 ? { kind: "tool", displayName: pickToolDisplay(data) }
                 : { kind: "search" };
+            // M3.4: a fresh start frame means the retry recovered —
+            // clear the indicator so the pill stops saying "重试中".
+            // The retry is opportunistic; if a later retry happens,
+            // the next provider_retry_attempt event will repaint it.
+            turn.retry = null;
           } else if (turn.activity?.kind === kind) {
             turn.activity = null;
           }
@@ -536,6 +545,9 @@ export function createWorkbench() {
           // tool / search.
           const turn = ensureTurn(d, turnId);
           turn.activity = { kind: "delta" };
+          // M3.4: text streaming = the retry succeeded. Drop the
+          // "重试中" pill state.
+          turn.retry = null;
         }),
       );
     } else if (ev.kind === "message_created" && ev.payload.role === "assistant") {
@@ -594,6 +606,13 @@ export function createWorkbench() {
           // but keep the field tidy so a debugger / future view doesn't
           // see a stale "writing reply" state on a closed turn.
           turn.activity = null;
+          // M3.4: also clear any in-flight retry indicator. If the
+          // turn ended in fatal_error after a retry exhaustion, the
+          // fatal-hint card carries "已自动重试 N 次" so the user
+          // still sees retries happened; the pill is gone (pill is
+          // hidden once `status === "done"`) so the field's value
+          // only matters for tidiness here.
+          turn.retry = null;
           // M3.3: extract the structured fatal_reason hint payload —
           // populated for fatal_error stops AND for idle_timeout stops
           // (the substantive-only idle detector trips with
@@ -632,6 +651,18 @@ export function createWorkbench() {
             capUsd: Number(ev.payload.cap_usd ?? 0),
             actualCostUsd: Number(ev.payload.actual_cost_usd ?? 0),
             iterCount: Number(ev.payload.iter_count ?? 0),
+          };
+        } else if (ev.kind === "provider_retry_attempt") {
+          // M3.4: the codex retry wrapper is about to make a retry
+          // attempt — pin the indicator so the pill shows "重试中
+          // (N/M)…". Cleared when the retry succeeds (next canvas
+          // activity / next iter / turn ends) or when the budget is
+          // exhausted (assistant_done with fatal_error follows).
+          turn.retry = {
+            attempt: Number(ev.payload.attempt ?? 0),
+            maxAttempts: Number(ev.payload.max_attempts ?? 0),
+            kind: String(ev.payload.kind ?? ""),
+            backoffMs: Number(ev.payload.backoff_ms ?? 0),
           };
         } else if (ev.kind === "error") {
           turn.error = ev.payload.message == null ? null : String(ev.payload.message);

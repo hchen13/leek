@@ -33,7 +33,7 @@ use tokio::sync::Notify;
 use crate::api::AppState;
 use crate::hooks::{HookEvent, HookOutcome};
 use crate::llm::{
-    pricing, ChatMessage, ChatRequest, LlmEvent, StopReason, ToolSpec, WebSearchPhase,
+    pricing, retry, ChatMessage, ChatRequest, LlmEvent, StopReason, ToolSpec, WebSearchPhase,
 };
 
 use super::builtin_governance::{BuiltinTracker, TrackerSignal};
@@ -341,13 +341,38 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
             iteration: transcript_iter,
         };
 
-        let mut stream = match p.st.codex.chat(req).await {
+        // M3.4: initial-call retry (5xx / connection) is wrapped inside
+        // call_codex_with_retry below. The wrapper emits
+        // `provider_retry_attempt` events transparently and stamps the
+        // final RetryExhausted error with the attempt count, which
+        // classify_anyhow + lift_retry_attempts lift into the
+        // FatalReason. Stream-side silent retry is **not** done at this
+        // layer: a silent re-run would re-emit canvas events and
+        // double-count any Usage tokens that landed before the silence,
+        // and the existing M3.3 substantive-idle path already surfaces
+        // a kind-specific hint card that points the user at the
+        // composer for a manual re-send. Silent-retry is documented as
+        // a follow-up (see retry::SILENT_RETRY_BUDGET).
+        let mut stream = match retry::call_codex_with_retry(
+            p.st,
+            &p.st.codex,
+            p.session_id,
+            Some(p.turn_id),
+            transcript_iter,
+            req,
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
-                // M3.3: classify the typed CodexCallError so the user gets
-                // a kind-specific hint (codex_http_5xx / 4xx / connection_failed)
-                // instead of "POST to the codex Responses endpoint".
-                let reason = classify_anyhow(&e);
+                // M3.3 + M3.4: classify the typed CodexCallError so the
+                // user gets a kind-specific hint (codex_http_5xx / 4xx /
+                // connection_failed) instead of "POST to the codex
+                // Responses endpoint", and lift the retry_attempts
+                // count off the RetryExhausted wrapper so the hint
+                // says "已自动重试 N 次, 仍失败".
+                let mut reason = classify_anyhow(&e);
+                reason = retry::lift_retry_attempts(&e, reason);
                 fatal_error = Some(reason.detail());
                 fatal_reason = Some(reason);
                 stop_reason = "fatal_error".into();
@@ -359,11 +384,11 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
         let mut pending: Vec<(String, String, String)> = Vec::new();
         let mut iter_stop: Option<StopReason> = None;
         let mut idle_hit = false;
-        // M3.1: set inside the stream loop when the builtin tracker fires
-        // an Abort signal — read after the stream exits to bail out of the
-        // turn with `stop_reason = "codex_duplicate_abort"`. Tracks the
-        // offending URL for diagnostics so the assistant_done payload can
-        // explain itself if anyone digs into the transcript.
+        // M3.1: set inside the stream loop when the builtin tracker
+        // fires an Abort signal — read after the stream exits to bail
+        // out of the turn with `stop_reason = "codex_duplicate_abort"`.
+        // Tracks the offending URL for diagnostics so the assistant_done
+        // payload can explain itself if anyone digs into the transcript.
         let mut codex_abort: Option<(String, String, u32)> = None;
         // M3.2: set when the user-abort `Notify` fires inside the stream
         // poll. Like `idle_hit`, we set the flag and break the stream so
@@ -596,8 +621,14 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
             // card tells the user "codex 连接静默 N 秒被超时杀, 重试即可"
             // instead of the bare "idle timeout" stop_note.
             if let Some(d) = p.guards.idle_timeout {
+                // M3.4: `retry_attempts` is stamped by the silent-retry
+                // wrapper below; here it lands at the no-retry default
+                // (1). When the silent-retry path is wired in, it bumps
+                // this to 2 via `with_retry_attempts` after the retry
+                // also fails.
                 fatal_reason = Some(FatalReason::CodexStreamSilent {
                     silent_secs: d.as_secs(),
+                    retry_attempts: 1,
                 });
             }
             break 'turn;

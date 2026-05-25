@@ -21,8 +21,7 @@ use futures::StreamExt;
 use tiktoken_rs::{o200k_base, CoreBPE};
 
 use crate::api::AppState;
-use crate::llm::codex::CodexClient;
-use crate::llm::{ChatMessage, ChatRequest, LlmEvent, Role, ToolSpec};
+use crate::llm::{retry, ChatMessage, ChatRequest, LlmEvent, Role, ToolSpec};
 
 /// Trailing session messages kept verbatim — never folded. Always includes
 /// the current user prompt (the last message). Four ≈ the last two Q&A
@@ -134,7 +133,7 @@ pub async fn compact(
         &ctx.tool_dialog[..plan.early_items],
     );
     let folded = summarize(
-        &st.codex,
+        st,
         idle_timeout,
         transcript,
         session_id,
@@ -368,7 +367,7 @@ fn render_for_summary(
 /// usage is intentionally not folded into the turn's token / cost totals:
 /// compaction is tracked separately (compaction_count + compaction events).
 async fn summarize(
-    codex: &CodexClient,
+    st: &AppState,
     idle: Option<Duration>,
     transcript: String,
     session_id: &str,
@@ -393,10 +392,22 @@ async fn summarize(
         iteration: transcript_iter,
     };
 
-    let mut stream = codex
-        .chat(req)
-        .await
-        .context("auto-compaction: summary model call")?;
+    // M3.4: route through the retry wrapper so a 5xx / connection blip
+    // during the summary call doesn't fatal the whole turn. The
+    // wrapper emits provider_retry_attempt events transparently; the
+    // turn_id is the parent turn (the summary belongs to a turn) so
+    // the frontend pill still shows the recovery indicator under the
+    // right turn.
+    let mut stream = retry::call_codex_with_retry(
+        st,
+        &st.codex,
+        session_id,
+        Some(turn_id),
+        transcript_iter,
+        req,
+    )
+    .await
+    .context("auto-compaction: summary model call")?;
 
     let mut out = String::new();
     loop {

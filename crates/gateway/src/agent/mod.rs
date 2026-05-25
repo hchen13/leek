@@ -25,7 +25,7 @@ mod compaction;
 #[cfg(test)]
 mod compaction_replay_test;
 pub mod events;
-mod fatal;
+pub mod fatal;
 mod guards;
 mod loop_core;
 mod prompt;
@@ -612,6 +612,7 @@ mod tests {
         let reason = fatal::FatalReason::CodexHttp5xx {
             status: 503,
             body_excerpt: "service unavailable".into(),
+            retry_attempts: 1,
         };
         let out = compose_final_text("", "fatal_error", Some("anyhow chain"), Some(&reason));
         assert!(out.contains("稍后重试"));
@@ -624,7 +625,10 @@ mod tests {
         // M3.3: idle_timeout + CodexStreamSilent reason → the persisted
         // message carries the silent_secs number so the user can see
         // exactly which threshold tripped.
-        let reason = fatal::FatalReason::CodexStreamSilent { silent_secs: 90 };
+        let reason = fatal::FatalReason::CodexStreamSilent {
+            silent_secs: 90,
+            retry_attempts: 1,
+        };
         let out = compose_final_text("", "idle_timeout", None, Some(&reason));
         assert!(out.contains("90"));
         assert!(out.contains("静默"));
