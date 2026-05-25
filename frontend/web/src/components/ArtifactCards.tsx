@@ -16,6 +16,21 @@ export interface ToolCallView {
   arguments?: string;
   output_preview?: string;
   output_bytes?: number;
+  ui_artifact?: ToolUiArtifact;
+  cached?: boolean;
+  cached_from?: string;
+  error_kind?: string;
+  retryable?: boolean;
+  partial_status?: string | null;
+}
+
+export interface ToolUiArtifact {
+  version?: number;
+  tool_name?: string;
+  arguments?: unknown;
+  content_type?: "json" | "markdown" | "text" | string;
+  payload?: unknown;
+  output_bytes?: number;
 }
 
 export interface SearchCallView {
@@ -53,6 +68,7 @@ export interface DecisionDraftView {
 export interface ArtifactEventView {
   id: string;
   kind: "narration" | "narration_group" | "search" | "tool" | "decision";
+  turn?: number;
   narration?: NarrationStep;
   narrations?: NarrationStep[];
   search?: SearchCallView;
@@ -69,8 +85,10 @@ export function ArtifactPanel(props: {
   tools: ToolCallView[];
   narrations?: NarrationStep[];
   events?: ArtifactEventView[];
+  currentTurn?: number;
   callbacks?: ArtifactCallbacks;
 }) {
+  const [showAllTurns, setShowAllTurns] = createSignal(false);
   const events = createMemo<ArtifactEventView[]>(() => {
     const source = props.events && props.events.length > 0 ? props.events : [
       ...(props.narrations ?? []).map((n, i) => ({
@@ -110,6 +128,8 @@ export function ArtifactPanel(props: {
           narrations.push({ ...narration, seq: narrationSeq });
         }
         if (narrations.length > 0) out.push({ ...event, narrations });
+      } else if (event.kind === "tool" && event.tool) {
+        upsertToolEvent(out, { ...event, id: event.tool.call_id });
       } else {
         out.push(event);
       }
@@ -121,12 +141,13 @@ export function ArtifactPanel(props: {
     for (const event of events()) {
       if (event.kind === "narration" && event.narration) {
         const last = out[out.length - 1];
-        if (last?.kind === "narration_group") {
+        if (last?.kind === "narration_group" && last.turn === event.turn) {
           last.narrations = [...(last.narrations ?? []), event.narration];
         } else {
           out.push({
             id: event.id,
             kind: "narration_group",
+            turn: event.turn,
             narrations: [event.narration],
           });
         }
@@ -136,18 +157,88 @@ export function ArtifactPanel(props: {
     }
     return out;
   });
+  const latestArtifactTurn = createMemo(() =>
+    groupedEvents().reduce((max, event) => Math.max(max, event.turn ?? 0), 0)
+  );
+  const latestTurn = createMemo(() => Math.max(props.currentTurn ?? 0, latestArtifactTurn()));
+  const visibleEvents = createMemo(() => {
+    const latest = latestTurn();
+    if (showAllTurns() || latest === 0) return groupedEvents();
+    return groupedEvents().filter((event) => event.turn === latest);
+  });
 
   return (
     <div class="lk-artifact-grid">
-      <For each={groupedEvents()}>{(event) => (
+      <Show when={latestTurn() > 0}>
+        <div class="lk-artifact-scope">
+          <span>第 {latestTurn()} 轮</span>
+          <button type="button" class={!showAllTurns() ? "active" : ""} onClick={() => setShowAllTurns(false)}>当前</button>
+          <button type="button" class={showAllTurns() ? "active" : ""} onClick={() => setShowAllTurns(true)}>全部</button>
+        </div>
+      </Show>
+      <For each={visibleEvents()}>{(event) => (
         <ArtifactEventCard event={event} callbacks={props.callbacks} />
       )}</For>
+      <Show when={!showAllTurns() && latestTurn() > 0 && visibleEvents().length === 0}>
+        <div class="lk-artifact-card is-wide" style={{
+          background: "rgba(255,255,255,0.018)",
+          border: "1px solid var(--line-1)",
+          "border-radius": "8px",
+          padding: "14px 16px",
+          color: "var(--ink-3)",
+          "font-size": "12px",
+        }}>
+          当前轮没有新的工具或网页证据，回答沿用了前文上下文。
+        </div>
+      </Show>
     </div>
   );
 }
 
 function normalizeNarrationText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
+}
+
+function mergeToolCall(prev: ToolCallView, next: ToolCallView): ToolCallView {
+  const merged = {
+    ...prev,
+    ...next,
+    call_id: prev.call_id || next.call_id,
+    arguments: prev.arguments ?? next.arguments,
+    output_preview: next.output_preview ?? prev.output_preview,
+    output_bytes: next.output_bytes ?? prev.output_bytes,
+    ui_artifact: next.ui_artifact ?? prev.ui_artifact,
+    cached: next.cached ?? prev.cached,
+    cached_from: next.cached_from ?? prev.cached_from,
+    error_kind: next.error_kind ?? prev.error_kind,
+    retryable: next.retryable ?? prev.retryable,
+    partial_status: next.partial_status ?? prev.partial_status,
+  };
+  if (next.status === "in_progress" && prev.status !== "in_progress") merged.status = prev.status;
+  return merged;
+}
+
+function upsertToolEvent(out: ArtifactEventView[], event: ArtifactEventView) {
+  const tool = event.tool;
+  if (!tool) return;
+  const toolEvents = out
+    .map((existing, index) => ({ existing, index }))
+    .filter(({ existing }) => existing.kind === "tool" && existing.tool);
+  const idx = toolEvents.find(({ existing }) => existing.tool?.call_id === tool.call_id)?.index
+    ?? (tool.cached === true && tool.cached_from
+      ? toolEvents.find(({ existing }) => existing.tool?.call_id === tool.cached_from)?.index
+      : undefined);
+  if (idx != null && idx >= 0) {
+    const prev = out[idx].tool;
+    out[idx] = {
+      ...out[idx],
+      ...event,
+      id: prev?.call_id ?? event.id,
+      tool: prev ? mergeToolCall(prev, tool) : tool,
+    };
+  } else {
+    out.push(event);
+  }
 }
 
 function ArtifactEventCard(props: { event: ArtifactEventView; callbacks?: ArtifactCallbacks }) {
@@ -350,12 +441,99 @@ function StatusDot(props: { status: string }) {
   );
 }
 
+function ToolStatusBadges(props: { tool?: ToolCallView }) {
+  const cachedLabel = () => props.tool?.cached ? "cached" : "";
+  const partialLabel = () => {
+    switch (props.tool?.partial_status) {
+      case "partial_with_unavailable_source": return "部分来源不可用";
+      case "valid_empty": return "无匹配数据";
+      case "success_with_no_data": return "无数据";
+      default: return props.tool?.partial_status ?? "";
+    }
+  };
+  const errorLabel = () => {
+    if (!props.tool?.error_kind) return "";
+    return props.tool.retryable === true
+      ? `${props.tool.error_kind} · retryable`
+      : props.tool.retryable === false
+      ? `${props.tool.error_kind} · final`
+      : props.tool.error_kind;
+  };
+  return (
+    <Show when={cachedLabel() || partialLabel() || errorLabel()}>
+      <span style={{
+        display: "inline-flex",
+        "align-items": "center",
+        gap: "5px",
+        "margin-left": "8px",
+        "min-width": 0,
+      }}>
+        <Show when={cachedLabel()}>
+          <span
+            title={props.tool?.cached_from ? `cached from ${props.tool.cached_from}` : "cached result"}
+            style={{
+              color: "rgba(158,183,143,0.95)",
+              background: "rgba(158,183,143,0.10)",
+              border: "1px solid rgba(158,183,143,0.18)",
+              "border-radius": "999px",
+              padding: "1px 6px",
+              "font-size": "9.5px",
+              "line-height": 1.45,
+              "text-transform": "uppercase",
+              "letter-spacing": "0.04em",
+            }}
+          >
+            cached
+          </span>
+        </Show>
+        <Show when={errorLabel()}>
+          <span style={{
+            color: "rgba(217,112,112,0.95)",
+            background: "rgba(217,112,112,0.10)",
+            border: "1px solid rgba(217,112,112,0.18)",
+            "border-radius": "999px",
+            padding: "1px 6px",
+            "font-size": "9.5px",
+            "line-height": 1.45,
+            "text-transform": "uppercase",
+            "letter-spacing": "0.04em",
+            overflow: "hidden",
+            "text-overflow": "ellipsis",
+            "white-space": "nowrap",
+          }}>
+            {errorLabel()}
+          </span>
+        </Show>
+        <Show when={partialLabel()}>
+          <span style={{
+            color: "rgba(217,167,108,0.98)",
+            background: "rgba(217,167,108,0.10)",
+            border: "1px solid rgba(217,167,108,0.18)",
+            "border-radius": "999px",
+            padding: "1px 6px",
+            "font-size": "9.5px",
+            "line-height": 1.45,
+            "text-transform": "uppercase",
+            "letter-spacing": "0.04em",
+            overflow: "hidden",
+            "text-overflow": "ellipsis",
+            "white-space": "nowrap",
+          }}>
+            {partialLabel()}
+          </span>
+        </Show>
+      </span>
+    </Show>
+  );
+}
+
 function CardShell(props: {
   status: string;
   badge: string;
   detail?: string;
   children: any;
   onClick?: () => void;
+  tool?: ToolCallView;
   /** Marks the card so chat-side click handlers can scrollIntoView. */
   callId?: string;
   /** How many grid columns this card spans (default 1). */
@@ -379,7 +557,9 @@ function CardShell(props: {
       <div style={{
         display: "flex",
         "align-items": "center",
+        "flex-wrap": "wrap",
         gap: "0",
+        "row-gap": "5px",
         "margin-bottom": "8px",
         "font-family": "var(--font-mono)",
         "font-size": "10.5px",
@@ -397,10 +577,13 @@ function CardShell(props: {
             overflow: "hidden",
             "text-overflow": "ellipsis",
             "white-space": "nowrap",
+            "min-width": 0,
+            "max-width": "100%",
           }}>
             {props.detail}
           </span>
         </Show>
+        <ToolStatusBadges tool={props.tool} />
       </div>
       {props.children}
     </div>
@@ -491,15 +674,16 @@ function ArtifactModal(props: {
 
 function SearchArtifact(props: { search: SearchCallView }) {
   const badge = () =>
-    props.search.action === "open_page" ? "web · page" :
-    props.search.action === "find_in_page" ? "web · find" :
-    "web · search";
+    props.search.action === "open_page" ? "网页 · 打开" :
+    props.search.action === "find_in_page" ? "网页 · 页内查找" :
+    "网页 · 搜索";
   const verb = () => props.search.status === "completed"
-    ? props.search.action === "open_page" ? "Opened"
-    : props.search.action === "find_in_page" ? "Found in page"
-    : "Searched"
-    : props.search.action === "open_page" ? "Opening"
-    : "Searching";
+    ? props.search.action === "open_page" ? "已打开"
+    : props.search.action === "find_in_page" ? "已查找"
+    : "已搜索"
+    : props.search.action === "open_page" ? "正在打开"
+    : props.search.action === "find_in_page" ? "正在查找"
+    : "正在搜索";
   const primaryDetail = () => props.search.detail || props.search.queries?.[0] || "";
   let host = primaryDetail();
   let isUrl = false;
@@ -639,18 +823,61 @@ function SearchArtifact(props: { search: SearchCallView }) {
 function ToolArtifact(props: { tool: ToolCallView; callbacks?: ArtifactCallbacks }) {
   switch (props.tool.name) {
     case "corpus_search": return <CorpusSearchCard {...props} />;
+    case "corpus_read": return <CorpusReadCard {...props} />;
     case "web_fetch":     return <WebFetchCard {...props} />;
     case "market_quote":
     case "tradingview_quote": return <MarketQuoteCard {...props} />;
+    case "get_a_share_market_snapshot": return <AShareMarketSnapshotCard {...props} />;
     case "get_candlesticks": return <CandlestickToolCard {...props} />;
-    case "tushare_quote": return <TushareCard {...props} />;
-    case "use_skill": return <UseSkillCard {...props} />;
     case "get_company_info": return <CompanyInfoCard {...props} />;
     case "get_financials": return <FinancialsCard {...props} />;
+    case "get_a_share_industry_context": return <AShareIndustryContextCards {...props} />;
+    case "get_a_share_research_sources": return <AShareResearchSourcesCard {...props} />;
     case "get_capital_flow": return <CapitalFlowCard {...props} />;
+    case "get_a_share_ownership_and_leverage": return <MarkdownContextCards {...props} badge={toolDisplayName(props.tool.name)} />;
+    case "get_china_macro_context": return <MarkdownContextCards {...props} badge={toolDisplayName(props.tool.name)} />;
+    case "get_china_fund_context": return <MarkdownContextCards {...props} badge={toolDisplayName(props.tool.name)} />;
+    case "get_china_index_context": return <MarkdownContextCards {...props} badge={toolDisplayName(props.tool.name)} />;
+    case "get_crypto_market": return <MarkdownContextCards {...props} badge={toolDisplayName(props.tool.name)} />;
+    case "get_funding_rate": return <MarkdownContextCards {...props} badge={toolDisplayName(props.tool.name)} />;
     case "sec_filing_fetch": return <SecFilingCard {...props} />;
     default:              return <GenericToolCard {...props} />;
   }
+}
+
+type ToolDisplayLocale = "zh" | "en";
+interface ToolDisplayName {
+  zh: string;
+  en: string;
+}
+
+const TOOL_DISPLAY_NAMES: Record<string, ToolDisplayName> = {
+  ask_user_question: { zh: "代理 · 追问", en: "Agent Question" },
+  corpus_search: { zh: "投研智库 · 检索", en: "Investment Corpus Search" },
+  corpus_read: { zh: "投研智库 · 阅读", en: "Investment Corpus Read" },
+  delegate_research: { zh: "研究 · 委派", en: "Delegated Research" },
+  get_a_share_industry_context: { zh: "A股 · 行业上下文", en: "A-share Industry Context" },
+  get_a_share_market_snapshot: { zh: "A股 · 行情快照", en: "A-share Market Snapshot" },
+  get_a_share_ownership_and_leverage: { zh: "A股 · 筹码杠杆", en: "A-share Ownership & Leverage" },
+  get_a_share_research_sources: { zh: "A股 · 源材料", en: "A-share Source Materials" },
+  get_candlesticks: { zh: "市场 · K线走势", en: "Market Candlesticks" },
+  get_capital_flow: { zh: "A股 · 资金流", en: "A-share Capital Flow" },
+  get_china_fund_context: { zh: "中国 · 基金上下文", en: "China Fund Context" },
+  get_china_index_context: { zh: "中国 · 指数上下文", en: "China Index Context" },
+  get_china_macro_context: { zh: "中国 · 宏观上下文", en: "China Macro Context" },
+  get_company_info: { zh: "公司 · 基本资料", en: "Company Profile" },
+  get_crypto_market: { zh: "加密 · 市场上下文", en: "Crypto Market Context" },
+  get_financials: { zh: "财务 · 三表指标", en: "Financial Statements & Ratios" },
+  get_funding_rate: { zh: "加密 · 合约资金面", en: "Funding & Open Interest" },
+  market_quote: { zh: "市场 · 报价", en: "Market Quote" },
+  sec_filing_fetch: { zh: "SEC · 文件", en: "SEC Filings" },
+  tradingview_quote: { zh: "市场 · 报价", en: "Market Quote" },
+  update_plan: { zh: "计划 · 更新", en: "Plan Update" },
+  web_fetch: { zh: "网页 · 读取", en: "Web Fetch" },
+};
+
+export function toolDisplayName(name: string, locale: ToolDisplayLocale = "zh"): string {
+  return TOOL_DISPLAY_NAMES[name]?.[locale] ?? name.replace(/_/g, " · ");
 }
 
 function safeParseJson(s: string | undefined): unknown {
@@ -711,18 +938,50 @@ function parseArgs(t: ToolCallView): Record<string, unknown> {
   catch { return {}; }
 }
 
-async function fetchToolPreview(url: URL): Promise<string> {
-  const r = await fetch(url);
-  const text = await r.text();
-  let body: any;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    throw new Error("工具数据接口返回非 JSON 响应");
+function toolOutput(tool: ToolCallView): string {
+  const artifact = tool.ui_artifact;
+  const payload = artifact?.payload;
+  if (artifact?.content_type === "markdown" && isRecord(payload) && typeof payload.markdown === "string") {
+    return payload.markdown;
   }
-  if (!r.ok) throw new Error(body?.error?.message || "工具数据接口请求失败");
-  return String(body.output_preview ?? "");
+  if (artifact?.content_type === "text" && isRecord(payload) && typeof payload.text === "string") {
+    return payload.text;
+  }
+  if (artifact?.content_type === "json" && payload !== undefined && payload !== null) {
+    try { return JSON.stringify(payload); } catch { /* fall back to preview */ }
+  }
+  return tool.output_preview ?? "";
 }
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function fetchToolPreview(url: URL): Promise<string> {
+  const key = url.toString();
+  const existing = toolPreviewCache.get(key);
+  if (existing) return existing;
+  const pending = fetch(url)
+    .then(async (r) => {
+      const text = await r.text();
+      let body: any;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        throw new Error("工具数据接口返回非 JSON 响应");
+      }
+      if (!r.ok) throw new Error(body?.error?.message || "工具数据接口请求失败");
+      return String(body.output_preview ?? "");
+    })
+    .catch((err) => {
+      toolPreviewCache.delete(key);
+      throw err;
+    });
+  toolPreviewCache.set(key, pending);
+  return pending;
+}
+
+const toolPreviewCache = new Map<string, Promise<string>>();
 
 function firstHeading(md: string): string {
   return md.match(/^##?\s+(.+)$/m)?.[1]?.trim() ?? "";
@@ -739,7 +998,7 @@ function parseMarkdownTables(md: string): MarkdownTable[] {
   const lines = md.split("\n");
   let title = "";
   for (let i = 0; i < lines.length; i++) {
-    const heading = lines[i].match(/^##\s+(.+)$/);
+    const heading = lines[i].match(/^#{2,3}\s+(.+)$/);
     if (heading) {
       title = heading[1].trim();
       continue;
@@ -777,10 +1036,40 @@ interface CorpusHit {
   snippet?: string;
 }
 
+interface CorpusReadDoc {
+  id: string;
+  title: string;
+  tier: string;
+  layer: string;
+  tags: string[];
+  body: string;
+}
+
+function parseCorpusRead(md: string, fallbackId: string): CorpusReadDoc {
+  const title = firstHeading(md);
+  const readLine = (field: string) => {
+    const match = md.match(new RegExp(`^- ${field}:\\s*(.+)$`, "m"));
+    return match?.[1]?.replace(/^`|`$/g, "").trim() ?? "";
+  };
+  const tagsRaw = readLine("tags");
+  const body = md
+    .replace(/^# .+\n\n(?:- .+\n)+\n/, "")
+    .replace(/\n\n\[corpus_read:[\s\S]*$/m, "")
+    .trim();
+  return {
+    id: readLine("id") || fallbackId,
+    title: title || fallbackId,
+    tier: readLine("tier"),
+    layer: readLine("layer"),
+    tags: !tagsRaw || tagsRaw === "(none)" ? [] : tagsRaw.split(",").map((tag) => tag.trim()).filter(Boolean),
+    body,
+  };
+}
+
 function CorpusSearchCard(props: { tool: ToolCallView; callbacks?: ArtifactCallbacks }) {
   const args = parseArgs(props.tool);
   const query = String(args.query ?? "");
-  const preview = props.tool.output_preview ?? "";
+  const preview = toolOutput(props.tool);
   const parsed = safeParseJson(preview) as
     | { hits?: CorpusHit[]; total_corpus_docs?: number } | null;
   // Fall back to brace-balanced extraction when the preview was truncated
@@ -790,8 +1079,9 @@ function CorpusSearchCard(props: { tool: ToolCallView; callbacks?: ArtifactCallb
   return (
     <CardShell
       status={props.tool.status}
-      badge="corpus"
+      badge={toolDisplayName(props.tool.name)}
       detail={query ? `"${query}"` : undefined}
+      tool={props.tool}
       callId={props.tool.call_id}
       size="normal"
     >
@@ -811,6 +1101,94 @@ function CorpusSearchCard(props: { tool: ToolCallView; callbacks?: ArtifactCallb
               props.callbacks?.onOpenDoc?.(h.id, h.title || h.id)
             } />
           )}</For>
+        </div>
+      </Show>
+    </CardShell>
+  );
+}
+
+function CorpusReadCard(props: { tool: ToolCallView; callbacks?: ArtifactCallbacks }) {
+  const args = parseArgs(props.tool);
+  const fallbackId = String(args.id ?? "");
+  const doc = createMemo(() => parseCorpusRead(toolOutput(props.tool), fallbackId));
+  const openDoc = () => {
+    if (doc().id) props.callbacks?.onOpenDoc?.(doc().id, doc().title || doc().id);
+  };
+
+  return (
+    <CardShell
+      status={props.tool.status}
+      badge={toolDisplayName(props.tool.name)}
+      detail={doc().id || fallbackId}
+      tool={props.tool}
+      callId={props.tool.call_id}
+      size="wide"
+      onClick={doc().id ? openDoc : undefined}
+    >
+      <Show
+        when={doc().title || doc().body}
+        fallback={
+          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+            <Show when={props.tool.status === "in_progress"} fallback="未读取到智库页面。">
+              正在读取投研智库页面…
+            </Show>
+          </div>
+        }
+      >
+        <div style={{ display: "flex", "flex-direction": "column", gap: "9px" }}>
+          <div style={{ display: "flex", "align-items": "baseline", gap: "8px", "min-width": 0 }}>
+            <div style={{
+              "font-size": "15px",
+              "font-weight": 650,
+              color: "var(--ink-0)",
+              overflow: "hidden",
+              "text-overflow": "ellipsis",
+              "white-space": "nowrap",
+            }}>
+              {doc().title}
+            </div>
+            <Show when={doc().tier || doc().layer}>
+              <div style={{
+                "font-family": "var(--font-mono)",
+                "font-size": "10px",
+                color: "var(--ink-3)",
+                "white-space": "nowrap",
+              }}>
+                {[doc().tier, doc().layer].filter(Boolean).join(" · ")}
+              </div>
+            </Show>
+          </div>
+          <Show when={doc().tags.length > 0}>
+            <div style={{ display: "flex", gap: "5px", "flex-wrap": "wrap" }}>
+              <For each={doc().tags.slice(0, 6)}>{(tag) => (
+                <span style={{
+                  "font-family": "var(--font-mono)",
+                  "font-size": "10px",
+                  color: "var(--clay-soft)",
+                  background: "rgba(217,119,87,0.08)",
+                  border: "1px solid rgba(217,119,87,0.14)",
+                  "border-radius": "999px",
+                  padding: "2px 6px",
+                }}>{tag}</span>
+              )}</For>
+            </div>
+          </Show>
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+            "max-height": "230px",
+            overflow: "hidden",
+            "font-size": "12px",
+            color: "var(--ink-2)",
+            "line-height": 1.55,
+          }}>
+            <SafeMarkdown source={doc().body} onWikiOpen={(id) => props.callbacks?.onOpenDoc?.(id, id)} />
+          </div>
+          <Show when={doc().id}>
+            <div style={{ "font-family": "var(--font-mono)", "font-size": "10px", color: "var(--clay-soft)" }}>
+              点击查看完整智库页面
+            </div>
+          </Show>
         </div>
       </Show>
     </CardShell>
@@ -859,11 +1237,31 @@ export interface LinkMeta {
   title: string;
   description: string;
   thumbnail?: string;
+  unusable?: boolean;
+}
+
+function unusableFetchReason(md: string): string {
+  const match = md.match(/\[web_fetch: clearly unusable \/ not citable \(([^)]+)\)\./i);
+  if (!match) return "";
+  switch (match[1]) {
+    case "binary_skipped": return "该来源是二进制文件，当前无法在卡片中读取正文。";
+    case "unreadable_or_garbled_text": return "该页面正文不可读或乱码，不能作为可引用证据。";
+    default: return "该来源无法提取可引用正文。";
+  }
 }
 
 /** Pull page title (first `# heading`), short description, and thumbnail
  *  (first markdown image) out of the truncated readability output. */
 export function extractLinkMeta(md: string): LinkMeta {
+  const unusableReason = unusableFetchReason(md);
+  if (unusableReason) {
+    return {
+      title: "来源未读取",
+      description: `${unusableReason} 已保留调试信息在事件记录中；结论应改用可读取的网页、公告文本或结构化工具结果。`,
+      unusable: true,
+    };
+  }
+
   // The fetched markdown is preceded by "# Source: <url>\n_(extraction: ...)_\n\n"
   // — strip both lines first.
   const body = md
@@ -910,7 +1308,7 @@ function WebFetchCard(props: { tool: ToolCallView }) {
     ? `https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=64`
     : "";
 
-  const meta = createMemo(() => extractLinkMeta(props.tool.output_preview ?? ""));
+  const meta = createMemo(() => extractLinkMeta(toolOutput(props.tool)));
 
   return (
     <div
@@ -918,8 +1316,8 @@ function WebFetchCard(props: { tool: ToolCallView }) {
       data-call-id={props.tool.call_id}
       class="lk-artifact-card is-normal"
       style={{
-        background: "var(--bg-1)",
-        border: "1px solid var(--bg-2)",
+        background: meta().unusable ? "rgba(217,112,112,0.06)" : "var(--bg-1)",
+        border: meta().unusable ? "1px solid rgba(217,112,112,0.26)" : "1px solid var(--bg-2)",
         "border-radius": "8px",
         cursor: url ? "pointer" : "default",
         transition: "border-color 120ms, box-shadow 200ms",
@@ -964,6 +1362,7 @@ function WebFetchCard(props: { tool: ToolCallView }) {
             "text-overflow": "ellipsis",
             "white-space": "nowrap",
           }}>{host}</span>
+          <ToolStatusBadges tool={props.tool} />
         </div>
         <Show
           when={meta().title || meta().description}
@@ -1001,71 +1400,6 @@ function WebFetchCard(props: { tool: ToolCallView }) {
         </Show>
       </div>
     </div>
-  );
-}
-
-/* ---------- use_skill ---------- */
-
-function UseSkillCard(props: { tool: ToolCallView }) {
-  const args = parseArgs(props.tool);
-  const skill = String(args.name ?? args.skill ?? "").replace(/[-_]/g, " ");
-  const body = () => props.tool.output_preview ?? "";
-  const headings = createMemo(() =>
-    body()
-      .split("\n")
-      .map((line) => line.match(/^#{2,3}\s+(.+)$/)?.[1]?.trim())
-      .filter(Boolean)
-      .slice(0, 6) as string[]
-  );
-
-  return (
-    <CardShell
-      status={props.tool.status}
-      badge="skill"
-      detail={skill || undefined}
-      callId={props.tool.call_id}
-      size="compact"
-    >
-      <Show
-        when={headings().length > 0}
-        fallback={
-          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
-            <Show when={props.tool.status === "in_progress"} fallback="Skill loaded.">
-              Loading skill…
-            </Show>
-          </div>
-        }
-      >
-        <div style={{ display: "flex", "flex-direction": "column", gap: "8px" }}>
-          <div style={{
-            "font-size": "13px",
-            color: "var(--ink-0)",
-            "line-height": 1.35,
-            "font-weight": 600,
-          }}>
-            {skill ? skill.replace(/\b\w/g, (m) => m.toUpperCase()) : "Research Skill"}
-          </div>
-          <div style={{
-            display: "flex",
-            "flex-wrap": "wrap",
-            gap: "6px",
-          }}>
-            <For each={headings()}>{(h) => (
-              <span style={{
-                "font-family": "var(--font-mono)",
-                "font-size": "10.5px",
-                color: "var(--ink-2)",
-                padding: "4px 7px",
-                background: "rgba(217,119,87,0.08)",
-                border: "1px solid rgba(217,119,87,0.18)",
-                "border-radius": "999px",
-                "white-space": "nowrap",
-              }}>{h}</span>
-            )}</For>
-          </div>
-        </div>
-      </Show>
-    </CardShell>
   );
 }
 
@@ -1115,10 +1449,11 @@ function CompanyInfoCard(props: { tool: ToolCallView }) {
   const args = parseArgs(props.tool);
   const tsCode = String(args.ts_code ?? "");
   const [open, setOpen] = createSignal(false);
-  const info = createMemo(() => parseCompanyInfo(props.tool.output_preview ?? ""));
+  const info = createMemo(() => parseCompanyInfo(toolOutput(props.tool)));
   const selectedBasics = () => info().basics.filter(([k]) =>
-    ["公司名", "所在地", "成立日期", "员工数", "主营业务"].includes(k)
+    ["所在地", "成立日期", "员工数"].includes(k)
   );
+  const mainBusiness = () => info().basics.find(([k]) => k === "主营业务")?.[1] ?? "";
   const selectedMetrics = () => info().metrics.filter(([k]) =>
     ["ROE", "毛利率", "资产负债率", "PE(TTM)", "PB", "营收同比", "净利润同比"].includes(k)
   );
@@ -1127,8 +1462,9 @@ function CompanyInfoCard(props: { tool: ToolCallView }) {
     <>
       <CardShell
         status={props.tool.status}
-        badge="company"
+        badge={toolDisplayName(props.tool.name)}
         detail={info().title || tsCode}
+        tool={props.tool}
         callId={props.tool.call_id}
         size="wide"
         onClick={() => setOpen(true)}
@@ -1152,8 +1488,8 @@ function CompanyInfoCard(props: { tool: ToolCallView }) {
               <div style={{ "font-size": "15px", "font-weight": 650, color: "var(--ink-0)", "line-height": 1.25 }}>
                 {info().title}
               </div>
-              <div style={{ display: "grid", "grid-template-columns": "repeat(2, minmax(0, 1fr))", gap: "6px" }}>
-                <For each={selectedBasics().slice(0, 4)}>{([k, v]) => (
+              <div style={{ display: "grid", "grid-template-columns": "repeat(3, minmax(0, 1fr))", gap: "6px" }}>
+                <For each={selectedBasics().slice(0, 3)}>{([k, v]) => (
                   <div style={{
                     padding: "6px 8px",
                     background: "rgba(255,255,255,0.025)",
@@ -1166,13 +1502,28 @@ function CompanyInfoCard(props: { tool: ToolCallView }) {
                   </div>
                 )}</For>
               </div>
+              <Show when={mainBusiness()}>
+                <div style={{
+                  padding: "8px 9px",
+                  background: "rgba(255,255,255,0.025)",
+                  border: "1px solid var(--line-1)",
+                  "border-radius": "6px",
+                  color: "var(--ink-2)",
+                  "font-size": "12px",
+                  "line-height": 1.5,
+                  display: "-webkit-box",
+                  "-webkit-line-clamp": "2",
+                  "-webkit-box-orient": "vertical",
+                  overflow: "hidden",
+                }}>{mainBusiness()}</div>
+              </Show>
               <Show when={info().intro}>
                 <div style={{
                   "font-size": "12px",
                   color: "var(--ink-2)",
                   "line-height": 1.55,
                   display: "-webkit-box",
-                  "-webkit-line-clamp": "4",
+                  "-webkit-line-clamp": mainBusiness() ? "2" : "3",
                   "-webkit-box-orient": "vertical",
                   overflow: "hidden",
                 }}>{info().intro}</div>
@@ -1261,30 +1612,31 @@ type StatementTab = "income" | "balance" | "cashflow";
 type PeriodMode = "quarterly" | "annual";
 
 const FINANCIAL_TABS: Array<[FinancialTab, string]> = [
-  ["overview", "Overview"],
-  ["statements", "Statements"],
-  ["statistics", "Statistics"],
-  ["dividends", "Dividends"],
-  ["earnings", "Earnings"],
-  ["revenue", "Revenue"],
+  ["overview", "概览"],
+  ["statements", "三表"],
+  ["statistics", "指标"],
+  ["dividends", "分红"],
+  ["earnings", "盈利"],
+  ["revenue", "收入"],
 ];
 
 const STATEMENT_TABS: Array<[StatementTab, string]> = [
-  ["income", "Income statement"],
-  ["balance", "Balance sheet"],
-  ["cashflow", "Cash flow"],
+  ["income", "利润表"],
+  ["balance", "资产负债表"],
+  ["cashflow", "现金流量表"],
 ];
 
 function FinancialsCard(props: { tool: ToolCallView }) {
   const args = parseArgs(props.tool);
   const ticker = String(args.ticker ?? "");
   const market = String(args.market ?? "");
+  const initialPeriods = typeof args.periods === "number" ? Math.max(1, Math.min(24, args.periods)) : 12;
   const [open, setOpen] = createSignal(false);
-  const [periods, setPeriods] = createSignal(12);
+  const [periods, setPeriods] = createSignal(initialPeriods);
   const [periodMode, setPeriodMode] = createSignal<PeriodMode>("quarterly");
   const [tab, setTab] = createSignal<FinancialTab>("overview");
   const [statementTab, setStatementTab] = createSignal<StatementTab>("income");
-  const [preview, setPreview] = createSignal(props.tool.output_preview ?? "");
+  const [preview, setPreview] = createSignal(toolOutput(props.tool));
   const [loading, setLoading] = createSignal(false);
   const [error, setError] = createSignal("");
   const tables = createMemo(() => parseMarkdownTables(preview()));
@@ -1297,6 +1649,16 @@ function FinancialsCard(props: { tool: ToolCallView }) {
     statementTab() === "income" ? incomeTable()
     : statementTab() === "balance" ? balanceTable()
     : cashflowTable();
+  const needsFullFinancials = () => {
+    if (tables().length === 0) return true;
+    const requested = String(args.report_type ?? "all");
+    if (requested === "all") return !incomeTable() || !balanceTable() || !cashflowTable() || !ratioTable();
+    if (requested === "income") return !incomeTable();
+    if (requested === "balance") return !balanceTable();
+    if (requested === "cashflow") return !cashflowTable();
+    if (requested === "ratios") return !ratioTable();
+    return false;
+  };
 
   const load = async (nextPeriods: number) => {
     if (!ticker || !market) return;
@@ -1318,15 +1680,18 @@ function FinancialsCard(props: { tool: ToolCallView }) {
   };
 
   onMount(() => {
-    if (props.tool.status === "completed" && ticker && market) void load(periods());
+    if (props.tool.status === "completed" && ticker && market && needsFullFinancials()) {
+      void load(periods());
+    }
   });
 
   return (
     <>
       <CardShell
         status={props.tool.status}
-        badge="financials"
+        badge={toolDisplayName(props.tool.name)}
         detail={ticker}
+        tool={props.tool}
         callId={props.tool.call_id}
         size="wide"
         onClick={() => setOpen(true)}
@@ -1356,15 +1721,15 @@ function FinancialsCard(props: { tool: ToolCallView }) {
         >
           <div style={{
             display: "grid",
-            "grid-template-columns": "minmax(220px, 0.75fr) minmax(0, 1.25fr)",
+            "grid-template-columns": "minmax(210px, 0.7fr) minmax(280px, 1.3fr)",
             gap: "12px",
           }}>
             <FinancialFactGrid facts={facts()} />
-            <div style={{ display: "grid", "grid-template-columns": "repeat(2, minmax(0, 1fr))", gap: "10px" }}>
-              <FinancialMiniChart title="Revenue" table={incomeTable()} columnHints={["营收", "Revenue"]} color="#3f82f6" />
-              <FinancialMiniChart title="Profitability" table={ratioTable()} columnHints={["ROE"]} color="#d9a76c" />
-              <FinancialMiniChart title="Operating CF" table={cashflowTable()} columnHints={["经营活动", "Operating CF"]} color="#35b7b5" />
-              <FinancialMiniChart title="Debt" table={ratioTable()} columnHints={["资产负债率", "Debt"]} color="#e05288" />
+            <div style={{ display: "grid", "grid-template-columns": "repeat(auto-fit, minmax(135px, 1fr))", gap: "10px" }}>
+              <FinancialMiniChart title="营业总收入" table={incomeTable()} columnHints={["营业总收入", "Total Revenue"]} color="#3f82f6" />
+              <FinancialMiniChart title="ROE" table={ratioTable()} columnHints={["ROE"]} color="#d9a76c" />
+              <FinancialMiniChart title="经营现金流" table={cashflowTable()} columnHints={["经营活动", "Operating CF"]} color="#35b7b5" />
+              <FinancialMiniChart title="资产负债率" table={ratioTable()} columnHints={["资产负债率", "Debt"]} color="#e05288" />
             </div>
           </div>
           <div style={{
@@ -1380,7 +1745,7 @@ function FinancialsCard(props: { tool: ToolCallView }) {
       <Show when={open()}>
         <ArtifactModal
           title={ticker}
-          subtitle={`Financials · ${periods()} periods`}
+          subtitle={`财务 · ${periods()} 期`}
           onClose={() => setOpen(false)}
         >
           <div class="lk-fin-modal">
@@ -1396,7 +1761,7 @@ function FinancialsCard(props: { tool: ToolCallView }) {
                 <PeriodModeToggle value={periodMode()} onPick={setPeriodMode} />
                 <PeriodButtons value={periods()} onPick={load} />
                 <Show when={loading()}>
-                  <span class="lk-fin-note">loading…</span>
+	                  <span class="lk-fin-note">加载中…</span>
                 </Show>
                 <Show when={error()}>
                   <span class="lk-fin-note error">{error()}</span>
@@ -1454,6 +1819,11 @@ function FinancialsCard(props: { tool: ToolCallView }) {
 }
 
 function PeriodButtons(props: { value: number; onPick: (periods: number) => void }) {
+  const options = createMemo(() => {
+    const base = [8, 12, 24];
+    if (base.includes(props.value)) return base;
+    return [props.value, ...base.filter((n) => n !== props.value)].slice(0, 4);
+  });
   return (
     <div style={{
       display: "inline-flex",
@@ -1463,10 +1833,10 @@ function PeriodButtons(props: { value: number; onPick: (periods: number) => void
       border: "1px solid var(--line-1)",
       "border-radius": "6px",
     }}>
-      <For each={[8, 12, 24]}>{(n) => (
+      <For each={options()}>{(n) => (
         <button
           type="button"
-          onClick={(e) => { e.stopPropagation(); props.onPick(n); }}
+          onClick={(e) => { e.stopPropagation(); if (props.value !== n) props.onPick(n); }}
           style={{
             appearance: "none",
             border: "0",
@@ -1487,8 +1857,8 @@ function PeriodButtons(props: { value: number; onPick: (periods: number) => void
 function PeriodModeToggle(props: { value: PeriodMode; onPick: (mode: PeriodMode) => void }) {
   return (
     <div class="lk-fin-period-toggle">
-      <button type="button" class={props.value === "annual" ? "active" : ""} onClick={() => props.onPick("annual")}>Annual</button>
-      <button type="button" class={props.value === "quarterly" ? "active" : ""} onClick={() => props.onPick("quarterly")}>Quarterly</button>
+      <button type="button" class={props.value === "annual" ? "active" : ""} onClick={() => props.onPick("annual")}>年报</button>
+      <button type="button" class={props.value === "quarterly" ? "active" : ""} onClick={() => props.onPick("quarterly")}>季报</button>
     </div>
   );
 }
@@ -1513,42 +1883,42 @@ function FinancialOverview(props: {
       </section>
       <div class="lk-fin-chart-grid">
         <FinancialSeriesChart
-          title="Growth and Profitability"
+          title="增长与盈利"
           table={props.income}
           mode={props.mode}
           series={[
-            { label: "Revenue", hints: ["营收", "Revenue"], color: "#3f82f6" },
-            { label: "Net income", hints: ["归母净利", "Net Income"], color: "#35c4d3" },
+            { label: "营业总收入", hints: ["营业总收入", "Total Revenue"], color: "#3f82f6" },
+            { label: "归母净利", hints: ["归母净利", "Net Income"], color: "#35c4d3" },
           ]}
         />
         <FinancialSeriesChart
-          title="Revenue to Profit Conversion"
+          title="收入到利润"
           table={props.income}
           mode={props.mode}
           series={[
-            { label: "Revenue", hints: ["营收", "Revenue"], color: "#35c4d3" },
-            { label: "Operating income", hints: ["营业利润", "Operating Income"], color: "#3f82f6" },
-            { label: "Net income", hints: ["归母净利", "Net Income"], color: "#ff4f8b" },
+            { label: "营业总收入", hints: ["营业总收入", "Total Revenue"], color: "#35c4d3" },
+            { label: "营业利润", hints: ["营业利润", "Operating Income"], color: "#3f82f6" },
+            { label: "归母净利", hints: ["归母净利", "Net Income"], color: "#ff4f8b" },
           ]}
         />
         <FinancialSeriesChart
-          title="Financial Health"
+          title="资产负债"
           table={props.balance}
           mode={props.mode}
           series={[
-            { label: "Assets", hints: ["总资产", "Total Assets"], color: "#3f82f6" },
-            { label: "Liabilities", hints: ["总负债", "Total Liabilities"], color: "#35c4d3" },
-            { label: "Debt", hints: ["总债务", "Total Debt"], color: "#ff4f8b" },
+            { label: "总资产", hints: ["总资产", "Total Assets"], color: "#3f82f6" },
+            { label: "总负债", hints: ["总负债", "Total Liabilities"], color: "#35c4d3" },
+            { label: "总债务", hints: ["总债务", "Total Debt"], color: "#ff4f8b" },
           ]}
         />
         <FinancialSeriesChart
-          title="Quality Ratios"
+          title="质量指标"
           table={props.ratios}
           mode={props.mode}
           series={[
             { label: "ROE", hints: ["ROE"], color: "#ff9d00" },
-            { label: "Gross margin", hints: ["毛利率", "Gross Margin"], color: "#43d7c4" },
-            { label: "Debt ratio", hints: ["资产负债率", "Debt"], color: "#ff4f8b" },
+            { label: "毛利率", hints: ["毛利率", "Gross Margin"], color: "#43d7c4" },
+            { label: "资产负债率", hints: ["资产负债率", "Debt"], color: "#ff4f8b" },
           ]}
         />
       </div>
@@ -1565,26 +1935,26 @@ function FinancialStatementView(props: {
   const chartSeries = () => {
     if (props.statement === "balance") {
       return [
-        { label: "Total assets", hints: ["总资产", "Total Assets"], color: "#3f82f6" },
-        { label: "Total liabilities", hints: ["总负债", "Total Liabilities"], color: "#35c4d3" },
+        { label: "总资产", hints: ["总资产", "Total Assets"], color: "#3f82f6" },
+        { label: "总负债", hints: ["总负债", "Total Liabilities"], color: "#35c4d3" },
       ];
     }
     if (props.statement === "cashflow") {
       return [
-        { label: "Operating CF", hints: ["经营活动", "Operating CF"], color: "#35c4d3" },
-        { label: "Investing CF", hints: ["投资活动", "Investing CF"], color: "#ff9d00" },
-        { label: "Financing CF", hints: ["筹资活动", "Financing CF"], color: "#ff4f8b" },
+        { label: "经营现金流", hints: ["经营活动", "Operating CF"], color: "#35c4d3" },
+        { label: "投资现金流", hints: ["投资活动", "Investing CF"], color: "#ff9d00" },
+        { label: "筹资现金流", hints: ["筹资活动", "Financing CF"], color: "#ff4f8b" },
       ];
     }
     return [
-      { label: "Revenue", hints: ["营收", "Revenue"], color: "#3f82f6" },
-      { label: "Operating income", hints: ["营业利润", "Operating Income"], color: "#35c4d3" },
-      { label: "Net income", hints: ["归母净利", "Net Income"], color: "#ff9d00" },
+      { label: "营业总收入", hints: ["营业总收入", "Total Revenue"], color: "#3f82f6" },
+      { label: "营业利润", hints: ["营业利润", "Operating Income"], color: "#35c4d3" },
+      { label: "归母净利", hints: ["归母净利", "Net Income"], color: "#ff9d00" },
     ];
   };
   return (
     <div class="lk-fin-tab-body">
-      <FinancialSeriesChart title="Statement trend" table={props.table} mode={props.mode} series={chartSeries()} height={210} />
+      <FinancialSeriesChart title="报表趋势" table={props.table} mode={props.mode} series={chartSeries()} height={210} />
       <FinancialMatrixTable table={props.table} mode={props.mode} periods={props.periods} />
     </div>
   );
@@ -1594,13 +1964,13 @@ function FinancialStatisticsView(props: { table?: MarkdownTable; mode: PeriodMod
   return (
     <div class="lk-fin-tab-body">
       <FinancialSeriesChart
-        title="Profitability Ratios"
+        title="盈利能力"
         table={props.table}
         mode={props.mode}
         series={[
           { label: "ROE", hints: ["ROE"], color: "#3f82f6" },
-          { label: "Gross margin", hints: ["毛利率", "Gross Margin"], color: "#35c4d3" },
-          { label: "Net margin", hints: ["净利率", "Net Margin"], color: "#ff9d00" },
+          { label: "毛利率", hints: ["毛利率", "Gross Margin"], color: "#35c4d3" },
+          { label: "净利率", hints: ["净利率", "Net Margin"], color: "#ff9d00" },
         ]}
         height={210}
       />
@@ -1614,12 +1984,12 @@ function FinancialDividendsView(props: { table?: MarkdownTable; mode: PeriodMode
   return (
     <div class="lk-fin-tab-body">
       <FinancialSeriesChart
-        title="Dividend History"
+        title="分红历史"
         table={props.table}
         mode={props.mode}
         series={[
-          { label: "Dividend per share", hints: dividendHints, color: "#3f82f6" },
-          { label: "Payout ratio", hints: ["派息率", "Payout"], color: "#35c4d3" },
+          { label: "每股股利", hints: dividendHints, color: "#3f82f6" },
+          { label: "派息率", hints: ["派息率", "Payout"], color: "#35c4d3" },
         ]}
         height={210}
       />
@@ -1644,12 +2014,12 @@ function FinancialEarningsView(props: {
         height={210}
       />
       <FinancialSeriesChart
-        title="Earnings"
+        title="盈利"
         table={props.income}
         mode={props.mode}
         series={[
-          { label: "Revenue", hints: ["营收", "Revenue"], color: "#ff9d00" },
-          { label: "Net income", hints: ["归母净利", "Net Income"], color: "#3f82f6" },
+          { label: "营业收入", hints: ["营业收入", "Revenue"], color: "#ff9d00" },
+          { label: "归母净利", hints: ["归母净利", "Net Income"], color: "#3f82f6" },
         ]}
         height={210}
       />
@@ -1662,17 +2032,18 @@ function FinancialRevenueView(props: { table?: MarkdownTable; mode: PeriodMode; 
   return (
     <div class="lk-fin-tab-body">
       <FinancialSeriesChart
-        title="Revenue"
+        title="收入与利润"
         table={props.table}
         mode={props.mode}
         series={[
-          { label: "Revenue", hints: ["营收", "Revenue"], color: "#3f82f6" },
-          { label: "Gross profit", hints: ["毛利", "Gross Profit"], color: "#35c4d3" },
-          { label: "Net income", hints: ["归母净利", "Net Income"], color: "#ff9d00" },
+          { label: "营业总收入", hints: ["营业总收入", "Total Revenue"], color: "#3f82f6" },
+          { label: "营业收入", hints: ["营业收入", "Revenue"], color: "#8fa8ff" },
+          { label: "毛利", hints: ["毛利", "Gross Profit"], color: "#35c4d3" },
+          { label: "归母净利", hints: ["归母净利", "Net Income"], color: "#ff9d00" },
         ]}
         height={230}
       />
-      <FinancialMatrixTable table={props.table} mode={props.mode} periods={props.periods} rowHints={["营收", "Revenue", "毛利", "Gross", "营业收入"]} />
+      <FinancialMatrixTable table={props.table} mode={props.mode} periods={props.periods} rowHints={["营业总收入", "营业收入", "Revenue", "毛利", "Gross"]} />
     </div>
   );
 }
@@ -1706,7 +2077,8 @@ function financialFacts(tables: MarkdownTable[]): Array<[string, string]> {
     if (value && value !== "—" && facts.length < 12) facts.push([label, value]);
   };
   add("报告期", income?.rows[0]?.[0] || ratio?.rows[0]?.[0] || "");
-  add("营收", financialCell(income, ["营收", "Revenue"]));
+  add("营业总收入", financialCell(income, ["营业总收入", "Total Revenue"]));
+  add("营业收入", financialCell(income, ["营业收入", "Revenue"]));
   add("净利", financialCell(income, ["归母净利", "Net Income"]));
   add("EPS", financialCell(ratio, ["EPS"]));
   add("ROE", financialCell(ratio, ["ROE"]));
@@ -1828,11 +2200,11 @@ function FinancialSeriesChart(props: {
     <section class="lk-fin-chart-card">
       <div class="lk-fin-section-head">
         <span>{props.title}</span>
-        <em>{props.mode === "annual" ? "Annual" : "Quarterly"}</em>
+	        <em>{props.mode === "annual" ? "年报" : "季报"}</em>
       </div>
       <Show
         when={plot().rows.length > 0 && plot().series.length > 0}
-        fallback={<FinancialEmpty label="No series available" />}
+	        fallback={<FinancialEmpty label="暂无可绘制序列" />}
       >
         <svg class="lk-fin-svg" viewBox={`0 0 ${chart().w} ${chart().h}`} preserveAspectRatio="none">
           <For each={[0, 1, 2, 3]}>{(n) => {
@@ -1919,12 +2291,12 @@ function FinancialMatrixTable(props: {
   };
   return (
     <section class="lk-fin-table-card">
-      <Show when={view().metrics.length > 0} fallback={<FinancialEmpty label="No table data available" />}>
+	      <Show when={view().metrics.length > 0} fallback={<FinancialEmpty label="暂无表格数据" />}>
         <div class="lk-fin-matrix">
           <table>
             <thead>
               <tr>
-                <th>Currency: CNY</th>
+	                <th>币种：CNY</th>
                 <For each={view().periods}>{(period) => <th>{period}</th>}</For>
               </tr>
             </thead>
@@ -1985,7 +2357,7 @@ function FinancialMiniChart(props: {
       </div>
       <Show
         when={rows().length > 0}
-        fallback={<div style={{ height: props.large ? "120px" : "68px", color: "var(--ink-3)", "font-size": "11px" }}>No series</div>}
+	        fallback={<div style={{ height: props.large ? "120px" : "68px", color: "var(--ink-3)", "font-size": "11px" }}>暂无序列</div>}
       >
         <div style={{
           height: props.large ? "130px" : "76px",
@@ -2085,6 +2457,363 @@ function FinancialTablePane(props: {
   );
 }
 
+/* ---------- generic markdown context tools ---------- */
+
+interface MarkdownSection {
+  title: string;
+  rows: string[];
+  unavailable: boolean;
+}
+
+function MarkdownContextCards(props: { tool: ToolCallView; badge: string }) {
+  const preview = () => toolOutput(props.tool);
+  const title = () => firstHeading(preview());
+  const tables = createMemo(() => parseMarkdownTables(preview()));
+  const sections = createMemo(() => parseMarkdownSections(preview()));
+  const overviewRows = createMemo(() => markdownTopRows(preview()));
+  const sectionTitles = () => new Set(sections().map((section) => section.title));
+  const standaloneTables = () => tables().filter((table) => !sectionTitles().has(table.title));
+  const hasStructured = () =>
+    Boolean(title()) || overviewRows().length > 0 || sections().length > 0 || standaloneTables().length > 0;
+
+  return (
+    <Show when={hasStructured()} fallback={<GenericToolCard tool={props.tool} />}>
+      <>
+        <Show when={title() || overviewRows().length > 0}>
+          <CardShell
+            status={props.tool.status}
+            badge={props.badge}
+            detail={toolPrimaryDetail(props.tool) || title()}
+            tool={props.tool}
+            callId={props.tool.call_id}
+            size="wide"
+          >
+            <Show
+              when={overviewRows().length > 0}
+              fallback={<div style={{ color: "var(--ink-2)", "font-size": "12px" }}>{title()}</div>}
+            >
+              <MarkdownBulletList rows={overviewRows()} limit={6} />
+            </Show>
+          </CardShell>
+        </Show>
+        <For each={sections().slice(0, 10)}>{(section, index) => {
+          const table = () => tables().find((candidate) => candidate.title === section.title);
+          const [sectionTitle, sectionDetail] = splitSectionTitle(section.title);
+          return (
+            <CardShell
+              status={props.tool.status}
+              badge={sectionTitle}
+              detail={section.unavailable ? "来源缺口" : sectionDetail}
+              tool={props.tool}
+              callId={`${props.tool.call_id}:section:${index()}`}
+              size={table() ? "wide" : "normal"}
+            >
+              <Show
+                when={table()}
+                fallback={<MarkdownBulletList rows={section.rows} limit={8} />}
+              >
+                <FinancialTablePane table={table()!} rowsLimit={8} colsLimit={8} />
+                <Show when={section.rows.length > 0}>
+                  <div style={{ "margin-top": "8px" }}>
+                    <MarkdownBulletList rows={section.rows} limit={4} />
+                  </div>
+                </Show>
+              </Show>
+            </CardShell>
+          );
+        }}</For>
+        <For each={standaloneTables().slice(0, 6)}>{(table, index) => (
+          <MarkdownTableCard
+            tool={props.tool}
+            badge={table.title.replace(/^.+?·\s*/, "") || props.badge}
+            detail={toolPrimaryDetail(props.tool)}
+            table={table}
+            callId={`${props.tool.call_id}:table:${index()}`}
+            size="wide"
+            rowsLimit={8}
+            colsLimit={8}
+            emptyText="暂无结构化数据。"
+          />
+        )}</For>
+      </>
+    </Show>
+  );
+}
+
+function MarkdownBulletList(props: { rows: string[]; limit: number }) {
+  return (
+    <div style={{ display: "flex", "flex-direction": "column", gap: "6px" }}>
+      <For each={props.rows.slice(0, props.limit)}>{(row) => (
+        <div style={{
+          color: row.includes("Source unavailable") || row.includes("unavailable") || row.includes("来源不可用") ? "#d97070" : "var(--ink-2)",
+          "font-size": "11.5px",
+          "line-height": 1.45,
+          overflow: "hidden",
+          "text-overflow": "ellipsis",
+          display: "-webkit-box",
+          "-webkit-line-clamp": "3",
+          "-webkit-box-orient": "vertical",
+        }}>
+          {row}
+        </div>
+      )}</For>
+    </div>
+  );
+}
+
+function parseMarkdownSections(md: string): MarkdownSection[] {
+  const sections: MarkdownSection[] = [];
+  let current: MarkdownSection | null = null;
+  let inTable = false;
+  for (const rawLine of md.split("\n")) {
+    const line = rawLine.trim();
+    const h3 = line.match(/^###\s+(.+)$/);
+    if (h3) {
+      current = { title: h3[1].trim(), rows: [], unavailable: h3[1].includes("unavailable") || h3[1].includes("不可用") };
+      sections.push(current);
+      inTable = false;
+      continue;
+    }
+    if (line.match(/^##\s+(.+)$/)) {
+      current = null;
+      inTable = false;
+      continue;
+    }
+    if (!current || !line) continue;
+    if (line.startsWith("|")) {
+      inTable = true;
+      continue;
+    }
+    if (inTable && line.startsWith("_")) {
+      inTable = false;
+    }
+    if (inTable) continue;
+    if (line.startsWith("_来源:") || line.startsWith("_Source:") || line.startsWith("_Caveat:")) continue;
+    const text = line.replace(/^-\s+/, "");
+    if (!text) continue;
+    current.rows.push(text);
+    if (text.includes("Source unavailable") || text.includes("unavailable") || text.includes("来源不可用")) current.unavailable = true;
+  }
+  return sections;
+}
+
+function markdownTopRows(md: string): string[] {
+  const rows: string[] = [];
+  let afterTitle = false;
+  for (const rawLine of md.split("\n")) {
+    const line = rawLine.trim();
+    if (line.startsWith("### ")) break;
+    if (line.startsWith("## ")) {
+      afterTitle = true;
+      continue;
+    }
+    if (!afterTitle || !line || line.startsWith("|") || line.includes("---")) continue;
+    if (line.startsWith("_来源:") || line.startsWith("_Source:") || line.startsWith("_Caveat:")) continue;
+    rows.push(line.replace(/^-\s+/, ""));
+  }
+  return rows;
+}
+
+function splitSectionTitle(title: string): [string, string] {
+  const parts = title.split("·").map((part) => part.trim()).filter(Boolean);
+  if (parts.length <= 1) return [title, ""];
+  return [parts[0], parts.slice(1).join(" · ").replace(/`/g, "")];
+}
+
+function toolPrimaryDetail(tool: ToolCallView): string {
+  const args = parseArgs(tool);
+  for (const key of ["ts_code", "ticker", "symbol", "fund_code", "index_code", "coin_id", "mode"]) {
+    if (typeof args[key] === "string" && String(args[key]).trim()) return String(args[key]);
+  }
+  if (Array.isArray(args.ts_codes)) return (args.ts_codes as string[]).slice(0, 3).join(", ");
+  return "";
+}
+
+/* ---------- get_a_share_industry_context ---------- */
+
+function AShareIndustryContextCards(props: { tool: ToolCallView }) {
+  const args = parseArgs(props.tool);
+  const subject = String(args.ts_code ?? args.industry_code ?? "");
+  const preview = () => toolOutput(props.tool);
+  const tables = createMemo(() => parseMarkdownTables(preview()));
+  const summaryItems = createMemo(() => markdownSectionBullets(preview(), "任务摘要"));
+  const classificationTable = () => findMarkdownTable(tables(), ["申万分类"]);
+  const indexTable = () => findMarkdownTable(tables(), ["行业指数"]);
+  const peersTable = () => findMarkdownTable(tables(), ["同业样本"]);
+  const flowTable = () => findMarkdownTable(tables(), ["行业资金面"]);
+  const hasStructured = () => summaryItems().length > 0 || tables().length > 0;
+  const flowUnavailable = () =>
+    flowTable()?.rows.some((row) => row.join(" ").includes("Source unavailable") || row.join(" ").includes("来源不可用") || row.join(" ").includes("暂不可用"));
+
+  return (
+    <Show when={hasStructured()} fallback={<GenericToolCard {...props} />}>
+      <>
+        <CardShell
+          status={props.tool.status}
+          badge={toolDisplayName(props.tool.name)}
+          detail={subject}
+          tool={props.tool}
+          callId={props.tool.call_id}
+          size="wide"
+        >
+          <Show
+            when={summaryItems().length > 0}
+            fallback={
+              <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+                <Show when={props.tool.status === "in_progress"} fallback="暂无行业上下文摘要。">
+                  正在获取行业上下文…
+                </Show>
+              </div>
+            }
+          >
+            <div style={{
+              display: "grid",
+              "grid-template-columns": "repeat(2, minmax(0, 1fr))",
+              gap: "8px",
+            }}>
+              <For each={summaryItems()}>{(item) => <IndustrySummaryTile item={item} />}</For>
+            </div>
+          </Show>
+        </CardShell>
+        <MarkdownTableCard
+          tool={props.tool}
+          badge="申万分类"
+          detail={classificationTable()?.rows[0]?.[2] || subject}
+          table={classificationTable()}
+          callId={`${props.tool.call_id}:classification`}
+          size="compact"
+          rowsLimit={3}
+          colsLimit={3}
+          emptyText="暂无行业分类。"
+        />
+        <MarkdownTableCard
+          tool={props.tool}
+          badge="行业指数"
+          detail={indexTable()?.rows.at(-1)?.[0]}
+          table={indexTable()}
+          callId={`${props.tool.call_id}:index`}
+          size="normal"
+          rowsLimit={8}
+          colsLimit={5}
+          emptyText="暂无行业指数序列。"
+        />
+        <MarkdownTableCard
+          tool={props.tool}
+          badge="同业样本"
+          detail={peersTable()?.rows.length ? `${peersTable()?.rows.length} 家` : undefined}
+          table={peersTable()}
+          callId={`${props.tool.call_id}:peers`}
+          size="normal"
+          rowsLimit={12}
+          colsLimit={2}
+          emptyText="暂无同业样本。"
+        />
+        <MarkdownTableCard
+          tool={props.tool}
+          badge="行业资金面"
+          detail={flowUnavailable() ? "来源缺口" : flowTable()?.rows[0]?.[0]}
+          table={flowTable()}
+          callId={`${props.tool.call_id}:flow`}
+          size="wide"
+          rowsLimit={3}
+          colsLimit={9}
+          emptyText="暂无行业资金面。"
+        />
+      </>
+    </Show>
+  );
+}
+
+function MarkdownTableCard(props: {
+  tool: ToolCallView;
+  badge: string;
+  detail?: string;
+  table?: MarkdownTable;
+  callId: string;
+  size?: "compact" | "normal" | "wide" | "hero";
+  rowsLimit?: number;
+  colsLimit?: number;
+  emptyText: string;
+}) {
+  return (
+    <CardShell
+      status={props.tool.status}
+      badge={props.badge}
+      detail={props.detail}
+      tool={props.tool}
+      callId={props.callId}
+      size={props.size ?? "normal"}
+    >
+      <Show
+        when={props.table && props.table.rows.length > 0}
+        fallback={<div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>{props.emptyText}</div>}
+      >
+        <FinancialTablePane table={props.table!} rowsLimit={props.rowsLimit} colsLimit={props.colsLimit} />
+      </Show>
+    </CardShell>
+  );
+}
+
+function IndustrySummaryTile(props: { item: string }) {
+  const [label, value] = splitSummaryItem(props.item);
+  return (
+    <div style={{
+      padding: "8px 9px",
+      background: "rgba(255,255,255,0.025)",
+      border: "1px solid var(--line-1)",
+      "border-radius": "7px",
+      "min-width": 0,
+    }}>
+      <div style={{
+        "font-family": "var(--font-mono)",
+        "font-size": "10px",
+        color: "var(--ink-3)",
+        "margin-bottom": "4px",
+      }}>
+        {label}
+      </div>
+      <div style={{
+        color: "var(--ink-0)",
+        "font-size": "12px",
+        "line-height": 1.45,
+        overflow: "hidden",
+        "text-overflow": "ellipsis",
+        display: "-webkit-box",
+        "-webkit-line-clamp": "3",
+        "-webkit-box-orient": "vertical",
+      }}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function markdownSectionBullets(md: string, sectionTitle: string): string[] {
+  const out: string[] = [];
+  let active = false;
+  for (const line of md.split("\n")) {
+    const heading = line.match(/^#{2,3}\s+(.+)$/);
+    if (heading) {
+      active = heading[1].includes(sectionTitle);
+      continue;
+    }
+    if (active && line.trim().startsWith("- ")) out.push(line.trim().replace(/^-\s+/, ""));
+  }
+  return out;
+}
+
+function splitSummaryItem(item: string): [string, string] {
+  const idx = item.indexOf("：") >= 0 ? item.indexOf("：") : item.indexOf(":");
+  if (idx < 0) return ["摘要", item];
+  return [item.slice(0, idx).trim(), item.slice(idx + 1).trim()];
+}
+
+function findMarkdownTable(tables: MarkdownTable[], needles: string[]): MarkdownTable | undefined {
+  return tables.find((table) =>
+    needles.some((needle) => table.title.toLowerCase().includes(needle.toLowerCase()))
+  );
+}
+
 /* ---------- get_capital_flow ---------- */
 
 function numericCell(raw: string): number {
@@ -2095,29 +2824,31 @@ function numericCell(raw: string): number {
 function CapitalFlowCard(props: { tool: ToolCallView }) {
   const args = parseArgs(props.tool);
   const tsCode = String(args.ts_code ?? "");
-  const tables = createMemo(() => parseMarkdownTables(props.tool.output_preview ?? ""));
+  const tables = createMemo(() => parseMarkdownTables(toolOutput(props.tool)));
   const stockTable = () => tables().find((t) => t.headers.some((h) => h.includes("净流入额")));
   const northTable = () => tables().find((t) => t.headers.some((h) => h.includes("北向")));
+  const genericTables = () => tables().filter((table) => table !== stockTable() && table !== northTable() && table.rows.length > 0);
   const recentStock = () => stockTable()?.rows.slice(-7) ?? [];
   const recentNorth = () => northTable()?.rows.slice(-5) ?? [];
   const hasStockRows = () => recentStock().length > 0;
-  const northStopped = () => recentNorth().some((row) => row[0] >= "2024-08-20");
-  const hasNorthRows = () => recentNorth().length > 0 && !northStopped();
-  const northUnavailable = () => capitalFlowNorthboundUnavailable(props.tool.output_preview ?? "") || northStopped();
-  const paneCount = () => [hasStockRows(), hasNorthRows(), northUnavailable()].filter(Boolean).length;
+  const hasNorthRows = () => recentNorth().length > 0;
+  const hasGenericRows = () => genericTables().length > 0;
+  const northUnavailable = () => capitalFlowNorthboundUnavailable(toolOutput(props.tool));
+  const paneCount = () => [hasStockRows(), hasNorthRows(), hasGenericRows(), northUnavailable()].filter(Boolean).length;
   const stockNetSum = () => recentStock().reduce((sum, row) => sum + numericCell(row[row.length - 1] ?? "0"), 0);
   const northNetSum = () => recentNorth().reduce((sum, row) => sum + numericCell(row[1] ?? "0"), 0);
 
   return (
     <CardShell
       status={props.tool.status}
-      badge="capital · flow"
+      badge={toolDisplayName(props.tool.name)}
       detail={tsCode || "northbound"}
+      tool={props.tool}
       callId={props.tool.call_id}
       size="wide"
     >
       <Show
-        when={hasStockRows() || hasNorthRows() || northUnavailable()}
+        when={hasStockRows() || hasNorthRows() || hasGenericRows() || northUnavailable()}
         fallback={
           <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
             <Show when={props.tool.status === "in_progress"} fallback="No capital-flow data.">
@@ -2137,6 +2868,9 @@ function CapitalFlowCard(props: { tool: ToolCallView }) {
           <Show when={hasNorthRows()}>
             <FlowPane title={northTable()?.title || "北向资金"} unit="亿" rows={recentNorth()} net={northNetSum()} netIndex={1} />
           </Show>
+          <For each={genericTables().slice(0, 6)}>{(table) => (
+            <FinancialTablePane table={table} rowsLimit={6} colsLimit={6} />
+          )}</For>
           <Show when={northUnavailable() && !hasNorthRows()}>
             <FlowNoticePane />
           </Show>
@@ -2147,7 +2881,7 @@ function CapitalFlowCard(props: { tool: ToolCallView }) {
 }
 
 function capitalFlowNorthboundUnavailable(md: string): boolean {
-  return md.includes("northbound_daily_unavailable") || md.includes("日度净流入已停更");
+  return md.includes("no northbound data available") || md.includes("northbound disclosure unavailable");
 }
 
 function FlowNoticePane() {
@@ -2162,10 +2896,10 @@ function FlowNoticePane() {
       "line-height": 1.55,
     }}>
       <div style={{ color: "var(--ink-0)", "font-weight": 700, "margin-bottom": "4px" }}>
-        北向资金日度净流入已停更
+        北向资金口径不可用
       </div>
       <div>
-        交易所自 2024-08-20 起停止日度北向披露；这里不再展示空白或零值面板。后续应接入季度持股或沪深港通成交类替代数据。
+        沪深港通披露机制调整后，近期北向净买入/净流入不能当作稳定资金面证据。不要把空值或零值解释为零流入，后续应改用个股资金流、成交活跃度、两融、行业资金或持股变化。
       </div>
     </div>
   );
@@ -2218,6 +2952,279 @@ function FlowPane(props: {
   );
 }
 
+/* ---------- get_a_share_market_snapshot ---------- */
+
+function AShareMarketSnapshotCard(props: { tool: ToolCallView }) {
+  const tables = createMemo(() => parseMarkdownTables(toolOutput(props.tool)));
+  const table = createMemo(() => tables()[0]);
+  const extraTables = () => tables().slice(1);
+  const args = parseArgs(props.tool);
+  const codes = Array.isArray(args.ts_codes) ? args.ts_codes.join(", ") : "";
+  return (
+    <CardShell
+      status={props.tool.status}
+      badge={toolDisplayName(props.tool.name)}
+      detail={table()?.rows.length ? `${table()?.rows.length}只标的` : codes}
+      tool={props.tool}
+      callId={props.tool.call_id}
+      size="wide"
+    >
+      <Show
+        when={table()?.rows.length}
+        fallback={
+          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+            <Show when={props.tool.status === "in_progress"} fallback="No market snapshot.">
+              Fetching market snapshot…
+            </Show>
+          </div>
+        }
+      >
+        <div style={{
+          overflow: "auto",
+          border: "1px solid var(--line-1)",
+          "border-radius": "7px",
+        }}>
+          <MarketSnapshotGrid table={table()!} />
+        </div>
+        <div style={{ "margin-top": "8px", "font-size": "10.5px", color: "var(--ink-3)" }}>
+          {marketSnapshotFootnote(table()!)}
+        </div>
+        <Show when={extraTables().length > 0}>
+          <div style={{ display: "grid", "grid-template-columns": "minmax(0, 1fr)", gap: "10px", "margin-top": "10px" }}>
+            <For each={extraTables()}>{(extra) => (
+              <FinancialTablePane table={extra} rowsLimit={6} colsLimit={8} />
+            )}</For>
+          </div>
+        </Show>
+      </Show>
+    </CardShell>
+  );
+}
+
+interface MarketSnapshotColumn {
+  label: string;
+  index: number;
+  align?: "left" | "right";
+  strong?: boolean;
+  mono?: boolean;
+  pct?: boolean;
+}
+
+const MARKET_SNAPSHOT_COLUMNS: Array<{ label: string; hints: string[]; align?: "left" | "right"; strong?: boolean; mono?: boolean; pct?: boolean }> = [
+  { label: "代码", hints: ["代码", "code"], mono: true, strong: true },
+  { label: "名称", hints: ["名称", "name"] },
+  { label: "时间", hints: ["更新时间", "交易日", "trade_date"], align: "right", mono: true },
+  { label: "最新价", hints: ["最新价", "最近收盘", "latest_close", "close"], align: "right", mono: true, strong: true },
+  { label: "涨跌幅", hints: ["涨跌幅", "%chg"], align: "right", mono: true, pct: true },
+  { label: "涨跌额", hints: ["涨跌额"], align: "right", mono: true },
+  { label: "今开", hints: ["今开"], align: "right", mono: true },
+  { label: "最高", hints: ["最高"], align: "right", mono: true },
+  { label: "最低", hints: ["最低"], align: "right", mono: true },
+  { label: "昨收", hints: ["昨收"], align: "right", mono: true },
+  { label: "成交量", hints: ["成交量", "volume", "vol"], align: "right", mono: true },
+  { label: "成交额", hints: ["成交额", "amount"], align: "right", mono: true },
+  { label: "换手率", hints: ["换手", "turnover"], align: "right", mono: true },
+  { label: "PE", hints: ["PE"], align: "right", mono: true },
+  { label: "PB", hints: ["PB"], align: "right", mono: true },
+  { label: "涨跌停", hints: ["涨跌停", "limit"], align: "right", mono: true },
+];
+
+function marketSnapshotColumns(table: MarkdownTable): MarketSnapshotColumn[] {
+  const used = new Set<number>();
+  const columns: MarketSnapshotColumn[] = [];
+  for (const spec of MARKET_SNAPSHOT_COLUMNS) {
+    const index = table.headers.findIndex((header, i) =>
+      !used.has(i) && spec.hints.some((hint) => header.toLowerCase().includes(hint.toLowerCase()))
+    );
+    if (index < 0) continue;
+    used.add(index);
+    columns.push({ ...spec, index });
+  }
+  return columns;
+}
+
+function MarketSnapshotGrid(props: { table: MarkdownTable }) {
+  const columns = createMemo(() => marketSnapshotColumns(props.table));
+  const template = () => `minmax(92px,0.9fr) minmax(110px,1fr) ${"minmax(82px,0.75fr) ".repeat(Math.max(0, columns().length - 2)).trim()}`;
+  return (
+    <div style={{
+      display: "grid",
+      "grid-template-columns": template(),
+      "min-width": `${Math.max(720, columns().length * 86)}px`,
+      background: "rgba(255,255,255,0.018)",
+    }}>
+      <For each={columns()}>{(column) => (
+        <QuoteHeader text={column.label} align={column.align} />
+      )}</For>
+      <For each={props.table.rows}>{(row) => {
+        const pctColumn = columns().find((column) => column.pct);
+        const pct = parseFloat(pctColumn ? row[pctColumn.index] ?? "" : "");
+        const pctColor = Number.isFinite(pct) ? pct >= 0 ? "#d97757" : "#6fb98a" : "var(--ink-3)";
+        return (
+          <>
+            <For each={columns()}>{(column) => {
+              const value = row[column.index] || "—";
+              const color = column.pct ? pctColor : undefined;
+              const suffix = column.pct && value !== "—" && !value.endsWith("%") ? "%" : "";
+              return (
+                <QuoteCell mono={column.mono} strong={column.strong} align={column.align} color={color}>
+                  {value}{suffix}
+                </QuoteCell>
+              );
+            }}</For>
+          </>
+        );
+      }}</For>
+    </div>
+  );
+}
+
+function marketSnapshotFootnote(table: MarkdownTable): string {
+  const headers = table.headers.join(" ");
+  if (headers.includes("最新价") || headers.includes("更新时间")) {
+    return "盘中公开行情快照 · 成交量/成交额为当前快照口径 · 不与最近收盘口径混用";
+  }
+  return "最近交易日收盘快照 · 成交量/成交额为日线口径";
+}
+
+/* ---------- get_a_share_research_sources ---------- */
+
+interface ResearchSourceSection {
+  title: string;
+  api: string;
+  status: string;
+  rows: string[];
+  unavailable: boolean;
+}
+
+function parseResearchSourceSections(md: string): ResearchSourceSection[] {
+  const sections: ResearchSourceSection[] = [];
+  let current: ResearchSourceSection | null = null;
+  for (const line of md.split("\n")) {
+    const heading = line.match(/^###\s+(.+?)\s+·\s+`([^`]+)`\s+·\s+(.+)$/);
+    if (heading) {
+      current = {
+        title: heading[1].trim(),
+        api: heading[2].trim(),
+        status: heading[3].trim(),
+        rows: [],
+        unavailable: heading[3].includes("unavailable") || heading[3].includes("不可用"),
+      };
+      sections.push(current);
+      continue;
+    }
+    if (current && line.startsWith("- ")) current.rows.push(line.slice(2).trim());
+  }
+  return sections;
+}
+
+function AShareResearchSourcesCard(props: { tool: ToolCallView }) {
+  const args = parseArgs(props.tool);
+  const tsCode = String(args.ts_code ?? "");
+  const sections = createMemo(() => parseResearchSourceSections(toolOutput(props.tool)));
+  return (
+    <CardShell
+      status={props.tool.status}
+      badge={toolDisplayName(props.tool.name)}
+      detail={tsCode || "structured sources"}
+      tool={props.tool}
+      callId={props.tool.call_id}
+      size="wide"
+    >
+      <Show
+        when={sections().length > 0}
+        fallback={
+          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+            <Show when={props.tool.status === "in_progress"} fallback="No structured source sections.">
+              Fetching source material…
+            </Show>
+          </div>
+        }
+      >
+        <div style={{
+          display: "grid",
+          "grid-template-columns": "repeat(auto-fit, minmax(240px, 1fr))",
+          gap: "10px",
+        }}>
+          <For each={sections()}>{(section) => (
+            <ResearchSourceSectionTile section={section} />
+          )}</For>
+        </div>
+      </Show>
+    </CardShell>
+  );
+}
+
+function ResearchSourceSectionTile(props: { section: ResearchSourceSection }) {
+  return (
+    <div style={{
+      padding: "9px 10px",
+      background: props.section.unavailable ? "rgba(217,112,112,0.055)" : "rgba(255,255,255,0.025)",
+      border: props.section.unavailable ? "1px solid rgba(217,112,112,0.22)" : "1px solid var(--line-1)",
+      "border-radius": "7px",
+      "min-width": 0,
+    }}>
+      <div style={{ display: "flex", gap: "8px", "align-items": "baseline", "margin-bottom": "7px" }}>
+        <div style={{ color: "var(--ink-0)", "font-weight": 650, "font-size": "12px" }}>{props.section.title}</div>
+        <div style={{
+          "font-family": "var(--font-mono)",
+          "font-size": "9.5px",
+          color: props.section.unavailable ? "#d97070" : "var(--ink-3)",
+          "margin-left": "auto",
+        }}>
+          {props.section.status}
+        </div>
+      </div>
+      <div style={{ display: "flex", "flex-direction": "column", gap: "5px" }}>
+        <For each={props.section.rows.slice(0, 4)}>{(row) => (
+          <ResearchSourceRow row={row} unavailable={props.section.unavailable} />
+        )}</For>
+      </div>
+    </div>
+  );
+}
+
+function ResearchSourceRow(props: { row: string; unavailable: boolean }) {
+  const url = () => props.row.match(/https?:\/\/\S+/)?.[0] ?? "";
+  const text = () => props.row.replace(/https?:\/\/\S+/g, "").replace(/\s+·\s*$/g, "").trim();
+  return (
+    <div style={{
+      display: "flex",
+      gap: "7px",
+      "align-items": "center",
+      "min-width": 0,
+      color: props.unavailable ? "#d97070" : "var(--ink-2)",
+      "font-size": "11px",
+      "line-height": 1.35,
+    }}>
+      <span style={{
+        flex: 1,
+        "min-width": 0,
+        overflow: "hidden",
+        "text-overflow": "ellipsis",
+        "white-space": "nowrap",
+      }}>{text()}</span>
+      <Show when={url()}>
+        <a
+          href={url()}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            color: "var(--clay-soft)",
+            "font-family": "var(--font-mono)",
+            "font-size": "9.5px",
+            "text-decoration": "none",
+            "flex-shrink": 0,
+          }}
+        >
+          来源
+        </a>
+      </Show>
+    </div>
+  );
+}
+
 /* ---------- market_quote · multi-ticker quote chips ---------- */
 
 interface TVQuoteRow {
@@ -2250,15 +3257,16 @@ function parseTradingViewTable(md: string): TVQuoteRow[] {
 function MarketQuoteCard(props: { tool: ToolCallView }) {
   const args = parseArgs(props.tool);
   const tickers = Array.isArray(args.tickers) ? (args.tickers as string[]) : [];
-  const rows = createMemo(() => parseTradingViewTable(props.tool.output_preview ?? ""));
+  const rows = createMemo(() => parseTradingViewTable(toolOutput(props.tool)));
   const multi = () => rows().length > 1;
-  const detail = () => multi() ? `${rows().length} symbols` : tickers.join(", ");
+  const detail = () => multi() ? `${rows().length}个标的` : tickers.join(", ");
 
   return (
     <CardShell
       status={props.tool.status}
-      badge="market · quote"
+      badge={toolDisplayName(props.tool.name)}
       detail={detail()}
+      tool={props.tool}
       callId={props.tool.call_id}
       size={multi() ? "wide" : "normal"}
     >
@@ -2464,26 +3472,6 @@ interface OhlcvRow {
   vol: number;
 }
 
-function parseTushareTable(md: string): OhlcvRow[] {
-  const rows: OhlcvRow[] = [];
-  const re = /^\|\s*(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([+\-\d.]+)\s*\|\s*([\d.]+)\s*\|/;
-  for (const line of md.split("\n")) {
-    const m = line.match(re);
-    if (!m) continue;
-    const [, date, o, h, l, c, p, v] = m;
-    rows.push({
-      date,
-      open: parseFloat(o),
-      high: parseFloat(h),
-      low: parseFloat(l),
-      close: parseFloat(c),
-      pctChg: parseFloat(p),
-      vol: parseFloat(v),
-    });
-  }
-  return rows;
-}
-
 function parseMarketNumber(raw: string): number {
   const trimmed = raw.trim();
   if (!trimmed || trimmed === "—") return NaN;
@@ -2521,6 +3509,10 @@ function parseCandlestickTable(md: string): OhlcvRow[] {
     });
   }
   return rows;
+}
+
+function candlestickSummary(md: string): string {
+  return md.match(/_摘要:\s*([^_]+)_/)?.[1]?.trim() ?? "";
 }
 
 function Candlestick(props: { data: OhlcvRow[]; height: number }) {
@@ -2627,42 +3619,6 @@ function Candlestick(props: { data: OhlcvRow[]; height: number }) {
   return <div ref={host} style={{ width: "100%", height: `${props.height}px` }} />;
 }
 
-function TushareCard(props: { tool: ToolCallView }) {
-  const args = parseArgs(props.tool);
-  const tsCode = String(args.ts_code ?? "");
-  const rows = createMemo(() => parseTushareTable(props.tool.output_preview ?? ""));
-  const last = () => rows().length > 0 ? rows()[rows().length - 1] : null;
-  const detail = () => {
-    const r = last();
-    if (!r) return tsCode;
-    const sign = r.pctChg >= 0 ? "+" : "";
-    return `${tsCode} · ${r.close.toFixed(2)} (${sign}${r.pctChg.toFixed(2)}%)`;
-  };
-
-  return (
-    <CardShell
-      status={props.tool.status}
-      badge="market · A 股"
-      detail={detail()}
-      callId={props.tool.call_id}
-      size="wide"
-    >
-      <Show
-        when={rows().length > 0}
-        fallback={
-          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
-            <Show when={props.tool.status === "in_progress"} fallback="No data.">
-              Fetching A-share OHLCV…
-            </Show>
-          </div>
-        }
-      >
-        <Candlestick data={rows()} height={180} />
-      </Show>
-    </CardShell>
-  );
-}
-
 function CandlestickToolCard(props: { tool: ToolCallView }) {
   const args = parseArgs(props.tool);
   const ticker = String(args.ticker ?? "");
@@ -2670,10 +3626,11 @@ function CandlestickToolCard(props: { tool: ToolCallView }) {
   const isAshare = market === "a_share" || market === "ashare" || market === "cn";
   const initialInterval = String(args.interval ?? "1d");
   const [interval, setInterval] = createSignal(isAshare && initialInterval === "15m" ? "1d" : initialInterval);
-  const [preview, setPreview] = createSignal(props.tool.output_preview ?? "");
+  const [preview, setPreview] = createSignal(toolOutput(props.tool));
   const [loading, setLoading] = createSignal(false);
   const [error, setError] = createSignal("");
   const rows = createMemo(() => parseCandlestickTable(preview()));
+  const summary = createMemo(() => candlestickSummary(preview()));
   const last = () => rows().length > 0 ? rows()[rows().length - 1] : null;
   const detail = () => {
     const r = last();
@@ -2706,14 +3663,17 @@ function CandlestickToolCard(props: { tool: ToolCallView }) {
   };
 
   onMount(() => {
-    if (props.tool.status === "completed" && ticker && market) void load(interval());
+    if (props.tool.status === "completed" && ticker && market && parseCandlestickTable(preview()).length === 0) {
+      void load(interval());
+    }
   });
 
   return (
     <CardShell
       status={props.tool.status}
-      badge="market · k-line"
+      badge={toolDisplayName(props.tool.name)}
       detail={detail()}
+      tool={props.tool}
       callId={props.tool.call_id}
       size="wide"
     >
@@ -2772,7 +3732,26 @@ function CandlestickToolCard(props: { tool: ToolCallView }) {
           </div>
         }
       >
+        <Show when={summary()}>
+          <div style={{
+            "font-family": "var(--font-mono)",
+            "font-size": "10.5px",
+            color: "var(--ink-2)",
+            "line-height": 1.45,
+            "margin-bottom": "8px",
+          }}>
+            {summary()}
+          </div>
+        </Show>
         <Candlestick data={rows()} height={260} />
+        <div style={{
+          "font-family": "var(--font-mono)",
+          "font-size": "10px",
+          color: "var(--ink-3)",
+          "margin-top": "8px",
+        }}>
+          K 线按表格保留窗口绘制；最新收盘以摘要和行情快照为准。
+        </div>
       </Show>
     </CardShell>
   );
@@ -2790,7 +3769,7 @@ interface SecFiling {
 function SecFilingCard(props: { tool: ToolCallView }) {
   const args = parseArgs(props.tool);
   const ticker = String(args.ticker ?? "").toUpperCase();
-  const preview = props.tool.output_preview ?? "";
+  const preview = toolOutput(props.tool);
   const parsed = safeParseJson(preview) as
     | { filings?: SecFiling[]; company_name?: string } | null;
   const filings: SecFiling[] = parsed?.filings
@@ -2798,8 +3777,9 @@ function SecFilingCard(props: { tool: ToolCallView }) {
   return (
     <CardShell
       status={props.tool.status}
-      badge="sec · edgar"
+      badge={toolDisplayName(props.tool.name)}
       detail={parsed?.company_name ? `${ticker} · ${parsed.company_name}` : ticker}
+      tool={props.tool}
       callId={props.tool.call_id}
       size="normal"
     >
@@ -2858,16 +3838,17 @@ function GenericToolCard(props: { tool: ToolCallView }) {
     return JSON.stringify(args).slice(0, 60);
   })();
   return (
-    <CardShell status={props.tool.status} badge={props.tool.name} detail={summary} callId={props.tool.call_id} size="compact">
-      <Show when={props.tool.output_preview}>
+    <CardShell status={props.tool.status} badge={toolDisplayName(props.tool.name)} detail={summary} tool={props.tool} callId={props.tool.call_id} size="compact">
+      <Show when={toolOutput(props.tool)}>
         <div style={{
-          "font-family": "var(--font-mono)",
-          "font-size": "11px",
+          "font-size": "11.5px",
           color: "var(--ink-2)",
-          "white-space": "pre-wrap",
-          "max-height": "120px",
-          overflow: "hidden",
-        }}>{props.tool.output_preview}</div>
+          "line-height": 1.45,
+          "max-height": "180px",
+          overflow: "auto",
+        }}>
+          <SafeMarkdown source={toolOutput(props.tool)} />
+        </div>
       </Show>
     </CardShell>
   );

@@ -3,10 +3,11 @@
 //! Used by `codex_oauth` (talking to chatgpt.com/backend-api/codex/responses)
 //! and will be reused by `openai_api_key` (api.openai.com/v1/responses) later.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_stream::try_stream;
-use futures::{stream::BoxStream, StreamExt};
+use futures::{StreamExt, stream::BoxStream};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use super::{ChatRequest, LlmEvent, Role, StopReason, ToolSpec, Usage, WebSearchAction};
 // `ReasoningEffort` is stringified at the call site (`effort.as_str()`),
@@ -34,45 +35,25 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
         .clone()
         .unwrap_or_else(|| "You are a helpful assistant.".to_string());
 
+    let uses_web_search = req
+        .tools
+        .iter()
+        .any(|t| matches!(t, ToolSpec::WebSearch { .. }));
+    let tools_json = serialize_tools(&req.tools);
+    let prompt_cache_key = prompt_cache_key(req, &instructions, &tools_json);
+
     let mut body = serde_json::json!({
         "model": req.model,
         "stream": true,
         "instructions": instructions,
         "input": input,
+        "prompt_cache_key": prompt_cache_key,
         // Codex backend disallows server-side response storage; we keep our own
         // history in vault.messages, so this is what we want anyway.
         "store": false,
     });
 
-    let uses_web_search = req
-        .tools
-        .iter()
-        .any(|t| matches!(t, ToolSpec::WebSearch { .. }));
-
-    if !req.tools.is_empty() {
-        let tools_json: Vec<serde_json::Value> = req
-            .tools
-            .iter()
-            .map(|t| match t {
-                ToolSpec::WebSearch {
-                    external_web_access,
-                } => serde_json::json!({
-                    "type": "web_search",
-                    "external_web_access": external_web_access,
-                }),
-                ToolSpec::Function {
-                    name,
-                    description,
-                    parameters,
-                } => serde_json::json!({
-                    "type": "function",
-                    "name": name,
-                    "description": description,
-                    "parameters": parameters,
-                    "strict": false,
-                }),
-            })
-            .collect();
+    if !tools_json.is_empty() {
         body["tools"] = serde_json::Value::Array(tools_json);
     }
 
@@ -108,6 +89,67 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
     // the openai_api_key provider lands (platform.openai.com supports it).
     let _ = req.max_output_tokens;
     body
+}
+
+fn serialize_tools(tools: &[ToolSpec]) -> Vec<serde_json::Value> {
+    tools
+        .iter()
+        .map(|t| match t {
+            ToolSpec::WebSearch {
+                external_web_access,
+            } => serde_json::json!({
+                "type": "web_search",
+                "external_web_access": external_web_access,
+            }),
+            ToolSpec::Function {
+                name,
+                description,
+                parameters,
+            } => serde_json::json!({
+                "type": "function",
+                "name": name,
+                "description": description,
+                "parameters": parameters,
+                "strict": false,
+            }),
+        })
+        .collect()
+}
+
+fn prompt_cache_key(
+    req: &ChatRequest,
+    instructions: &str,
+    tools_json: &[serde_json::Value],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(req.model.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(instructions.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(
+        serde_json::to_string(tools_json)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    let digest = hasher.finalize();
+    let short_hash = digest
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let model = req
+        .model
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(40)
+        .collect::<String>();
+    format!("leek:{model}:{short_hash}")
 }
 
 /// Parse an OpenAI Responses SSE stream into our normalized `LlmEvent` flow.
@@ -595,6 +637,13 @@ mod tests {
             body["include"],
             serde_json::json!(["web_search_call.action.sources"])
         );
+        assert!(
+            body["prompt_cache_key"]
+                .as_str()
+                .unwrap()
+                .starts_with("leek:gpt-5.5:")
+        );
+        assert!(body.get("prompt_cache_retention").is_none());
     }
 
     #[test]
@@ -746,6 +795,52 @@ mod tests {
         };
         let body = build_request_body(&req);
         assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn build_request_body_cache_key_ignores_chat_history() {
+        use super::super::{ChatMessage, ChatRequest, Role, ToolSpec};
+        let mk = |content: &str| ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: content.into(),
+            }],
+            system: Some("stable instructions".into()),
+            model: "gpt-5.5".into(),
+            max_output_tokens: None,
+            tools: vec![ToolSpec::Function {
+                name: "web_fetch".into(),
+                description: "Fetch a URL.".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+            additional_inputs: Vec::new(),
+            reasoning_effort: None,
+        };
+        let first = build_request_body(&mk("first question"));
+        let second = build_request_body(&mk("second question"));
+
+        assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+    }
+
+    #[test]
+    fn build_request_body_cache_key_tracks_static_prefix_changes() {
+        use super::super::{ChatMessage, ChatRequest, Role};
+        let mk = |system: &str| ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "same question".into(),
+            }],
+            system: Some(system.into()),
+            model: "gpt-5.5".into(),
+            max_output_tokens: None,
+            tools: Vec::new(),
+            additional_inputs: Vec::new(),
+            reasoning_effort: None,
+        };
+        let first = build_request_body(&mk("stable instructions"));
+        let second = build_request_body(&mk("changed instructions"));
+
+        assert_ne!(first["prompt_cache_key"], second["prompt_cache_key"]);
     }
 
     #[test]

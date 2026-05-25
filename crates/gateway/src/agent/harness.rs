@@ -1,16 +1,13 @@
 //! System prompt builder — assembles leek's "investment-research mind"
-//! baseline from `harness/` markdown assets and runtime context (compaction
-//! handoff, eventually mandate + distilled corpus principles).
+//! baseline from `harness/` markdown assets and distilled corpus principles.
 //!
 //! The pieces:
 //! - identity.md — who leek is + mission
 //! - discipline.md — operational discipline (fact/inference/speculation,
-//!   citation, uncertainty, mandate boundary, autonomous continuation,
+//!   citation, uncertainty, user-constraint boundary, autonomous continuation,
 //!   tool-use discipline)
 //! - corpus_orientation.md — corpus dual-axis layout + thinking order
-//! - distilled corpus principles — TODO once the distiller exists
-//! - user mandate — TODO once `vault/{user_id}/mandate.md` is wired
-//! - handoff summaries from prior compactions — pre-extracted by the caller
+//! - distilled corpus principles
 //!
 //! Per-tool "when to use / when not to" lives in each tool's `description`
 //! field (tools/*.rs) — not in this builder. The 60-line ad-hoc SYSTEM_PROMPT
@@ -21,11 +18,11 @@ const IDENTITY: &str = include_str!("../../../../harness/identity.md");
 const DISCIPLINE: &str = include_str!("../../../../harness/discipline.md");
 const CORPUS_ORIENTATION: &str = include_str!("../../../../harness/corpus_orientation.md");
 
-use crate::agent::tools::use_skill::skill_metadata;
 use std::path::PathBuf;
 
 const DEFAULT_CORPUS_PROMPT_PATH: &str = "crates/gateway/assets/corpus_distilled.md";
 const ENV_CORPUS_PROMPT_PATH: &str = "LEEK_CORPUS_PROMPT_PATH";
+const MAX_CORPUS_PROMPT_CHARS: usize = 14_000;
 
 /// Citation *surface* conventions — runtime rules for how to render citations
 /// (don't leak internal path ids, prefer titled markdown links). Different
@@ -47,61 +44,72 @@ const METHOD_AND_DELEGATION: &str = "\
 task, first identify the decision type, then choose the right corpus lens, \
 then gather situation data, then stress-test the thesis, then translate it \
 into a decision frame only if the user is asking for one.\n\
-- The default chain is: user mandate → corpus principles → current facts → \
-opposing case → risk/exit conditions → answer.\n\
+- The default research chain is: corpus principles → current facts → opposing \
+case → risk/exit conditions → answer. Add user constraints only when the \
+current session explicitly provides them.\n\
 - If the task scope, desired depth, risk tolerance, time horizon, or required \
 private context is genuinely unclear and materially changes the answer, call \
-`ask_user_question` before creating or executing the plan. Do not ask when a \
-reasonable default or read-only research can resolve the ambiguity.\n\
-- For non-trivial research tasks, create and maintain an active plan with \
-`update_plan` using the `plan` argument. Keep exactly one item in_progress unless all items are \
-completed. A final task answer is allowed only after the active plan is \
-completed.\n\
+`ask_user_question` before committing to a path. Do not ask when a reasonable \
+default or read-only research can resolve the ambiguity.\n\
+- Use `update_plan` only when the work is long-running or complex enough that \
+a visible checklist will improve execution. Do not create a plan for ordinary \
+questions, short explanations, or quick lookups. When you create a plan, keep \
+it honest: update it when the real state changes, revise it when the direction \
+changes, and abandon it explicitly when it no longer fits.\n\
 - Ground before asking: inspect corpus, available tools, session history, and \
 current market facts before asking the user. Ask only for preferences or \
 private context that materially change the work.\n\
 - Persist through failures. A failed function call is not a stopping condition: \
-read the error, try a better query, another source, another tool, or mark the \
-specific plan item as blocked with evidence before concluding.\n\
+read the error, try a better query, another source, another tool, or state the \
+blocked evidence boundary before concluding. If an active plan exists, update \
+it to match that boundary.\n\
 - Explore credible alternatives. If the first lens/source/tool produces a weak \
 or one-sided thesis, try another relevant lens or source path before answering.\n\
+- Use a hard evidence budget per user turn. For normal public-company research, \
+do at most three web-search batches and open/fetch at most three external pages \
+before synthesizing. Exceed this only when the user explicitly asks for deep \
+source collection or the current evidence is contradictory. Do not repeat \
+semantically identical searches, URLs, PDFs, quote pulls, K-line pulls, or \
+financial calls unless freshness or a different field is required.\n\
+- Stop gathering once the answer has enough evidence for the user's requested \
+decision stage. A framework-only turn should not sneak in a final action. A \
+screening turn should not become a full report. If the remaining gaps are \
+non-blocking, name them in the answer instead of extending the tool loop.\n\
 - A final answer is allowed only after the declared research frame has been \
 acted on. If you say a working model needs industry, channel, macro, policy, \
 competition, or liquidity facts, gather those facts with tools before you \
-answer. Do not hand the checklist back to the user as the deliverable.\n\
+answer. Do not hand the checklist back to the user as the answer.\n\
 - For public-company research, corpus gaps normally require live external \
 grounding: use web_search/web_fetch for industry state, policy/macro context, \
 channel or competitive facts unless the user forbids web access or the tool \
 fails after a real attempt.\n\
-- Use `record_research_note` for reversible memory, preferences, mandate \
-candidates, or reusable lessons. Use `record_investment_action` only for a \
-clear capital commitment to a named instrument and direction.\n\
-	- Use `delegate_research` when a task needs a specialized second lens. The \
-	main agent remains accountable for the final answer; subagents provide \
-	focused reports, not final authority.\n\
-	- Good delegation examples: data gaps to `data_scout`, valuation quality to \
-	`fundamental_analyst`, short-term opportunity structure to `trading_analyst`, \
-	bear case and sizing risk to `risk_manager`, and corpus drift checks to \
-	`corpus_guardian`.\n\n\
-	# Visible progress narration\n\n\
-	- For non-trivial research work, before each research tool call or coherent \
-	tool batch after the initial `use_skill`, write one short Chinese progress \
-	note explaining what you are checking and why it matters.\n\
-	- The progress note is a user-visible reasoning trace, not private chain of \
-	thought. State the next check, the decision relevance, and any key uncertainty; \
-	do not expose hidden deliberation.\n\
-	- Keep each note concise. Do not repeat the final answer in progress notes.";
+- For A-share research, prefer company announcements, exchange/CNINFO \
+disclosures, company IR pages, official government/statistical sources, and \
+structured financial tools. Treat industry reports and media as secondary \
+judgment sources, and filter weakly related sources such as Reddit, arXiv, \
+Wikipedia, forums, SEO aggregators, or unreadable fetch outputs.\n\
+- For listed-bank comparisons, generic income/balance/cashflow ratios are not \
+enough for asset quality. Actively seek non-performing-loan ratio, provision \
+coverage, special-mention/overdue loans, net interest margin, and capital \
+adequacy from announcements, annual/interim reports, exchange/CNINFO/IR, \
+or bank-sector research; if unavailable, state the blocked evidence boundary \
+instead of pretending ROE/PB is an asset-quality proxy.\n\
+- Use `delegate_research` when a task benefits from a genuinely separate \
+worker. Define that worker's role, task, thinking frame, and output shape in \
+the call itself. The main agent remains accountable for the final answer.\n\n\
+# Visible progress narration\n\n\
+- For non-trivial research work, before each research tool call or coherent \
+tool batch, write one short Chinese progress note explaining what you are \
+checking and why it matters.\n\
+- The progress note is a user-visible reasoning trace, not private chain of \
+thought. State the next check, the decision relevance, and any key uncertainty; \
+do not expose hidden deliberation.\n\
+- Keep each note concise. Do not repeat the final answer in progress notes.";
 
-/// Build the full system prompt. `handoff_summaries` are pre-extracted
-/// compaction-summary message texts (role=compaction_summary rows), to be
-/// joined into the inherited-context section. `mandate` is the contents of
-/// `vault/<user_id>/mandate.md` if it exists and is non-empty — caller is
-/// responsible for reading the file (we keep this fn pure for testability).
-pub fn build_system_prompt(
-    handoff_summaries: &[String],
-    mandate: Option<&str>,
-    charter: Option<&str>,
-) -> String {
+/// Build the stable system prompt. Runtime state such as compaction handoff,
+/// plans, and tool outputs belongs in input messages so
+/// the provider can cache this static instruction prefix aggressively.
+pub fn build_system_prompt() -> String {
     let mut prompt = String::with_capacity(8192);
 
     prompt.push_str(IDENTITY);
@@ -114,45 +122,9 @@ pub fn build_system_prompt(
     prompt.push_str("\n\n");
     prompt.push_str(METHOD_AND_DELEGATION);
     prompt.push_str("\n\n");
-    prompt.push_str("# Research Skills\n\n");
-    prompt.push_str(
-        "Available skills (call `use_skill` with the skill name as your FIRST action \
-         when the task matches — before any other tool call or analysis):\n\n",
-    );
-    prompt.push_str(&skill_metadata());
-
     if let Some(corpus_prompt) = load_corpus_prompt() {
         prompt.push_str("\n\n");
         prompt.push_str(&corpus_prompt);
-    }
-
-    // User mandate — discipline §5 promotes this to the source of truth
-    // for risk tolerance / position caps / mandate hints. Empty / missing
-    // mandate omits the section so the LLM doesn't hallucinate constraints.
-    if let Some(text) = mandate {
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            prompt.push_str("\n\n# User mandate (vault/<user_id>/mandate.md)\n\n");
-            prompt.push_str(trimmed);
-        }
-    }
-
-    if let Some(text) = charter {
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            prompt.push_str("\n\n# Investment philosophy (team charter)\n\n");
-            prompt.push_str(trimmed);
-        }
-    }
-
-    if !handoff_summaries.is_empty() {
-        prompt.push_str("\n\n# Prior session handoff (compacted)\n\n");
-        prompt.push_str(&handoff_summaries.join("\n\n---\n\n"));
-        prompt.push_str(
-            "\n\nThe above summarizes the conversation up to this point. \
-             Continue from where it leaves off; treat established facts and \
-             the user's ongoing thread as known.",
-        );
     }
 
     prompt
@@ -185,20 +157,32 @@ fn read_corpus_prompt(path: &std::path::Path) -> Option<String> {
     if trimmed.is_empty() || trimmed.starts_with("<!-- placeholder") {
         None
     } else {
-        Some(trimmed.to_string())
+        Some(limit_corpus_prompt(trimmed))
     }
 }
 
-pub fn build_subagent_prompt(role: &str, role_instruction: &str) -> String {
+fn limit_corpus_prompt(trimmed: &str) -> String {
+    if trimmed.chars().count() <= MAX_CORPUS_PROMPT_CHARS {
+        return trimmed.to_string();
+    }
+    let mut out = trimmed
+        .chars()
+        .take(MAX_CORPUS_PROMPT_CHARS)
+        .collect::<String>();
+    out.push_str(
+        "\n\n[Corpus kernel truncated for runtime budget. Use corpus_search and corpus_read for any specific principle, source wording, or deeper framework needed by the task.]",
+    );
+    out
+}
+
+pub fn build_subagent_prompt(_role: &str, role_instruction: &str) -> String {
     format!(
         "{IDENTITY}\n\n{DISCIPLINE}\n\n{CORPUS_ORIENTATION}\n\n\
          # Subagent role\n\n\
-         You are `{role}`, a focused research subagent inside L.E.E.K. \
+         You are a focused research subagent inside L.E.E.K. \
          {role_instruction}\n\n\
-         Output in Chinese. Keep the report compact but decision-useful. \
-         Separate facts, inference, speculation, missing data, and the strongest \
-         opposing view. Do not claim you fetched data unless the main agent gave \
-         it to you in context."
+         Output in Chinese. Follow the task shape requested by the main agent. \
+         Do not claim you fetched data unless the main agent gave it to you in context."
     )
 }
 
@@ -208,7 +192,7 @@ mod tests {
 
     #[test]
     fn build_includes_all_baseline_sections() {
-        let p = build_system_prompt(&[], None, None);
+        let p = build_system_prompt();
         assert!(p.contains("# Identity"));
         assert!(p.contains("truth-seeking investment partner"));
         assert!(p.contains("# Discipline"));
@@ -217,9 +201,8 @@ mod tests {
         assert!(p.contains("Citation surface conventions"));
         assert!(p.contains("General research method"));
         assert!(p.contains("delegate_research"));
-        assert!(p.contains("# Research Skills"));
-        assert!(p.contains("equity-valuation"));
-        assert!(p.contains("crypto-research"));
+        assert!(p.contains("A 股 source discipline"));
+        assert!(p.contains("exchange/CNINFO"));
     }
 
     #[test]
@@ -246,50 +229,44 @@ mod tests {
     }
 
     #[test]
-    fn build_appends_handoff_summaries() {
-        let summaries = vec!["旧 session 摘要".to_string()];
-        let p = build_system_prompt(&summaries, None, None);
-        assert!(p.contains("Prior session handoff"));
-        assert!(p.contains("旧 session 摘要"));
+    fn corpus_prompt_is_budget_limited() {
+        let text = "a".repeat(MAX_CORPUS_PROMPT_CHARS + 10);
+        let limited = limit_corpus_prompt(&text);
+        assert!(limited.contains("Corpus kernel truncated"));
+        assert!(limited.chars().count() < text.chars().count() + 200);
+    }
+
+    #[test]
+    fn build_does_not_inject_compaction_handoff() {
+        let p = build_system_prompt();
+        assert!(!p.contains("Prior session handoff"));
+        assert!(!p.contains("旧 session 摘要"));
     }
 
     #[test]
     fn build_omits_handoff_when_empty() {
-        let p = build_system_prompt(&[], None, None);
+        let p = build_system_prompt();
         assert!(!p.contains("Prior session handoff"));
     }
 
     #[test]
-    fn build_includes_mandate_when_provided() {
-        let m = "- 单标位置上限 5%\n- 不碰复杂衍生品";
-        let p = build_system_prompt(&[], Some(m), None);
-        assert!(p.contains("# User mandate"));
-        assert!(p.contains("单标位置上限 5%"));
-        assert!(p.contains("不碰复杂衍生品"));
+    fn build_does_not_inject_legacy_user_profile_section() {
+        let p = build_system_prompt();
+        assert!(!p.contains("# User profile"));
+        assert!(!p.contains("vault/<user_id>/profile.md"));
     }
 
     #[test]
-    fn build_omits_mandate_when_empty_or_whitespace() {
-        let p1 = build_system_prompt(&[], Some(""), None);
-        let p2 = build_system_prompt(&[], Some("   \n\n   "), None);
-        let p3 = build_system_prompt(&[], None, None);
-        assert!(!p1.contains("# User mandate"));
-        assert!(!p2.contains("# User mandate"));
-        assert!(!p3.contains("# User mandate"));
+    fn build_does_not_advertise_removed_research_note_tool() {
+        let p = build_system_prompt();
+        assert!(!p.contains("record_research_note"));
     }
 
     #[test]
-    fn build_includes_charter_when_provided() {
-        let charter = "We believe in long-term value investing.\n\n关注有护城河的企业。";
-        let p = build_system_prompt(&[], None, Some(charter));
-        assert!(p.contains("Investment philosophy"));
-        assert!(p.contains("护城河"));
-    }
-
-    #[test]
-    fn build_omits_charter_when_none() {
-        let p = build_system_prompt(&[], None, None);
+    fn build_keeps_runtime_context_out_of_static_prompt() {
+        let p = build_system_prompt();
         assert!(!p.contains("Investment philosophy"));
+        assert!(!p.contains("COMPACTED PRIOR SESSION HISTORY"));
     }
 
     /// Disabled by default; run with
@@ -298,7 +275,7 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_prompt() {
-        let p = build_system_prompt(&[], None, None);
+        let p = build_system_prompt();
         eprintln!("--- PROMPT (len={} bytes) ---\n{}\n--- END ---", p.len(), p);
     }
 }

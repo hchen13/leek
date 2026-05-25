@@ -1,12 +1,12 @@
 //! HTTP / SSE API — axum router + shared `AppState`.
 
-pub mod charter;
 pub mod corpus;
 pub mod deliverables;
 pub mod health;
 pub mod messages;
 pub mod portfolio;
 pub mod sessions;
+pub mod settings;
 pub mod static_files;
 pub mod stream;
 pub mod tools;
@@ -14,13 +14,13 @@ pub mod tools;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::agent::tools::ToolRegistry;
 use crate::events::EventBus;
@@ -51,25 +51,28 @@ pub struct AppState {
     pub active_replies: Arc<Mutex<HashMap<String, ActiveTask>>>,
     /// Client-side tool registry passed into the agent loop on each reply.
     pub tools: ToolRegistry,
-    /// Filesystem path to the active user's mandate.md file (their investment
-    /// preferences / risk tolerance / position caps / etc — discipline §5).
-    /// Resolved at boot from the vault directory: `<vault-dir>/mandates/<user_id>.md`.
-    /// Read on every chat turn so edits take effect immediately. `None` only
-    /// in degenerate test setups where the path can't be resolved.
-    pub mandate_path: Option<std::path::PathBuf>,
 }
 
 pub fn router(state: AppState) -> Router {
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(|origin, _| {
+            is_allowed_local_origin(origin)
+        }))
         .allow_headers(Any)
-        .allow_methods(Any);
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::PUT,
+            Method::DELETE,
+        ]);
 
     Router::new()
         .route("/api/v1/health", get(health::handler))
+        .route("/api/v1/settings", get(settings::get_handler))
         .route(
-            "/api/v1/charter",
-            get(charter::get_handler).put(charter::put_handler),
+            "/api/v1/settings/tushare",
+            patch(settings::put_tushare_handler).put(settings::put_tushare_handler),
         )
         .route("/api/v1/corpus/graph", get(corpus::graph_handler))
         .route("/api/v1/corpus/doc", get(corpus::doc_handler))
@@ -122,6 +125,22 @@ pub fn router(state: AppState) -> Router {
         .layer(cors)
 }
 
+fn is_allowed_local_origin(origin: &HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Some(rest) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    let Some((host, port)) = rest.rsplit_once(':') else {
+        return false;
+    };
+    if !matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
+        return false;
+    }
+    port.parse::<u16>().is_ok()
+}
+
 /// Bridge `anyhow::Error` to a JSON 500 response.
 pub struct AppError(pub anyhow::Error);
 
@@ -131,6 +150,30 @@ where
 {
     fn from(e: E) -> Self {
         Self(e.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cors_allows_local_dev_origins_only() {
+        assert!(is_allowed_local_origin(&HeaderValue::from_static(
+            "http://localhost:5173"
+        )));
+        assert!(is_allowed_local_origin(&HeaderValue::from_static(
+            "http://127.0.0.1:5173"
+        )));
+        assert!(is_allowed_local_origin(&HeaderValue::from_static(
+            "http://[::1]:5173"
+        )));
+        assert!(!is_allowed_local_origin(&HeaderValue::from_static(
+            "https://example.com"
+        )));
+        assert!(!is_allowed_local_origin(&HeaderValue::from_static(
+            "http://localhost.evil.com:5173"
+        )));
     }
 }
 

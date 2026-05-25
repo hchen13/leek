@@ -1,9 +1,8 @@
 //! Task row helpers.
 //!
-//! P1 slice: routing layer creates `in_progress` tasks directly (skipping
-//! `queued` — that path is for cron / agent_proposed). Lifecycle simplified
-//! to `in_progress` → `delivered`; awaiting_user / confirmed / rejected /
-//! cancelled lifecycle states land when we wire the full main agent loop.
+//! Lifecycle is simplified to `in_progress` -> `delivered` in the current
+//! chat slice; queued cron / agent-proposed tasks and richer review states
+//! are stored here for later task-oriented flows.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -87,7 +86,7 @@ pub async fn insert_in_progress(
     Ok(task_id)
 }
 
-#[allow(dead_code)] // used once the routing layer can attach to existing in-progress task
+#[allow(dead_code)] // used once chat can attach replies to existing in-progress tasks
 pub async fn get_active_for_session(
     pool: &SqlitePool,
     user_id: &str,
@@ -188,8 +187,8 @@ pub async fn mark_in_progress(pool: &SqlitePool, user_id: &str, task_id: &str) -
     Ok(())
 }
 
-/// Update the `task_id` column for a message that was inserted before its
-/// task existed (POST handler writes user message first, then routing decides).
+/// Update the `task_id` column for a message whose task binding is assigned
+/// after the row is inserted.
 pub async fn link_message(
     pool: &SqlitePool,
     user_id: &str,

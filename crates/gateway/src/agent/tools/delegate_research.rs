@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -15,7 +15,7 @@ use crate::vault::{events as vault_events, subagents as vault_subagents};
 
 use super::{ToolContext, ToolHandler};
 
-const TOOL_NAME: &str = "delegate_research";
+pub(crate) const TOOL_NAME: &str = "delegate_research";
 const SUBAGENT_MODEL: &str = "gpt-5.5";
 
 pub struct DelegateResearchTool {
@@ -39,24 +39,18 @@ impl ToolHandler for DelegateResearchTool {
             name: TOOL_NAME.into(),
             description:
                 "Run a focused financial-research subagent and return its independent report. \
-                 Use this when the task needs a second specialized lens: data_scout, \
-                 fundamental_analyst, trading_analyst, risk_manager, or corpus_guardian. \
+                 Use this when the task needs a separate worker with a role, thinking frame, \
+                 and output shape defined by the main agent. \
                  Give the subagent enough context, retrieved facts, and corpus snippets; \
-                 it cannot fetch data by itself in this slice."
+                 it cannot fetch data by itself in this slice. Reuse prior tool evidence in \
+                 the context instead of asking the subagent to rediscover facts."
                     .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "role": {
                         "type": "string",
-                        "enum": [
-                            "data_scout",
-                            "fundamental_analyst",
-                            "trading_analyst",
-                            "risk_manager",
-                            "corpus_guardian"
-                        ],
-                        "description": "Specialized subagent role"
+                        "description": "Role or persona for this subagent, defined for this specific task"
                     },
                     "question": {
                         "type": "string",
@@ -66,9 +60,13 @@ impl ToolHandler for DelegateResearchTool {
                         "type": "string",
                         "description": "Relevant facts, quotes, tool outputs, corpus snippets, and user constraints"
                     },
-                    "expected_output": {
+                    "thinking_frame": {
                         "type": "string",
-                        "description": "Optional shape of the answer, e.g. checklist, bear case, valuation bridge"
+                        "description": "Optional method or lens this worker should use"
+                    },
+                    "output_shape": {
+                        "type": "string",
+                        "description": "Optional requested form for the answer"
                     }
                 },
                 "required": ["role", "question", "context"]
@@ -85,18 +83,24 @@ impl ToolHandler for DelegateResearchTool {
         let role = required_str(&args, "role")?;
         let question = required_str(&args, "question")?;
         let context = required_str(&args, "context")?;
-        let expected_output = args
-            .get("expected_output")
+        let thinking_frame = args
+            .get("thinking_frame")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or("给出结论、证据、不确定性、反方或缺口。");
+            .unwrap_or("");
+        let output_shape = args
+            .get("output_shape")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("");
 
-        let role_instruction = role_instruction(&role)?;
         let task_id = ctx.task_id.as_deref().unwrap_or("ad-hoc");
         let scope = serde_json::json!({
             "role": role,
-            "expected_output": expected_output,
+            "thinking_frame": thinking_frame,
+            "output_shape": output_shape,
         });
         let input = serde_json::json!({
             "question": question,
@@ -126,9 +130,15 @@ impl ToolHandler for DelegateResearchTool {
         .await;
 
         let started = Instant::now();
-        let system = harness::build_subagent_prompt(&role, role_instruction);
-        let user =
-            format!("# 子任务\n{question}\n\n# 上下文\n{context}\n\n# 期望输出\n{expected_output}");
+        let role_instruction = format_subagent_instruction(&role, thinking_frame, output_shape);
+        let system = harness::build_subagent_prompt(&role, &role_instruction);
+        let mut user = format!("# 子任务\n{question}\n\n# 上下文\n{context}");
+        if !thinking_frame.is_empty() {
+            user.push_str(&format!("\n\n# 思维框架\n{thinking_frame}"));
+        }
+        if !output_shape.is_empty() {
+            user.push_str(&format!("\n\n# 输出要求\n{output_shape}"));
+        }
         let req = ChatRequest {
             messages: vec![ChatMessage {
                 role: Role::User,
@@ -214,6 +224,58 @@ impl ToolHandler for DelegateResearchTool {
     }
 }
 
+fn format_subagent_instruction(role: &str, thinking_frame: &str, output_shape: &str) -> String {
+    let mut instruction = format!("你的角色由主 agent 为本次任务定义为：{role}。");
+    if !thinking_frame.is_empty() {
+        instruction.push_str(&format!(" 使用这个思维框架：{thinking_frame}。"));
+    }
+    if !output_shape.is_empty() {
+        instruction.push_str(&format!(" 输出形态按这个要求组织：{output_shape}。"));
+    }
+    instruction
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream::BoxStream;
+
+    struct NullProvider;
+
+    #[async_trait]
+    impl LlmProvider for NullProvider {
+        fn name(&self) -> &str {
+            "null"
+        }
+
+        async fn chat(&self, _req: ChatRequest) -> Result<BoxStream<'static, Result<LlmEvent>>> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    #[test]
+    fn spec_does_not_force_known_roles_or_output_aliases() {
+        let provider = Arc::new(NullProvider);
+        let tool = DelegateResearchTool::new(provider);
+        let ToolSpec::Function { parameters, .. } = tool.spec() else {
+            panic!("expected function spec");
+        };
+        let role = &parameters["properties"]["role"];
+        assert!(role.get("enum").is_none());
+        assert!(parameters["properties"].get("expected_output").is_none());
+        assert!(parameters["properties"].get("output_shape").is_some());
+    }
+
+    #[test]
+    fn subagent_instruction_is_defined_by_call_arguments() {
+        let text =
+            format_subagent_instruction("bear-case reviewer", "只检查永久损失路径", "列三条证据");
+        assert!(text.contains("bear-case reviewer"));
+        assert!(text.contains("只检查永久损失路径"));
+        assert!(text.contains("列三条证据"));
+    }
+}
+
 fn required_str(args: &serde_json::Value, key: &str) -> Result<String> {
     args.get(key)
         .and_then(|v| v.as_str())
@@ -221,27 +283,6 @@ fn required_str(args: &serde_json::Value, key: &str) -> Result<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .ok_or_else(|| anyhow!("missing '{key}' argument"))
-}
-
-fn role_instruction(role: &str) -> Result<&'static str> {
-    match role {
-        "data_scout" => Ok(
-            "你只负责事实盘点：已有数据说明了什么，缺了什么，哪些数据源还需要主 agent 继续查。不要给最终交易建议。",
-        ),
-        "fundamental_analyst" => Ok(
-            "你负责商业质量、财务质量、估值和长期复利逻辑。必须区分可验证事实、估值假设和安全边际。",
-        ),
-        "trading_analyst" => Ok(
-            "你负责短中期交易结构：催化、流动性、拥挤度、技术位置、入场/退出条件。必须指出失效条件。",
-        ),
-        "risk_manager" => Ok(
-            "你负责反方和风控：找永久损失路径、流动性陷阱、仓位错误、叙事过热和用户 mandate 冲突。",
-        ),
-        "corpus_guardian" => Ok(
-            "你负责检查分析是否偏离 corpus：是否忽略安全边际、能力圈、Mr. Market、反身性、债务周期或反方证据。",
-        ),
-        other => bail!("unknown subagent role: {other}"),
-    }
 }
 
 async fn finish_failed(

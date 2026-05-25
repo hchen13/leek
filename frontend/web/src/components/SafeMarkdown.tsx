@@ -47,6 +47,7 @@ const md = new MarkdownIt({
   breaks: true,       // single \n → <br/>, matches chat conventions
   typographer: false,
 });
+md.linkify.set({ fuzzyLink: false });
 
 // Open links in a new tab so the user doesn't lose their session, AND
 // when the visible text equals the href (autolinked plain URLs), replace

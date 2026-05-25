@@ -9,26 +9,32 @@
 //! advertised through `ToolSpec::WebSearch` and execute on OpenAI's side.
 
 pub mod ask_user_question;
+pub mod corpus_read;
 pub mod corpus_search;
+pub mod data_provider_tokens;
 pub mod delegate_research;
+pub mod get_a_share_industry_context;
+pub mod get_a_share_market_snapshot;
+pub mod get_a_share_ownership_and_leverage;
+pub mod get_a_share_research_sources;
 pub mod get_candlesticks;
 pub mod get_capital_flow;
+pub mod get_china_fund_context;
+pub mod get_china_index_context;
+pub mod get_china_macro_context;
 pub mod get_company_info;
 pub mod get_crypto_market;
 pub mod get_financials;
 pub mod get_funding_rate;
-pub mod record_investment_action;
-pub mod record_research_note;
 pub mod sec_filing_fetch;
 pub mod tradingview_quote;
 pub mod update_plan;
-pub mod use_skill;
 pub mod web_fetch;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
@@ -36,7 +42,7 @@ use crate::llm::ToolSpec;
 
 /// Per-request context injected by the agent loop into every tool call.
 /// Stateless tools (web_fetch, corpus_search, etc.) may ignore it.
-/// Stateful tools (record_investment_action, etc.) need it to write to vault.
+/// Stateful tools need it to write to vault.
 #[derive(Clone)]
 pub struct ToolContext {
     pub pool: sqlx::SqlitePool,

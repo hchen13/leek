@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;

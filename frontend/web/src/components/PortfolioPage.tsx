@@ -43,19 +43,7 @@ export function PortfolioPage() {
   const [error, setError] = createSignal<string | null>(null);
   const [dirty, setDirty] = createSignal(false);
 
-  const [charterText, setCharterText] = createSignal("");
-  const [charterDirty, setCharterDirty] = createSignal(false);
-  const [charterSaving, setCharterSaving] = createSignal(false);
-
   onMount(async () => {
-    try {
-      const cr = await fetch("/api/v1/charter");
-      if (cr.ok) {
-        const cj = await cr.json();
-        setCharterText(cj.charter?.text ?? "");
-      }
-    } catch { /* ignore */ }
-
     try {
       const r = await fetch("/api/v1/portfolio");
       if (r.ok) {
@@ -120,23 +108,6 @@ export function PortfolioPage() {
       setError("网络错误");
     } finally {
       setSaving(false);
-    }
-  }
-
-  async function saveCharter() {
-    setCharterSaving(true);
-    try {
-      const resp = await fetch("/api/v1/charter", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: charterText() }),
-      });
-      if (resp.ok) setCharterDirty(false);
-      else setError(`Charter 保存失败 ${resp.status}`);
-    } catch {
-      setError("Charter 保存失败：网络错误");
-    } finally {
-      setCharterSaving(false);
     }
   }
 
@@ -515,72 +486,6 @@ export function PortfolioPage() {
             }}>
               自然语言解析功能即将接入 leek agent，解析结果需确认后生效
             </span>
-          </div>
-        </div>
-
-        <div style={{
-          background: "var(--bg-2)",
-          border: "1px solid var(--line-1)",
-          "border-radius": "10px",
-          overflow: "hidden",
-        }}>
-          <div style={{
-            display: "flex",
-            "align-items": "center",
-            padding: "10px 14px",
-            "border-bottom": "1px solid var(--line-0)",
-            gap: "8px",
-          }}>
-            <span style={{
-              "font-family": "var(--font-mono)",
-              "font-size": "11px",
-              color: "var(--ink-2)",
-              "letter-spacing": "0.06em",
-              "text-transform": "uppercase",
-            }}>Investment Philosophy · Team Charter</span>
-            <div style={{ flex: 1 }} />
-            <Show when={charterDirty()}>
-              <button
-                onClick={saveCharter}
-                disabled={charterSaving()}
-                style={{
-                  background: "linear-gradient(180deg, var(--clay), var(--clay-deep))",
-                  color: "#2a1810",
-                  "font-weight": 600,
-                  "font-size": "11px",
-                  padding: "4px 12px",
-                  "border-radius": "6px",
-                  "letter-spacing": "0.04em",
-                  "text-transform": "uppercase",
-                  "font-family": "var(--font-mono)",
-                  cursor: charterSaving() ? "wait" : "pointer",
-                  opacity: charterSaving() ? 0.7 : 1,
-                  border: "none",
-                }}
-              >
-                {charterSaving() ? "保存中…" : "保存"}
-              </button>
-            </Show>
-          </div>
-          <div style={{ padding: "14px" }}>
-            <textarea
-              value={charterText()}
-              onInput={(e) => { setCharterText(e.currentTarget.value); setCharterDirty(true); }}
-              rows={8}
-              placeholder="在此描述你的投资哲学、信仰体系、长期目标……leek 将在每次对话中遵循这些原则"
-              style={{
-                background: "var(--bg-3)",
-                border: "1px solid var(--line-2)",
-                "border-radius": "6px",
-                padding: "10px 12px",
-                "font-size": "13px",
-                "line-height": "1.6",
-                color: "var(--ink-0)",
-                resize: "vertical",
-                width: "100%",
-                "font-family": "var(--font-sans)",
-              }}
-            />
           </div>
         </div>
 

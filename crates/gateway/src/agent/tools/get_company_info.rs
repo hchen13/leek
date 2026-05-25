@@ -1,13 +1,13 @@
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::ToolSpec;
 
-use super::ToolHandler;
+use super::{ToolHandler, data_provider_tokens};
 
 const TOOL_NAME: &str = "get_company_info";
 const ENDPOINT: &str = "https://api.tushare.pro";
@@ -85,17 +85,17 @@ impl ToolHandler for GetCompanyInfoTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
-            description: "Fetch A-share company background and key financial indicators from Tushare. \
+            description: "Fetch A-share company background and key financial indicators from configured company/fundamental data sources. \
                 Use when researching a company's business, industry, management, and financial health. \
-                Requires TUSHARE_TOKEN env var. ts_code format: \"600519.SH\", \"000001.SZ\". \
-                Returns company profile + latest period key ratios in one call."
+                ts_code format: \"600519.SH\", \"000001.SZ\". Returns company profile + latest period key ratios in one call. \
+                Access/configuration failures are not valid empty results; use another source or tell the user what evidence is blocked."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "ts_code": {
                         "type": "string",
-                        "description": "Tushare ts_code, e.g. '600519.SH', '000001.SZ'"
+                        "description": "A-share security code, e.g. '600519.SH', '000001.SZ'"
                     }
                 },
                 "required": ["ts_code"]
@@ -107,11 +107,9 @@ impl ToolHandler for GetCompanyInfoTool {
         &self,
         args: serde_json::Value,
         cancel: CancellationToken,
-        _ctx: &super::ToolContext,
+        ctx: &super::ToolContext,
     ) -> Result<String> {
-        let token = std::env::var("TUSHARE_TOKEN").map_err(|_| {
-            anyhow!("TUSHARE_TOKEN env var not set — A-share data unavailable. Get a token at https://tushare.pro/register")
-        })?;
+        let token = data_provider_tokens::tushare_token(ctx).await?;
         let ts_code = args
             .get("ts_code")
             .and_then(|v| v.as_str())
@@ -213,6 +211,11 @@ impl ToolHandler for GetCompanyInfoTool {
         if !introduction.is_empty() {
             out.push_str(&format!("\n**公司简介**\n{introduction}\n"));
         }
+        if needs_bank_asset_quality_followup(&com_name, &main_business, &introduction) {
+            out.push_str("\n**银行资产质量缺口**\n");
+            out.push_str("- 本公司属于银行/类银行研究对象时，仅靠通用财务指标不够；比较资产质量必须继续核验不良贷款率、拨备覆盖率、关注贷款率、逾期率、净息差和资本充足率。\n");
+            out.push_str("- 这些字段通常在年报/中报、交易所公告、公司 IR 或银行业研报中披露；当前通用公司资料工具不会把它们当作已验证事实。\n");
+        }
 
         let fina_data = fina_body
             .get("data")
@@ -279,9 +282,39 @@ impl ToolHandler for GetCompanyInfoTool {
                     }
                 }
             }
+        } else {
+            out.push_str("\n**最新财务指标**\n- 当前财务指标来源没有返回记录；这是有效数据缺口，不代表公司没有财务指标。\n");
         }
 
         out.push_str("\n_Source: Tushare Pro_\n");
         Ok(out)
+    }
+}
+
+fn needs_bank_asset_quality_followup(name: &str, main_business: &str, introduction: &str) -> bool {
+    [name, main_business, introduction].iter().any(|text| {
+        text.contains("银行")
+            || text.contains("商业银行")
+            || text.contains("银行业")
+            || text.contains("金融服务")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bank_company_requires_asset_quality_followup() {
+        assert!(needs_bank_asset_quality_followup(
+            "招商银行股份有限公司",
+            "商业银行业务",
+            ""
+        ));
+        assert!(!needs_bank_asset_quality_followup(
+            "贵州茅台酒股份有限公司",
+            "白酒生产销售",
+            ""
+        ));
     }
 }

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::DateTime;
 use reqwest::Client;
@@ -9,11 +9,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::llm::ToolSpec;
 
-use super::ToolHandler;
+use super::{ToolContext, ToolHandler, data_provider_tokens};
 
 const TOOL_NAME: &str = "get_candlesticks";
 const TUSHARE_ENDPOINT: &str = "https://api.tushare.pro";
 const TUSHARE_FIELDS: &str = "ts_code,trade_date,open,high,low,close,vol,amount,pct_chg";
+const TUSHARE_ADJ_FIELDS: &str = "ts_code,trade_date,adj_factor";
 const YAHOO_BASE: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
 const BINANCE_BASE: &str = "https://api.binance.com/api/v3/klines";
 const COINGECKO_SEARCH: &str = "https://api.coingecko.com/api/v3/search";
@@ -21,6 +22,7 @@ const COINGECKO_OHLC: &str = "https://api.coingecko.com/api/v3/coins/{id}/ohlc";
 const REQUEST_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_LIMIT: usize = 30;
 const MAX_LIMIT: usize = 200;
+const MAX_MODEL_TABLE_ROWS: usize = 40;
 
 pub struct GetCandlesticksTool {
     http: Client,
@@ -126,14 +128,15 @@ impl ToolHandler for GetCandlesticksTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
-            description: "Fetch historical OHLCV (K-line) data for any tradable asset.\n\
-                Market is controlled by the `market` parameter — this single tool covers all asset classes.\n\
+            description: "Fetch historical OHLCV (K-line) data for supported asset classes.\n\
+                Market is controlled by the `market` parameter — this single tool covers A-share, US/HK stocks, and crypto.\n\
                 - A-share (CN equities): ts_code like \"600519.SH\", \"000001.SZ\", \"300750.SZ\"\n\
                 - US/HK stocks: ticker like \"AAPL\", \"TSLA\", \"0700.HK\", \"BABA\"\n\
                 - Crypto: Binance symbol like \"BTCUSDT\", \"ETHUSDT\", \"SOLUSDT\"\n\
-                Interval: 1d/1w/1mo for all markets; 15m only for US/HK/crypto until PyTDX is wired for A-share intraday/realtime.\n\
-                Returns a markdown table of OHLCV data sorted oldest→newest.\n\
-                Prefer this whenever price trend or mean-reversion context matters."
+                Interval: 1d/1w/1mo for all markets. A-share daily/weekly/monthly uses the configured official historical K-line source; same-day daily candles may lag after market close. 15m is only for US/HK/crypto until an A-share intraday source is wired.\n\
+                Returns a compact summary plus a recent markdown OHLCV table sorted oldest→newest; \
+                front-end cards can fetch a larger interactive series separately.\n\
+                Prefer this whenever price trend or mean-reversion context matters; use get_a_share_market_snapshot with freshness=realtime or both for current-session A-share quotes."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -157,7 +160,7 @@ impl ToolHandler for GetCandlesticksTool {
                     },
                     "adjusted": {
                         "type": "boolean",
-                        "description": "Front-adjusted prices (default true, A-share and US only)"
+                        "description": "Adjusted prices where supported. A-share applies front-adjustment to OHLC when all returned rows have factors; US/HK uses Yahoo adjclose for close only; unsupported markets return raw prices."
                     }
                 },
                 "required": ["ticker", "market"]
@@ -169,7 +172,7 @@ impl ToolHandler for GetCandlesticksTool {
         &self,
         args: serde_json::Value,
         cancel: CancellationToken,
-        _ctx: &super::ToolContext,
+        ctx: &ToolContext,
     ) -> Result<String> {
         let args: Args =
             serde_json::from_value(args).map_err(|e| anyhow!("invalid arguments: {e}"))?;
@@ -178,7 +181,7 @@ impl ToolHandler for GetCandlesticksTool {
 
         match args.market {
             Market::AShare => {
-                self.fetch_a_share(&args.ticker, args.interval, limit, cancel)
+                self.fetch_a_share(ctx, &args.ticker, args.interval, limit, adjusted, cancel)
                     .await
             }
             Market::UsStock | Market::HkStock => {
@@ -196,24 +199,18 @@ impl ToolHandler for GetCandlesticksTool {
 impl GetCandlesticksTool {
     async fn fetch_a_share(
         &self,
+        ctx: &ToolContext,
         ticker: &str,
         interval: Interval,
         limit: usize,
+        adjusted: bool,
         cancel: CancellationToken,
     ) -> Result<String> {
-        let token = match std::env::var("TUSHARE_TOKEN") {
-            Ok(t) => t,
-            Err(_) => {
-                return Ok("[get_candlesticks: TUSHARE_TOKEN not configured — \
-                     A-share candlesticks unavailable. \
-                     Get a free token at https://tushare.pro/register]"
-                    .to_string());
-            }
-        };
-
         if matches!(interval, Interval::Minute15) {
-            return Ok("[get_candlesticks: A-share intraday candles are not available through the current Tushare token. Tushare stk_mins requires separate permission; use daily/weekly/monthly for now. PyTDX integration is required for A-share intraday/realtime candles.]".to_string());
+            return Ok("[get_candlesticks: A-share 15m candles are not available through the current primary K-line provider. Use Tushare daily/weekly/monthly for historical K-lines, or get_a_share_market_snapshot freshness=realtime/both for the current-session quote snapshot.]".to_string());
         }
+
+        let token = data_provider_tokens::tushare_token(ctx).await?;
 
         let payload = serde_json::json!({
             "api_name": interval.tushare_api(),
@@ -268,8 +265,7 @@ impl GetCandlesticksTool {
 
         if items.is_empty() {
             return Ok(format!(
-                "[get_candlesticks: no data returned for {ticker} from Tushare. \
-                 Verify the ts_code format.]"
+                "[get_candlesticks: no data returned for {ticker} from Tushare. Treat this as a valid empty/source-coverage gap for the selected market and interval, not proof of no trading; verify the symbol only if other evidence suggests a code mismatch.]"
             ));
         }
 
@@ -292,42 +288,162 @@ impl GetCandlesticksTool {
                 .unwrap_or_default()
         };
 
-        let mut rows: Vec<[String; 7]> = items
+        let mut rows: Vec<CandleRow> = items
             .iter()
-            .map(|row| {
+            .filter_map(|row| {
                 let raw_date = cell(row, i_date);
                 let date = tushare_date_fmt(&raw_date);
-                let open = cell(row, i_open);
-                let high = cell(row, i_high);
-                let low = cell(row, i_low);
-                let close = cell(row, i_close);
-                let pct = cell(row, i_pct);
-                let vol = cell(row, i_vol)
-                    .parse::<f64>()
-                    .map(fmt_vol_cn)
-                    .unwrap_or_default();
-                [date, open, high, low, close, pct, vol]
+                Some(CandleRow {
+                    date,
+                    open: cell(row, i_open).parse().ok()?,
+                    high: cell(row, i_high).parse().ok()?,
+                    low: cell(row, i_low).parse().ok()?,
+                    close: cell(row, i_close).parse().ok()?,
+                    pct_chg: cell(row, i_pct).parse().unwrap_or(0.0),
+                    volume: cell(row, i_vol).parse().unwrap_or(0.0),
+                })
             })
             .collect();
 
-        rows.sort_by(|a, b| a[0].cmp(&b[0]));
+        rows.sort_by(|a, b| a.date.cmp(&b.date));
+
+        let mut price_basis = "不复权";
+        let mut basis_note = String::new();
+        if adjusted {
+            match self
+                .fetch_a_share_adj_factors(&token, ticker, limit, &cancel)
+                .await
+            {
+                Ok(factors) if apply_front_adjustment(&mut rows, &factors) => {
+                    price_basis = "前复权";
+                }
+                Ok(_) => {
+                    basis_note =
+                        "\n_复权说明: 已请求前复权，但未匹配到足够 adj_factor；本次返回不复权价格。_"
+                            .to_string();
+                }
+                Err(err) => {
+                    basis_note = format!(
+                        "\n_复权说明: 已请求前复权，但 adj_factor 获取失败；本次返回不复权价格。错误: {}_",
+                        preview_err(&err.to_string())
+                    );
+                }
+            }
+        }
 
         let mut out = format!(
-            "## {ticker} · {} · 不复权 ({limit})\n\n",
+            "## {ticker} · {} · {price_basis} ({limit})\n\n",
             interval.label_cn()
         );
+        out.push_str(&render_candle_summary(&rows, interval.label_cn()));
+        out.push('\n');
         out.push_str(
             "| 日期       | 开盘    | 最高    | 最低    | 收盘    | 涨跌幅 | 成交量   |\n",
         );
         out.push_str("|-----------|---------|---------|---------|---------|--------|----------|\n");
-        for r in &rows {
+        let display_rows = recent_rows(&rows, MAX_MODEL_TABLE_ROWS);
+        for r in display_rows {
             out.push_str(&format!(
                 "| {:<10} | {:>7} | {:>7} | {:>7} | {:>7} | {:>6} | {:>8} |\n",
-                r[0], r[1], r[2], r[3], r[4], r[5], r[6]
+                r.date,
+                fmt_price(r.open),
+                fmt_price(r.high),
+                fmt_price(r.low),
+                fmt_price(r.close),
+                fmt_pct(r.pct_chg),
+                fmt_vol_cn(r.volume)
             ));
         }
-        out.push_str("\n_来源: Tushare Pro (pro_bar)_\n");
+        if rows.len() > display_rows.len() {
+            out.push_str(&format!(
+                "\n_表格仅保留最近 {} 根，完整 K 线由前端卡片按需加载。_",
+                display_rows.len()
+            ));
+        }
+        out.push_str(&basis_note);
+        out.push_str("\n_来源: 配置的 A 股日/周/月 K 线来源。同日收盘 K 线可能在收盘后一段时间才更新；当前盘中价请用 A 股行情快照工具的 realtime/both。_\n");
         Ok(out)
+    }
+
+    async fn fetch_a_share_adj_factors(
+        &self,
+        token: &str,
+        ticker: &str,
+        limit: usize,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<(String, f64)>> {
+        let payload = serde_json::json!({
+            "api_name": "adj_factor",
+            "token": token,
+            "params": {
+                "ts_code": ticker,
+                "limit": limit,
+            },
+            "fields": TUSHARE_ADJ_FIELDS,
+        });
+        let resp = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("aborted before tushare adj_factor request"),
+            r = self.http.post(TUSHARE_ENDPOINT).json(&payload).send() => r?,
+        };
+        if !resp.status().is_success() {
+            bail!(
+                "tushare adj_factor returned HTTP {}",
+                resp.status().as_u16()
+            );
+        }
+        let body: serde_json::Value = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("aborted during tushare adj_factor parse"),
+            r = resp.json() => r?,
+        };
+        let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = body
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            bail!("tushare adj_factor error (code={code}): {msg}");
+        }
+        let data = body
+            .get("data")
+            .ok_or_else(|| anyhow!("tushare adj_factor response missing 'data'"))?;
+        let fields: Vec<String> = data
+            .get("fields")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let items: Vec<&Vec<serde_json::Value>> = data
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|row| row.as_array()).collect())
+            .unwrap_or_default();
+        let idx = |name: &str| fields.iter().position(|f| f == name);
+        let i_date = idx("trade_date");
+        let i_factor = idx("adj_factor");
+        let cell = |row: &Vec<serde_json::Value>, i: Option<usize>| -> String {
+            i.and_then(|j| row.get(j))
+                .map(|v| match v {
+                    serde_json::Value::Null => String::new(),
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default()
+        };
+        let mut factors: Vec<(String, f64)> = items
+            .iter()
+            .filter_map(|row| {
+                let date = tushare_date_fmt(&cell(row, i_date));
+                let factor = cell(row, i_factor).parse().ok()?;
+                Some((date, factor))
+            })
+            .collect();
+        factors.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(factors)
     }
 
     async fn fetch_yahoo(
@@ -777,6 +893,189 @@ fn array_f64(v: &serde_json::Value, key: &str) -> Vec<Option<f64>> {
         .and_then(|a| a.as_array())
         .map(|arr| arr.iter().map(|x| x.as_f64()).collect())
         .unwrap_or_default()
+}
+
+#[derive(Clone, Debug)]
+struct CandleRow {
+    date: String,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    pct_chg: f64,
+    volume: f64,
+}
+
+fn apply_front_adjustment(rows: &mut [CandleRow], factors: &[(String, f64)]) -> bool {
+    if rows.is_empty() || factors.is_empty() {
+        return false;
+    }
+    let factor_by_date: std::collections::HashMap<&str, f64> = factors
+        .iter()
+        .map(|(date, factor)| (date.as_str(), *factor))
+        .collect();
+    let Some(latest_factor) = rows
+        .iter()
+        .rev()
+        .find_map(|row| factor_by_date.get(row.date.as_str()).copied())
+    else {
+        return false;
+    };
+    if latest_factor <= 0.0 {
+        return false;
+    }
+    let Some(ratios) = rows
+        .iter()
+        .map(|row| {
+            let factor = factor_by_date.get(row.date.as_str()).copied()?;
+            if factor <= 0.0 {
+                return None;
+            }
+            Some(factor / latest_factor)
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    for (row, ratio) in rows.iter_mut().zip(ratios) {
+        row.open *= ratio;
+        row.high *= ratio;
+        row.low *= ratio;
+        row.close *= ratio;
+    }
+    true
+}
+
+fn render_candle_summary(rows: &[CandleRow], interval_label: &str) -> String {
+    let Some(first) = rows.first() else {
+        return "_摘要: 暂无可计算 K 线。_\n".to_string();
+    };
+    let Some(last) = rows.last() else {
+        return "_摘要: 暂无可计算 K 线。_\n".to_string();
+    };
+    let high = rows
+        .iter()
+        .map(|r| r.high)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let low = rows.iter().map(|r| r.low).fold(f64::INFINITY, f64::min);
+    let change = if first.close.abs() > f64::EPSILON {
+        (last.close / first.close - 1.0) * 100.0
+    } else {
+        0.0
+    };
+    let percentile = if high > low {
+        ((last.close - low) / (high - low) * 100.0).clamp(0.0, 100.0)
+    } else {
+        50.0
+    };
+    let drawdown = max_drawdown_pct(rows);
+    format!(
+        "_摘要: {interval_label}共{}根，区间{}→{}，最新收盘{}，区间涨跌{}，区间高低{} / {}，当前位置约为区间{}分位，最大回撤{}。_\n",
+        rows.len(),
+        first.date,
+        last.date,
+        fmt_price(last.close),
+        fmt_pct(change),
+        fmt_price(high),
+        fmt_price(low),
+        fmt_pct(percentile),
+        fmt_pct(drawdown)
+    )
+}
+
+fn max_drawdown_pct(rows: &[CandleRow]) -> f64 {
+    let mut peak = f64::NEG_INFINITY;
+    let mut max_dd = 0.0;
+    for row in rows {
+        peak = peak.max(row.high);
+        if peak > 0.0 {
+            let dd = (row.close / peak - 1.0) * 100.0;
+            if dd < max_dd {
+                max_dd = dd;
+            }
+        }
+    }
+    max_dd
+}
+
+fn recent_rows(rows: &[CandleRow], max_rows: usize) -> &[CandleRow] {
+    if rows.len() <= max_rows {
+        rows
+    } else {
+        &rows[rows.len() - max_rows..]
+    }
+}
+
+fn fmt_price(v: f64) -> String {
+    format!("{v:.2}")
+}
+
+fn fmt_pct(v: f64) -> String {
+    format!("{v:+.2}%")
+}
+
+fn preview_err(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.len() <= 120 {
+        trimmed.to_string()
+    } else {
+        let mut end = 120;
+        while !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &trimmed[..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(date: &str, close: f64) -> CandleRow {
+        CandleRow {
+            date: date.to_string(),
+            open: close,
+            high: close * 1.02,
+            low: close * 0.98,
+            close,
+            pct_chg: 0.0,
+            volume: 1000.0,
+        }
+    }
+
+    #[test]
+    fn front_adjustment_keeps_latest_price_anchored() {
+        let mut rows = vec![row("2026-01-01", 10.0), row("2026-01-02", 20.0)];
+        let factors = vec![
+            ("2026-01-01".to_string(), 2.0),
+            ("2026-01-02".to_string(), 4.0),
+        ];
+
+        assert!(apply_front_adjustment(&mut rows, &factors));
+        assert_eq!(fmt_price(rows[0].close), "5.00");
+        assert_eq!(fmt_price(rows[1].close), "20.00");
+    }
+
+    #[test]
+    fn candle_summary_contains_high_signal_metrics() {
+        let rows = vec![row("2026-01-01", 10.0), row("2026-01-02", 12.0)];
+        let summary = render_candle_summary(&rows, "日线");
+
+        assert!(summary.contains("日线共2根"));
+        assert!(summary.contains("区间涨跌"));
+        assert!(summary.contains("最大回撤"));
+    }
+
+    #[test]
+    fn recent_rows_limits_model_table() {
+        let rows: Vec<CandleRow> = (0..45)
+            .map(|i| row(&format!("2026-01-{i:02}"), 10.0 + i as f64))
+            .collect();
+        let recent = recent_rows(&rows, MAX_MODEL_TABLE_ROWS);
+
+        assert_eq!(recent.len(), MAX_MODEL_TABLE_ROWS);
+        assert_eq!(recent[0].date, "2026-01-05");
+    }
 }
 
 fn tushare_date_fmt(s: &str) -> String {

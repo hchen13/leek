@@ -19,12 +19,12 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use dom_smoothie::{Config, Readability, TextMode};
 use lru::LruCache;
-use reqwest::redirect::{Action, Attempt};
 use reqwest::Client;
+use reqwest::redirect::{Action, Attempt};
 use std::num::NonZeroUsize;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -164,8 +164,9 @@ impl ToolHandler for WebFetchTool {
                  Use for articles, news, filings, blog posts, PRs. The page is parsed with \
                  a Readability algorithm — navigation, ads, footers are stripped. Tables, \
                  lists, links, and code blocks are preserved. JavaScript is NOT executed; \
-                 for SPA-heavy or login-gated pages a fallback to Jina Reader fires \
-                 automatically (when configured). Always cite the URL in your final answer."
+                 if the result says clearly unusable / not \
+                 citable, do not cite it; fetch a readable source instead. Otherwise cite the \
+                 URL in your final answer."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -278,11 +279,22 @@ impl ToolHandler for WebFetchTool {
             ));
         }
 
-        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let binary_without_type = content_type.is_empty() && looks_like_binary_payload(&bytes);
+        let body = if binary_without_type {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
 
-        let (extracted, tier_used) = if content_type.contains("text/html")
-            || content_type.is_empty()
-        {
+        let (mut extracted, mut tier_used) = if binary_without_type {
+            (
+                unusable_source_message(
+                    "binary_skipped",
+                    "missing content-type; payload looks binary",
+                ),
+                "binary_skipped",
+            )
+        } else if content_type.contains("text/html") || content_type.is_empty() {
             // Tier 1: Readability + dom_smoothie
             let tier1 = extract_readable_markdown(&body, &final_url);
             let tier1_len = tier1.as_ref().map(|s| s.chars().count()).unwrap_or(0);
@@ -332,14 +344,25 @@ impl ToolHandler for WebFetchTool {
             (body.clone(), "raw_text")
         } else {
             (
-                format!(
-                    "[web_fetch: non-text content (`{}`, {} bytes) — not rendered]",
-                    content_type,
-                    bytes.len()
+                unusable_source_message(
+                    "binary_skipped",
+                    &format!(
+                        "non-text content-type `{}` ({} bytes)",
+                        content_type,
+                        bytes.len()
+                    ),
                 ),
                 "binary_skipped",
             )
         };
+
+        if tier_used != "binary_skipped" && looks_unreadable_or_garbled(extracted.trim()) {
+            extracted = unusable_source_message(
+                "unreadable_or_garbled_text",
+                "decoded/extracted text is clearly unreadable",
+            );
+            tier_used = "unreadable_or_garbled_text";
+        }
 
         let final_body = format!(
             "# Source: {final_url}\n_(extraction: {tier_used})_\n\n{}",
@@ -372,6 +395,47 @@ fn parse_and_validate_url(s: &str) -> Result<Url> {
         }
     }
     Ok(url)
+}
+
+fn unusable_source_message(reason: &str, detail: &str) -> String {
+    format!(
+        "[web_fetch: clearly unusable / not citable ({reason}). {detail}. Do not cite this URL; fetch a readable HTML/text source or an official text/announcement source instead.]"
+    )
+}
+
+fn looks_like_binary_payload(bytes: &[u8]) -> bool {
+    if bytes.starts_with(b"%PDF-") || bytes.starts_with(b"PK\x03\x04") {
+        return true;
+    }
+    let sample_len = bytes.len().min(2048);
+    if sample_len == 0 {
+        return false;
+    }
+    let sample = &bytes[..sample_len];
+    if sample.contains(&0) {
+        return true;
+    }
+    let control_count = sample
+        .iter()
+        .filter(|b| b.is_ascii_control() && !matches!(b, b'\n' | b'\r' | b'\t'))
+        .count();
+    control_count * 20 > sample_len
+}
+
+fn looks_unreadable_or_garbled(text: &str) -> bool {
+    let total = text.chars().count();
+    if total < 40 {
+        return false;
+    }
+    let replacement_count = text.chars().filter(|c| *c == '\u{FFFD}').count();
+    if replacement_count >= 8 && replacement_count * 20 > total {
+        return true;
+    }
+    let control_count = text
+        .chars()
+        .filter(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        .count();
+    control_count * 20 > total
 }
 
 fn check_hostname(host: &str) -> Result<()> {
@@ -611,6 +675,34 @@ mod tests {
     fn truncate_passthrough_when_under_limit() {
         let t = truncate_markdown("hello", 100);
         assert_eq!(t, "hello");
+    }
+
+    #[test]
+    fn unusable_message_blocks_citation() {
+        let msg = unusable_source_message("binary_skipped", "application/pdf");
+        assert!(msg.contains("clearly unusable / not citable"));
+        assert!(msg.contains("Do not cite this URL"));
+    }
+
+    #[test]
+    fn binary_payload_sniffer_catches_pdf_and_null_bytes() {
+        assert!(looks_like_binary_payload(b"%PDF-1.7\n..."));
+        assert!(looks_like_binary_payload(b"abc\0def"));
+        assert!(!looks_like_binary_payload(
+            b"<html><body>readable text</body></html>"
+        ));
+    }
+
+    #[test]
+    fn garbled_text_detector_catches_replacement_noise() {
+        let noisy = format!(
+            "{} readable tail with enough length to clear the detector floor",
+            "\u{FFFD}".repeat(20)
+        );
+        assert!(looks_unreadable_or_garbled(&noisy));
+        assert!(!looks_unreadable_or_garbled(
+            "This is a readable page with enough normal words and no decoding replacement noise."
+        ));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::Serialize;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 
 /// Capacity per-session — if a slow subscriber falls more than this behind,
 /// it gets `Lagged` errors and recovers via Last-Event-ID replay (P2).

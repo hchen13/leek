@@ -4,13 +4,14 @@
 // The 5 scenes are forms of the same UI under different session states;
 // the LIVE workbench evolves through them based on real data.
 
-import { Show, createSignal, onCleanup, onMount } from "solid-js";
+import { Match, Show, Switch, createSignal, onCleanup, onMount } from "solid-js";
 import { LiveChat } from "./components/LiveChat";
 import { Workbench } from "./components/Workbench";
 import { PortfolioPage } from "./components/PortfolioPage";
+import { SettingsPage } from "./components/SettingsPage";
 import { ALL_SCENES, type Scene } from "./scenes";
 
-type Page = "chat" | "portfolio";
+type Page = "chat" | "portfolio" | "settings";
 
 type View =
   | { mode: "live" }
@@ -53,15 +54,26 @@ export function App() {
           when={view().mode === "live"}
           fallback={<Workbench scene={(view() as { mode: "demo"; scene: Scene }).scene} />}
         >
-          <Show
-            when={page() === "portfolio"}
-            fallback={<LiveChat onNavigate={setPage} />}
-          >
-            <PortfolioWithRail onNavigate={setPage} />
-          </Show>
+          <LivePage page={page} onNavigate={setPage} />
         </Show>
       </div>
     </div>
+  );
+}
+
+function LivePage(props: { page: () => Page; onNavigate: (p: Page) => void }) {
+  return (
+    <Switch>
+      <Match when={props.page() === "portfolio"}>
+        <PortfolioWithRail onNavigate={props.onNavigate} />
+      </Match>
+      <Match when={props.page() === "settings"}>
+        <SettingsWithRail onNavigate={props.onNavigate} />
+      </Match>
+      <Match when={props.page() === "chat"}>
+        <LiveChat onNavigate={props.onNavigate} />
+      </Match>
+    </Switch>
   );
 }
 
@@ -76,6 +88,17 @@ function PortfolioWithRail(props: { onNavigate: (p: Page) => void }) {
   );
 }
 
+function SettingsWithRail(props: { onNavigate: (p: Page) => void }) {
+  return (
+    <div class="lk-app" style={{ width: "100%", height: "100%" }}>
+      <NavRail page="settings" onNavigate={props.onNavigate} />
+      <div class="lk-main" style={{ "grid-template-rows": "1fr", "grid-template-columns": "1fr" }}>
+        <SettingsPage />
+      </div>
+    </div>
+  );
+}
+
 export function NavRail(props: { page: Page; onNavigate: (p: Page) => void }) {
   return (
     <aside class="lk-rail">
@@ -83,6 +106,19 @@ export function NavRail(props: { page: Page; onNavigate: (p: Page) => void }) {
       <RailNavBtn label="C" sub="chat" target="chat" active={props.page === "chat"} onNavigate={props.onNavigate} />
       <RailNavBtn label="P" sub="port" target="portfolio" active={props.page === "portfolio"} onNavigate={props.onNavigate} />
       <div class="lk-rail-spacer" />
+      <button
+        class="lk-rail-btn"
+        data-active={props.page === "settings"}
+        onClick={() => props.onNavigate("settings")}
+        title="settings"
+      >
+        <span style={{ width: "18px", height: "18px", display: "inline-flex" }}>
+          <svg class="ic" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19 12a7 7 0 0 0-.1-1.2l2-1.5-2-3.5-2.4.9a7 7 0 0 0-2-1.2L14 3h-4l-.5 2.5a7 7 0 0 0-2 1.2l-2.4-.9-2 3.5 2 1.5A7 7 0 0 0 5 12c0 .4 0 .8.1 1.2l-2 1.5 2 3.5 2.4-.9a7 7 0 0 0 2 1.2L10 21h4l.5-2.5a7 7 0 0 0 2-1.2l2.4.9 2-3.5-2-1.5c.1-.4.1-.8.1-1.2Z" />
+          </svg>
+        </span>
+      </button>
       <div class="lk-rail-avatar">JC</div>
     </aside>
   );

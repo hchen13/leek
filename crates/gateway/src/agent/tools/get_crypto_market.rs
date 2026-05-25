@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
@@ -285,10 +285,10 @@ impl ToolHandler for GetCryptoMarketTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
-            description: "Fetch cryptocurrency market overview and coin-level data via CoinGecko. \
-                Use for: total crypto market cap, BTC dominance, top coins by market cap, \
-                individual coin stats (price, volume, 24h change, ATH). \
-                No API key required."
+            description: "Fetch cryptocurrency market context from configured public market-data sources. \
+                Use when the task needs market regime, dominance, liquidity, or coin-level spot context before reasoning about crypto assets. \
+                This is market evidence, not token valuation or an investment conclusion. \
+                Supports total market overview, top coins by market cap, and individual coin stats such as price, volume, 24h change, and ATH."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",

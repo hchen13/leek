@@ -1,18 +1,15 @@
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use super::sessions as api_sessions;
 use super::{AppError, AppState};
-use crate::agent::routing::{self, DecisionKind};
-use crate::agent::{self, TaskBinding};
+use crate::agent;
 use crate::events::EventEnvelope;
-use crate::llm::{ChatMessage, Role};
 use crate::vault::{
     events as vault_events, messages as vault_messages, sessions as vault_sessions,
-    tasks as vault_tasks,
 };
 
 /// Auto-compaction threshold. When the session's last `llm_usage` event
@@ -34,9 +31,8 @@ fn auto_compact_threshold() -> i64 {
 
 #[derive(Deserialize)]
 pub struct PostMessageBody {
-    /// Optional task thread to attach this message to. Routing layer will
-    /// honor it once #48 grows the full extraction logic; ignored for the
-    /// chat_reply slice.
+    /// Optional task thread to attach this message to once task binding is
+    /// wired through the message endpoint; ignored for the chat_reply slice.
     #[serde(default)]
     #[allow(dead_code)]
     pub task_id: Option<String>,
@@ -104,7 +100,7 @@ pub async fn post_handler(
         &session_id,
         "user",
         &serde_json::json!({ "type": "text", "text": user_text }),
-        None, // task_id will be back-filled if routing decides new_task
+        None,
     )
     .await?;
 
@@ -145,14 +141,13 @@ pub async fn post_handler(
         }
     }
 
-    // Route + reply in the background — POST returns 201 immediately.
+    // Reply in the background — POST returns 201 immediately.
     let pool = state.pool.clone();
     let user_id = state.user_id.clone();
     let sess = session_id.clone();
     let provider = state.provider.clone();
     let bus = state.event_bus.clone();
     let tools = state.tools.clone();
-    let mandate_path = state.mandate_path.clone();
     let cancel_for_task = cancel.clone();
     let cancel_for_cleanup = cancel.clone();
     let active_replies = state.active_replies.clone();
@@ -167,18 +162,21 @@ pub async fn post_handler(
             user_seq,
             cancel_for_task,
             tools,
-            mandate_path,
         )
         .await
         {
             tracing::error!(error = %e, "agent dispatch failed");
         }
-        // Clear the cancel token after the reply finishes so /compact knows
-        // the session is idle. Skip if we were replaced by a later POST —
-        // replacement cancels the previous token; if ours is cancelled, the
-        // map slot belongs to someone else now.
-        if !cancel_for_cleanup.is_cancelled() {
-            active_replies.lock().await.remove(&sess);
+        // Clear the in-flight slot after normal completion or a user abort.
+        // If a later POST replaced us, its token is still live and stays put.
+        let mut replies = active_replies.lock().await;
+        if !cancel_for_cleanup.is_cancelled()
+            || replies
+                .get(&sess)
+                .map(|task| task.token.is_cancelled())
+                .unwrap_or(false)
+        {
+            replies.remove(&sess);
         }
     });
 
@@ -201,260 +199,61 @@ async fn handle_user_message(
     user_message_seq: i64,
     cancel: CancellationToken,
     tools: crate::agent::tools::ToolRegistry,
-    mandate_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    // P1 simplification: routing layer fires only when there's no in-progress
-    // task. With one, attach to it directly (in-thread chat_reply).
-    let active = vault_tasks::get_active_for_session(&pool, &user_id, &session_id).await?;
-    if let Some(task) = active {
-        // Link the user message to the existing task and reply within it.
-        vault_tasks::link_message(&pool, &user_id, &session_id, user_message_seq, &task.id).await?;
-        let task_binding = if task.status == "awaiting_user" {
-            vault_tasks::mark_in_progress(&pool, &user_id, &task.id).await?;
-            Some(TaskBinding {
-                task_id: task.id,
-                expected_deliverable: task.expected_deliverable,
-            })
-        } else {
-            None
-        };
-        return agent::run_chat_reply(
-            pool,
-            user_id,
-            session_id,
-            provider,
-            event_bus,
-            task_binding,
-            cancel,
-            tools,
-            mandate_path,
-        )
-        .await;
-    }
+    let _ = (user_text, user_message_seq);
+    let result = agent::run_chat_reply(
+        pool.clone(),
+        user_id.clone(),
+        session_id.clone(),
+        provider,
+        event_bus.clone(),
+        cancel.clone(),
+        tools,
+    )
+    .await;
 
-    // No active task — run the routing layer.
-    let history = load_history_for_routing(&pool, &user_id, &session_id).await?;
-    let decision = match routing::decide_route(provider.clone(), &history, &user_text).await {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(error = %e, "routing failed; falling back to chat_reply");
-            // Fallback: just run the main reply pipeline
-            return agent::run_chat_reply(
-                pool,
-                user_id,
-                session_id,
-                provider,
-                event_bus,
+    if let Err(e) = &result {
+        if !latest_agent_event_is_terminal(&pool, &user_id, &session_id)
+            .await
+            .unwrap_or(false)
+        {
+            let stop_reason = if cancel.is_cancelled() {
+                "user_aborted"
+            } else {
+                "agent_error"
+            };
+            agent::publish_terminal_failure(
+                &pool,
+                &user_id,
+                &session_id,
                 None,
-                cancel,
-                tools,
-                mandate_path,
+                &event_bus,
+                "",
+                stop_reason,
+                &e.to_string(),
             )
             .await;
         }
-    };
-
-    match decision.kind {
-        DecisionKind::NewTask => {
-            let draft = decision
-                .task_draft
-                .ok_or_else(|| anyhow::anyhow!("routing returned new_task without task_draft"))?;
-            let task_id = vault_tasks::insert_in_progress(
-                &pool,
-                &user_id,
-                &session_id,
-                vault_tasks::NewTask {
-                    title: &draft.title,
-                    goal: &draft.goal,
-                    expected_deliverable: &draft.expected_deliverable,
-                    source: "user",
-                    constraints_json: None,
-                    context_refs_json: None,
-                },
-            )
-            .await?;
-
-            vault_tasks::link_message(&pool, &user_id, &session_id, user_message_seq, &task_id)
-                .await?;
-
-            agent::publish_and_persist(
-                &pool,
-                &user_id,
-                &session_id,
-                Some(&task_id),
-                &event_bus,
-                "task_created",
-                serde_json::json!({
-                    "task_id": task_id,
-                    "title": draft.title,
-                    "goal": draft.goal,
-                    "expected_deliverable": draft.expected_deliverable,
-                    "reason": decision.reason,
-                }),
-            )
-            .await?;
-            agent::publish_and_persist(
-                &pool,
-                &user_id,
-                &session_id,
-                Some(&task_id),
-                &event_bus,
-                "task_started",
-                serde_json::json!({
-                    "task_id": task_id,
-                    "title": draft.title,
-                }),
-            )
-            .await?;
-
-            agent::run_chat_reply(
-                pool,
-                user_id,
-                session_id,
-                provider,
-                event_bus,
-                Some(TaskBinding {
-                    task_id,
-                    expected_deliverable: draft.expected_deliverable,
-                }),
-                cancel,
-                tools,
-                mandate_path,
-            )
-            .await
-        }
-
-        DecisionKind::ChatReply => {
-            agent::run_chat_reply(
-                pool,
-                user_id,
-                session_id,
-                provider,
-                event_bus,
-                None,
-                cancel,
-                tools,
-                mandate_path,
-            )
-            .await
-        }
-
-        DecisionKind::Ambiguous => {
-            // Routing layer already produced the clarification text; surface it
-            // as an agent message + clarification_requested event without burning
-            // a second LLM call.
-            let question = decision.clarification_question.unwrap_or_else(|| {
-                "Could you clarify what you'd like me to look into?".to_string()
-            });
-            simulate_agent_reply(
-                &pool,
-                &user_id,
-                &session_id,
-                &event_bus,
-                &question,
-                Some("clarification_requested"),
-            )
-            .await
-        }
     }
+
+    result
 }
 
-async fn load_history_for_routing(
+async fn latest_agent_event_is_terminal(
     pool: &sqlx::SqlitePool,
     user_id: &str,
     session_id: &str,
-) -> anyhow::Result<Vec<ChatMessage>> {
-    let rows = vault_messages::list(pool, user_id, session_id, None, 100).await?;
-    let messages: Vec<ChatMessage> = rows
-        .iter()
-        .filter_map(|row| {
-            let content: serde_json::Value = serde_json::from_str(&row.content_json).ok()?;
-            let text = content.get("text")?.as_str()?.to_string();
-            let role = match row.role.as_str() {
-                "user" => Role::User,
-                "agent" => Role::Assistant,
-                _ => return None,
-            };
-            Some(ChatMessage {
-                role,
-                content: text,
-            })
-        })
-        .collect();
-    Ok(messages)
-}
-
-/// Stream an agent message that doesn't come from an LLM (clarifications etc).
-/// Mirrors the event sequence the live UI expects so it renders identically
-/// to a real LLM stream.
-async fn simulate_agent_reply(
-    pool: &sqlx::SqlitePool,
-    user_id: &str,
-    session_id: &str,
-    event_bus: &crate::events::EventBus,
-    text: &str,
-    extra_kind_before: Option<&str>,
-) -> anyhow::Result<()> {
-    if let Some(kind) = extra_kind_before {
-        agent::publish_and_persist(
-            pool,
-            user_id,
-            session_id,
-            None,
-            event_bus,
-            kind,
-            serde_json::json!({ "question": text }),
-        )
-        .await?;
-    }
-
-    agent::publish_and_persist(
-        pool,
-        user_id,
-        session_id,
-        None,
-        event_bus,
-        "agent_message_start",
-        serde_json::json!({}),
+) -> anyhow::Result<bool> {
+    let kind: Option<String> = sqlx::query_scalar(
+        "SELECT kind FROM events WHERE user_id = ? AND session_id = ? ORDER BY seq DESC LIMIT 1",
     )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(pool)
     .await?;
-
-    agent::publish_and_persist(
-        pool,
-        user_id,
-        session_id,
-        None,
-        event_bus,
-        "agent_message_delta",
-        serde_json::json!({ "text": text }),
-    )
-    .await?;
-
-    let msg_seq = vault_messages::insert(
-        pool,
-        user_id,
-        session_id,
-        "agent",
-        &serde_json::json!({ "type": "text", "text": text }),
-        None,
-    )
-    .await?;
-
-    agent::publish_and_persist(
-        pool,
-        user_id,
-        session_id,
-        None,
-        event_bus,
-        "agent_message_end",
-        serde_json::json!({
-            "stop_reason": "end_turn",
-            "message_seq": msg_seq,
-        }),
-    )
-    .await?;
-
-    Ok(())
+    Ok(kind
+        .map(|kind| kind == "agent_message_end" || kind == "agent_message_failed")
+        .unwrap_or(false))
 }
 
 #[derive(Deserialize, Default)]

@@ -24,7 +24,7 @@ P2 把 leek 从"裸 codex 聊天"演进为"多工具协作研究"，加入：
   | `web_fetch` | client-side function | 读全文 | reqwest + dom_smoothie + Jina + strip-tag |
   | `corpus_search` | client-side function | 查 user 自己的 wiki | rust-embed 嵌入 287 篇 .md |
   | `sec_filing_fetch` | client-side function | 美股 SEC 文件 | EDGAR submissions JSON |
-  | `tushare_quote` | client-side function | A 股 OHLCV | api.tushare.pro daily |
+  | `get_candlesticks` | client-side function | A 股 OHLCV | api.tushare.pro daily / weekly / monthly |
   | `tradingview_quote` | client-side function | 全球行情快照 | scanner.tradingview.com（内部 API） |
 - **UI 三件套**：tool_call chip 流（含完成态、错误态）、events 时间线 panel
   （Cmd/Ctrl+E）、thinking 计时器（▸ Ns / ✓ Ns done）、corpus brain 节点
@@ -200,10 +200,10 @@ SolidJS modal （title + tags chips + 全文 markdown）
   marker 会被 403 拦截，已踩坑）。env 覆盖：`LEEK_SEC_USER_AGENT`。
 - 输出 metadata + `primary_doc_url` —— 模型自己挑一个再 web_fetch。
 
-### 5.2 tushare_quote
+### 5.2 get_candlesticks
 - POST `https://api.tushare.pro` body
   `{api_name, token, params, fields}`，封装 `daily` 接口。
-- token 走 `TUSHARE_TOKEN` env，仓库不带。
+- token 优先走 Settings 中保存的 Tushare 配置，本地开发可 fallback 到 `TUSHARE_TOKEN` env。
 - ts_code 校验 `<digits>.<SH|SZ|BJ>`。
 - 输出 markdown table（date / open / high / low / close / pct_chg / vol）。
 

@@ -2,8 +2,8 @@
 //!
 //! See `design/p1-spec/data-schema.md` for the full schema reference.
 
-pub mod charters;
 pub mod compactions;
+pub mod data_provider_configs;
 pub mod decisions;
 pub mod events;
 pub mod holdings;
@@ -12,12 +12,11 @@ pub mod plans;
 pub mod provider_configs;
 pub mod sessions;
 pub mod subagents;
-pub mod tasks;
 pub mod tool_runs;
 
 use anyhow::{Context, Result};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;

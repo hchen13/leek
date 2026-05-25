@@ -4,8 +4,8 @@
 //! Verifying the signature would require OpenAI's JWKS, which we don't need
 //! for refresh decisions (the LLM API itself rejects invalid tokens).
 
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 

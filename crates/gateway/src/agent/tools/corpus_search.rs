@@ -10,11 +10,11 @@
 //!   interpretation layer. Callers can still force `layer: "source"` when they
 //!   need primary text.
 //! - Returns top-N hits with a 240-char snippet around the first match so
-//!   the model sees enough context to decide whether to web_fetch / drill in.
+//!   the model sees enough context to decide whether to call `corpus_read`.
 
 use std::sync::OnceLock;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use rust_embed::RustEmbed;
 use tokio_util::sync::CancellationToken;
@@ -169,7 +169,7 @@ impl ToolHandler for CorpusSearchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
-            description: "Search the local LEEK corpus (curated investing wikis + source texts: \
+            description: "Search the local LEEK investment corpus / 投研智库 (curated investing wikis + source texts: \
                  Buffett letters, Dalio books, Munger speeches, NVIDIA/AI/macro notes, etc.). \
                  Use this BEFORE web_search when the question is about value-investing \
                  principles, mental models, or the people / books you'd find in a serious \
@@ -178,9 +178,12 @@ impl ToolHandler for CorpusSearchTool {
                  lenses; source hits are supporting evidence candidates and should not be \
                  treated as active context unless their snippet directly matters or the user \
                  asks for primary-source grounding. Returns top hits as JSON with id, title, \
-                 tier, layer, usage_role, tags, and a snippet around the first match. Combine \
-                 with web_fetch (using the returned id as a wikilink reference) to read the \
-                 full document if needed."
+                 tier, layer, usage_role, tags, and a snippet around the first match. Use \
+                 `corpus_read` with a returned id when the snippet is not enough. Use \
+                 `web_fetch` only for external URLs, not corpus ids. If hits are empty for a company, industry, or macro \
+                 topic, treat it as a corpus coverage gap, not as an answer: build a session-only \
+                 working model from external company/industry/macro facts and do not write it \
+                 into corpus."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -319,6 +322,12 @@ impl ToolHandler for CorpusSearchTool {
             })
             .collect();
 
+        let guidance = if hits.is_empty() {
+            "No corpus hit found. Treat this as a corpus coverage gap, not a stopping condition: build a session-only working model from external company/industry/macro facts, label it as session facts/inference, and do not write it into corpus."
+        } else {
+            "Treat wiki hits as active reasoning lenses. Treat source hits as supporting evidence candidates; open/use them only when the snippet directly affects the task or primary-source grounding is required."
+        };
+
         Ok(serde_json::json!({
             "query": query,
             "filters": {
@@ -327,7 +336,7 @@ impl ToolHandler for CorpusSearchTool {
                 "tags": tag_filter,
             },
             "total_corpus_docs": docs.len(),
-            "guidance": "Treat wiki hits as active reasoning lenses. Treat source hits as supporting evidence candidates; open/use them only when the snippet directly affects the task or primary-source grounding is required.",
+            "guidance": guidance,
             "hits": hits,
         })
         .to_string())

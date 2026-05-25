@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
@@ -9,7 +9,7 @@ use crate::vault::{events as vault_events, plans as vault_plans};
 
 use super::{ToolContext, ToolHandler};
 
-const TOOL_NAME: &str = "update_plan";
+pub(crate) const TOOL_NAME: &str = "update_plan";
 
 pub struct UpdatePlanTool;
 
@@ -30,9 +30,11 @@ impl ToolHandler for UpdatePlanTool {
             name: TOOL_NAME.into(),
             description:
                 "Create or replace the active execution plan for the current research task. \
-                Use this for non-trivial research before doing the work, then update it as items \
-                move from pending to in_progress to completed. The runtime will not accept a final \
-                task answer while the active plan still has pending or in_progress items."
+                Use this only when the work is long-running or complex enough that a visible \
+                checklist will improve execution. Do not use it for ordinary questions or quick \
+                replies. When you do use it, update it as the real work state changes. Before \
+                a final or closing answer, do not leave fake in_progress or pending items: mark \
+                real completions, revise stale steps, or explicitly abandon steps that no longer apply."
                     .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -143,9 +145,9 @@ impl ToolHandler for UpdatePlanTool {
             "open_items": open,
             "items": rows.iter().map(plan_item_json).collect::<Vec<_>>(),
             "guidance": if open == 0 {
-                "active plan is complete; final answer may now synthesize the completed work"
+                "active plan is complete; synthesize the final answer if the task is otherwise done"
             } else {
-                "continue executing incomplete plan items; do not provide the final answer yet"
+                "continue using this plan as working memory while it remains useful; before a final answer, update real completions or revise/abandon stale open items"
             }
         })
         .to_string())

@@ -14,6 +14,7 @@ interface EventRow {
 }
 
 const KIND_FILTERS: { id: string; label: string; predicate: (k: string) => boolean }[] = [
+  { id: "signal",  label: "关键",  predicate: (k) => k !== "agent_message_delta" },
   { id: "all",     label: "all",     predicate: () => true },
   { id: "agent",   label: "agent",   predicate: (k) => k.startsWith("agent_message_") },
   { id: "tool",    label: "tool",    predicate: (k) => k === "tool_call" || k === "web_search_call" },
@@ -84,7 +85,7 @@ export function EventsPanel(props: {
   liveTick?: { seq: number; kind: string; payload: unknown; ts: string } | null;
 }) {
   const [events, setEvents] = createSignal<EventRow[]>([]);
-  const [filter, setFilter] = createSignal<string>("all");
+  const [filter, setFilter] = createSignal<string>("signal");
   const [loading, setLoading] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [expanded, setExpanded] = createSignal<Record<number, boolean>>({});
@@ -93,7 +94,7 @@ export function EventsPanel(props: {
     setLoading(true);
     setError(null);
     try {
-      const r = await fetch(`/api/v1/sessions/${props.sessionId}/events?limit=2000`);
+      const r = await fetch(`/api/v1/sessions/${props.sessionId}/events?limit=100000`);
       if (!r.ok) {
         setError(`HTTP ${r.status}`);
         return;

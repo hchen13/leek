@@ -1,13 +1,13 @@
 use std::{collections::HashSet, time::Duration};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::ToolSpec;
 
-use super::ToolHandler;
+use super::{ToolContext, ToolHandler, data_provider_tokens};
 
 const TOOL_NAME: &str = "get_financials";
 const TUSHARE_ENDPOINT: &str = "https://api.tushare.pro";
@@ -39,7 +39,12 @@ impl ToolHandler for GetFinancialsTool {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
             description: "Fetch financial statements and key ratios for a listed company.\n\
-                Covers A-shares (via Tushare Pro) and US stocks (via FMP).\n\
+                Covers A-shares and US stocks through configured financial-data sources.\n\
+                For A-shares, use this as a structured financial-data aid; for final \
+                company financial claims, prefer announcements, exchange/CNINFO disclosures, \
+                and company IR pages when available. Output includes field metadata; reconcile \
+                announcement/tool conflicts by report period, scope, unit, and field definition \
+                before mixing numbers.\n\
                 - A-share ts_code: \"600519.SH\", \"000001.SZ\"\n\
                 - US ticker: \"AAPL\", \"TSLA\", \"NVDA\"\n\
                 report_type controls what to fetch:\n\
@@ -77,7 +82,7 @@ impl ToolHandler for GetFinancialsTool {
         &self,
         args: serde_json::Value,
         cancel: CancellationToken,
-        _ctx: &super::ToolContext,
+        ctx: &ToolContext,
     ) -> Result<String> {
         let ticker = args
             .get("ticker")
@@ -100,7 +105,9 @@ impl ToolHandler for GetFinancialsTool {
             .unwrap_or(DEFAULT_PERIODS) as usize;
 
         match market {
-            "a_share" => fetch_a_share(&self.http, &ticker, report_type, periods, cancel).await,
+            "a_share" => {
+                fetch_a_share(&self.http, ctx, &ticker, report_type, periods, cancel).await
+            }
             "us_stock" => fetch_us_stock(&self.http, &ticker, report_type, periods, cancel).await,
             _ => bail!("unknown market: {market}"),
         }
@@ -111,17 +118,13 @@ impl ToolHandler for GetFinancialsTool {
 
 async fn fetch_a_share(
     http: &Client,
+    ctx: &ToolContext,
     ts_code: &str,
     report_type: &str,
     periods: usize,
     cancel: CancellationToken,
 ) -> Result<String> {
-    let token = std::env::var("TUSHARE_TOKEN").map_err(|_| {
-        anyhow!(
-            "[get_financials: TUSHARE_TOKEN not set — A-share financials unavailable. \
-             Get a free token at https://tushare.pro/register]"
-        )
-    })?;
+    let token = data_provider_tokens::tushare_token(ctx).await?;
 
     let mut parts: Vec<String> = Vec::new();
 
@@ -334,20 +337,27 @@ async fn fetch_ashare_income(
     }
 
     let mut out = format!("## {ts_code} · 利润表（近{periods}期）\n\n");
-    out.push_str("| 报告期 | 营收（亿） | 营业利润（亿） | 归母净利（亿） | 基本EPS |\n");
-    out.push_str("|--------|-----------|--------------|--------------|--------|\n");
+    out.push_str("| 报告期 | 营业总收入（亿） | 营业收入（亿） | 营业利润（亿） | 净利润（亿） | 归母净利（亿） | 基本EPS |\n");
+    out.push_str("|--------|---------------|-------------|--------------|------------|--------------|--------|\n");
     for row in &items {
         let period = ashare_period(col(row, &field_names, "end_date"));
-        let revenue = fmt_yi(col(row, &field_names, "total_revenue"));
+        let total_revenue = fmt_yi(col(row, &field_names, "total_revenue"));
+        let revenue = fmt_yi(col(row, &field_names, "revenue"));
         let op_profit = fmt_yi(col(row, &field_names, "operate_profit"));
+        let net_profit = fmt_yi(col(row, &field_names, "n_income"));
         let net_income = fmt_yi(col(row, &field_names, "n_income_attr_p"));
         let eps = fmt_f2(col(row, &field_names, "basic_eps"));
         out.push_str(&format!(
-            "| {period} | {revenue} | {op_profit} | {net_income} | {eps} |\n"
+            "| {period} | {total_revenue} | {revenue} | {op_profit} | {net_profit} | {net_income} | {eps} |\n"
         ));
     }
-    out.push_str("\n_来源: Tushare Pro (income_vip)_");
+    append_ashare_income_metadata(&mut out);
     Ok(out)
+}
+
+fn append_ashare_income_metadata(out: &mut String) {
+    out.push_str("\n_来源: Tushare Pro (income_vip)_\n");
+    out.push_str("_字段口径: total_revenue=营业总收入；revenue=营业收入；operate_profit=营业利润；n_income=净利润；n_income_attr_p=归母净利润；basic_eps=基本每股收益。金额字段来自 Tushare 原始元单位并换算为亿元。公告/交易所/巨潮/公司官网与工具数值冲突时，必须先 reconcile 报告期、合并范围、单位和字段口径，不得把营业收入、营业总收入、净利润、归母净利润直接混用。_");
 }
 
 async fn fetch_ashare_balance(
@@ -494,8 +504,7 @@ async fn fetch_us_stock(
     let key = match std::env::var("FMP_API_KEY") {
         Ok(k) => k,
         Err(_) => {
-            return Ok("[get_financials: FMP_API_KEY not set — get a free key at \
-                 https://financialmodelingprep.com/developer/docs to access US stock financials]"
+            return Ok("[get_financials: US stock financial-data source is not configured. Treat this as a blocked source, not as missing company financials.]"
                 .to_string());
         }
     };
@@ -559,11 +568,17 @@ async fn fmp_get(
 
 fn fmp_http_error(status: u16, body: &str) -> String {
     let base = match status {
-        401 | 403 => format!(
-            "FMP HTTP {status}: authentication or endpoint permission denied. Check FMP_API_KEY and the API plan."
-        ),
-        402 => "FMP HTTP 402: API key was loaded, but the current FMP plan/quota does not allow this financial-statement endpoint.".to_string(),
-        429 => "FMP HTTP 429: provider rate limit exceeded. Retry later or lower request frequency.".to_string(),
+        401 | 403 => {
+            format!("FMP HTTP {status}: provider authentication or endpoint permission denied.")
+        }
+        402 => {
+            "FMP HTTP 402: provider access/quota does not allow this financial-statement endpoint."
+                .to_string()
+        }
+        429 => {
+            "FMP HTTP 429: provider rate limit exceeded. Retry later or lower request frequency."
+                .to_string()
+        }
         _ => format!("FMP HTTP {status}: provider request failed."),
     };
     let detail = body.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -772,10 +787,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fmp_http_402_mentions_loaded_key_and_plan() {
+    fn fmp_http_402_mentions_provider_access_quota() {
         let msg = fmp_http_error(402, "{\"Error Message\":\"Plan limit\"}");
-        assert!(msg.contains("API key was loaded"));
-        assert!(msg.contains("plan/quota"));
+        assert!(msg.contains("access/quota"));
         assert!(msg.contains("Plan limit"));
+    }
+
+    #[test]
+    fn ashare_income_metadata_names_financial_statement_fields() {
+        let mut out = String::new();
+        append_ashare_income_metadata(&mut out);
+        assert!(out.contains("total_revenue=营业总收入"));
+        assert!(out.contains("revenue=营业收入"));
+        assert!(out.contains("n_income=净利润"));
+        assert!(out.contains("n_income_attr_p=归母净利润"));
+        assert!(out.contains("不得把营业收入、营业总收入、净利润、归母净利润直接混用"));
+    }
+
+    #[test]
+    fn tool_description_requires_reconcile_on_ashare_conflicts() {
+        let tool = GetFinancialsTool::new().unwrap();
+        let description = match tool.spec() {
+            ToolSpec::Function { description, .. } => description,
+            _ => panic!("get_financials should expose a function tool"),
+        };
+        assert!(description.contains("exchange/CNINFO"));
+        assert!(description.contains("field metadata"));
+        assert!(description.contains("reconcile"));
     }
 }

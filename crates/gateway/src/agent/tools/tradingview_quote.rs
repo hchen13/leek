@@ -11,10 +11,10 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE};
 use reqwest::Client;
+use reqwest::header::{ACCEPT_LANGUAGE, HeaderMap, HeaderValue};
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::ToolSpec;
@@ -227,7 +227,9 @@ impl ToolHandler for TradingViewQuoteTool {
                 cell(10),
             ));
         }
-        out.push_str("\n_Source: scanner.tradingview.com (delayed; undocumented internal API)._\n");
+        out.push_str(
+            "\n_Source: TradingView scanner quote source (delayed public market snapshot)._\n",
+        );
         Ok(out)
     }
 }

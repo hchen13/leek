@@ -2,9 +2,19 @@
 //!
 //! `events.seq` is per-session monotonic and **independent** from `messages.seq`.
 
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+
 use anyhow::{Context, Result};
 use serde::Serialize;
 use sqlx::{FromRow, SqlitePool};
+use tokio::time::{Duration, sleep};
+
+const INSERT_MAX_ATTEMPTS: usize = 6;
+const INSERT_RETRY_BASE_MS: u64 = 10;
+
+static EVENT_SEQ_LOCKS: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
 
 /// Wire shape returned by the events list endpoint.
 #[derive(Debug, FromRow, Serialize)]
@@ -98,6 +108,51 @@ pub async fn insert(
     source: Option<&str>,
     ts: chrono::DateTime<chrono::Utc>,
 ) -> Result<i64> {
+    let session_lock = event_seq_lock(user_id, session_id).await;
+    let _guard = session_lock.lock().await;
+
+    let mut last_error: Option<sqlx::Error> = None;
+    for attempt in 0..INSERT_MAX_ATTEMPTS {
+        match insert_once(
+            pool, user_id, session_id, task_id, kind, payload, source, ts,
+        )
+        .await
+        {
+            Ok(seq) => return Ok(seq),
+            Err(err) if is_retryable_insert_error(&err) && attempt + 1 < INSERT_MAX_ATTEMPTS => {
+                let delay = insert_retry_delay(attempt);
+                tracing::warn!(
+                    user_id,
+                    session_id,
+                    kind,
+                    attempt = attempt + 1,
+                    delay_ms = delay.as_millis(),
+                    error = %err,
+                    "retrying event insert"
+                );
+                last_error = Some(err);
+                sleep(delay).await;
+            }
+            Err(err) => {
+                return Err(err).context("inserting event");
+            }
+        }
+    }
+
+    Err(last_error.expect("event insert retry loop recorded no error")).context("inserting event")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_once(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    task_id: Option<&str>,
+    kind: &str,
+    payload: &serde_json::Value,
+    source: Option<&str>,
+    ts: chrono::DateTime<chrono::Utc>,
+) -> std::result::Result<i64, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
     let seq: i64 = sqlx::query_scalar(
@@ -106,8 +161,7 @@ pub async fn insert(
     .bind(user_id)
     .bind(session_id)
     .fetch_one(&mut *tx)
-    .await
-    .context("computing next event seq")?;
+    .await?;
 
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
@@ -127,9 +181,116 @@ pub async fn insert(
     .bind(ts.to_rfc3339())
     .bind(&now)
     .execute(&mut *tx)
-    .await
-    .context("inserting event")?;
+    .await?;
 
     tx.commit().await?;
     Ok(seq)
+}
+
+async fn event_seq_lock(user_id: &str, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let locks = EVENT_SEQ_LOCKS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
+    let key = format!("{user_id}\x1f{session_id}");
+    let mut guard = locks.lock().await;
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+fn insert_retry_delay(attempt: usize) -> Duration {
+    let multiplier = 1_u64 << attempt.min(5);
+    Duration::from_millis((INSERT_RETRY_BASE_MS * multiplier).min(250))
+}
+
+fn is_retryable_insert_error(err: &sqlx::Error) -> bool {
+    let message = err.to_string().to_lowercase();
+    message.contains("database is locked")
+        || message.contains("database table is locked")
+        || message.contains("busy")
+        || message.contains("locked")
+        || message.contains("unique constraint failed")
+        || message.contains("constraint failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn concurrent_event_inserts_keep_session_seq_dense() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE events (
+                user_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                task_id TEXT,
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                source TEXT,
+                ts TEXT NOT NULL,
+                persisted_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, session_id, seq)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let user_id = format!("u-{}", uuid::Uuid::new_v4());
+        let session_id = format!("s-{}", uuid::Uuid::new_v4());
+        let mut joins = Vec::new();
+        for i in 0..40 {
+            let pool = pool.clone();
+            let user_id = user_id.clone();
+            let session_id = session_id.clone();
+            joins.push(tokio::spawn(async move {
+                insert(
+                    &pool,
+                    &user_id,
+                    &session_id,
+                    None,
+                    "test_event",
+                    &serde_json::json!({ "i": i }),
+                    Some("test"),
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap()
+            }));
+        }
+
+        for join in joins {
+            join.await.unwrap();
+        }
+
+        let seqs: Vec<i64> = sqlx::query_scalar(
+            "SELECT seq FROM events WHERE user_id = ? AND session_id = ? ORDER BY seq",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(seqs, (1..=40).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn sqlite_lock_and_unique_errors_are_retryable() {
+        assert!(is_retryable_insert_error(&sqlx::Error::Protocol(
+            "database is locked".into()
+        )));
+        assert!(is_retryable_insert_error(&sqlx::Error::Protocol(
+            "UNIQUE constraint failed: events.user_id".into()
+        )));
+        assert!(!is_retryable_insert_error(&sqlx::Error::Protocol(
+            "syntax error".into()
+        )));
+    }
 }

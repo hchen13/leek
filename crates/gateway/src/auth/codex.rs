@@ -5,7 +5,7 @@
 //! token (rotation invalidates the others). We run our own device flow and
 //! store tokens in vault, isolated from `~/.codex/auth.json`.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::time::{Duration, Instant};
@@ -182,7 +182,7 @@ async fn poll_device_token(
                 return resp
                     .json::<DevicePollResponse>()
                     .await
-                    .context("invalid poll response")
+                    .context("invalid poll response");
             }
             403 | 404 => continue,
             other => bail!("device poll returned unexpected status {}", other),

@@ -9,7 +9,7 @@ import { InsightSidebar, type AgentPlanView } from "./BrainWidget";
 import { Rail, TopBar } from "./Workbench";
 import { NavRail } from "../App";
 import { SafeMarkdown } from "./SafeMarkdown";
-import { ArtifactPanel, extractLinkMeta, type ArtifactEventView, type DecisionDraftView } from "./ArtifactCards";
+import { ArtifactPanel, extractLinkMeta, toolDisplayName, type ArtifactEventView, type DecisionDraftView, type ToolUiArtifact } from "./ArtifactCards";
 import { SessionMenu, type SessionRow } from "./SessionMenu";
 import { CorpusDocModal, type CorpusDoc } from "./CorpusDocModal";
 import type { Scene } from "../scenes";
@@ -71,6 +71,12 @@ interface ToolCall {
   arguments?: string;
   output_preview?: string;
   output_bytes?: number;
+  ui_artifact?: ToolUiArtifact;
+  cached?: boolean;
+  cached_from?: string;
+  error_kind?: string;
+  retryable?: boolean;
+  partial_status?: string | null;
 }
 
 interface NarrationStep {
@@ -328,14 +334,14 @@ function summarizeSearch(s: SearchCall): string {
   const verb = s.status === "completed" ? "✓" : "▸";
   switch (s.action) {
     case "search":
-      return `${verb} ${s.status === "completed" ? "Searched" : "Searching"}: ${s.detail || "…"}`;
+      return `${verb} ${s.status === "completed" ? "已搜索" : "正在搜索"}: ${s.detail || "…"}`;
     case "open_page": {
       let host = s.detail;
       try { host = new URL(s.detail).hostname; } catch { /* keep raw */ }
-      return `${verb} ${s.status === "completed" ? "Opened" : "Opening"}: ${host}`;
+      return `${verb} ${s.status === "completed" ? "已打开" : "正在打开"}: ${host}`;
     }
     case "find_in_page":
-      return `${verb} ${s.status === "completed" ? "Searched in page" : "Searching in page"}: ${s.detail}`;
+      return `${verb} ${s.status === "completed" ? "已页内查找" : "正在页内查找"}: ${s.detail}`;
     default:
       return `${verb} ${s.action}`;
   }
@@ -363,18 +369,89 @@ function summarizeTool(t: ToolCall): string {
       }
     } catch { /* show name only */ }
   }
+  const name = toolDisplayName(t.name);
   const head = t.status === "completed"
-    ? `${verb} ${t.name}`
+    ? `${verb} ${name}`
     : t.status === "error"
-    ? `${verb} ${t.name} failed`
-    : `${verb} ${t.name}`;
+    ? `${verb} ${name} 失败`
+    : `${verb} ${name}`;
   return detail ? `${head}: ${detail}` : head;
 }
 
+function toolCallFromPayload(p: any): ToolCall {
+  return {
+    call_id: String(p.call_id ?? ""),
+    status: p.status ?? "in_progress",
+    name: p.name ?? "",
+    arguments: typeof p.arguments === "string" ? p.arguments : undefined,
+    output_preview: typeof p.output_preview === "string" ? p.output_preview : undefined,
+    output_bytes: typeof p.output_bytes === "number" ? p.output_bytes : undefined,
+    ui_artifact: typeof p.ui_artifact === "object" && p.ui_artifact !== null ? p.ui_artifact : undefined,
+    cached: typeof p.cached === "boolean" ? p.cached : typeof p.cached_from === "string" ? true : undefined,
+    cached_from: typeof p.cached_from === "string" ? p.cached_from : undefined,
+    error_kind: typeof p.error_kind === "string" ? p.error_kind : undefined,
+    retryable: typeof p.retryable === "boolean" ? p.retryable : undefined,
+    partial_status: typeof p.partial_status === "string" ? p.partial_status : undefined,
+  };
+}
+
+function mergeToolCall(prev: ToolCall, next: ToolCall): ToolCall {
+  const merged = {
+    ...prev,
+    ...next,
+    call_id: prev.call_id || next.call_id,
+    arguments: prev.arguments ?? next.arguments,
+    output_preview: next.output_preview ?? prev.output_preview,
+    output_bytes: next.output_bytes ?? prev.output_bytes,
+    ui_artifact: next.ui_artifact ?? prev.ui_artifact,
+    cached: next.cached ?? prev.cached,
+    cached_from: next.cached_from ?? prev.cached_from,
+    error_kind: next.error_kind ?? prev.error_kind,
+    retryable: next.retryable ?? prev.retryable,
+    partial_status: next.partial_status ?? prev.partial_status,
+  };
+  if (next.status === "in_progress" && prev.status !== "in_progress") {
+    merged.status = prev.status;
+  }
+  return merged;
+}
+
+function findMatchingToolIndex(calls: ToolCall[], call: ToolCall): number {
+  const sameCall = calls.findIndex((t) => t.call_id === call.call_id);
+  if (sameCall >= 0) return sameCall;
+  if (call.cached === true && call.cached_from) {
+    const cachedFrom = calls.findIndex((t) => t.call_id === call.cached_from);
+    if (cachedFrom >= 0) return cachedFrom;
+  }
+  return -1;
+}
+
+function upsertToolCall(calls: ToolCall[] | undefined, call: ToolCall): ToolCall[] {
+  const out = [...(calls ?? [])];
+  const idx = findMatchingToolIndex(out, call);
+  if (idx >= 0) out[idx] = mergeToolCall(out[idx], call);
+  else out.push(call);
+  return out;
+}
+
 function summarizeProcess(m: LiveMsg): string {
-  const narrations = m.narrations?.length ?? 0;
-  const tools = m.tool_calls?.length ?? 0;
-  const searches = m.searches?.length ?? 0;
+  let narrations = m.narrations?.length ?? 0;
+  let tools = (m.tool_calls ?? []).filter(isCanvasTool).length;
+  let searches = m.searches?.length ?? 0;
+  if (m.artifacts && m.artifacts.length > 0) {
+    narrations = 0;
+    searches = 0;
+    const toolIds = new Set<string>();
+    const searchIds = new Set<string>();
+    for (const event of m.artifacts) {
+      if (event.kind === "narration" && event.narration) narrations += 1;
+      if (event.kind === "narration_group" && event.narrations) narrations += event.narrations.length;
+      if (event.kind === "search" && event.search) searchIds.add(event.id);
+      if (event.kind === "tool" && event.tool && isCanvasTool(event.tool)) toolIds.add(event.tool.call_id);
+    }
+    tools = toolIds.size;
+    searches = searchIds.size;
+  }
   const parts: string[] = [];
   if (narrations > 0) parts.push(`${narrations} 个推理步骤`);
   if (tools > 0) parts.push(`${tools} 个工具`);
@@ -392,18 +469,26 @@ function firstCanvasTarget(m: LiveMsg): string | undefined {
   return m.tool_calls?.[0]?.call_id;
 }
 
-function upsertToolEvent(events: ArtifactEvent[] | undefined, call: ToolCall): ArtifactEvent[] {
+function upsertToolEvent(events: ArtifactEvent[] | undefined, call: ToolCall, turn?: number): ArtifactEvent[] {
   const out = [...(events ?? [])];
-  const idx = out.findIndex((event) => event.kind === "tool" && event.id === call.call_id);
-  if (idx >= 0) {
+  const toolEvents = out
+    .map((event, index) => ({ event, index }))
+    .filter(({ event }) => event.kind === "tool" && event.tool);
+  const idx = toolEvents.find(({ event }) => event.tool && event.tool.call_id === call.call_id)?.index
+    ?? (call.cached === true && call.cached_from
+      ? toolEvents.find(({ event }) => event.tool?.call_id === call.cached_from)?.index
+      : undefined);
+  if (idx != null && idx >= 0) {
     const prev = out[idx].tool;
     out[idx] = {
-      id: call.call_id,
+      ...out[idx],
+      id: prev?.call_id ?? call.call_id,
       kind: "tool",
-      tool: { ...(prev ?? call), ...call, arguments: prev?.arguments ?? call.arguments },
+      turn: turn ?? out[idx].turn,
+      tool: prev ? mergeToolCall(prev, call) : call,
     };
   } else {
-    out.push({ id: call.call_id, kind: "tool", tool: call });
+    out.push({ id: call.call_id, kind: "tool", turn, tool: call });
   }
   return out;
 }
@@ -438,7 +523,6 @@ function appendNarrationEvent(
 ): ArtifactEvent[] {
   const text = normalizeNarrationText(narration.text);
   if (!text) return [...(events ?? [])];
-  if (isSearchActionNarration(text)) return [...(events ?? [])];
   if ((events ?? []).some((event) =>
     event.kind === "narration" &&
     normalizeNarrationText(event.narration?.text ?? "") === text
@@ -456,23 +540,20 @@ function appendNarrationStep(steps: NarrationStep[] | undefined, step: Narration
   const out = [...(steps ?? [])];
   const text = normalizeNarrationText(step.text);
   if (!text) return out;
-  if (isSearchActionNarration(text)) return out;
   if (out.some((existing) => normalizeNarrationText(existing.text) === text)) return out;
   out.push(step);
   return out;
 }
 
-function isSearchActionNarration(text: string): boolean {
-  return /^我用\s*\d+\s*个相关查询做网页搜索[，,]\s*主查询是[:：]/.test(text)
-    || /^我做了一次网页搜索[:：]/.test(text)
-    || /^我打开了搜索结果页面[:：]/.test(text)
-    || /^我在页面内查找[:：]/.test(text);
-}
-
 function isFatalStopReason(stopReason: string | undefined): boolean {
   return stopReason === "max_tool_turns" ||
-    stopReason === "plan_guard_exhausted" ||
-    stopReason === "user_aborted";
+    stopReason === "max_tool_turns_finalized" ||
+    stopReason === "user_aborted" ||
+    stopReason === "provider_error" ||
+    stopReason === "provider_stream_error" ||
+    stopReason === "provider_stream_idle_timeout" ||
+    stopReason === "provider_synthesis_timeout" ||
+    stopReason === "agent_error";
 }
 
 function mergeArtifactEvents(to: ArtifactEvent[] | undefined, from: ArtifactEvent[] | undefined): ArtifactEvent[] {
@@ -488,7 +569,10 @@ function mergeArtifactEvents(to: ArtifactEvent[] | undefined, from: ArtifactEven
       continue;
     }
     const idx = out.findIndex((existing) => existing.id === event.id && existing.kind === event.kind);
-    if (idx >= 0) out[idx] = { ...out[idx], ...event };
+    if (event.kind === "tool" && event.tool) {
+      const merged = upsertToolEvent(out, event.tool, event.turn);
+      out.splice(0, out.length, ...merged);
+    } else if (idx >= 0) out[idx] = { ...out[idx], ...event };
     else out.push(event);
   }
   return out;
@@ -599,6 +683,13 @@ interface UsageInfo {
   outTokens: number;
 }
 
+interface ProviderRetryNotice {
+  retry: number;
+  max: number;
+  delaySec: number;
+  message: string;
+}
+
 function fmtTime(d: Date | string = new Date()): string {
   // Render HH:MM in the user's local timezone. RFC3339 strings (UTC) get
   // converted via Date(); Date instances pass through.
@@ -616,13 +707,15 @@ interface LiveTick {
   ts: string;
 }
 
-export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => void } = {}) {
+export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "settings") => void } = {}) {
   const [sessionId, setSessionId] = createSignal<string>(readSessionFromLocation());
   const [sessions, setSessions] = createSignal<SessionRow[]>([]);
   const [messages, setMessages] = createSignal<LiveMsg[]>([]);
   const [usage, setUsage] = createSignal<UsageInfo | null>(null);
   const [error, setError] = createSignal<string | null>(null);
+  const [providerRetry, setProviderRetry] = createSignal<ProviderRetryNotice | null>(null);
   const [pending, setPending] = createSignal(false);
+  const [stopping, setStopping] = createSignal(false);
   const [connected, setConnected] = createSignal(false);
   // Compaction state — set when /compact is in flight. While true, the
   // composer locks SEND, new submits queue (don't fire), and Esc routes to
@@ -707,14 +800,20 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
   }
 
   async function renameSession(id: string, title: string) {
+    const nextTitle = title.trim();
+    if (!nextTitle) return;
+    setSessions((prev) => prev.map((s) => s.id === id ? { ...s, title: nextTitle } : s));
     try {
-      await fetch(`/api/v1/sessions/${id}`, {
+      const r = await fetch(`/api/v1/sessions/${id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title }),
+        body: JSON.stringify({ title: nextTitle }),
       });
+      if (!r.ok) throw new Error(`rename failed: ${r.status}`);
       await refreshSessions();
-    } catch {/* ignore */}
+    } catch {
+      await refreshSessions();
+    }
   }
 
   async function deleteSession(id: string) {
@@ -735,6 +834,10 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     const seq = parseInt(e.lastEventId, 10);
     if (!Number.isFinite(seq)) return;
     setLiveTick({ seq, kind, payload, ts: new Date().toISOString() });
+  }
+
+  function clearProviderRetry() {
+    if (providerRetry()) setProviderRetry(null);
   }
 
   // Auto-scroll to bottom whenever messages change (length OR last text changes
@@ -857,24 +960,8 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
             case "tool_call":
               if (cursor >= 0 && cursor < agentIdxs.length) {
                 const msg = hist[agentIdxs[cursor]];
-                const calls = (msg.tool_calls ?? []) as ToolCall[];
-                const idx = calls.findIndex((t) => t.call_id === p.call_id);
-                const next: ToolCall = {
-                  call_id: p.call_id,
-                  status: p.status ?? "in_progress",
-                  name: p.name ?? "",
-                  arguments: p.arguments,
-                  output_preview: p.output_preview,
-                  output_bytes: p.output_bytes,
-                };
-                if (idx >= 0) {
-                  // Preserve arguments from in_progress event when completed
-                  // event doesn't carry them.
-                  calls[idx] = { ...calls[idx], ...next, arguments: calls[idx].arguments ?? next.arguments };
-                } else {
-                  calls.push(next);
-                }
-                msg.tool_calls = calls;
+                const next = toolCallFromPayload(p);
+                msg.tool_calls = upsertToolCall(msg.tool_calls, next);
                 msg.artifacts = upsertToolEvent(msg.artifacts, next);
               }
               break;
@@ -981,7 +1068,10 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     // 3. Subscribe to live event stream
     evtSrc = new EventSource(`/stream/sessions/${id}/events`);
 
-    evtSrc.addEventListener("open", () => setConnected(true));
+    evtSrc.addEventListener("open", () => {
+      setConnected(true);
+      setError((prev) => prev === "stream reconnecting…" ? null : prev);
+    });
     evtSrc.onerror = () => {
       setConnected(false);
       // EventSource auto-reconnects; surface a soft hint
@@ -997,6 +1087,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     evtSrc.addEventListener("agent_message_start", (e: MessageEvent) => {
       agentBuffer = "";
       setPending(true);
+      setStopping(false);
       // send() already inserted a streaming placeholder when the user hit
       // Enter (so "thinking · Ns" appears instantly). If we got here on a
       // server-initiated reply (e.g. resumed session), insert one now.
@@ -1021,32 +1112,14 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     evtSrc.addEventListener("tool_call", (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data);
+        clearProviderRetry();
         emitTick(e, "tool_call", data);
-        const call: ToolCall = {
-          call_id: data.call_id,
-          status: data.status ?? "in_progress",
-          name: data.name ?? "",
-          arguments: data.arguments,
-          output_preview: data.output_preview,
-          output_bytes: data.output_bytes,
-        };
+        const call = toolCallFromPayload(data);
         setMessages((prev) => {
           const out = [...prev];
           const last = out[out.length - 1];
           if (!last || last.role !== "agent" || !last.streaming) return prev;
-          const tool_calls = [...(last.tool_calls ?? [])];
-          // Match completed/error to the in-progress chip with the same call_id.
-          if (call.status !== "in_progress") {
-            const idx = tool_calls.findIndex((t) => t.call_id === call.call_id);
-            if (idx >= 0) {
-              // Preserve original arguments since server omits them on completion.
-              tool_calls[idx] = { ...tool_calls[idx], ...call, arguments: tool_calls[idx].arguments ?? call.arguments };
-            } else {
-              tool_calls.push(call);
-            }
-          } else {
-            tool_calls.push(call);
-          }
+          const tool_calls = upsertToolCall(last.tool_calls, call);
           out[out.length - 1] = { ...last, tool_calls, artifacts: upsertToolEvent(last.artifacts, call) };
           return out;
         });
@@ -1058,6 +1131,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     evtSrc.addEventListener("web_search_call", (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data);
+        clearProviderRetry();
         emitTick(e, "web_search_call", data);
         const call: SearchCall = {
           status: data.status ?? "in_progress",
@@ -1100,6 +1174,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     evtSrc.addEventListener("agent_message_delta", (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data);
+        clearProviderRetry();
         if (typeof data.text === "string") appendDelta(data.text);
         emitTick(e, "agent_message_delta", data);
       } catch {
@@ -1160,6 +1235,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     evtSrc.addEventListener("llm_usage", (e: MessageEvent) => {
       try {
         const u = JSON.parse(e.data);
+        clearProviderRetry();
         setUsage({ inTokens: u.input_tokens ?? 0, outTokens: u.output_tokens ?? 0 });
         emitTick(e, "llm_usage", u);
       } catch {
@@ -1173,10 +1249,20 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
         const retry = Number(data.retry ?? 0);
         const max = Number(data.max_retries ?? 10);
         const delaySec = Math.max(0, Math.round(Number(data.delay_ms ?? 0) / 1000));
-        setError(`provider error，${delaySec}s 后重试 ${retry}/${max}`);
+        setProviderRetry({
+          retry,
+          max,
+          delaySec,
+          message: typeof data.message === "string" ? data.message : "provider temporarily unavailable",
+        });
         emitTick(e, "provider_retry", data);
       } catch {
-        setError("provider error，准备重试");
+        setProviderRetry({
+          retry: 0,
+          max: 10,
+          delaySec: 0,
+          message: "provider temporarily unavailable",
+        });
       }
     });
 
@@ -1187,8 +1273,12 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
       } catch {
         data = {};
       }
+      const stopReason = String(data.stop_reason ?? "");
+      const wasStopping = stopping();
       setPending(false);
-      if (!isFatalStopReason(String(data.stop_reason ?? ""))) setError(null);
+      setStopping(false);
+      clearProviderRetry();
+      if (!isFatalStopReason(stopReason) || (stopReason === "user_aborted" && wasStopping)) setError(null);
       if (elapsedTimer) {
         clearInterval(elapsedTimer);
         elapsedTimer = undefined;
@@ -1307,6 +1397,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     });
 
     evtSrc.addEventListener("error", (e: MessageEvent) => {
+      clearProviderRetry();
       try {
         const data = JSON.parse(e.data);
         setError(data.message ?? "agent error");
@@ -1407,6 +1498,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
 
   async function send(text: string) {
     setError(null);
+    setStopping(false);
     setAgentPlan(null);
     // While a compaction is in flight, hold the message in a local queue
     // rather than firing it. The compaction.completed handler flushes the
@@ -1432,6 +1524,26 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
     elapsedTimer = window.setInterval(() => {
       setElapsedSec(Math.max(0, Math.floor((Date.now() - agentStartTs) / 1000)));
     }, 1000);
+    const finishFailedSend = (message: string) => {
+      if (elapsedTimer) {
+        clearInterval(elapsedTimer);
+        elapsedTimer = undefined;
+      }
+      setPending(false);
+      setStopping(false);
+      setElapsedSec(0);
+      setError(message);
+      setMessages((prev) => {
+        const out = [...prev];
+        const last = out[out.length - 1];
+        if (last?.role === "agent" && last.streaming && !last.text && !(last.tool_calls?.length) && !(last.searches?.length)) {
+          out.pop();
+        } else if (last?.role === "agent" && last.streaming) {
+          out[out.length - 1] = { ...last, streaming: false };
+        }
+        return out;
+      });
+    };
     try {
       const r = await fetch(`/api/v1/sessions/${sessionId()}/messages`, {
         method: "POST",
@@ -1461,17 +1573,44 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
       }
       if (!r.ok) {
         const body = await r.text();
-        setError(`POST ${r.status}: ${body.slice(0, 200)}`);
+        finishFailedSend(`POST ${r.status}: ${body.slice(0, 200)}`);
       }
     } catch (e: any) {
-      setError(e?.message ?? "network error");
+      finishFailedSend(e?.message ?? "network error");
     }
   }
 
   async function stop() {
+    if (!pending() && !compacting()) return;
+    setStopping(true);
     try {
-      await fetch(`/api/v1/sessions/${sessionId()}/abort`, { method: "POST" });
+      const r = await fetch(`/api/v1/sessions/${sessionId()}/abort`, { method: "POST" });
+      if (!r.ok) {
+        const body = await r.text();
+        setStopping(false);
+        setError(`abort ${r.status}: ${body.slice(0, 200)}`);
+        return;
+      }
+      if (elapsedTimer) {
+        clearInterval(elapsedTimer);
+        elapsedTimer = undefined;
+      }
+      const finalSec = agentStartTs ? Math.max(0, Math.floor((Date.now() - agentStartTs) / 1000)) : 0;
+      setPending(false);
+      setStopping(false);
+      setCompacting(false);
+      setElapsedSec(0);
+      setError(null);
+      setMessages((prev) => {
+        const out = [...prev];
+        const last = out[out.length - 1];
+        if (last && last.role === "agent" && last.streaming) {
+          out[out.length - 1] = { ...last, streaming: false, total_sec: finalSec };
+        }
+        return out;
+      });
     } catch (e: any) {
+      setStopping(false);
       setError(e?.message ?? "abort failed");
     }
   }
@@ -1524,9 +1663,8 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
   // Derive a Scene from real session state so the Workbench shell (canvas
   // header / brain meta / etc) shows the right form. `idle` until a turn
   // happens; `thinking-shallow` while pending; `delivered` once a reply
-  // exists. `clarify` / `deep` are reserved for routing-layer signals
-  // (clarification_requested) and active multi-turn task work — wired
-  // when those events surface in the UI.
+  // exists. `clarify` / `deep` are reserved for future clarification and
+  // active multi-turn task states.
   const derivedScene = createMemo<Scene>(() => {
     if (pending()) return "thinking-shallow";
     if (messages().some((m) => m.role === "agent")) return "delivered";
@@ -1538,14 +1676,10 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
   // erase prior research. Cleared by /clear (planned).
   const sessionTools = createMemo<ToolCall[]>(() => {
     const out: ToolCall[] = [];
-    const seen = new Set<string>();
     for (const m of messages()) {
       if (m.role !== "agent" || !m.tool_calls) continue;
       for (const t of m.tool_calls) {
-        if (!seen.has(t.call_id)) {
-          seen.add(t.call_id);
-          out.push(t);
-        }
+        out.splice(0, out.length, ...upsertToolCall(out, t));
       }
     }
     return out;
@@ -1591,33 +1725,40 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
 
   const sessionArtifactEvents = createMemo<ArtifactEvent[]>(() => {
     const out: ArtifactEvent[] = [];
+    let agentTurn = 0;
     for (const m of messages()) {
       if (m.role === "decision_draft" && m.decision_draft) {
         out.push({
           id: `decision:${m.decision_draft.deliverable_id}`,
           kind: "decision",
+          turn: agentTurn || undefined,
           decision: m.decision_draft,
         });
         continue;
       }
       if (m.role !== "agent") continue;
+      agentTurn += 1;
       if (m.artifacts && m.artifacts.length > 0) {
-        out.push(...m.artifacts.filter(isCanvasArtifact));
+        const scoped = m.artifacts
+          .filter(isCanvasArtifact)
+          .map((event) => ({ ...event, turn: agentTurn }));
+        out.splice(0, out.length, ...mergeArtifactEvents(out, scoped));
         continue;
       }
       for (const n of m.narrations ?? []) {
-        out.push({ id: `narration:${n.turn}:${out.length}`, kind: "narration", narration: n });
+        out.push({ id: `narration:${n.turn}:${out.length}`, kind: "narration", turn: agentTurn, narration: n });
       }
       for (const s of m.searches ?? []) {
-        out.push({ id: searchKey(s), kind: "search", search: s });
+        out.push({ id: searchKey(s), kind: "search", turn: agentTurn, search: s });
       }
       for (const t of m.tool_calls ?? []) {
         if (!isCanvasTool(t)) continue;
-        out.push({ id: t.call_id, kind: "tool", tool: t });
+        out.splice(0, out.length, ...upsertToolEvent(out, t, agentTurn));
       }
     }
     return out;
   });
+  const sessionAgentTurn = createMemo(() => messages().filter((m) => m.role === "agent").length);
 
   const corpusTools = createMemo<ToolCall[]>(() =>
     sessionTools().filter((t) => t.name === "corpus_search")
@@ -1785,6 +1926,23 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
               <CompactingDivider />
             </Show>
 
+            <Show when={providerRetry()}>
+              {(retry) => (
+                <div style={{
+                  color: "#d9a76c",
+                  "font-size": "11px",
+                  "font-family": "var(--font-mono)",
+                  padding: "6px 10px",
+                  margin: "8px 0",
+                  background: "rgba(217,167,108,0.10)",
+                  border: "1px solid rgba(217,167,108,0.20)",
+                  "border-radius": "6px",
+                }} title={retry().message}>
+                  provider 暂时不可用，正在自动恢复 · {retry().delaySec}s 后重试 {retry().retry}/{retry().max}
+                </div>
+              )}
+            </Show>
+
             <Show when={error()}>
               <div style={{
                 color: "#d97070",
@@ -1795,7 +1953,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
                 background: "rgba(217,112,112,0.08)",
                 "border-radius": "6px",
               }}>
-                ⚠ {error()}
+                {error()}
               </div>
             </Show>
           </div>
@@ -1804,7 +1962,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
             placeholder="跟 L.E.E.K 说点什么…"
             onSubmit={send}
             onStop={stop}
-            pending={pending()}
+            pending={pending() || stopping()}
             compacting={compacting()}
             cancellable={compactionTrigger() !== "auto_pre_turn"}
             commands={slashCommands}
@@ -1823,6 +1981,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio") => v
           searches={sessionSearches()}
           narrations={sessionNarrations()}
           artifactEvents={sessionArtifactEvents()}
+          currentTurn={sessionAgentTurn()}
           corpusTools={corpusTools()}
           plan={agentPlan()}
           onOpenDoc={openWiki}
@@ -1859,6 +2018,7 @@ function CanvasArea(props: {
   searches: SearchCall[];
   narrations: NarrationStep[];
   artifactEvents: ArtifactEvent[];
+  currentTurn: number;
   corpusTools: ToolCall[];
   plan: AgentPlanView | null;
   onOpenDoc: (id: string, title?: string) => void;
@@ -1898,6 +2058,7 @@ function CanvasArea(props: {
           tools={props.tools}
           narrations={props.narrations}
           events={props.artifactEvents}
+          currentTurn={props.currentTurn}
           callbacks={{ onOpenDoc: (id, title) => props.onOpenDoc(id, title) }}
         />
       </Show>

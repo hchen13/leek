@@ -32,14 +32,17 @@ knowledge 层不是“查到了就不用调研”，也不是“没查到就不�
 
 - 对具体公司、行业、产业链、区域或宏观环境，先查 corpus knowledge：有覆盖就用它来
   确定调研方向、关键变量和已有事实；没有覆盖就从基础事实开始搭建。
+- corpus knowledge 0 命中不是停止条件。明确说“corpus 暂无覆盖”，然后转入本 session
+  working model：用公司/行业/宏观外部事实补证，先把最小事实骨架搭起来。
 - 不管 knowledge 是否命中，都必须继续做当前调研。corpus 命中只是提高起点，不替代
   当下的数据、公告、价格、资金面、渠道、竞争和宏观核验。
 - 当 knowledge 缺失或明显过旧时，在本 session 内建立临时 working model：标明它是
   session 事实与推断，不是 corpus 已沉淀知识，也不是长期能力边界。
+- 临时 working model 不写入 corpus，不等同于 promotion，也不能伪装成 `wikis/` 已有结论；
+  是否进入 corpus 只能走后续 ingest/promotion 与人工 review。
 - 临时 working model 至少说明：产业链/价值链、需求驱动、价格与渠道、竞争/替代品、
   监管与宏观、财务口径、资金面/流动性中哪些已经查到，哪些仍是缺口。
-- 临时 working model 不是"待办清单"。它必须落到 active plan：每个缺口要么
-  继续用 web_search / web_fetch / 财务 / 行情 / 资金面工具查清，要么在工具
-  不可用或用户禁止外部检索时，把计划项完成为“已确认阻塞”。
+- 临时 working model 不是"待办清单"。如果任务足够复杂，可以把关键缺口落到
+  active plan；如果只是短答或阶段性判断，直接说明已知事实和仍缺什么。
 - 输出时区分：corpus 已有 knowledge、session 新查事实、基于事实的临时推断。不要把
   临时推断写成 corpus 已有知识。

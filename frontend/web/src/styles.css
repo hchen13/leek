@@ -802,34 +802,65 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
   bottom: 20px;
   padding-top: 4px;
   overflow: auto;
-  display: flex;
-  flex-wrap: wrap;
-  align-content: start;
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  grid-auto-flow: row dense;
+  grid-auto-rows: min-content;
   align-items: start;
   gap: 12px;
 }
 .lk-artifact-card {
-  flex: 0 0 calc((100% - 12px) / 2);
+  grid-column: span 6;
   min-width: 0;
+  width: 100%;
   max-width: 100%;
   position: relative;
   box-sizing: border-box;
   overflow: hidden;
   isolation: isolate;
 }
-.lk-artifact-card.is-compact { flex-basis: calc((100% - 24px) / 3); }
-.lk-artifact-card.is-normal { flex-basis: calc((100% - 12px) / 2); }
+.lk-artifact-card.is-compact { grid-column: span 4; }
+.lk-artifact-card.is-normal { grid-column: span 6; }
 .lk-artifact-card.is-wide,
-.lk-artifact-card.is-hero,
-.lk-artifact-card.is-reasoning { flex-basis: 100%; }
+.lk-artifact-card.is-hero { grid-column: span 12; }
+.lk-artifact-card.is-reasoning { grid-column: span 8; }
 .lk-artifact-card.is-clickable:hover {
   border-color: rgba(217, 119, 87, 0.34) !important;
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
 }
+.lk-artifact-scope {
+  grid-column: span 12;
+  display: inline-flex;
+  align-items: center;
+  justify-self: end;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--line-1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.025);
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.lk-artifact-scope span {
+  padding: 0 6px;
+}
+.lk-artifact-scope button {
+  border-radius: 6px;
+  padding: 4px 8px;
+  color: var(--ink-3);
+}
+.lk-artifact-scope button.active {
+  background: rgba(217, 119, 87, 0.16);
+  color: var(--clay-soft);
+}
 @media (max-width: 1280px) {
   .lk-artifact-card.is-compact,
   .lk-artifact-card.is-normal {
-    flex-basis: calc((100% - 12px) / 2);
+    grid-column: span 12;
+  }
+  .lk-artifact-card.is-reasoning {
+    grid-column: span 12;
   }
 }
 @media (max-width: 980px) {
@@ -842,7 +873,7 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
   .lk-artifact-card.is-wide,
   .lk-artifact-card.is-hero,
   .lk-artifact-card.is-reasoning {
-    flex-basis: 100%;
+    grid-column: span 12;
   }
 }
 
@@ -1897,6 +1928,159 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
 .lk-mod-val .step .lbl { color: var(--ink-2); font-size: 10.5px; }
 .lk-mod-val .step.tot { border-top: 1px solid var(--line-1); padding-top: 5px; margin-top: 4px; }
 .lk-mod-val .step.tot .v { color: var(--clay-soft); font-size: 13px; }
+
+/* — settings — */
+.lk-settings {
+  min-height: 100%;
+  overflow: auto;
+  padding: 34px clamp(24px, 4vw, 64px);
+  background:
+    linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px),
+    var(--bg-0);
+  background-size: 32px 32px;
+}
+.lk-settings-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  max-width: 920px;
+  margin: 0 auto 22px;
+}
+.lk-settings-kicker,
+.lk-settings-sub,
+.lk-settings-status,
+.lk-settings-field span,
+.lk-settings-toggle,
+.lk-settings-refresh,
+.lk-settings-save {
+  font-family: var(--font-mono);
+}
+.lk-settings-kicker {
+  color: var(--clay-soft);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+}
+.lk-settings h1 {
+  margin: 4px 0 0;
+  color: var(--ink-0);
+  font-size: 24px;
+  font-weight: 600;
+}
+.lk-settings-refresh,
+.lk-settings-save {
+  border: 1px solid var(--line-1);
+  border-radius: 6px;
+  padding: 7px 13px;
+  color: var(--ink-1);
+  background: rgba(255,255,255,0.03);
+  font-size: 11px;
+}
+.lk-settings-refresh:hover,
+.lk-settings-save:hover {
+  border-color: rgba(217,119,87,0.45);
+  color: var(--clay-soft);
+}
+.lk-settings-card {
+  max-width: 920px;
+  margin: 0 auto;
+  border: 1px solid var(--line-1);
+  border-radius: 8px;
+  background: rgba(30, 27, 23, 0.78);
+  padding: 18px;
+}
+.lk-settings-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line-0);
+}
+.lk-settings-title {
+  color: var(--ink-0);
+  font-size: 17px;
+  font-weight: 600;
+}
+.lk-settings-sub {
+  margin-top: 4px;
+  color: var(--ink-3);
+  font-size: 11px;
+}
+.lk-settings-status {
+  color: var(--ink-3);
+  border: 1px solid var(--line-1);
+  border-radius: 999px;
+  padding: 4px 9px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+.lk-settings-status[data-ok="true"] {
+  color: var(--up);
+  border-color: rgba(111,185,138,0.42);
+  background: rgba(111,185,138,0.08);
+}
+.lk-settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 18px;
+}
+.lk-settings-field span {
+  color: var(--ink-3);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.lk-settings-field input {
+  height: 40px;
+  border: 1px solid var(--line-1);
+  border-radius: 7px;
+  background: rgba(255,255,255,0.035);
+  padding: 0 12px;
+  color: var(--ink-0);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+.lk-settings-field input:focus {
+  border-color: rgba(217,119,87,0.6);
+}
+.lk-settings-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.lk-settings-toggle input {
+  accent-color: var(--clay-soft);
+}
+.lk-settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 18px;
+}
+.lk-settings-ok {
+  color: var(--up);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.lk-settings-error,
+.lk-settings-error-inline {
+  color: #d97070;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.lk-settings-error {
+  margin-top: 12px;
+  border: 1px solid rgba(217,112,112,0.25);
+  border-radius: 6px;
+  background: rgba(217,112,112,0.06);
+  padding: 9px 10px;
+}
 
 /* ---------- icons ---------- */
 .ic { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }

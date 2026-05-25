@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use reqwest::Client;
@@ -307,9 +307,10 @@ impl ToolHandler for GetFundingRateTool {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
             description:
-                "Fetch perpetual futures funding rates and open interest for crypto assets. \
-                Use for sentiment analysis, funding arbitrage, and leverage assessment. \
-                Supports Binance (default) and OKX. No API key required. \
+                "Fetch perpetual futures funding rates, open interest, and long/short positioning where available. \
+                Use when the task needs leverage, crowding, or derivatives-flow context for crypto assets. \
+                This is derivatives market evidence, not a standalone long/short signal; combine with spot trend, liquidity, and event context. \
+                Supports Binance (default) and OKX. \
                 symbol format: \"BTCUSDT\" for Binance, \"BTC-USD-SWAP\" for OKX."
                     .into(),
             parameters: serde_json::json!({

@@ -4,6 +4,7 @@ mod auth;
 mod corpus;
 mod events;
 mod llm;
+pub mod tushare;
 mod vault;
 
 use std::io::Write;
@@ -11,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 
@@ -218,14 +219,12 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
         .register(Arc::new(
             agent::tools::corpus_search::CorpusSearchTool::new(),
         ))
+        .register(Arc::new(agent::tools::corpus_read::CorpusReadTool::new()))
         .register(Arc::new(
             agent::tools::sec_filing_fetch::SecFilingFetchTool::new()?,
         ))
         .register(Arc::new(
             agent::tools::tradingview_quote::TradingViewQuoteTool::new()?,
-        ))
-        .register(Arc::new(
-            agent::tools::record_investment_action::RecordInvestmentActionTool::new(),
         ))
         .register(Arc::new(
             agent::tools::get_financials::GetFinancialsTool::new()?,
@@ -242,23 +241,32 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
         .register(Arc::new(
             agent::tools::get_capital_flow::GetCapitalFlowTool::new()?,
         ))
-        .register(Arc::new(agent::tools::use_skill::UseSkillTool::new()))
-        .register(Arc::new(agent::tools::update_plan::UpdatePlanTool::new()))
         .register(Arc::new(
-            agent::tools::record_research_note::RecordResearchNoteTool::new(),
+            agent::tools::get_a_share_research_sources::GetAShareResearchSourcesTool::new()?,
         ))
+        .register(Arc::new(
+            agent::tools::get_a_share_industry_context::GetAShareIndustryContextTool::new()?,
+        ))
+        .register(Arc::new(
+            agent::tools::get_china_macro_context::GetChinaMacroContextTool::new()?,
+        ))
+        .register(Arc::new(
+            agent::tools::get_china_fund_context::GetChinaFundContextTool::new()?,
+        ))
+        .register(Arc::new(
+            agent::tools::get_china_index_context::GetChinaIndexContextTool::new()?,
+        ))
+        .register(Arc::new(
+            agent::tools::get_a_share_market_snapshot::GetAShareMarketSnapshotTool::new()?,
+        ))
+        .register(Arc::new(
+            agent::tools::get_a_share_ownership_and_leverage::GetAShareOwnershipAndLeverageTool::new()?,
+        ))
+        .register(Arc::new(agent::tools::update_plan::UpdatePlanTool::new()))
         .register(Arc::new(
             agent::tools::delegate_research::DelegateResearchTool::new(provider.clone()),
         ))
         .build();
-
-    // mandates/<user_id>.md sits next to the vault sqlite. Users edit this
-    // file directly (markdown over Obsidian / vim / etc); we re-read it on
-    // every chat turn so edits take effect without restart.
-    let mandate_path = vault_path.parent().map(|dir| {
-        dir.join("mandates")
-            .join(format!("{}.md", vault::LOCAL_USER_ID))
-    });
 
     let state = api::AppState {
         pool: vault.pool.clone(),
@@ -269,7 +277,6 @@ async fn run_serve(vault_path: &Path, port: u16) -> Result<()> {
             std::collections::HashMap::new(),
         )),
         tools,
-        mandate_path,
     };
 
     let app = api::router(state);
