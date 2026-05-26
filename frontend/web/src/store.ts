@@ -301,6 +301,43 @@ export function createWorkbench() {
     return d.turns[d.turns.length - 1];
   }
 
+  // ── M3.7 follow-up: subagent turn-id helpers ──────────────────────
+  //
+  // A subagent's `turn_id` is the parent's id with a `.sub-XXX`
+  // suffix; nesting deepens with another `.sub-YYY`. The frontend
+  // tracks ONE Turn entry per main turn (since each subagent's
+  // per-turn metadata lives on its `subagent_card` artifact). The
+  // bug before this fix: `ensureTurn(d, parentTurnId)` was called
+  // with parentTurnId that was itself a sub-turn id, minting a
+  // stray Turn entry that never received an `assistant_done` to
+  // flip its status to "done" — so the composer's "回合进行中"
+  // pill rendered forever on every replayed session.
+  //
+  // `topLevelTurnId` strips back to the main turn so `ensureTurn`
+  // always lands on the right anchor. `findSubagentInTree` walks
+  // the nested subagent_card tree to locate a card by its
+  // subagent_turn_id (depth N >= 1), so depth-2+ events land in the
+  // correct innerArtifacts instead of a stray Turn entry.
+
+  function topLevelTurnId(turnId: string): string {
+    const idx = turnId.indexOf(".sub-");
+    return idx < 0 ? turnId : turnId.slice(0, idx);
+  }
+
+  function findSubagentInTree(turn: Turn, subagentTurnId: string): Artifact | null {
+    function walk(arts: Artifact[]): Artifact | null {
+      for (const a of arts) {
+        if (a.kind === "subagent" && a.subagentTurnId === subagentTurnId) return a;
+        if (a.kind === "subagent" && a.innerArtifacts) {
+          const inner = walk(a.innerArtifacts);
+          if (inner) return inner;
+        }
+      }
+      return null;
+    }
+    return walk(turn.artifacts);
+  }
+
   function applyCanvas(ev: EventRow) {
     const kind = canvasKind(ev.kind);
     if (!kind) return;
@@ -329,13 +366,13 @@ export function createWorkbench() {
         produce((d: WorkbenchState) => {
           // Route into parent's subagent card when emitted inside a
           // subagent loop (parent_turn_id present), otherwise the main
-          // turn's artifacts.
+          // turn's artifacts. M3.7 follow-up: walk the subagent tree
+          // from the MAIN turn (parent_turn_id may itself be a sub-
+          // turn for depth ≥ 2 subagents).
           const targetArtifacts = (() => {
             if (parentTurnId) {
-              const parentTurn = ensureTurn(d, parentTurnId);
-              const subagentCard = parentTurn.artifacts.find(
-                (a) => a.kind === "subagent" && a.subagentTurnId === turnId,
-              );
+              const mainTurn = ensureTurn(d, topLevelTurnId(parentTurnId));
+              const subagentCard = findSubagentInTree(mainTurn, turnId);
               if (!subagentCard) return null;
               if (!subagentCard.innerArtifacts) subagentCard.innerArtifacts = [];
               return subagentCard.innerArtifacts;
@@ -369,6 +406,9 @@ export function createWorkbench() {
     // `subagent_turn_id` is the spawned subagent's id. The card lives
     // on the parent turn.
     if (kind === "subagent") {
+      // For subagent_lifecycle, `turn_id` is the SPAWNING turn (the
+      // immediate parent of the new subagent). For depth-1 subagents
+      // that's the main turn; for depth ≥ 2 it's itself a sub-turn.
       const parentTurnId = String(ev.payload.turn_id ?? "");
       if (!parentTurnId) return;
       const artifactId = String(ev.payload.artifact_id ?? "");
@@ -376,8 +416,24 @@ export function createWorkbench() {
       const phase = (ev.payload.phase as Phase) ?? "completion";
       setState(
         produce((d: WorkbenchState) => {
-          const turn = ensureTurn(d, parentTurnId);
-          const idx = turn.artifacts.findIndex((a) => a.artifactId === artifactId);
+          // M3.7 follow-up: always anchor the turn at the top-level
+          // main turn; if the spawning parent is itself a subagent,
+          // nest the new subagent_card into that parent's
+          // innerArtifacts. Pre-fix: a depth-2 subagent spawn would
+          // mint a stray Turn entry for the depth-1 sub-turn id
+          // ("回合 2 进行中") because `ensureTurn(parentTurnId)`
+          // accepted any string.
+          const mainTurnId = topLevelTurnId(parentTurnId);
+          const mainTurn = ensureTurn(d, mainTurnId);
+          const targetArtifacts = (() => {
+            if (parentTurnId === mainTurnId) return mainTurn.artifacts;
+            const parentCard = findSubagentInTree(mainTurn, parentTurnId);
+            if (!parentCard) return null;
+            if (!parentCard.innerArtifacts) parentCard.innerArtifacts = [];
+            return parentCard.innerArtifacts;
+          })();
+          if (!targetArtifacts) return;
+          const idx = targetArtifacts.findIndex((a) => a.artifactId === artifactId);
           if (idx < 0) {
             const art: Artifact = {
               artifactId,
@@ -388,9 +444,9 @@ export function createWorkbench() {
               innerArtifacts: [],
             };
             mergeData(art, "subagent", ev.payload as Record<string, unknown>);
-            turn.artifacts.push(art);
+            targetArtifacts.push(art);
           } else {
-            const art = turn.artifacts[idx];
+            const art = targetArtifacts[idx];
             art.phase = phase;
             mergeData(art, "subagent", ev.payload as Record<string, unknown>);
           }
@@ -416,12 +472,14 @@ export function createWorkbench() {
     setState(
       produce((d: WorkbenchState) => {
         if (parentTurnId) {
-          // Subagent-emitted event — append / merge into the parent
-          // turn's subagent_card whose subagent_turn_id == turnId.
-          const parentTurn = ensureTurn(d, parentTurnId);
-          const subagentCard = parentTurn.artifacts.find(
-            (a) => a.kind === "subagent" && a.subagentTurnId === turnId,
-          );
+          // Subagent-emitted event — append / merge into the
+          // subagent_card whose subagent_turn_id == turnId.
+          // M3.7 follow-up: walk from the top-level main turn so
+          // depth ≥ 2 events land in the correct nested innerArtifacts
+          // instead of minting a stray "回合 2" Turn entry from a
+          // sub-turn parentTurnId.
+          const mainTurn = ensureTurn(d, topLevelTurnId(parentTurnId));
+          const subagentCard = findSubagentInTree(mainTurn, turnId);
           if (!subagentCard) {
             // The lifecycle Start frame should arrive before any inner
             // event. If it didn't, drop the event rather than crash —
@@ -583,6 +641,19 @@ export function createWorkbench() {
   function applyLifecycle(ev: EventRow) {
     const turnId = String(ev.payload.turn_id ?? "");
     if (!turnId) return;
+    // M3.7 follow-up: subagent-emitted lifecycle events (currently
+    // `turn_cost_capped`, but the gate is defensive against future
+    // additions) carry `parent_turn_id` pointing at the spawning
+    // turn. The subagent's per-turn state — including cost cap, stop
+    // reason, retries — is rendered through the subagent_card living
+    // on the parent turn (see `applyCanvas` + the `subagent`
+    // artifact's mergeData), so the lifecycle surface does NOT need
+    // to mint a separate Turn entry for the sub-turn id. Doing so
+    // (the pre-fix behaviour) poisoned `turns[]` with a "running"
+    // entry that never received an `assistant_done` to flip it to
+    // "done", which the composer footer ("回合进行中 · 正在启动…")
+    // then surfaced forever on every replayed session — UI ≠ truth.
+    if (ev.payload.parent_turn_id != null) return;
     // Brain activation: assistant_done settles `currentTurn` to the
     // just-finished turn so the brain's "this turn" highlight follows
     // the user's most recent question even if no tool was called this

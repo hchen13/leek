@@ -175,5 +175,177 @@ check("completion of a different kind does not clear", () => {
   assert.deepEqual(a, { kind: "tool", displayName: "X" });
 });
 
+// ── shape mirror: applyLifecycle subagent gate (M3.7 follow-up) ──────
+// The composer footer ("回合进行中 · 正在启动…") reads
+// `turns.find(t => t.status === "running")`. Before the fix,
+// `applyLifecycle` called `ensureTurn(d, turn_id)` even when the event
+// was emitted from a subagent loop (turn_id like
+// "turn-abc.sub-deadbeef"), creating a Turn entry that never received
+// an `assistant_done` to flip it to "done" — so every replayed session
+// showed the pill forever. The gate skips lifecycle events with
+// `parent_turn_id` set, because the subagent's per-turn state is
+// already surfaced via the subagent_card on the parent turn.
+
+function lifecycleShouldCreateTurn(payload) {
+  // Returns true if the lifecycle event should be allowed to call
+  // ensureTurn(turn_id). Mirrors the gate at the top of
+  // store.applyLifecycle.
+  if (!payload || !payload.turn_id) return false;
+  if (payload.parent_turn_id != null) return false;
+  return true;
+}
+
+// ── shape mirror: subagent turn-id helpers (M3.7 follow-up) ─────────
+// The depth-2+ subagent rendering bug: `applyCanvas` called
+// `ensureTurn(d, parentTurnId)` with a parentTurnId that was itself a
+// sub-turn id (depth ≥ 2 subagents nest), minting a stray Turn entry
+// that became "回合 2 进行中" forever. The fix introduces
+// topLevelTurnId() to strip back to the main turn, and
+// findSubagentInTree() to walk the subagent_card chain.
+
+function topLevelTurnId(turnId) {
+  const idx = turnId.indexOf(".sub-");
+  return idx < 0 ? turnId : turnId.slice(0, idx);
+}
+
+function findSubagentInTree(turn, subagentTurnId) {
+  function walk(arts) {
+    for (const a of arts) {
+      if (a.kind === "subagent" && a.subagentTurnId === subagentTurnId) return a;
+      if (a.kind === "subagent" && a.innerArtifacts) {
+        const inner = walk(a.innerArtifacts);
+        if (inner) return inner;
+      }
+    }
+    return null;
+  }
+  return walk(turn.artifacts);
+}
+
+console.log("\ntopLevelTurnId:");
+check("main turn passes through unchanged", () => {
+  assert.equal(topLevelTurnId("turn-abc123"), "turn-abc123");
+});
+check("depth-1 sub-turn strips the .sub- suffix", () => {
+  assert.equal(
+    topLevelTurnId("turn-abc123.sub-deadbeef"),
+    "turn-abc123",
+  );
+});
+check("depth-2 nested sub-turn strips ALL suffixes", () => {
+  assert.equal(
+    topLevelTurnId("turn-abc123.sub-deadbeef.sub-cafebabe"),
+    "turn-abc123",
+  );
+});
+check("depth-3 nested sub-turn strips ALL suffixes", () => {
+  assert.equal(
+    topLevelTurnId("turn-abc.sub-d.sub-e.sub-f"),
+    "turn-abc",
+  );
+});
+
+console.log("\nfindSubagentInTree:");
+check("finds depth-1 card directly on main turn", () => {
+  const turn = {
+    artifacts: [
+      { kind: "subagent", subagentTurnId: "turn-X.sub-D1", innerArtifacts: [] },
+      { kind: "tool", artifactId: "t1" },
+    ],
+  };
+  const found = findSubagentInTree(turn, "turn-X.sub-D1");
+  assert.ok(found && found.kind === "subagent");
+  assert.equal(found.subagentTurnId, "turn-X.sub-D1");
+});
+check("walks into innerArtifacts to find depth-2 card", () => {
+  const turn = {
+    artifacts: [
+      {
+        kind: "subagent",
+        subagentTurnId: "turn-X.sub-D1",
+        innerArtifacts: [
+          { kind: "tool", artifactId: "t1" },
+          { kind: "subagent", subagentTurnId: "turn-X.sub-D1.sub-D2a", innerArtifacts: [] },
+          { kind: "subagent", subagentTurnId: "turn-X.sub-D1.sub-D2b", innerArtifacts: [] },
+        ],
+      },
+    ],
+  };
+  const found = findSubagentInTree(turn, "turn-X.sub-D1.sub-D2b");
+  assert.ok(found);
+  assert.equal(found.subagentTurnId, "turn-X.sub-D1.sub-D2b");
+});
+check("walks recursively for depth-3", () => {
+  const turn = {
+    artifacts: [
+      {
+        kind: "subagent",
+        subagentTurnId: "turn-X.sub-A",
+        innerArtifacts: [
+          {
+            kind: "subagent",
+            subagentTurnId: "turn-X.sub-A.sub-B",
+            innerArtifacts: [
+              { kind: "subagent", subagentTurnId: "turn-X.sub-A.sub-B.sub-C", innerArtifacts: [] },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+  const found = findSubagentInTree(turn, "turn-X.sub-A.sub-B.sub-C");
+  assert.ok(found);
+  assert.equal(found.subagentTurnId, "turn-X.sub-A.sub-B.sub-C");
+});
+check("returns null when no match", () => {
+  const turn = {
+    artifacts: [{ kind: "subagent", subagentTurnId: "turn-X.sub-Z", innerArtifacts: [] }],
+  };
+  assert.equal(findSubagentInTree(turn, "turn-X.sub-MISSING"), null);
+});
+check("returns null on empty turn", () => {
+  assert.equal(findSubagentInTree({ artifacts: [] }, "anything"), null);
+});
+
+console.log("\napplyLifecycle subagent gate:");
+check("main-agent assistant_done passes through", () => {
+  assert.equal(
+    lifecycleShouldCreateTurn({
+      turn_id: "turn-abc123",
+      stop_reason: "end_turn",
+    }),
+    true,
+  );
+});
+check("subagent turn_cost_capped (parent_turn_id set) is skipped", () => {
+  // Real shape from a DR4-style cost-capped subagent — the event
+  // surface=lifecycle and parent_turn_id points at the spawning turn.
+  assert.equal(
+    lifecycleShouldCreateTurn({
+      turn_id: "turn-abc123.sub-deadbeef",
+      parent_turn_id: "turn-abc123",
+      cap_usd: 5.0,
+      actual_cost_usd: 5.018,
+    }),
+    false,
+  );
+});
+check("subagent provider_retry_attempt is skipped", () => {
+  assert.equal(
+    lifecycleShouldCreateTurn({
+      turn_id: "turn-abc123.sub-deadbeef",
+      parent_turn_id: "turn-abc123",
+      attempt: 1,
+      max_attempts: 5,
+      kind: "codex_stream_silent",
+    }),
+    false,
+  );
+});
+check("missing turn_id never creates an entry", () => {
+  assert.equal(lifecycleShouldCreateTurn({}), false);
+  assert.equal(lifecycleShouldCreateTurn(null), false);
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);
