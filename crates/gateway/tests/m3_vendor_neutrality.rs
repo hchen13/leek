@@ -52,6 +52,13 @@ fn tool_spec_descriptions_are_vendor_neutral() {
         "src/agent/tools/get_financials.rs",
         "src/agent/tools/get_company_info.rs",
         "src/agent/tools/get_capital_flow.rs",
+        // M4.1 — supplementary research tools.
+        "src/agent/tools/get_industry_peers.rs",
+        "src/agent/tools/get_business_breakdown.rs",
+        "src/agent/tools/get_announcements.rs",
+        "src/agent/tools/get_consensus.rs",
+        "src/agent/tools/get_top_holders.rs",
+        "src/agent/tools/get_concepts.rs",
     ];
     let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut violations: Vec<String> = Vec::new();

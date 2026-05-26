@@ -15,6 +15,7 @@ reasoning_effort: medium
    - `web_search` / `web_fetch`：补充外部公开信息（依照求证纪律：事实先搜后答）
    - `update_plan`：复杂任务时用来切分步骤
    - `use_skill`：必要时加载 skill body 获取专业指南
+   - A 股取数全套：`market_quote` / `get_candlesticks` / `get_financials` / `get_company_info` / `get_capital_flow` / `get_industry_peers` / `get_business_breakdown` / `get_announcements` / `get_consensus` / `get_top_holders` / `get_concepts`。注意：当工具返回 `display_payload.data_available: false` 时绝对**不要**编造数据，明示用户该项暂不可用。
 3. **综合 + 整理**。把多个工具的结果合成成一份 text digest —— 几百字到几千字，视任务复杂度。Digest 必须可直接被父 agent 读懂。
 4. **final response**。这是你给父 agent 的唯一返回 —— single text block，没有特定格式但要有 logical 结构。包含：
    - 任务的执行情况（用了什么工具、命中什么）

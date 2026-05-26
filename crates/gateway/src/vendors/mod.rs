@@ -41,7 +41,9 @@ pub use sina::SinaClient;
 pub use tushare::TushareClient;
 pub use types::*;
 pub use vendor_trait::{
-    VendorCandle, VendorCapitalFlow, VendorCompanyInfo, VendorFinancial, VendorQuote,
+    VendorAnnouncements, VendorBusinessBreakdown, VendorCandle, VendorCapitalFlow,
+    VendorCompanyInfo, VendorConcepts, VendorConsensus, VendorFinancial, VendorIndustryPeers,
+    VendorQuote, VendorTopHolders,
 };
 #[allow(unused_imports)]
 pub use vendor_trait::VendorError;

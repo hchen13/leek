@@ -378,6 +378,16 @@ Web search 使用 provider/server-side search，不作为普通 client-side func
 - `get_financials`
 - `get_company_info`
 - `get_capital_flow`
+- `get_industry_peers`（M4.1）
+- `get_business_breakdown`（M4.1）
+- `get_announcements`（M4.1）
+- `get_consensus`（M4.1）
+- `get_top_holders`（M4.1）
+- `get_concepts`（M4.1）
+
+M4.1 起的 6 个工具在所有 vendor 都拒绝时 **必须** 返回结构化的
+`data_available: false`，模型基于此明示用户"该项不可用"，**绝对禁止**
+凭印象补数。
 
 工具名称是否最终采用以上名字，由实现时的工具语义决定；UI 必须通过 display metadata 渲染人话名称。
 

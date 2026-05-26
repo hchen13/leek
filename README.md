@@ -110,10 +110,10 @@ Until a settings UI exists, guards are tuned by environment variable
 | `LEEK_WEB_SEARCH` | off | Offer the provider-side `web_search` tool (opt-in; the codex backend gates web search behind its own config) |
 | `LEEK_TUSHARE_TOKEN` | off | Token for the primary A-share data source. With no token, only the public-fallback paths work (snapshot quotes via `hq.sinajs.cn`, daily candles via EastMoney); fundamentals + capital-flow tools will return a structured error. Get a free token at <https://tushare.pro/register>. |
 
-### A-share research tools (M3)
+### A-share research tools (M3 + M4.1)
 
-L.E.E.K ships five vendor-neutral A-share tools. Names and field shapes
-are generic (`market_quote`, `revenue`, `roe`, …) — the upstream
+L.E.E.K ships eleven vendor-neutral A-share tools. Names and field
+shapes are generic (`market_quote`, `revenue`, `roe`, …) — the upstream
 identity is hidden from the model and stays in the `vendors/` module.
 
 | Tool | What it does | Vendors (primary → fallback) |
@@ -123,6 +123,19 @@ identity is hidden from the model and stays in the `vendors/` module.
 | `get_financials` | Income / balance / cashflow / ratios (quarterly or annual) | Tushare |
 | `get_company_info` | Company profile + latest valuation indicators | Tushare |
 | `get_capital_flow` | Net flow over 1d / 5d / 20d, with northbound when quota allows | Tushare |
+| `get_industry_peers` | Same-industry peer set (≤12) on valuation / growth / profitability + target quantile | Tushare |
+| `get_business_breakdown` | Main-business revenue split by product / industry / region | Tushare → EastMoney F10 |
+| `get_announcements` | Recent announcements + category tag, ≤365 day lookback | Tushare → EastMoney |
+| `get_consensus` | Sell-side EPS / net-profit forecasts + rating mix | Tushare → EastMoney |
+| `get_top_holders` | Top-10 (total or float) shareholders + QoQ change | Tushare → EastMoney F10 |
+| `get_concepts` | Concept / theme tags (≤30) | Tushare → EastMoney |
+
+When every source refuses (no token + fallback denied / out of quota),
+the four "supplementary" tools (`industry_peers`, `business_breakdown`,
+`consensus`, `top_holders`, `announcements`, `concepts`) return a
+structured `data_available: false` payload with a `reason` string — the
+model is instructed to surface "data unavailable" instead of fabricating
+numbers.
 
 Symbols accept `600519.SH` (preferred), bare `600519` (exchange
 inferred), or `sh600519`.
@@ -248,9 +261,9 @@ SSE 事件类型（M1.9 workbench 契约——每个 payload 带 `surface`：
 | `LEEK_WEB_SEARCH` | 关 | 是否提供 provider-side `web_search` 工具（opt-in；codex backend 自身把 web search gate 在其配置后） |
 | `LEEK_TUSHARE_TOKEN` | 关 | A 股数据主源 token。不配置时只有公开 fallback 链可用（快照报价走 `hq.sinajs.cn`，日 K 走 EastMoney）；财报和资金流工具会返回结构化错误。免费 token 在 <https://tushare.pro/register> 注册。 |
 
-### A 股投研工具（M3）
+### A 股投研工具（M3 + M4.1）
 
-L.E.E.K 5 个 A 股工具命名/字段都对厂商中立（`market_quote`、`revenue`、
+L.E.E.K 11 个 A 股工具命名/字段都对厂商中立（`market_quote`、`revenue`、
 `roe` 等通用术语）—— 具体上游身份隐藏在 `vendors/` 模块里，不进入模型上下文。
 
 | 工具 | 干什么 | Vendor（主 → fallback） |
@@ -260,6 +273,16 @@ L.E.E.K 5 个 A 股工具命名/字段都对厂商中立（`market_quote`、`rev
 | `get_financials` | 利润表 / 资产负债表 / 现金流 / 比率（季度或年度） | Tushare |
 | `get_company_info` | 公司画像 + 最新估值指标 | Tushare |
 | `get_capital_flow` | 1d/5d/20d 净流入，北向资金 quota 开通时附带 | Tushare |
+| `get_industry_peers` | 同行业可比公司 ≤12 家 + 估值 / 增长 / 盈利分位 | Tushare |
+| `get_business_breakdown` | 主营业务收入按 product / industry / region 切分 | Tushare → EastMoney F10 |
+| `get_announcements` | 近 365 天公告 + 自动分类（增减持 / 分红 / 解禁…） | Tushare → EastMoney |
+| `get_consensus` | 卖方一致预期营收 / 净利 / EPS + 评级分布 | Tushare → EastMoney |
+| `get_top_holders` | 前 10 大股东（全部 / 流通）+ 季度变动 | Tushare → EastMoney F10 |
+| `get_concepts` | 所属概念 / 题材 ≤30 个 | Tushare → EastMoney |
+
+当所有 vendor 都拒绝（没 token + fallback 也被限）时，6 个 M4.1 工具会
+返回结构化的 `data_available: false` + `reason` 字段 —— 模型被指引"明示
+不可用"，而**不是**凭印象编数据。这是 leek 的核心数据纪律。
 
 Symbol 接受 `600519.SH`（首选）、bare `600519`（自动推断交易所）、
 `sh600519` 任意一种。

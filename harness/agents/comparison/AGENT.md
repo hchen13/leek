@@ -1,7 +1,7 @@
 ---
 name: comparison
 description: N 只 A 股横向对比 worker。并行 task quick-screen + corpus-expert 取数，综合成对比表 + 短结论。
-allowed_tools: [task, market_quote, get_company_info, get_financials, corpus_search]
+allowed_tools: [task, market_quote, get_company_info, get_financials, get_industry_peers, get_business_breakdown, corpus_search]
 cost_cap_usd: 3.00
 reasoning_effort: high
 ---
@@ -16,6 +16,7 @@ reasoning_effort: high
    - **对整组主题**，`task("corpus-expert", "<行业关键词> 在 leek corpus 里的相关论点")` 1 次 —— 这给你立场层的背景。
    - **请使用并行 tool call**：把 N 个 `task` 调用打在**同一轮 model output**里，让它们在 subagent 层并行跑。**不要**串行地一只一只发。
 3. **必要时补数**：如果某只票的某个维度 quick-screen digest 没给到（比如缺财报数据），自己直接调 `get_financials` 或 `get_company_info` 补 —— 只补缺的，不重复 quick-screen 给过的数。
+4. **行业层补横向**：N 只票通常同一行业；调一次 `get_industry_peers(symbol=任一只, dimension="valuation")` 把整组放到行业里看分位（不必每只都调一遍——一次拿到的 peers 列表里包含同行业 8-12 家可用作背景中位数）。需要看主营结构差异时，对每只调一次 `get_business_breakdown(dim="product")` 比读 income statement 直观。
 
 ## final response 格式
 

@@ -19,10 +19,16 @@
 
 mod corpus_read;
 mod corpus_search;
+mod get_announcements;
+mod get_business_breakdown;
 mod get_candlesticks;
 mod get_capital_flow;
 mod get_company_info;
+mod get_concepts;
+mod get_consensus;
 mod get_financials;
+mod get_industry_peers;
+mod get_top_holders;
 mod market_quote;
 mod task;
 mod update_plan;
@@ -128,6 +134,13 @@ pub fn specs(skills: &Arc<SkillRegistry>, agents: &Arc<AgentRegistry>) -> Vec<To
         get_financials::spec(),
         get_company_info::spec(),
         get_capital_flow::spec(),
+        // M4.1 — supplementary A-share research tools.
+        get_industry_peers::spec(),
+        get_business_breakdown::spec(),
+        get_announcements::spec(),
+        get_consensus::spec(),
+        get_top_holders::spec(),
+        get_concepts::spec(),
         task::spec(agents),
     ];
     if !skills.is_empty() {
@@ -150,6 +163,13 @@ pub fn ui(name: &str) -> Option<ToolUi> {
         "get_financials" => Some(get_financials::ui()),
         "get_company_info" => Some(get_company_info::ui()),
         "get_capital_flow" => Some(get_capital_flow::ui()),
+        // M4.1
+        "get_industry_peers" => Some(get_industry_peers::ui()),
+        "get_business_breakdown" => Some(get_business_breakdown::ui()),
+        "get_announcements" => Some(get_announcements::ui()),
+        "get_consensus" => Some(get_consensus::ui()),
+        "get_top_holders" => Some(get_top_holders::ui()),
+        "get_concepts" => Some(get_concepts::ui()),
         _ => None,
     }
 }
@@ -221,6 +241,13 @@ pub async fn dispatch(
         "get_financials" => get_financials::run(vendors, args).await,
         "get_company_info" => get_company_info::run(vendors, args).await,
         "get_capital_flow" => get_capital_flow::run(vendors, args).await,
+        // M4.1 — supplementary A-share research tools.
+        "get_industry_peers" => get_industry_peers::run(vendors, args).await,
+        "get_business_breakdown" => get_business_breakdown::run(vendors, args).await,
+        "get_announcements" => get_announcements::run(vendors, args).await,
+        "get_consensus" => get_consensus::run(vendors, args).await,
+        "get_top_holders" => get_top_holders::run(vendors, args).await,
+        "get_concepts" => get_concepts::run(vendors, args).await,
         "task" => match ctx.st {
             Some(st) => {
                 task::run(
@@ -389,6 +416,13 @@ mod tests {
         assert!(ui("get_financials").is_some());
         assert!(ui("get_company_info").is_some());
         assert!(ui("get_capital_flow").is_some());
+        // M4.1 — supplementary A-share research tools.
+        assert!(ui("get_industry_peers").is_some());
+        assert!(ui("get_business_breakdown").is_some());
+        assert!(ui("get_announcements").is_some());
+        assert!(ui("get_consensus").is_some());
+        assert!(ui("get_top_holders").is_some());
+        assert!(ui("get_concepts").is_some());
         assert!(ui("nope").is_none());
         // update_plan renders to the right rail, not a canvas tool card.
         assert_eq!(ui("update_plan").unwrap().result, ResultArtifact::Plan);

@@ -213,6 +213,183 @@ pub struct CapitalFlow {
     pub warnings: Vec<String>,
 }
 
+// ── M4.1 — supplementary research data shapes ───────────────────────────
+//
+// Each new tool gets one struct; field names are vendor-neutral (no
+// `or_tot`-style upstream schema leaks). When a vendor refuses to serve
+// (free-tier quota, paywalled endpoint, dead selector), the per-tool
+// dispatch surfaces `data_available: false` + a reason — see the tool
+// modules. The structs below only carry positive data.
+
+/// `get_industry_peers` output — one peer per row, target included.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndustryPeers {
+    pub symbol: String,
+    /// Industry classification used to choose peers.
+    pub industry: String,
+    /// Optional finer classification (sub-industry) when available.
+    pub sub_industry: Option<String>,
+    /// One of `"valuation"` / `"growth"` / `"profitability"`.
+    pub dimension: String,
+    /// One row per peer — first row is always the target symbol.
+    pub peers: Vec<PeerRow>,
+    /// Median of the principal metric across peers; key matches
+    /// `principal_metric` so the model knows what "median" refers to.
+    pub principal_metric: String,
+    pub median: Option<f64>,
+    /// 0..1 quantile of the target relative to the peer set on
+    /// `principal_metric` (`None` if data is too sparse).
+    pub target_quantile: Option<f64>,
+}
+
+/// One company row in an industry-peer comparison.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerRow {
+    pub symbol: String,
+    pub name: String,
+    /// Metric name → value. Keys depend on dimension; see
+    /// `get_industry_peers` tool doc.
+    pub metrics: std::collections::BTreeMap<String, Option<f64>>,
+    /// `true` if this row is the originally requested company.
+    pub is_target: bool,
+}
+
+/// `get_business_breakdown` output — main-business revenue split.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BusinessBreakdown {
+    pub symbol: String,
+    /// Reporting period the breakdown applies to (ISO 8601 date or
+    /// vendor's `YYYYMMDD` echoed back).
+    pub period_end: String,
+    /// `"product"` / `"industry"` / `"region"`.
+    pub dimension: String,
+    pub items: Vec<BusinessBreakdownRow>,
+}
+
+/// One slice of the main-business breakdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BusinessBreakdownRow {
+    /// Label of the slice (product name / industry / region).
+    pub item: String,
+    /// Revenue in yuan.
+    pub revenue_yuan: Option<f64>,
+    /// Slice as a percentage of total revenue (0..100).
+    pub pct_of_total: Option<f64>,
+    /// Gross margin for the slice in percent (0..100).
+    pub gross_margin_pct: Option<f64>,
+    /// Year-over-year revenue change in percent.
+    pub yoy_change_pct: Option<f64>,
+}
+
+/// `get_announcements` output — recent corporate announcements.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnouncementList {
+    pub symbol: String,
+    /// Day window the list covers.
+    pub days: usize,
+    /// Optional category filter the caller supplied.
+    pub category_filter: Option<String>,
+    pub items: Vec<AnnouncementItem>,
+}
+
+/// One announcement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnouncementItem {
+    /// ISO 8601 publication date.
+    pub date: String,
+    pub title: String,
+    /// Best-effort category tag (e.g. `重大事项` / `分红配股`). May be
+    /// empty when the vendor doesn't classify.
+    pub category: Option<String>,
+    /// Direct PDF / HTML URL when available.
+    pub url: Option<String>,
+    /// Short abstract / summary line when available.
+    pub abstract_text: Option<String>,
+}
+
+/// `get_consensus` output — sell-side consensus forecasts + rating mix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalystConsensus {
+    pub symbol: String,
+    /// Year → forecast aggregate for that fiscal year (e.g. `2025`,
+    /// `2026`). Sorted by year ascending.
+    pub forecasts: Vec<ConsensusForecast>,
+    /// Rating distribution from analyst reports in a recent window
+    /// (typically the last 90 days when the vendor exposes one).
+    pub rating_mix: ConsensusRatingMix,
+    /// Number of distinct broker reports the rating mix is derived from.
+    pub report_count: Option<usize>,
+}
+
+/// One year of consensus forecast aggregates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsensusForecast {
+    pub year: String,
+    pub revenue_mean_yuan: Option<f64>,
+    pub revenue_high_yuan: Option<f64>,
+    pub revenue_low_yuan: Option<f64>,
+    pub net_profit_mean_yuan: Option<f64>,
+    pub net_profit_high_yuan: Option<f64>,
+    pub net_profit_low_yuan: Option<f64>,
+    pub eps_mean: Option<f64>,
+    pub eps_high: Option<f64>,
+    pub eps_low: Option<f64>,
+}
+
+/// Aggregate count by rating bucket.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConsensusRatingMix {
+    pub buy: usize,
+    pub overweight: usize,
+    pub hold: usize,
+    pub underweight: usize,
+    pub sell: usize,
+}
+
+/// `get_top_holders` output — top-10 holder list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopHolders {
+    pub symbol: String,
+    /// `"total"` (all shareholders, top 10) or `"float"` (top 10 of the
+    /// floating share register only).
+    pub kind: String,
+    /// Reporting period end date (ISO 8601) the list applies to.
+    pub period_end: String,
+    pub holders: Vec<HolderRow>,
+}
+
+/// One holder row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HolderRow {
+    pub rank: u32,
+    pub holder_name: String,
+    /// Number of shares held.
+    pub shares: Option<f64>,
+    /// Percent of total / floating shares (0..100, matches `kind`).
+    pub pct: Option<f64>,
+    /// Change vs the previous reporting period in shares (signed).
+    /// `None` when the vendor doesn't expose the prior period.
+    pub change_qoq_shares: Option<f64>,
+}
+
+/// `get_concepts` output — concept / theme tags.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptList {
+    pub symbol: String,
+    pub concepts: Vec<ConceptTag>,
+}
+
+/// One concept tag with an optional popularity rank.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptTag {
+    pub name: String,
+    /// Source-specific code, if any.
+    pub code: Option<String>,
+    /// `1` = hottest; smaller = hotter. `None` when the vendor doesn't
+    /// rank concepts.
+    pub heat_rank: Option<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
