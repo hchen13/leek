@@ -609,14 +609,58 @@ Task 形态——有 eval case 端到端跑通：
 
 ---
 
-## M4 — A 股完整版
+## M4 — A 股完整版（无记忆 agent 全力打磨）
 
-### 目标（占位）
+### 范围决策（2026-05-26，M3 真 done 后定）
 
-生产可用的 A 股研究纵向：所有常见研究问题形态覆盖、跨 session
-保留结论、可观测性仪表盘。
+跨 session 记忆系统 **deferred 到 M5**。M3 跑通后看到 leek 单 session
+内还远没"漂亮"：工具极度缺失（不能胜任最简单 A 股分析）、UI 设计
+原始（K 线 / 财务还是 JSON 不是 chart）、user 看不见 leek 替自己干了
+啥（没仪表盘）、跑出的好分析没法搬出工作台（无导出 / 分享）。先把
+无记忆 agent 这条线打到位再考虑给它装记忆。
 
-[细节范围 M3 落地、看到缺什么之后再细化。]
+### 5 个子 milestone
+
+**M4.1 — A 股工具补齐**（make basic A-share analysis usable）
+- 加 6-7 个常见研究必需工具：同行业对比 / 主营业务构成 / 公告事件 /
+  一致预期 / 股东结构 / 概念题材 / 财经新闻
+- vendor 层 tushare 主源 + sina/eastmoney/web_fetch fallback 链对齐
+  M3 模式
+- 内置 AGENT.md（quick-screen / deep-review / comparison）描述更新
+
+**M4.2 — 数据可视化 + 卡片设计**
+- K 线 / 财务 / 资金流 / 同行业对比的卡片从 JSON 升级到 chart（svg /
+  canvas-based）
+- 卡片视觉系统统一（typography / spacing / color / 涨跌色 / 数据 cite
+  标记）
+- "详情" 抽屉式展开（不再吞掉整个 canvas 宽度）
+
+**M4.3 — Workbench 整体设计升级**
+- session list 加 grouping（today / 这周 / 这月 / earlier）+ search
+- chat / canvas 视觉层次（typography scale / line height / 暗色主题
+  保留 + 加亮色可选）
+- empty state / loading state / error state 全套 polish
+- 微交互（hover / focus / transition）
+
+**M4.4 — 可观测性 Dashboard**
+- 新页：本周 / 本月 leek 做了什么
+- stop_reason 分布 / 平均 wall clock / cost 总额 / subagent 命中率
+- 最近 turn 列表 + filter（by stop_reason / by symbol / by date）
+- corpus 激活 top N / 最贵 prompt top 5
+
+**M4.5 — 报告导出 + 分享**
+- chat assistant message → 一键导出 Markdown / PDF / 微信图文格式
+- canvas 完整 turn → 导出 HTML report（含工具卡片 + chart）
+- 单 session 分享 link（只读快照，不携带 token，不跨 session 拉数据）
+
+### Ordering 与依赖
+
+M4.1（工具）→ M4.2（数据可视化，依赖 M4.1 的新数据 shape）→
+M4.3（整体 polish，独立）→ M4.4（dashboard，独立但 M4.2 的卡片
+设计可复用）→ M4.5（导出，依赖 M4.2 的 chart 渲染能否导出 PNG /
+HTML）。
+
+跨 session 记忆 / 持仓 / 价格预警 → 推到 M5。
 
 ---
 
