@@ -47,18 +47,17 @@ fn tool_spec_descriptions_are_vendor_neutral() {
     // entry-point; this is the cheapest binding-free way to read what
     // every tool advertises.
     let spec_files = [
-        "src/agent/tools/market_quote.rs",
-        "src/agent/tools/get_candlesticks.rs",
-        "src/agent/tools/get_financials.rs",
-        "src/agent/tools/get_company_info.rs",
-        "src/agent/tools/get_capital_flow.rs",
-        // M4.1 — supplementary research tools.
-        "src/agent/tools/get_industry_peers.rs",
-        "src/agent/tools/get_business_breakdown.rs",
-        "src/agent/tools/get_announcements.rs",
-        "src/agent/tools/get_consensus.rs",
-        "src/agent/tools/get_top_holders.rs",
-        "src/agent/tools/get_concepts.rs",
+        // M4.1.1 — facts-only A-share research kit (replaces the M3
+        // and M4.1-v1 endpoint wrappers).
+        "src/agent/tools/macro_indicators.rs",
+        "src/agent/tools/industry_landscape.rs",
+        "src/agent/tools/market_overview.rs",
+        "src/agent/tools/stock_overview.rs",
+        "src/agent/tools/recent_actions.rs",
+        "src/agent/tools/market_pulse.rs",
+        "src/agent/tools/research_sentiment.rs",
+        "src/agent/tools/chart_data.rs",
+        "src/agent/tools/read_pdf.rs",
     ];
     let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut violations: Vec<String> = Vec::new();

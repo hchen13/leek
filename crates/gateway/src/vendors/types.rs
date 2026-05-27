@@ -1,9 +1,27 @@
-//! Vendor-neutral data shapes returned by every market tool. Field names
-//! use generic financial terminology (`revenue`, `net_profit`, `roe`) —
-//! never vendor-specific schema names (Tushare's `or_tot`, `n_income_attr_p`,
-//! etc.). The mapping happens inside each vendor module.
+//! Vendor-neutral shapes shared across the M4.1.1 facts-only tool set.
+//!
+//! Field names use generic financial terminology only (e.g. `revenue`,
+//! `pe_ttm`, `roe`) — never an upstream's schema field name. Vendor
+//! identity is confined to the `vendors/` module bodies, env-var names
+//! and tracing log fields. The `tests/m3_vendor_neutrality.rs`
+//! integration test enforces that nothing leaks across the model
+//! boundary.
+//!
+//! Most of these types are *transport* shapes — the tools collapse them
+//! into a per-call display payload and a distilled markdown surface.
+//! They are kept narrow and serializable so the canvas card can read
+//! them verbatim.
+//!
+//! ## Date handling
+//!
+//! All `date` / `period_end` strings are ISO 8601 (`2026-05-26`). The
+//! vendor parsers normalize compact dates (`20260526`) inside their
+//! adapter modules.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+// ── Symbol ────────────────────────────────────────────────────────────
 
 /// Normalized A-share symbol: numeric code + standardized exchange suffix.
 /// `600519.SH`, `000001.SZ`. The parser accepts `600519`, `600519.sh`,
@@ -23,22 +41,21 @@ impl Symbol {
         format!("{}.{}", self.code, self.exchange)
     }
 
-    /// Render the form some vendors want (Sina: `sh600519`).
+    /// Render the form some vendors want (Sina-style: `sh600519`).
+    #[allow(dead_code)]
     pub fn to_prefixed(&self) -> String {
         format!("{}{}", self.exchange.to_lowercase(), self.code)
     }
 
-    /// Render the form EastMoney wants (`1.600519` = SH, `0.000001` = SZ).
-    /// Internal helper kept on `Symbol` so callers don't have to redo the
-    /// mapping per vendor module.
+    /// Render the form EastMoney's push2 + datacenter accept
+    /// (`1.600519` = SH, `0.000001` = SZ).
     pub fn to_eastmoney(&self) -> String {
         let prefix = if self.exchange == "SH" { 1 } else { 0 };
         format!("{}.{}", prefix, self.code)
     }
 
-    /// Parse `600519`, `600519.SH`, `sh600519`, etc. into a normalized
-    /// symbol. Exchange is inferred from the leading code digits when
-    /// missing.
+    /// Parse `600519`, `600519.SH`, `sh600519`, etc. Exchange is inferred
+    /// from the leading code digits when missing.
     pub fn parse(raw: &str) -> Result<Self, String> {
         let s = raw.trim();
         if s.is_empty() {
@@ -73,12 +90,10 @@ impl Symbol {
                 ));
             }
         }
-        // bare 6-digit code — infer
+        // Bare 6-digit code — infer.
         if s.len() == 6 && s.chars().all(|c| c.is_ascii_digit()) {
             let exchange = match &s[..3] {
-                // Shanghai mainboard / sci-tech / B-share
                 "600" | "601" | "603" | "605" | "688" | "900" => "SH",
-                // Shenzhen mainboard / SME / ChiNext / B-share
                 "000" | "001" | "002" | "003" | "300" | "301" | "200" => "SZ",
                 _ => {
                     return Err(format!(
@@ -97,248 +112,403 @@ impl Symbol {
     }
 }
 
-/// `market_quote` output — a snapshot of trading state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MarketQuote {
+// ── Vendor error envelope ─────────────────────────────────────────────
+
+/// One vendor's reason for not serving a request. `recoverable=true`
+/// means a sibling endpoint or fallback may still help; the tools surface
+/// recoverable failures as `empty_dimensions` (still success) when a
+/// dimension is optional, or as a structured tool error otherwise.
+#[derive(Debug, Clone)]
+pub struct VendorError {
+    #[allow(dead_code)]
+    pub vendor: &'static str,
+    pub message: String,
+    /// Hint kept on the struct for callers that want to know whether
+    /// they should attempt a sibling endpoint. Tools mostly route on
+    /// `message`, so the field reads as dead-code without an explicit
+    /// allow.
+    #[allow(dead_code)]
+    pub recoverable: bool,
+}
+
+impl VendorError {
+    pub fn recoverable(vendor: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            vendor,
+            message: message.into(),
+            recoverable: true,
+        }
+    }
+    pub fn fatal(vendor: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            vendor,
+            message: message.into(),
+            recoverable: false,
+        }
+    }
+}
+
+impl std::fmt::Display for VendorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.vendor, self.message)
+    }
+}
+
+impl std::error::Error for VendorError {}
+
+// ── Macro indicators (tool 1) ─────────────────────────────────────────
+
+/// One observation in a monthly CPI / PPI series.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CpiPpiObs {
+    /// `YYYYMM` (vendor's compact form preserved).
+    pub month: String,
+    /// 100-base index (e.g. 101.2 = +1.2% YoY).
+    pub nation_value: Option<f64>,
+    pub nation_yoy: Option<f64>,
+    pub nation_mom: Option<f64>,
+    pub nation_accum_yoy: Option<f64>,
+}
+
+/// One observation in a quarterly GDP series.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GdpObs {
+    /// `2025Q4` style.
+    pub quarter: String,
+    /// Headline GDP in 亿元.
+    pub gdp_yi_yuan: Option<f64>,
+    pub gdp_yoy: Option<f64>,
+    pub primary_yoy: Option<f64>,
+    pub secondary_yoy: Option<f64>,
+    pub tertiary_yoy: Option<f64>,
+}
+
+/// One month of PMI — only the two headline series.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PmiObs {
+    pub month: String,
+    /// 制造业 PMI (vendor field PMI010000).
+    pub manufacturing: Option<f64>,
+    /// 非制造业商务活动 PMI (vendor field PMI020100).
+    pub non_manufacturing: Option<f64>,
+}
+
+/// One month of M0/M1/M2 money-supply observations (亿元).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MoneyObs {
+    pub month: String,
+    pub m0_yi_yuan: Option<f64>,
+    pub m1_yi_yuan: Option<f64>,
+    pub m2_yi_yuan: Option<f64>,
+    pub m0_yoy: Option<f64>,
+    pub m1_yoy: Option<f64>,
+    pub m2_yoy: Option<f64>,
+}
+
+/// One month of social-financing aggregate flow (亿元).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SocialFinancingObs {
+    pub month: String,
+    pub increment_yi_yuan: Option<f64>,
+    pub cumulative_yi_yuan: Option<f64>,
+    pub stock_wan_yi_yuan: Option<f64>,
+}
+
+/// One LPR observation (in percent).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShiborLprObs {
+    /// ISO date.
+    pub date: String,
+    pub lpr_1y: Option<f64>,
+    pub lpr_5y: Option<f64>,
+}
+
+/// One observation of US Treasury bill rates (in percent).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsTbrObs {
+    pub date: String,
+    /// 4-week bond discount.
+    pub w4_bd: Option<f64>,
+    /// 13-week bond discount.
+    pub w13_bd: Option<f64>,
+    /// 52-week bond discount.
+    pub w52_bd: Option<f64>,
+}
+
+// ── Index snapshot (used by market_overview / industry_landscape) ─────
+
+/// One index daily basic snapshot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IndexBasic {
+    /// `000001.SH` etc.
+    pub ts_code: String,
+    pub trade_date: String,
+    pub total_mv_yuan: Option<f64>,
+    pub pe: Option<f64>,
+    pub pe_ttm: Option<f64>,
+    pub pb: Option<f64>,
+    pub turnover_rate: Option<f64>,
+}
+
+/// One row of `daily_info`: per-market stats (沪/深 A/B etc.).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MarketTotals {
+    pub ts_code: String,
+    pub ts_name: String,
+    pub com_count: Option<f64>,
+    pub total_mv_yi_yuan: Option<f64>,
+    pub amount_yi_yuan: Option<f64>,
+    pub pe: Option<f64>,
+    pub turnover_rate: Option<f64>,
+    pub trade_date: String,
+}
+
+/// Push2 realtime snapshot — used by `market_pulse` and `stock_overview`
+/// when the trade day is current.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LiveQuote {
     pub symbol: String,
     pub name: Option<String>,
-    /// Latest traded price (yuan).
-    pub price: f64,
-    /// Price change since the previous close (yuan, signed).
-    pub change: f64,
-    /// Percent change since the previous close (signed; `1.23` = +1.23%).
-    pub change_pct: f64,
-    /// Day-cumulative volume (shares).
-    pub volume: Option<f64>,
-    /// Day-cumulative turnover (yuan).
-    pub turnover: Option<f64>,
-    /// Open / high / low for the trading day.
+    pub price: Option<f64>,
+    pub change: Option<f64>,
+    pub change_pct: Option<f64>,
     pub open: Option<f64>,
     pub high: Option<f64>,
     pub low: Option<f64>,
-    /// Previous trading day's close.
     pub prev_close: Option<f64>,
-    /// As-of timestamp in ISO 8601. Reflects when the upstream snapshot
-    /// was generated — not the moment leek fetched it.
-    pub timestamp: String,
-    /// `"realtime"` / `"delayed"` / `"close"` (post-session snapshot).
-    /// Tools that only return EoD prices report `"close"`.
-    pub data_freshness: String,
+    pub volume_shares: Option<f64>,
+    pub turnover_yuan: Option<f64>,
+    pub turnover_rate: Option<f64>,
+    pub timestamp_unix: Option<i64>,
 }
 
-/// `get_candlesticks` output — a single OHLCV bar.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Push2 realtime capital flow snapshot (per-symbol).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LiveFlow {
+    pub symbol: String,
+    pub main_net_yuan: Option<f64>,
+    pub main_net_pct: Option<f64>,
+    pub super_net_yuan: Option<f64>,
+    pub large_net_yuan: Option<f64>,
+    pub medium_net_yuan: Option<f64>,
+    pub small_net_yuan: Option<f64>,
+}
+
+// ── OHLCV candle ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Candle {
-    /// ISO 8601 date (`2026-05-20`) or compact (`20260520`); we normalize
-    /// to ISO.
+    /// ISO 8601 (`2026-05-20`).
     pub date: String,
     pub open: f64,
     pub high: f64,
     pub low: f64,
     pub close: f64,
+    /// Shares.
     pub volume: f64,
+    /// Yuan.
     pub turnover: Option<f64>,
 }
 
-/// `get_financials` output — a list of reports across periods, in a
-/// generic shape (no vendor-specific schema names). Selected statement
-/// type is echoed back so the model knows what `metrics` means.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FinancialReport {
-    pub symbol: String,
-    /// `"income"` / `"balance"` / `"cashflow"` / `"ratios"`.
-    pub statement: String,
-    /// `"quarter"` / `"year"`.
-    pub period: String,
-    pub rows: Vec<FinancialRow>,
+/// Technical-indicator row from Tushare's `stk_factor`. All values are
+/// raw numbers — the agent decides what "oversold" / "breakout" mean.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TechRow {
+    pub date: String,
+    pub close: Option<f64>,
+    pub macd_dif: Option<f64>,
+    pub macd_dea: Option<f64>,
+    pub macd: Option<f64>,
+    pub kdj_k: Option<f64>,
+    pub kdj_d: Option<f64>,
+    pub kdj_j: Option<f64>,
+    pub rsi_6: Option<f64>,
+    pub rsi_12: Option<f64>,
+    pub rsi_24: Option<f64>,
+    pub boll_upper: Option<f64>,
+    pub boll_mid: Option<f64>,
+    pub boll_lower: Option<f64>,
 }
 
-/// One reporting-period worth of financial fields.
+// ── Financial statement rows ──────────────────────────────────────────
+
+/// One reporting-period worth of financial fields. Statement-specific
+/// keys live in `metrics` — see `Tushare` adapter for the canonical list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinancialRow {
-    /// Period end date (ISO 8601). For annuals: `2024-12-31`.
+    /// ISO 8601 period end (e.g. `2024-12-31`).
     pub period_end: String,
     /// Period label, e.g. `2024Q4` / `2024`.
     pub label: String,
-    /// Vendor-neutral metric name → value. Only fields the chosen
-    /// statement covers are populated. Common keys:
-    /// - income: `revenue`, `gross_profit`, `operating_profit`,
-    ///   `net_profit`, `eps_basic`
-    /// - balance: `total_assets`, `total_liabilities`, `total_equity`,
-    ///   `cash_and_equivalents`
-    /// - cashflow: `cf_operating`, `cf_investing`, `cf_financing`,
-    ///   `free_cash_flow`
-    /// - ratios: `roe`, `roa`, `gross_margin`, `net_margin`,
-    ///   `debt_to_equity`, `current_ratio`, `quick_ratio`
-    pub metrics: std::collections::BTreeMap<String, Option<f64>>,
+    pub metrics: BTreeMap<String, Option<f64>>,
 }
 
-/// `get_company_info` output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompanyInfo {
+// ── Company profile ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompanyProfile {
     pub symbol: String,
     pub name: String,
+    pub chairman: Option<String>,
+    pub secretary: Option<String>,
     pub industry: Option<String>,
-    /// Chinese / SASAC sector classification (e.g. `白酒`).
-    pub sector: Option<String>,
-    /// Listing exchange display name (e.g. `上海证券交易所`).
-    pub exchange: Option<String>,
+    pub area: Option<String>,
+    pub exchange_label: Option<String>,
     pub list_date: Option<String>,
-    pub business_scope: Option<String>,
-    /// Latest indicators snapshot, vendor-neutral keys: `market_cap`,
-    /// `float_market_cap`, `pe_ttm`, `pb`, `dividend_yield_pct`.
-    pub latest_indicators: std::collections::BTreeMap<String, Option<f64>>,
+    pub introduction: Option<String>,
+    pub main_business: Option<String>,
+    pub website: Option<String>,
+    pub employees: Option<f64>,
+    /// `stock_basic.fullname` — full registered name.
+    pub fullname: Option<String>,
 }
 
-/// `get_capital_flow` output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CapitalFlow {
-    pub symbol: String,
-    /// Aggregation window: `"1d"` / `"5d"` / `"20d"`.
-    pub period: String,
-    /// Net inflow over the window (yuan, signed).
-    pub net_inflow: f64,
-    /// Retail-classified net flow.
-    pub retail_flow: Option<f64>,
-    /// Institutional / large-trade net flow ("main force" in CN parlance).
-    pub main_flow: Option<f64>,
-    /// Northbound (Stock Connect) flow availability — `false` when the
-    /// vendor quota doesn't include it. The `north_flow` field stays
-    /// `None` in that case so the model never reads a half-truth value.
-    pub north_flow_available: bool,
-    /// Northbound net flow (yuan, signed). `None` whenever
-    /// `north_flow_available == false`.
-    pub north_flow: Option<f64>,
-    /// Any partial-data warnings (e.g. "northbound quota exhausted").
-    pub warnings: Vec<String>,
+// ── Top holders ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HolderRow {
+    pub rank: u32,
+    pub holder_name: String,
+    pub holder_type: Option<String>,
+    pub shares: Option<f64>,
+    pub pct: Option<f64>,
+    pub change_qoq_shares: Option<f64>,
 }
 
-// ── M4.1 — supplementary research data shapes ───────────────────────────
-//
-// Each new tool gets one struct; field names are vendor-neutral (no
-// `or_tot`-style upstream schema leaks). When a vendor refuses to serve
-// (free-tier quota, paywalled endpoint, dead selector), the per-tool
-// dispatch surfaces `data_available: false` + a reason — see the tool
-// modules. The structs below only carry positive data.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HolderCountObs {
+    /// ISO date of the report period end.
+    pub end_date: String,
+    pub holder_count: Option<f64>,
+}
 
-/// `get_industry_peers` output — one peer per row, target included.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndustryPeers {
-    pub symbol: String,
-    /// Industry classification used to choose peers.
-    pub industry: String,
-    /// Optional finer classification (sub-industry) when available.
-    pub sub_industry: Option<String>,
-    /// One of `"valuation"` / `"growth"` / `"profitability"`.
+// ── Business breakdown row ────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BusinessRow {
+    /// `product` / `industry` / `region` dimension type, echoed back.
     pub dimension: String,
-    /// One row per peer — first row is always the target symbol.
-    pub peers: Vec<PeerRow>,
-    /// Median of the principal metric across peers; key matches
-    /// `principal_metric` so the model knows what "median" refers to.
-    pub principal_metric: String,
-    pub median: Option<f64>,
-    /// 0..1 quantile of the target relative to the peer set on
-    /// `principal_metric` (`None` if data is too sparse).
-    pub target_quantile: Option<f64>,
-}
-
-/// One company row in an industry-peer comparison.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerRow {
-    pub symbol: String,
-    pub name: String,
-    /// Metric name → value. Keys depend on dimension; see
-    /// `get_industry_peers` tool doc.
-    pub metrics: std::collections::BTreeMap<String, Option<f64>>,
-    /// `true` if this row is the originally requested company.
-    pub is_target: bool,
-}
-
-/// `get_business_breakdown` output — main-business revenue split.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BusinessBreakdown {
-    pub symbol: String,
-    /// Reporting period the breakdown applies to (ISO 8601 date or
-    /// vendor's `YYYYMMDD` echoed back).
-    pub period_end: String,
-    /// `"product"` / `"industry"` / `"region"`.
-    pub dimension: String,
-    pub items: Vec<BusinessBreakdownRow>,
-}
-
-/// One slice of the main-business breakdown.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BusinessBreakdownRow {
-    /// Label of the slice (product name / industry / region).
     pub item: String,
-    /// Revenue in yuan.
     pub revenue_yuan: Option<f64>,
-    /// Slice as a percentage of total revenue (0..100).
     pub pct_of_total: Option<f64>,
-    /// Gross margin for the slice in percent (0..100).
     pub gross_margin_pct: Option<f64>,
-    /// Year-over-year revenue change in percent.
-    pub yoy_change_pct: Option<f64>,
+    /// Period the row applies to (ISO 8601).
+    pub period_end: String,
 }
 
-/// `get_announcements` output — recent corporate announcements.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AnnouncementList {
-    pub symbol: String,
-    /// Day window the list covers.
-    pub days: usize,
-    /// Optional category filter the caller supplied.
-    pub category_filter: Option<String>,
-    pub items: Vec<AnnouncementItem>,
-}
+// ── Announcement / event ──────────────────────────────────────────────
 
-/// One announcement.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnnouncementItem {
-    /// ISO 8601 publication date.
     pub date: String,
     pub title: String,
-    /// Best-effort category tag (e.g. `重大事项` / `分红配股`). May be
-    /// empty when the vendor doesn't classify.
+    /// Free-text keyword tag (e.g. `分红配股`, `重大事项`).
     pub category: Option<String>,
-    /// Direct PDF / HTML URL when available.
     pub url: Option<String>,
-    /// Short abstract / summary line when available.
-    pub abstract_text: Option<String>,
+    /// Direct PDF URL if known (eastmoney `pdf.dfcfw.com/pdf/H2_*.pdf`).
+    pub pdf_url: Option<String>,
 }
 
-/// `get_consensus` output — sell-side consensus forecasts + rating mix.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AnalystConsensus {
-    pub symbol: String,
-    /// Year → forecast aggregate for that fiscal year (e.g. `2025`,
-    /// `2026`). Sorted by year ascending.
-    pub forecasts: Vec<ConsensusForecast>,
-    /// Rating distribution from analyst reports in a recent window
-    /// (typically the last 90 days when the vendor exposes one).
-    pub rating_mix: ConsensusRatingMix,
-    /// Number of distinct broker reports the rating mix is derived from.
-    pub report_count: Option<usize>,
-}
-
-/// One year of consensus forecast aggregates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConsensusForecast {
-    pub year: String,
-    pub revenue_mean_yuan: Option<f64>,
-    pub revenue_high_yuan: Option<f64>,
-    pub revenue_low_yuan: Option<f64>,
-    pub net_profit_mean_yuan: Option<f64>,
-    pub net_profit_high_yuan: Option<f64>,
-    pub net_profit_low_yuan: Option<f64>,
-    pub eps_mean: Option<f64>,
-    pub eps_high: Option<f64>,
-    pub eps_low: Option<f64>,
-}
-
-/// Aggregate count by rating bucket.
+/// Stock-holder trade / 高管增减持 row.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ConsensusRatingMix {
+pub struct InsiderTradeItem {
+    pub ann_date: String,
+    pub holder_name: String,
+    /// `IN`(增持) / `DE`(减持).
+    pub direction: Option<String>,
+    pub change_vol_shares: Option<f64>,
+    pub change_ratio_pct: Option<f64>,
+    pub after_shares: Option<f64>,
+    pub after_ratio_pct: Option<f64>,
+}
+
+/// Dividend / 分红 event.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DividendItem {
+    pub end_date: String,
+    pub ann_date: String,
+    pub process: Option<String>,
+    pub stk_div: Option<f64>,
+    pub cash_div_pretax: Option<f64>,
+    pub ex_date: Option<String>,
+    pub pay_date: Option<String>,
+}
+
+/// Share unlock / 限售解禁 event.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShareUnlockItem {
+    pub ann_date: String,
+    pub float_date: String,
+    pub float_share: Option<f64>,
+    pub float_ratio: Option<f64>,
+    pub holder_name: Option<String>,
+    pub share_type: Option<String>,
+}
+
+/// Block trade / 大宗交易.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlockTradeItem {
+    pub trade_date: String,
+    pub price: Option<f64>,
+    pub vol_wan_shares: Option<f64>,
+    pub amount_wan_yuan: Option<f64>,
+    pub buyer: Option<String>,
+    pub seller: Option<String>,
+}
+
+/// Lung-hu-bang / 龙虎榜 row.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TopListItem {
+    pub trade_date: String,
+    pub close: Option<f64>,
+    pub pct_change: Option<f64>,
+    pub turnover_rate: Option<f64>,
+    pub net_amount: Option<f64>,
+    pub l_buy: Option<f64>,
+    pub l_sell: Option<f64>,
+    pub reason: Option<String>,
+}
+
+/// Pledge / 质押 status.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PledgeStatItem {
+    pub end_date: String,
+    pub pledge_count: Option<f64>,
+    pub unrest_pledge_wan: Option<f64>,
+    pub rest_pledge_wan: Option<f64>,
+    pub total_share_wan: Option<f64>,
+    pub pledge_ratio_pct: Option<f64>,
+}
+
+/// Repurchase / 回购 event.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepurchaseItem {
+    pub ann_date: String,
+    pub end_date: Option<String>,
+    pub proc: Option<String>,
+    pub vol_share: Option<f64>,
+    pub amount_yuan: Option<f64>,
+    pub high_limit: Option<f64>,
+    pub low_limit: Option<f64>,
+}
+
+/// Institution visit / 机构调研 record.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstitutionVisitItem {
+    pub surv_date: String,
+    pub receivers: Option<String>,
+    pub place: Option<String>,
+    pub mode: Option<String>,
+    pub visiting_org: Option<String>,
+    pub org_type: Option<String>,
+    /// 公司接待人(董秘 / IR 等).
+    pub host: Option<String>,
+}
+
+// ── Sell-side research (research_sentiment) ───────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RatingMix {
     pub buy: usize,
     pub overweight: usize,
     pub hold: usize,
@@ -346,48 +516,96 @@ pub struct ConsensusRatingMix {
     pub sell: usize,
 }
 
-/// `get_top_holders` output — top-10 holder list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TopHolders {
-    pub symbol: String,
-    /// `"total"` (all shareholders, top 10) or `"float"` (top 10 of the
-    /// floating share register only).
-    pub kind: String,
-    /// Reporting period end date (ISO 8601) the list applies to.
-    pub period_end: String,
-    pub holders: Vec<HolderRow>,
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct YearForecast {
+    /// `2025` / `2026`.
+    pub year: String,
+    pub eps_mean: Option<f64>,
+    pub eps_high: Option<f64>,
+    pub eps_low: Option<f64>,
+    pub net_profit_mean_yi_yuan: Option<f64>,
+    pub net_profit_high_yi_yuan: Option<f64>,
+    pub net_profit_low_yi_yuan: Option<f64>,
+    /// Distinct contributing report count.
+    pub sample_size: usize,
 }
 
-/// One holder row.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HolderRow {
-    pub rank: u32,
-    pub holder_name: String,
-    /// Number of shares held.
-    pub shares: Option<f64>,
-    /// Percent of total / floating shares (0..100, matches `kind`).
-    pub pct: Option<f64>,
-    /// Change vs the previous reporting period in shares (signed).
-    /// `None` when the vendor doesn't expose the prior period.
-    pub change_qoq_shares: Option<f64>,
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResearchReportItem {
+    pub date: String,
+    pub title: String,
+    pub org_name: Option<String>,
+    pub author: Option<String>,
+    pub rating: Option<String>,
+    pub target_price: Option<f64>,
+    /// Direct PDF URL (eastmoney H3_*) or sourced URL (tushare's `url`).
+    pub pdf_url: Option<String>,
 }
 
-/// `get_concepts` output — concept / theme tags.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConceptList {
-    pub symbol: String,
-    pub concepts: Vec<ConceptTag>,
-}
-
-/// One concept tag with an optional popularity rank.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConceptTag {
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BrokerMonthlyPick {
+    pub month: String,
+    pub broker: String,
+    pub ts_code: String,
     pub name: String,
-    /// Source-specific code, if any.
-    pub code: Option<String>,
-    /// `1` = hottest; smaller = hotter. `None` when the vendor doesn't
-    /// rank concepts.
-    pub heat_rank: Option<u32>,
+}
+
+// ── Industry leaders / valuation rows ─────────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IndustryLeaderRow {
+    pub ts_code: String,
+    pub name: String,
+    pub total_mv_yi_yuan: Option<f64>,
+    pub pe_ttm: Option<f64>,
+    pub pb: Option<f64>,
+    pub dv_ttm: Option<f64>,
+    pub turnover_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IndustryFlowRow {
+    pub ts_code: String,
+    pub name: String,
+    pub pct_change: Option<f64>,
+    pub net_amount_yuan: Option<f64>,
+    pub net_amount_rate: Option<f64>,
+    pub rank: Option<u32>,
+    pub lead_stock: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LimitCapt {
+    pub ts_code: String,
+    pub name: String,
+    pub days: Option<u32>,
+    pub up_stat: Option<String>,
+    pub cons_nums: Option<String>,
+    pub up_nums: Option<u32>,
+    pub pct_change: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LimitListRow {
+    pub trade_date: String,
+    pub ts_code: String,
+    pub name: String,
+    pub close: Option<f64>,
+    pub pct_chg: Option<f64>,
+    pub turnover_ratio: Option<f64>,
+    /// `U` = up-limit, `D` = down-limit, `Z` = once-limit / 炸板.
+    pub limit: Option<String>,
+}
+
+/// `hsgt` total-flow snapshot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HsgtFlow {
+    pub trade_date: String,
+    /// Total northbound net flow (万元).
+    pub north_money_wan: Option<f64>,
+    pub south_money_wan: Option<f64>,
+    pub hgt_wan: Option<f64>,
+    pub sgt_wan: Option<f64>,
 }
 
 #[cfg(test)]
@@ -420,19 +638,33 @@ mod tests {
 
     #[test]
     fn infers_exchange_from_bare_code() {
-        assert_eq!(Symbol::parse("600519").unwrap().exchange, "SH"); // mainboard
-        assert_eq!(Symbol::parse("000001").unwrap().exchange, "SZ"); // Shenzhen
-        assert_eq!(Symbol::parse("300750").unwrap().exchange, "SZ"); // ChiNext
-        assert_eq!(Symbol::parse("688981").unwrap().exchange, "SH"); // STAR
-        assert_eq!(Symbol::parse("605378").unwrap().exchange, "SH"); // SH mainboard 605
+        assert_eq!(Symbol::parse("600519").unwrap().exchange, "SH");
+        assert_eq!(Symbol::parse("000001").unwrap().exchange, "SZ");
+        assert_eq!(Symbol::parse("300750").unwrap().exchange, "SZ");
+        assert_eq!(Symbol::parse("688981").unwrap().exchange, "SH");
+        assert_eq!(Symbol::parse("605378").unwrap().exchange, "SH");
     }
 
     #[test]
     fn rejects_garbage() {
         assert!(Symbol::parse("").is_err());
         assert!(Symbol::parse("foo").is_err());
-        assert!(Symbol::parse("123").is_err()); // wrong length
-        assert!(Symbol::parse("999999").is_err()); // unknown prefix
+        assert!(Symbol::parse("123").is_err());
+        assert!(Symbol::parse("999999").is_err());
         assert!(Symbol::parse("600519.XX").is_err());
+    }
+
+    #[test]
+    fn vendor_error_display_includes_vendor_tag() {
+        let e = VendorError::recoverable("tushare", "no token");
+        let s = format!("{e}");
+        assert!(s.contains("tushare"));
+        assert!(s.contains("no token"));
+    }
+
+    #[test]
+    fn vendor_error_recoverable_flag_drives_fallback() {
+        assert!(VendorError::recoverable("v", "x").recoverable);
+        assert!(!VendorError::fatal("v", "x").recoverable);
     }
 }

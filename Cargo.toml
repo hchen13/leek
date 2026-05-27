@@ -47,6 +47,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # polluted by builtin web_search, so leek tokenizes its own request.
 tiktoken-rs = "0.11"
 
+# PDF reader (M4.1.1 `read_pdf` tool). Pure Rust, no system deps.
+# Best-effort for Chinese — falls back to ASCII when CMap decoding
+# fails. The tool surfaces low-quality output as a caveat rather than
+# silently fabricating.
+pdf-extract = "0.9"
+tempfile = "3"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

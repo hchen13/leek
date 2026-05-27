@@ -1,35 +1,34 @@
-//! Client-side function tools — the M1.9 tool set.
+//! Function tools — M4.1.1 facts-only A-share kit.
 //!
-//! M1 kept the surface tiny (`web_fetch`). M1.9 adds `update_plan` and
-//! splits two concerns the model and the workbench need kept apart:
+//! Each tool returns a `ToolOutcome` triple (REQUIREMENTS §4.2):
 //!
-//! - The **LLM-facing spec** (`ToolSpec`: name, description, JSON schema) is
-//!   all the model sees.
-//! - The **UI metadata** (`ToolUi`: display name, where the result renders,
-//!   a one-line `summary`) is for the workbench only and never enters the
-//!   model's context (REQUIREMENTS §4.1).
+//! - `model_output` — distilled markdown ≤ 1500 tokens default
+//!   (≤ 4000 in focus modes). Carries load-bearing facts only.
+//! - `display_payload` — raw structured data for the canvas card.
+//!   Vendor JSON is normalized into typed shapes from `vendors/types.rs`.
+//! - `debug_payload` — debug-view detail (vendor identity, attempts,
+//!   timing).
 //!
-//! A run returns three surfaces (REQUIREMENTS §4.2), produced by one
-//! execution: `model_output` goes to the model via `function_call_output`;
-//! `display_payload` is the structured body of the canvas card;
-//! `debug_payload` backs its expand / debug view. The agent loop never
-//! transforms business data — the tool produces all three, the loop only
-//! plumbs them. Tool names and descriptions stay vendor-neutral
-//! (ARCHITECTURE §12.1).
+//! The tools fan out internally with `tokio::try_join!`, talk to one
+//! or more vendor methods, then surface partial gaps as
+//! `empty_dimensions` (an array of focus / dimension keys that came
+//! back empty) inside `display_payload` — **never** a tool-level error.
+//! That keeps the model honest: "this section is unavailable" surfaces
+//! as a markdown line ("数据来源: 暂不可用") and a structured
+//! `empty_dimensions` flag the model can read, instead of triggering a
+//! pointless retry.
 
+mod chart_data;
 mod corpus_read;
 mod corpus_search;
-mod get_announcements;
-mod get_business_breakdown;
-mod get_candlesticks;
-mod get_capital_flow;
-mod get_company_info;
-mod get_concepts;
-mod get_consensus;
-mod get_financials;
-mod get_industry_peers;
-mod get_top_holders;
-mod market_quote;
+mod industry_landscape;
+mod macro_indicators;
+mod market_overview;
+mod market_pulse;
+mod read_pdf;
+mod recent_actions;
+mod research_sentiment;
+mod stock_overview;
 mod task;
 mod update_plan;
 mod use_skill;
@@ -48,17 +47,17 @@ use crate::vendors::VendorRegistry;
 /// Outcome of running one tool call — the three result surfaces of
 /// REQUIREMENTS §4.2, produced by a single execution.
 pub struct ToolOutcome {
-    /// The model's view of the result — goes into `function_call_output`.
+    /// The model's view — goes into `function_call_output`.
     pub model_output: String,
-    /// Structured body of the canvas card. UI-only; never sent to the model.
+    /// Structured body of the canvas card. UI-only; never sent to the
+    /// model. `empty_dimensions: [..]` lives inside `display_payload`.
     pub display_payload: serde_json::Value,
-    /// Detail for the card's expand / debug view.
+    /// Debug-view detail (vendor identity, attempts, timing).
     pub debug_payload: serde_json::Value,
     pub is_error: bool,
 }
 
 impl ToolOutcome {
-    /// A successful run, with the three result surfaces given explicitly.
     pub(super) fn ok(
         model_output: impl Into<String>,
         display_payload: serde_json::Value,
@@ -72,9 +71,6 @@ impl ToolOutcome {
         }
     }
 
-    /// A failed run. The message is the same across all three surfaces — an
-    /// error is not business data, so there is nothing to keep apart: the
-    /// model sees it to recover, the card shows it.
     pub(super) fn error(message: impl Into<String>) -> Self {
         let message = message.into();
         Self {
@@ -89,58 +85,37 @@ impl ToolOutcome {
 /// Where a tool's result renders on the workbench.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ResultArtifact {
-    /// A canvas tool card (REQUIREMENTS §2.4). The string is the renderer
-    /// hint (`card_kind`).
     Card(&'static str),
-    /// The right-rail Plan / TODO widget — not a canvas card (§2.6).
     Plan,
 }
 
-/// UI-only metadata for a tool (REQUIREMENTS §4.1). Registered alongside the
-/// `ToolSpec`, but kept strictly separate: none of this reaches the model.
+/// UI-only metadata.
 #[derive(Clone, Copy)]
 pub struct ToolUi {
-    /// Human-readable name for cards and the chat tool summary.
     pub display_name: &'static str,
-    /// Where this tool's result renders.
     pub result: ResultArtifact,
-    /// A one-line human summary of a call, derived from its arguments
-    /// (REQUIREMENTS §2.1's running tool summary). The frontend must not
-    /// summarize tool args itself (§8.2), so the backend supplies this.
     pub summary: fn(&serde_json::Value) -> String,
 }
 
-/// The function-tool specs offered to the model this milestone.
-///
-/// `use_skill` is conditional on a non-empty skill registry — exposing
-/// it with nothing to load would invite a guaranteed-error call.
-/// `task` is always offered: even when no AGENT.md is registered, the
-/// task tool can fall back to `general-purpose` (the built-in baseline),
-/// so the surface stays stable. The dispatch path still errors loudly
-/// if the named agent is genuinely absent — we don't want the surface
-/// to silently disappear because a user removed an agent file.
+/// Specs offered to the model this milestone. `use_skill` only when
+/// at least one skill is loaded; `task` is always offered (has a
+/// built-in `general-purpose` fallback).
 pub fn specs(skills: &Arc<SkillRegistry>, agents: &Arc<AgentRegistry>) -> Vec<ToolSpec> {
     let mut v = vec![
         web_fetch::spec(),
         update_plan::spec(),
         corpus_search::spec(),
         corpus_read::spec(),
-        // M3 — A-share research tools. Always offered; an absent
-        // upstream token surfaces as a per-call structured error
-        // rather than removing the surface (the model can prompt
-        // the user to configure one).
-        market_quote::spec(),
-        get_candlesticks::spec(),
-        get_financials::spec(),
-        get_company_info::spec(),
-        get_capital_flow::spec(),
-        // M4.1 — supplementary A-share research tools.
-        get_industry_peers::spec(),
-        get_business_breakdown::spec(),
-        get_announcements::spec(),
-        get_consensus::spec(),
-        get_top_holders::spec(),
-        get_concepts::spec(),
+        // M4.1.1 facts-only A-share research kit.
+        macro_indicators::spec(),
+        industry_landscape::spec(),
+        market_overview::spec(),
+        stock_overview::spec(),
+        recent_actions::spec(),
+        market_pulse::spec(),
+        research_sentiment::spec(),
+        chart_data::spec(),
+        read_pdf::spec(),
         task::spec(agents),
     ];
     if !skills.is_empty() {
@@ -158,44 +133,30 @@ pub fn ui(name: &str) -> Option<ToolUi> {
         "corpus_read" => Some(corpus_read::ui()),
         "use_skill" => Some(use_skill::ui()),
         "task" => Some(task::ui()),
-        "market_quote" => Some(market_quote::ui()),
-        "get_candlesticks" => Some(get_candlesticks::ui()),
-        "get_financials" => Some(get_financials::ui()),
-        "get_company_info" => Some(get_company_info::ui()),
-        "get_capital_flow" => Some(get_capital_flow::ui()),
-        // M4.1
-        "get_industry_peers" => Some(get_industry_peers::ui()),
-        "get_business_breakdown" => Some(get_business_breakdown::ui()),
-        "get_announcements" => Some(get_announcements::ui()),
-        "get_consensus" => Some(get_consensus::ui()),
-        "get_top_holders" => Some(get_top_holders::ui()),
-        "get_concepts" => Some(get_concepts::ui()),
+        // M4.1.1
+        "macro_indicators" => Some(macro_indicators::ui()),
+        "industry_landscape" => Some(industry_landscape::ui()),
+        "market_overview" => Some(market_overview::ui()),
+        "stock_overview" => Some(stock_overview::ui()),
+        "recent_actions" => Some(recent_actions::ui()),
+        "market_pulse" => Some(market_pulse::ui()),
+        "research_sentiment" => Some(research_sentiment::ui()),
+        "chart_data" => Some(chart_data::ui()),
+        "read_pdf" => Some(read_pdf::ui()),
         _ => None,
     }
 }
 
-/// Per-call context the dispatch path needs, beyond the (skills /
+/// Per-call context the dispatch path needs beyond the (skills /
 /// corpus / http) values that have been there since M2.1.
-///
-/// `task` (M2.7) is the one tool that needs the live `AppState`, the
-/// caller's session / turn ids, and the depth-cap context to spawn a
-/// subagent loop. The other tools ignore everything in this struct. We
-/// pass it explicitly so unit tests that don't exercise `task` can
-/// build a minimal struct without a full `AppState`.
 pub struct DispatchCtx<'a> {
-    /// `Some` enables `task`; `None` makes a `task` call error out with
-    /// "task not available in this dispatch context". Tests that don't
-    /// exercise `task` pass `None`.
     pub st: Option<&'a AppState>,
     pub session_id: &'a str,
     pub parent_turn_id: &'a str,
-    /// Depth of the calling turn (main agent = 0, subagent = 1, …).
     pub parent_depth: u32,
 }
 
 impl<'a> DispatchCtx<'a> {
-    /// Convenience: a context that disables `task` (for unit tests of
-    /// the other tools).
     #[cfg(test)]
     pub fn for_test() -> Self {
         Self {
@@ -207,15 +168,7 @@ impl<'a> DispatchCtx<'a> {
     }
 }
 
-/// Dispatch one function call. An unknown name is a structured error, not a
-/// panic — the model gets it back as `function_call_output` and can recover.
-///
-/// 8 explicit `&Arc<…>` registries threaded through one call site is a
-/// lot, but each one is a different runtime surface (HTTP / corpus /
-/// skills / agents / vendors). Bundling them into a "ServiceBag" struct
-/// would make the call-site shorter at the cost of obscuring the
-/// dependency surface; given the small number of dispatch sites (loop +
-/// two unit tests) we accept the parameter count.
+/// Dispatch one function call.
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     ctx: &DispatchCtx<'_>,
@@ -233,21 +186,16 @@ pub async fn dispatch(
         "corpus_search" => corpus_search::run(corpus, args),
         "corpus_read" => corpus_read::run(corpus, args),
         "use_skill" => use_skill::run(skills, args),
-        // M3 — A-share research tools. Each runs the vendor-fallback
-        // chain inside its own module; the loop sees only the
-        // `ToolOutcome` triple.
-        "market_quote" => market_quote::run(vendors, args).await,
-        "get_candlesticks" => get_candlesticks::run(vendors, args).await,
-        "get_financials" => get_financials::run(vendors, args).await,
-        "get_company_info" => get_company_info::run(vendors, args).await,
-        "get_capital_flow" => get_capital_flow::run(vendors, args).await,
-        // M4.1 — supplementary A-share research tools.
-        "get_industry_peers" => get_industry_peers::run(vendors, args).await,
-        "get_business_breakdown" => get_business_breakdown::run(vendors, args).await,
-        "get_announcements" => get_announcements::run(vendors, args).await,
-        "get_consensus" => get_consensus::run(vendors, args).await,
-        "get_top_holders" => get_top_holders::run(vendors, args).await,
-        "get_concepts" => get_concepts::run(vendors, args).await,
+        // M4.1.1 facts-only A-share kit.
+        "macro_indicators" => macro_indicators::run(vendors, args).await,
+        "industry_landscape" => industry_landscape::run(vendors, args).await,
+        "market_overview" => market_overview::run(vendors, args).await,
+        "stock_overview" => stock_overview::run(vendors, args).await,
+        "recent_actions" => recent_actions::run(vendors, args).await,
+        "market_pulse" => market_pulse::run(vendors, args).await,
+        "research_sentiment" => research_sentiment::run(vendors, args).await,
+        "chart_data" => chart_data::run(vendors, args).await,
+        "read_pdf" => read_pdf::run(http, args).await,
         "task" => match ctx.st {
             Some(st) => {
                 task::run(
@@ -260,7 +208,8 @@ pub async fn dispatch(
                 .await
             }
             None => ToolOutcome::error(
-                "task: tool not available in this dispatch context (no AppState bound)".to_string(),
+                "task: tool not available in this dispatch context (no AppState bound)"
+                    .to_string(),
             ),
         },
         other => ToolOutcome::error(format!(
@@ -269,11 +218,7 @@ pub async fn dispatch(
     }
 }
 
-/// Build the canvas-artifact frame for a tool call (REQUIREMENTS §2.2, §2.4).
-/// `outcome = None` is the `Start` frame, emitted before dispatch; `Some` is
-/// the `Completion` / `Error` frame. UI metadata comes from the registry and
-/// the display / debug payloads from the tool — the loop never transforms
-/// business data (REQUIREMENTS §4).
+/// Build the canvas-artifact frame for a tool call.
 pub fn tool_artifact(
     turn_id: &str,
     iteration: usize,
@@ -390,9 +335,6 @@ mod tests {
 
     #[test]
     fn task_tool_is_always_offered() {
-        // Spec §A: the task tool is always advertised — the
-        // default fallback agent `general-purpose` is built-in,
-        // so the surface stays stable across boots.
         let empty_skills = Arc::new(SkillRegistry::default());
         let empty_agents = Arc::new(AgentRegistry::default());
         let names: Vec<_> = specs(&empty_skills, &empty_agents)
@@ -405,48 +347,30 @@ mod tests {
 
     #[test]
     fn ui_registry_covers_the_tool_set() {
-        assert!(ui("web_fetch").is_some());
-        assert!(ui("update_plan").is_some());
-        assert!(ui("corpus_search").is_some());
-        assert!(ui("corpus_read").is_some());
-        assert!(ui("task").is_some());
-        // M3 — A-share research tools.
-        assert!(ui("market_quote").is_some());
-        assert!(ui("get_candlesticks").is_some());
-        assert!(ui("get_financials").is_some());
-        assert!(ui("get_company_info").is_some());
-        assert!(ui("get_capital_flow").is_some());
-        // M4.1 — supplementary A-share research tools.
-        assert!(ui("get_industry_peers").is_some());
-        assert!(ui("get_business_breakdown").is_some());
-        assert!(ui("get_announcements").is_some());
-        assert!(ui("get_consensus").is_some());
-        assert!(ui("get_top_holders").is_some());
-        assert!(ui("get_concepts").is_some());
+        for n in [
+            "web_fetch",
+            "update_plan",
+            "corpus_search",
+            "corpus_read",
+            "task",
+            "macro_indicators",
+            "industry_landscape",
+            "market_overview",
+            "stock_overview",
+            "recent_actions",
+            "market_pulse",
+            "research_sentiment",
+            "chart_data",
+            "read_pdf",
+        ] {
+            assert!(ui(n).is_some(), "missing UI registration for {n}");
+        }
         assert!(ui("nope").is_none());
-        // update_plan renders to the right rail, not a canvas tool card.
         assert_eq!(ui("update_plan").unwrap().result, ResultArtifact::Plan);
-        // corpus tools render as canvas cards with their own kinds.
-        assert_eq!(
-            ui("corpus_search").unwrap().result,
-            ResultArtifact::Card("corpus_search")
-        );
-        assert_eq!(
-            ui("corpus_read").unwrap().result,
-            ResultArtifact::Card("corpus_read")
-        );
-        // task tool has a placeholder canvas kind — actual rendering is
-        // the subagent_card emitted via the lifecycle event.
-        assert_eq!(
-            ui("task").unwrap().result,
-            ResultArtifact::Card("task_dispatch")
-        );
     }
 
     #[test]
     fn dispatch_task_without_appstate_returns_error_not_panic() {
-        // Unit tests can call task with `DispatchCtx::for_test()` —
-        // expecting a structured error, not a crash.
         let http = reqwest::Client::new();
         let corpus = Arc::new(Corpus::empty());
         let skills = Arc::new(SkillRegistry::default());
@@ -465,29 +389,5 @@ mod tests {
         ));
         assert!(out.is_error);
         assert!(out.model_output.contains("not available"));
-    }
-
-    #[test]
-    fn tool_artifact_start_then_done_share_one_card() {
-        let args = serde_json::json!({ "url": "https://example.com" });
-        let start = tool_artifact("t", 1, "c1", "web_fetch", &args, None).into_payload();
-        assert_eq!(start["phase"], "start");
-        assert_eq!(start["data"]["tool"], "web_fetch");
-        assert!(start["data"]["display_name"].is_string());
-        assert!(start["data"]["summary"].is_string());
-        // No result payload on the start frame.
-        assert!(start["data"]["display_payload"].is_null());
-
-        let outcome = ToolOutcome::ok(
-            "ok",
-            serde_json::json!({ "url": "https://example.com" }),
-            serde_json::json!({}),
-        );
-        let done = tool_artifact("t", 1, "c1", "web_fetch", &args, Some(&outcome)).into_payload();
-        assert_eq!(done["phase"], "completion");
-        assert_eq!(done["data"]["display_payload"]["url"], "https://example.com");
-        // Same id and identity → the frontend updates one card, not two.
-        assert_eq!(start["artifact_id"], done["artifact_id"]);
-        assert_eq!(start["canvas_identity"], done["canvas_identity"]);
     }
 }

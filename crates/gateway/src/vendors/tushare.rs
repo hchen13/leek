@@ -1,4 +1,4 @@
-//! Tushare client — the primary A-share data vendor (M3).
+//! Tushare HTTP adapter (M4.1.1 facts-only).
 //!
 //! Tushare exposes one POST endpoint that switches on `api_name`:
 //!
@@ -13,15 +13,21 @@
 //! { "code": 0, "msg": null, "data": { "fields": [...], "items": [[...], ...] } }
 //! ```
 //!
-//! Every vendor-specific Tushare field name (`or_tot`, `n_income_attr_p`,
-//! `pe_ttm`, …) is mapped INSIDE this file to vendor-neutral keys
-//! (`revenue`, `net_profit`, `pe_ttm` — that last one happens to be
-//! generic too). The grep guardrail at `tests/m3-vendor-neutrality.rs`
+//! Every vendor-specific Tushare field name (`or_tot`, `n_income_attr_p`, …)
+//! is mapped INSIDE this module to vendor-neutral keys (`revenue`,
+//! `net_profit`, …). The grep guardrail at `tests/m3_vendor_neutrality.rs`
 //! ensures no Tushare schema name leaks past this module.
 //!
-//! Token resolution: `LEEK_TUSHARE_TOKEN` env > `Config::tushare_token` >
-//! none. With no token the client errors recoverably so the dispatch
-//! path moves on to Sina / EastMoney.
+//! Token resolution lives in `vendors/mod.rs`: env > config > none. With
+//! no token the client errors recoverably so tools surface "this dimension
+//! is empty" instead of fabricating.
+//!
+//! ## Method discipline
+//!
+//! Each public method below is a one-call wrapper around a tushare
+//! endpoint that returns a typed shape. **Fan-out happens inside the
+//! tool**, never here — that lets tools join concurrently with
+//! `tokio::try_join!` and surface partial gaps cleanly.
 
 use std::collections::BTreeMap;
 
@@ -29,15 +35,12 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::types::{
-    AnalystConsensus, AnnouncementItem, AnnouncementList, BusinessBreakdown,
-    BusinessBreakdownRow, CapitalFlow, Candle, CompanyInfo, ConceptList, ConceptTag,
-    ConsensusForecast, ConsensusRatingMix, FinancialReport, FinancialRow, HolderRow,
-    IndustryPeers, MarketQuote, PeerRow, Symbol, TopHolders,
-};
-use super::vendor_trait::{
-    BoxFuture, VendorAnnouncements, VendorBusinessBreakdown, VendorCandle, VendorCapitalFlow,
-    VendorCompanyInfo, VendorConcepts, VendorConsensus, VendorError, VendorFinancial,
-    VendorIndustryPeers, VendorQuote, VendorTopHolders,
+    AnnouncementItem, BlockTradeItem, BrokerMonthlyPick, Candle, CompanyProfile, CpiPpiObs,
+    DividendItem, FinancialRow, GdpObs, HolderCountObs, HolderRow, HsgtFlow, IndexBasic,
+    IndustryFlowRow, InsiderTradeItem, InstitutionVisitItem, LimitCapt, LimitListRow,
+    LiveQuote, MarketTotals, MoneyObs, PledgeStatItem, PmiObs, RatingMix, RepurchaseItem,
+    ResearchReportItem, ShareUnlockItem, ShiborLprObs, SocialFinancingObs, Symbol, TechRow,
+    TopListItem, UsTbrObs, VendorError, YearForecast,
 };
 
 const VENDOR: &str = "tushare";
@@ -45,7 +48,7 @@ const TUSHARE_URL: &str = "http://api.tushare.pro";
 const TIMEOUT_SECS: u64 = 20;
 
 /// Tushare HTTP client. `token=None` makes every fetch return a
-/// recoverable error tagged `"no token"` — the dispatch path moves on.
+/// recoverable error tagged `"no token"`.
 pub struct TushareClient {
     http: reqwest::Client,
     token: Option<String>,
@@ -56,7 +59,6 @@ impl TushareClient {
         Self { http, token }
     }
 
-    /// Tushare response envelope. `data` is the columnar matrix.
     fn token_or_error(&self) -> Result<&str, VendorError> {
         self.token
             .as_deref()
@@ -69,7 +71,9 @@ impl TushareClient {
             })
     }
 
-    async fn post(
+    /// Generic POST wrapper. Surfaces tushare's `code != 0` as a
+    /// recoverable error so callers can pivot.
+    pub(crate) async fn post(
         &self,
         api_name: &str,
         params: Value,
@@ -90,9 +94,7 @@ impl TushareClient {
             .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
             .send()
             .await
-            .map_err(|e| {
-                VendorError::recoverable(VENDOR, format!("{api_name} HTTP failed: {e}"))
-            })?;
+            .map_err(|e| VendorError::recoverable(VENDOR, format!("{api_name} HTTP failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(VendorError::recoverable(
                 VENDOR,
@@ -103,7 +105,6 @@ impl TushareClient {
             VendorError::recoverable(VENDOR, format!("{api_name} JSON parse failed: {e}"))
         })?;
         if parsed.code != 0 {
-            // 40001 = bad token, 40002 = quota, etc. All recoverable.
             return Err(VendorError::recoverable(
                 VENDOR,
                 format!(
@@ -131,8 +132,6 @@ pub(crate) struct TushareData {
 }
 
 impl TushareData {
-    /// One row of the matrix → `BTreeMap<field, value>` for ergonomic
-    /// extraction by name.
     pub fn row_map(&self, row: &[Value]) -> BTreeMap<String, Value> {
         self.fields
             .iter()
@@ -144,7 +143,7 @@ impl TushareData {
 
 // ── Field extraction helpers ──────────────────────────────────────────
 
-fn f64_of(v: &Value) -> Option<f64> {
+pub(crate) fn f64_of(v: &Value) -> Option<f64> {
     match v {
         Value::Number(n) => n.as_f64(),
         Value::String(s) => s.parse::<f64>().ok(),
@@ -152,7 +151,7 @@ fn f64_of(v: &Value) -> Option<f64> {
     }
 }
 
-fn str_of(v: &Value) -> Option<String> {
+pub(crate) fn str_of(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
@@ -160,8 +159,8 @@ fn str_of(v: &Value) -> Option<String> {
     }
 }
 
-/// `20260520` → `2026-05-20`. Tushare's compact date format.
-fn iso_date(raw: &str) -> String {
+/// `20260520` → `2026-05-20`. Tushare's compact date form.
+pub(crate) fn iso_date(raw: &str) -> String {
     if raw.len() == 8 && raw.chars().all(|c| c.is_ascii_digit()) {
         format!("{}-{}-{}", &raw[..4], &raw[4..6], &raw[6..8])
     } else {
@@ -169,269 +168,1635 @@ fn iso_date(raw: &str) -> String {
     }
 }
 
-// ── VendorQuote ───────────────────────────────────────────────────────
+fn rows_take<'a>(data: &'a TushareData, n: usize) -> impl Iterator<Item = BTreeMap<String, Value>> + 'a {
+    data.items.iter().take(n).map(|r| data.row_map(r))
+}
 
-impl VendorQuote for TushareClient {
-    fn vendor_name(&self) -> &'static str {
-        VENDOR
-    }
-    fn fetch_quote<'a>(
-        &'a self,
-        symbol: &'a Symbol,
-    ) -> BoxFuture<'a, Result<MarketQuote, VendorError>> {
-        Box::pin(async move {
-            // `daily` is end-of-day OHLCV — Tushare's free tier doesn't
-            // expose realtime. Take the latest row.
-            let resp = self
-                .post(
-                    "daily",
-                    serde_json::json!({ "ts_code": symbol.to_dotted() }),
-                    "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount",
-                )
-                .await?;
-            let data = resp.data.ok_or_else(|| {
-                VendorError::recoverable(VENDOR, "daily: empty data envelope")
-            })?;
-            let row = data.items.first().ok_or_else(|| {
-                VendorError::recoverable(VENDOR, "daily: no rows for symbol")
-            })?;
-            let m = data.row_map(row);
-            let close = f64_of(m.get("close").unwrap_or(&Value::Null))
-                .ok_or_else(|| VendorError::recoverable(VENDOR, "daily: missing close"))?;
-            let change = f64_of(m.get("change").unwrap_or(&Value::Null)).unwrap_or(0.0);
-            let pct = f64_of(m.get("pct_chg").unwrap_or(&Value::Null)).unwrap_or(0.0);
-            let trade_date = str_of(m.get("trade_date").unwrap_or(&Value::Null))
-                .unwrap_or_else(|| "".into());
-            Ok(MarketQuote {
-                symbol: symbol.to_dotted(),
-                name: None, // daily endpoint doesn't return name; merged downstream
-                price: close,
-                change,
-                change_pct: pct,
-                volume: f64_of(m.get("vol").unwrap_or(&Value::Null)).map(|v| v * 100.0), // 手 → 股
-                turnover: f64_of(m.get("amount").unwrap_or(&Value::Null)).map(|v| v * 1000.0), // 千元 → 元
-                open: f64_of(m.get("open").unwrap_or(&Value::Null)),
-                high: f64_of(m.get("high").unwrap_or(&Value::Null)),
-                low: f64_of(m.get("low").unwrap_or(&Value::Null)),
-                prev_close: f64_of(m.get("pre_close").unwrap_or(&Value::Null)),
-                timestamp: iso_date(&trade_date),
-                data_freshness: "close".into(),
+// ── A. Macro indicators (`macro_indicators` tool) ────────────────────
+
+impl TushareClient {
+    /// `cn_cpi` — newest first.
+    pub async fn cn_cpi(&self, months: usize) -> Result<Vec<CpiPpiObs>, VendorError> {
+        let resp = self
+            .post(
+                "cn_cpi",
+                serde_json::json!({}),
+                "month,nt_val,nt_yoy,nt_mom,nt_accu",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "cn_cpi: empty data envelope")
+        })?;
+        Ok(rows_take(&data, months)
+            .map(|m| CpiPpiObs {
+                month: str_of(m.get("month").unwrap_or(&Value::Null)).unwrap_or_default(),
+                nation_value: f64_of(m.get("nt_val").unwrap_or(&Value::Null)),
+                nation_yoy: f64_of(m.get("nt_yoy").unwrap_or(&Value::Null)),
+                nation_mom: f64_of(m.get("nt_mom").unwrap_or(&Value::Null)),
+                nation_accum_yoy: f64_of(m.get("nt_accu").unwrap_or(&Value::Null)),
             })
-        })
+            .collect())
+    }
+
+    /// `cn_ppi` — newest first.
+    pub async fn cn_ppi(&self, months: usize) -> Result<Vec<CpiPpiObs>, VendorError> {
+        let resp = self
+            .post(
+                "cn_ppi",
+                serde_json::json!({}),
+                "month,ppi_yoy,ppi_mp,ppi_mp_qm",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "cn_ppi: empty data envelope")
+        })?;
+        Ok(rows_take(&data, months)
+            .map(|m| CpiPpiObs {
+                month: str_of(m.get("month").unwrap_or(&Value::Null)).unwrap_or_default(),
+                nation_value: None,
+                nation_yoy: f64_of(m.get("ppi_yoy").unwrap_or(&Value::Null)),
+                nation_mom: f64_of(m.get("ppi_mp").unwrap_or(&Value::Null)),
+                nation_accum_yoy: f64_of(m.get("ppi_mp_qm").unwrap_or(&Value::Null)),
+            })
+            .collect())
+    }
+
+    /// `cn_gdp` — newest first.
+    pub async fn cn_gdp(&self, quarters: usize) -> Result<Vec<GdpObs>, VendorError> {
+        let resp = self
+            .post(
+                "cn_gdp",
+                serde_json::json!({}),
+                "quarter,gdp,gdp_yoy,pi_yoy,si_yoy,ti_yoy",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "cn_gdp: empty data envelope")
+        })?;
+        Ok(rows_take(&data, quarters)
+            .map(|m| GdpObs {
+                quarter: str_of(m.get("quarter").unwrap_or(&Value::Null)).unwrap_or_default(),
+                gdp_yi_yuan: f64_of(m.get("gdp").unwrap_or(&Value::Null)),
+                gdp_yoy: f64_of(m.get("gdp_yoy").unwrap_or(&Value::Null)),
+                primary_yoy: f64_of(m.get("pi_yoy").unwrap_or(&Value::Null)),
+                secondary_yoy: f64_of(m.get("si_yoy").unwrap_or(&Value::Null)),
+                tertiary_yoy: f64_of(m.get("ti_yoy").unwrap_or(&Value::Null)),
+            })
+            .collect())
+    }
+
+    /// `cn_pmi` — newest first. We only project the two headline series.
+    pub async fn cn_pmi(&self, months: usize) -> Result<Vec<PmiObs>, VendorError> {
+        // The vendor returns ~60 PMI sub-codes; pull all and project.
+        let resp = self
+            .post("cn_pmi", serde_json::json!({}), "")
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "cn_pmi: empty data envelope")
+        })?;
+        Ok(rows_take(&data, months)
+            .map(|m| PmiObs {
+                month: str_of(m.get("MONTH").or_else(|| m.get("month")).unwrap_or(&Value::Null))
+                    .unwrap_or_default(),
+                manufacturing: f64_of(m.get("PMI010000").unwrap_or(&Value::Null)),
+                non_manufacturing: f64_of(m.get("PMI020100").unwrap_or(&Value::Null)),
+            })
+            .collect())
+    }
+
+    /// `cn_m` — money supply, newest first.
+    pub async fn cn_m(&self, months: usize) -> Result<Vec<MoneyObs>, VendorError> {
+        let resp = self
+            .post(
+                "cn_m",
+                serde_json::json!({}),
+                "month,m0,m1,m2,m0_yoy,m1_yoy,m2_yoy",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "cn_m: empty data envelope")
+        })?;
+        Ok(rows_take(&data, months)
+            .map(|m| MoneyObs {
+                month: str_of(m.get("month").unwrap_or(&Value::Null)).unwrap_or_default(),
+                m0_yi_yuan: f64_of(m.get("m0").unwrap_or(&Value::Null)),
+                m1_yi_yuan: f64_of(m.get("m1").unwrap_or(&Value::Null)),
+                m2_yi_yuan: f64_of(m.get("m2").unwrap_or(&Value::Null)),
+                m0_yoy: f64_of(m.get("m0_yoy").unwrap_or(&Value::Null)),
+                m1_yoy: f64_of(m.get("m1_yoy").unwrap_or(&Value::Null)),
+                m2_yoy: f64_of(m.get("m2_yoy").unwrap_or(&Value::Null)),
+            })
+            .collect())
+    }
+
+    /// `sf_month` — social financing monthly increment, newest first.
+    pub async fn sf_month(&self, months: usize) -> Result<Vec<SocialFinancingObs>, VendorError> {
+        let resp = self
+            .post(
+                "sf_month",
+                serde_json::json!({}),
+                "month,inc_month,inc_cumval,stk_endval",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "sf_month: empty data envelope")
+        })?;
+        Ok(rows_take(&data, months)
+            .map(|m| SocialFinancingObs {
+                month: str_of(m.get("month").unwrap_or(&Value::Null)).unwrap_or_default(),
+                increment_yi_yuan: f64_of(m.get("inc_month").unwrap_or(&Value::Null)),
+                cumulative_yi_yuan: f64_of(m.get("inc_cumval").unwrap_or(&Value::Null)),
+                stock_wan_yi_yuan: f64_of(m.get("stk_endval").unwrap_or(&Value::Null)),
+            })
+            .collect())
+    }
+
+    /// `shibor_lpr` — newest first.
+    pub async fn shibor_lpr(&self, rows: usize) -> Result<Vec<ShiborLprObs>, VendorError> {
+        let resp = self
+            .post("shibor_lpr", serde_json::json!({}), "date,1y,5y")
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "shibor_lpr: empty data envelope")
+        })?;
+        Ok(rows_take(&data, rows)
+            .map(|m| ShiborLprObs {
+                date: iso_date(
+                    &str_of(m.get("date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                ),
+                lpr_1y: f64_of(m.get("1y").unwrap_or(&Value::Null)),
+                lpr_5y: f64_of(m.get("5y").unwrap_or(&Value::Null)),
+            })
+            .collect())
+    }
+
+    /// `us_tbr` — newest first.
+    pub async fn us_tbr(&self, rows: usize) -> Result<Vec<UsTbrObs>, VendorError> {
+        let resp = self
+            .post(
+                "us_tbr",
+                serde_json::json!({}),
+                "date,w4_bd,w13_bd,w26_bd,w52_bd",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "us_tbr: empty data envelope")
+        })?;
+        Ok(rows_take(&data, rows)
+            .map(|m| UsTbrObs {
+                date: iso_date(
+                    &str_of(m.get("date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                ),
+                w4_bd: f64_of(m.get("w4_bd").unwrap_or(&Value::Null)),
+                w13_bd: f64_of(m.get("w13_bd").unwrap_or(&Value::Null)),
+                w52_bd: f64_of(m.get("w52_bd").unwrap_or(&Value::Null)),
+            })
+            .collect())
     }
 }
 
-// ── VendorCandle ──────────────────────────────────────────────────────
+// ── B. Market overview helpers ───────────────────────────────────────
 
-impl VendorCandle for TushareClient {
-    fn vendor_name(&self) -> &'static str {
-        VENDOR
-    }
-    fn fetch_candles<'a>(
-        &'a self,
-        symbol: &'a Symbol,
-        period: &'a str,
-        count: usize,
-    ) -> BoxFuture<'a, Result<Vec<Candle>, VendorError>> {
-        Box::pin(async move {
-            let api = match period {
-                "1d" => "daily",
-                "1w" => "weekly",
-                "1mo" => "monthly",
-                other => {
-                    return Err(VendorError::fatal(
-                        VENDOR,
-                        format!("unsupported period '{other}' (try 1d/1w/1mo)"),
-                    ))
+impl TushareClient {
+    /// `daily_info` — per-market totals (沪 A / 沪 B / 深 A / …).
+    pub async fn daily_info(
+        &self,
+        trade_date: Option<&str>,
+    ) -> Result<Vec<MarketTotals>, VendorError> {
+        let mut params = serde_json::json!({});
+        if let Some(d) = trade_date {
+            params["trade_date"] = d.into();
+        }
+        let resp = self
+            .post(
+                "daily_info",
+                params,
+                "trade_date,ts_code,ts_name,com_count,total_mv,amount,pe,tr,exchange",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "daily_info: empty data envelope")
+        })?;
+        Ok(data
+            .items
+            .iter()
+            .map(|row| {
+                let m = data.row_map(row);
+                MarketTotals {
+                    ts_code: str_of(m.get("ts_code").unwrap_or(&Value::Null)).unwrap_or_default(),
+                    ts_name: str_of(m.get("ts_name").unwrap_or(&Value::Null)).unwrap_or_default(),
+                    com_count: f64_of(m.get("com_count").unwrap_or(&Value::Null)),
+                    total_mv_yi_yuan: f64_of(m.get("total_mv").unwrap_or(&Value::Null)),
+                    amount_yi_yuan: f64_of(m.get("amount").unwrap_or(&Value::Null)),
+                    pe: f64_of(m.get("pe").unwrap_or(&Value::Null)),
+                    turnover_rate: f64_of(m.get("tr").unwrap_or(&Value::Null)),
+                    trade_date: iso_date(
+                        &str_of(m.get("trade_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                    ),
                 }
-            };
-            let resp = self
-                .post(
-                    api,
-                    serde_json::json!({ "ts_code": symbol.to_dotted() }),
-                    "ts_code,trade_date,open,high,low,close,vol,amount",
-                )
-                .await?;
-            let data = resp.data.ok_or_else(|| {
-                VendorError::recoverable(VENDOR, format!("{api}: empty data envelope"))
-            })?;
-            // Tushare returns newest-first; we want a chronological list
-            // capped at `count`.
-            let mut candles: Vec<Candle> = data
-                .items
-                .iter()
-                .take(count)
-                .filter_map(|row| {
-                    let m = data.row_map(row);
-                    let date = str_of(m.get("trade_date").unwrap_or(&Value::Null))?;
-                    Some(Candle {
-                        date: iso_date(&date),
-                        open: f64_of(m.get("open").unwrap_or(&Value::Null))?,
-                        high: f64_of(m.get("high").unwrap_or(&Value::Null))?,
-                        low: f64_of(m.get("low").unwrap_or(&Value::Null))?,
-                        close: f64_of(m.get("close").unwrap_or(&Value::Null))?,
-                        volume: f64_of(m.get("vol").unwrap_or(&Value::Null))
-                            .map(|v| v * 100.0)
-                            .unwrap_or(0.0),
-                        turnover: f64_of(m.get("amount").unwrap_or(&Value::Null))
-                            .map(|v| v * 1000.0),
-                    })
+            })
+            .collect())
+    }
+
+    /// `index_dailybasic` — latest basic stats for the given index codes.
+    pub async fn index_dailybasic(
+        &self,
+        ts_codes: &[&str],
+        trade_date: Option<&str>,
+    ) -> Result<Vec<IndexBasic>, VendorError> {
+        let mut params = serde_json::json!({});
+        if let Some(d) = trade_date {
+            params["trade_date"] = d.into();
+        }
+        let resp = self
+            .post(
+                "index_dailybasic",
+                params,
+                "ts_code,trade_date,total_mv,pe,pe_ttm,pb,turnover_rate",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "index_dailybasic: empty data envelope")
+        })?;
+        let want: std::collections::HashSet<&&str> = ts_codes.iter().collect();
+        Ok(data
+            .items
+            .iter()
+            .filter_map(|row| {
+                let m = data.row_map(row);
+                let ts =
+                    str_of(m.get("ts_code").unwrap_or(&Value::Null)).unwrap_or_default();
+                if !ts_codes.is_empty() && !want.contains(&ts.as_str()) {
+                    return None;
+                }
+                Some(IndexBasic {
+                    ts_code: ts,
+                    trade_date: iso_date(
+                        &str_of(m.get("trade_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                    ),
+                    total_mv_yuan: f64_of(m.get("total_mv").unwrap_or(&Value::Null))
+                        .map(|v| v * 10_000.0),
+                    pe: f64_of(m.get("pe").unwrap_or(&Value::Null)),
+                    pe_ttm: f64_of(m.get("pe_ttm").unwrap_or(&Value::Null)),
+                    pb: f64_of(m.get("pb").unwrap_or(&Value::Null)),
+                    turnover_rate: f64_of(m.get("turnover_rate").unwrap_or(&Value::Null)),
                 })
-                .collect();
-            candles.reverse();
-            if candles.is_empty() {
-                return Err(VendorError::recoverable(
+            })
+            .collect())
+    }
+
+    /// `moneyflow_mkt_dc` — single-row big-picture market money flow.
+    pub async fn moneyflow_mkt_dc(
+        &self,
+        trade_date: Option<&str>,
+    ) -> Result<Option<BTreeMap<String, Option<f64>>>, VendorError> {
+        let mut params = serde_json::json!({});
+        if let Some(d) = trade_date {
+            params["trade_date"] = d.into();
+        }
+        let resp = self.post("moneyflow_mkt_dc", params, "").await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "moneyflow_mkt_dc: empty data envelope")
+        })?;
+        let Some(row) = data.items.first() else { return Ok(None) };
+        let m = data.row_map(row);
+        let mut out = BTreeMap::new();
+        for k in [
+            "close_sh",
+            "pct_change_sh",
+            "close_sz",
+            "pct_change_sz",
+            "net_amount",
+            "net_amount_rate",
+            "buy_elg_amount",
+            "buy_lg_amount",
+            "buy_md_amount",
+            "buy_sm_amount",
+        ] {
+            out.insert(k.into(), f64_of(m.get(k).unwrap_or(&Value::Null)));
+        }
+        out.insert(
+            "trade_date".into(),
+            f64_of(m.get("trade_date").unwrap_or(&Value::Null)),
+        );
+        Ok(Some(out))
+    }
+
+    /// `moneyflow_hsgt` — sh/sz/hk/total connect flow snapshot.
+    pub async fn moneyflow_hsgt(
+        &self,
+        trade_date: Option<&str>,
+    ) -> Result<Option<HsgtFlow>, VendorError> {
+        let mut params = serde_json::json!({});
+        if let Some(d) = trade_date {
+            params["trade_date"] = d.into();
+        }
+        let resp = self
+            .post(
+                "moneyflow_hsgt",
+                params,
+                "trade_date,ggt_ss,ggt_sz,hgt,sgt,north_money,south_money",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "moneyflow_hsgt: empty data envelope")
+        })?;
+        let Some(row) = data.items.first() else { return Ok(None) };
+        let m = data.row_map(row);
+        Ok(Some(HsgtFlow {
+            trade_date: iso_date(
+                &str_of(m.get("trade_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+            ),
+            north_money_wan: f64_of(m.get("north_money").unwrap_or(&Value::Null)),
+            south_money_wan: f64_of(m.get("south_money").unwrap_or(&Value::Null)),
+            hgt_wan: f64_of(m.get("hgt").unwrap_or(&Value::Null)),
+            sgt_wan: f64_of(m.get("sgt").unwrap_or(&Value::Null)),
+        }))
+    }
+
+    /// `moneyflow_ind_dc` — industry-level main-force flow,
+    /// ranked by net amount.
+    pub async fn moneyflow_ind_dc(
+        &self,
+        trade_date: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<IndustryFlowRow>, VendorError> {
+        let mut params = serde_json::json!({});
+        if let Some(d) = trade_date {
+            params["trade_date"] = d.into();
+        }
+        let resp = self
+            .post(
+                "moneyflow_ind_dc",
+                params,
+                "trade_date,content_type,ts_code,name,pct_change,net_amount,net_amount_rate,rank,buy_sm_amount_stock",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "moneyflow_ind_dc: empty data envelope")
+        })?;
+        Ok(data
+            .items
+            .iter()
+            .filter_map(|row| {
+                let m = data.row_map(row);
+                let ct = str_of(m.get("content_type").unwrap_or(&Value::Null))
+                    .unwrap_or_default();
+                if !ct.contains("行业") && !ct.is_empty() {
+                    return None;
+                }
+                Some(IndustryFlowRow {
+                    ts_code: str_of(m.get("ts_code").unwrap_or(&Value::Null))
+                        .unwrap_or_default(),
+                    name: str_of(m.get("name").unwrap_or(&Value::Null)).unwrap_or_default(),
+                    pct_change: f64_of(m.get("pct_change").unwrap_or(&Value::Null)),
+                    net_amount_yuan: f64_of(m.get("net_amount").unwrap_or(&Value::Null)),
+                    net_amount_rate: f64_of(m.get("net_amount_rate").unwrap_or(&Value::Null)),
+                    rank: f64_of(m.get("rank").unwrap_or(&Value::Null)).map(|v| v as u32),
+                    lead_stock: str_of(m.get("buy_sm_amount_stock").unwrap_or(&Value::Null)),
+                })
+            })
+            .take(limit)
+            .collect())
+    }
+
+    /// `limit_list_d` — today's up/down-limit list.
+    pub async fn limit_list_d(
+        &self,
+        trade_date: &str,
+    ) -> Result<Vec<LimitListRow>, VendorError> {
+        let resp = self
+            .post(
+                "limit_list_d",
+                serde_json::json!({ "trade_date": trade_date }),
+                "trade_date,ts_code,name,close,pct_chg,turnover_ratio,limit",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "limit_list_d: empty data envelope")
+        })?;
+        Ok(data
+            .items
+            .iter()
+            .map(|row| {
+                let m = data.row_map(row);
+                LimitListRow {
+                    trade_date: iso_date(
+                        &str_of(m.get("trade_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                    ),
+                    ts_code: str_of(m.get("ts_code").unwrap_or(&Value::Null))
+                        .unwrap_or_default(),
+                    name: str_of(m.get("name").unwrap_or(&Value::Null)).unwrap_or_default(),
+                    close: f64_of(m.get("close").unwrap_or(&Value::Null)),
+                    pct_chg: f64_of(m.get("pct_chg").unwrap_or(&Value::Null)),
+                    turnover_ratio: f64_of(m.get("turnover_ratio").unwrap_or(&Value::Null)),
+                    limit: str_of(m.get("limit").unwrap_or(&Value::Null)),
+                }
+            })
+            .collect())
+    }
+
+    /// `limit_cpt_list` — strongest concept boards by consecutive limits.
+    pub async fn limit_cpt_list(&self, trade_date: &str) -> Result<Vec<LimitCapt>, VendorError> {
+        let resp = self
+            .post(
+                "limit_cpt_list",
+                serde_json::json!({ "trade_date": trade_date }),
+                "ts_code,name,trade_date,days,up_stat,cons_nums,up_nums,pct_change,rank",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "limit_cpt_list: empty data envelope")
+        })?;
+        Ok(data
+            .items
+            .iter()
+            .map(|row| {
+                let m = data.row_map(row);
+                LimitCapt {
+                    ts_code: str_of(m.get("ts_code").unwrap_or(&Value::Null))
+                        .unwrap_or_default(),
+                    name: str_of(m.get("name").unwrap_or(&Value::Null)).unwrap_or_default(),
+                    days: f64_of(m.get("days").unwrap_or(&Value::Null)).map(|v| v as u32),
+                    up_stat: str_of(m.get("up_stat").unwrap_or(&Value::Null)),
+                    cons_nums: str_of(m.get("cons_nums").unwrap_or(&Value::Null)),
+                    up_nums: f64_of(m.get("up_nums").unwrap_or(&Value::Null)).map(|v| v as u32),
+                    pct_change: f64_of(m.get("pct_change").unwrap_or(&Value::Null)),
+                }
+            })
+            .collect())
+    }
+}
+
+// ── C. Industry landscape (industry_landscape tool) ──────────────────
+
+impl TushareClient {
+    /// `stock_basic` — full listed catalog (industry, name, exchange).
+    /// We filter client-side because Tushare's `industry` param accepts
+    /// only an exact match and there are common variants.
+    pub async fn stock_basic_for_industry(
+        &self,
+        industry: &str,
+    ) -> Result<Vec<(String, String)>, VendorError> {
+        let resp = self
+            .post(
+                "stock_basic",
+                serde_json::json!({ "industry": industry, "list_status": "L" }),
+                "ts_code,name,industry",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "stock_basic: empty data envelope")
+        })?;
+        Ok(data
+            .items
+            .iter()
+            .filter_map(|row| {
+                let m = data.row_map(row);
+                let ts = str_of(m.get("ts_code").unwrap_or(&Value::Null))?;
+                let name = str_of(m.get("name").unwrap_or(&Value::Null))?;
+                Some((ts, name))
+            })
+            .collect())
+    }
+
+    /// `stock_basic` for one symbol — used to discover the symbol's
+    /// industry.
+    pub async fn stock_basic_one(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<(String, Option<String>, Option<String>), VendorError> {
+        let resp = self
+            .post(
+                "stock_basic",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,name,industry,area",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "stock_basic: empty data envelope")
+        })?;
+        let row = data
+            .items
+            .first()
+            .ok_or_else(|| VendorError::recoverable(VENDOR, "stock_basic: no row for symbol"))?;
+        let m = data.row_map(row);
+        Ok((
+            str_of(m.get("name").unwrap_or(&Value::Null)).unwrap_or_default(),
+            str_of(m.get("industry").unwrap_or(&Value::Null)),
+            str_of(m.get("area").unwrap_or(&Value::Null)),
+        ))
+    }
+
+    /// `daily_basic` for one symbol — latest valuation row.
+    pub async fn daily_basic_one(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<BTreeMap<String, Option<f64>>, VendorError> {
+        let resp = self
+            .post(
+                "daily_basic",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,trade_date,pe_ttm,pb,ps_ttm,dv_ttm,total_mv,circ_mv,turnover_rate",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "daily_basic: empty data envelope")
+        })?;
+        let Some(row) = data.items.first() else {
+            return Err(VendorError::recoverable(VENDOR, "daily_basic: no row"));
+        };
+        let m = data.row_map(row);
+        let mut out = BTreeMap::new();
+        for k in ["pe_ttm", "pb", "ps_ttm", "dv_ttm", "turnover_rate"] {
+            out.insert(k.into(), f64_of(m.get(k).unwrap_or(&Value::Null)));
+        }
+        // Convert 万元 → 元.
+        for (vendor_k, neutral_k) in [("total_mv", "market_cap"), ("circ_mv", "float_market_cap")]
+        {
+            out.insert(
+                neutral_k.into(),
+                f64_of(m.get(vendor_k).unwrap_or(&Value::Null)).map(|v| v * 10_000.0),
+            );
+        }
+        out.insert(
+            "trade_date".into(),
+            str_of(m.get("trade_date").unwrap_or(&Value::Null))
+                .and_then(|s| s.parse::<f64>().ok()),
+        );
+        Ok(out)
+    }
+
+    /// Bulk `daily_basic` for a peer set — returns one row per ts_code.
+    /// We loop one-by-one because tushare's multi-code call bundles
+    /// historical rows together.
+    pub async fn daily_basic_bulk(
+        &self,
+        ts_codes: &[String],
+    ) -> Vec<(String, BTreeMap<String, Option<f64>>)> {
+        let mut out = Vec::new();
+        for ts in ts_codes {
+            if let Ok(resp) = self
+                .post(
+                    "daily_basic",
+                    serde_json::json!({ "ts_code": ts }),
+                    "ts_code,trade_date,pe_ttm,pb,ps_ttm,dv_ttm,total_mv,turnover_rate",
+                )
+                .await
+            {
+                if let Some(data) = resp.data {
+                    if let Some(row) = data.items.first() {
+                        let m = data.row_map(row);
+                        let mut row_map = BTreeMap::new();
+                        for k in ["pe_ttm", "pb", "ps_ttm", "dv_ttm", "turnover_rate"] {
+                            row_map.insert(k.into(), f64_of(m.get(k).unwrap_or(&Value::Null)));
+                        }
+                        row_map.insert(
+                            "market_cap".into(),
+                            f64_of(m.get("total_mv").unwrap_or(&Value::Null))
+                                .map(|v| v * 10_000.0),
+                        );
+                        out.push((ts.clone(), row_map));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `fina_indicator` for one symbol — latest annual ratios. Kept
+    /// available for `industry_landscape` "rank by ROE" extension; not
+    /// wired in M4.1.1 (we rank by market cap there).
+    #[allow(dead_code)]
+    pub async fn fina_indicator_one(
+        &self,
+        ts_code: &str,
+    ) -> Option<BTreeMap<String, Option<f64>>> {
+        let resp = self
+            .post(
+                "fina_indicator",
+                serde_json::json!({ "ts_code": ts_code }),
+                "ts_code,end_date,roe,grossprofit_margin,netprofit_margin",
+            )
+            .await
+            .ok()?;
+        let data = resp.data?;
+        let row = data.items.first()?;
+        let m = data.row_map(row);
+        let mut out = BTreeMap::new();
+        out.insert("roe".into(), f64_of(m.get("roe").unwrap_or(&Value::Null)));
+        out.insert(
+            "gross_margin".into(),
+            f64_of(m.get("grossprofit_margin").unwrap_or(&Value::Null)),
+        );
+        out.insert(
+            "net_margin".into(),
+            f64_of(m.get("netprofit_margin").unwrap_or(&Value::Null)),
+        );
+        Some(out)
+    }
+
+    /// `sw_daily` — SW industry index daily values for the given symbol
+    /// list.
+    pub async fn sw_daily(&self, trade_date: &str) -> Result<Vec<Value>, VendorError> {
+        let resp = self
+            .post(
+                "sw_daily",
+                serde_json::json!({ "trade_date": trade_date }),
+                "ts_code,trade_date,name,close,pct_change,pe,pb",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "sw_daily: empty data envelope")
+        })?;
+        Ok(data
+            .items
+            .iter()
+            .map(|row| {
+                let m = data.row_map(row);
+                serde_json::json!({
+                    "ts_code": str_of(m.get("ts_code").unwrap_or(&Value::Null)),
+                    "name": str_of(m.get("name").unwrap_or(&Value::Null)),
+                    "close": f64_of(m.get("close").unwrap_or(&Value::Null)),
+                    "pct_change": f64_of(m.get("pct_change").unwrap_or(&Value::Null)),
+                    "pe": f64_of(m.get("pe").unwrap_or(&Value::Null)),
+                    "pb": f64_of(m.get("pb").unwrap_or(&Value::Null)),
+                })
+            })
+            .collect())
+    }
+}
+
+// ── D. Individual-stock dossier helpers (`stock_overview`) ───────────
+
+impl TushareClient {
+    /// `stock_company` — extended company profile (chairman / secretary
+    /// / introduction / business scope).
+    pub async fn stock_company(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<CompanyProfile>, VendorError> {
+        let resp = self
+            .post(
+                "stock_company",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,com_name,chairman,secretary,reg_capital,setup_date,province,city,introduction,website,employees,main_business,exchange",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "stock_company: empty data envelope")
+        })?;
+        let Some(row) = data.items.first() else { return Ok(None) };
+        let m = data.row_map(row);
+        Ok(Some(CompanyProfile {
+            symbol: symbol.to_dotted(),
+            name: str_of(m.get("com_name").unwrap_or(&Value::Null)).unwrap_or_default(),
+            chairman: str_of(m.get("chairman").unwrap_or(&Value::Null)),
+            secretary: str_of(m.get("secretary").unwrap_or(&Value::Null)),
+            industry: None,
+            area: None,
+            exchange_label: str_of(m.get("exchange").unwrap_or(&Value::Null)).map(|raw| {
+                match raw.as_str() {
+                    "SSE" => "上海证券交易所".into(),
+                    "SZSE" => "深圳证券交易所".into(),
+                    "BSE" => "北京证券交易所".into(),
+                    _ => raw,
+                }
+            }),
+            list_date: None,
+            introduction: str_of(m.get("introduction").unwrap_or(&Value::Null)),
+            main_business: str_of(m.get("main_business").unwrap_or(&Value::Null)),
+            website: str_of(m.get("website").unwrap_or(&Value::Null)),
+            employees: f64_of(m.get("employees").unwrap_or(&Value::Null)),
+            fullname: None,
+        }))
+    }
+
+    /// Three statements (income / balance / cashflow / ratios). Returns
+    /// rows newest-first, count-capped.
+    pub async fn fina_statement(
+        &self,
+        symbol: &Symbol,
+        statement: &str,
+        period: &str,
+        count: usize,
+    ) -> Result<Vec<FinancialRow>, VendorError> {
+        let (api, fields, key_map): (&str, &str, &[(&str, &str)]) = match statement {
+            "income" => (
+                "income",
+                "ts_code,end_date,total_revenue,revenue,oper_cost,operate_profit,total_profit,n_income,n_income_attr_p,basic_eps",
+                &[
+                    ("revenue", "total_revenue"),
+                    ("operating_revenue", "revenue"),
+                    ("operating_cost", "oper_cost"),
+                    ("operating_profit", "operate_profit"),
+                    ("total_profit", "total_profit"),
+                    ("net_profit", "n_income"),
+                    ("net_profit_to_parent", "n_income_attr_p"),
+                    ("eps_basic", "basic_eps"),
+                ],
+            ),
+            "balance" => (
+                "balancesheet",
+                "ts_code,end_date,total_assets,total_liab,total_hldr_eqy_inc_min_int,money_cap,total_cur_assets,total_cur_liab",
+                &[
+                    ("total_assets", "total_assets"),
+                    ("total_liabilities", "total_liab"),
+                    ("total_equity", "total_hldr_eqy_inc_min_int"),
+                    ("cash_and_equivalents", "money_cap"),
+                    ("current_assets", "total_cur_assets"),
+                    ("current_liabilities", "total_cur_liab"),
+                ],
+            ),
+            "cashflow" => (
+                "cashflow",
+                "ts_code,end_date,n_cashflow_act,n_cashflow_inv_act,n_cash_flows_fnc_act,free_cashflow",
+                &[
+                    ("cf_operating", "n_cashflow_act"),
+                    ("cf_investing", "n_cashflow_inv_act"),
+                    ("cf_financing", "n_cash_flows_fnc_act"),
+                    ("free_cash_flow", "free_cashflow"),
+                ],
+            ),
+            "ratios" => (
+                "fina_indicator",
+                "ts_code,end_date,roe,roa,grossprofit_margin,netprofit_margin,debt_to_assets,current_ratio,quick_ratio,or_yoy,netprofit_yoy",
+                &[
+                    ("roe", "roe"),
+                    ("roa", "roa"),
+                    ("gross_margin", "grossprofit_margin"),
+                    ("net_margin", "netprofit_margin"),
+                    ("debt_to_assets", "debt_to_assets"),
+                    ("current_ratio", "current_ratio"),
+                    ("quick_ratio", "quick_ratio"),
+                    ("revenue_yoy", "or_yoy"),
+                    ("net_profit_yoy", "netprofit_yoy"),
+                ],
+            ),
+            other => {
+                return Err(VendorError::fatal(
                     VENDOR,
-                    format!("{api}: no candles for symbol"),
+                    format!(
+                        "unsupported statement '{other}' (try income/balance/cashflow/ratios)"
+                    ),
                 ));
             }
-            Ok(candles)
-        })
+        };
+        let params = if period == "year" {
+            serde_json::json!({ "ts_code": symbol.to_dotted(), "period": "1231" })
+        } else {
+            serde_json::json!({ "ts_code": symbol.to_dotted() })
+        };
+        let resp = self.post(api, params, fields).await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, format!("{api}: empty data envelope"))
+        })?;
+        let filter_annual = period == "year";
+        Ok(data
+            .items
+            .iter()
+            .filter_map(|row| {
+                let m = data.row_map(row);
+                let end = str_of(m.get("end_date").unwrap_or(&Value::Null))?;
+                if filter_annual && !end.ends_with("1231") {
+                    return None;
+                }
+                let mut metrics = BTreeMap::new();
+                for (neutral, tushare_key) in key_map {
+                    let v = m.get(*tushare_key).cloned().unwrap_or(Value::Null);
+                    metrics.insert((*neutral).into(), f64_of(&v));
+                }
+                Some(FinancialRow {
+                    period_end: iso_date(&end),
+                    label: derive_label(&end, period),
+                    metrics,
+                })
+            })
+            .take(count)
+            .collect())
+    }
+
+    /// `fina_mainbz` — main business breakdown for one symbol.
+    pub async fn fina_mainbz(
+        &self,
+        symbol: &Symbol,
+        dim: &str,
+    ) -> Result<Vec<super::types::BusinessRow>, VendorError> {
+        let bz_item = match dim {
+            "product" => "P",
+            "industry" => "I",
+            "region" => "R",
+            other => {
+                return Err(VendorError::fatal(
+                    VENDOR,
+                    format!(
+                        "unsupported breakdown dim '{other}' (try product/industry/region)"
+                    ),
+                ))
+            }
+        };
+        let resp = self
+            .post(
+                "fina_mainbz",
+                serde_json::json!({ "ts_code": symbol.to_dotted(), "type": bz_item }),
+                "ts_code,end_date,bz_item,bz_sales,bz_profit,bz_cost",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "fina_mainbz: empty data envelope")
+        })?;
+        if data.items.is_empty() {
+            return Err(VendorError::recoverable(
+                VENDOR,
+                "fina_mainbz: no rows for symbol",
+            ));
+        }
+        let latest = data
+            .items
+            .iter()
+            .filter_map(|row| {
+                let m = data.row_map(row);
+                str_of(m.get("end_date").unwrap_or(&Value::Null))
+            })
+            .max()
+            .unwrap_or_default();
+        let scoped: Vec<_> = data
+            .items
+            .iter()
+            .filter(|row| {
+                let m = data.row_map(row);
+                str_of(m.get("end_date").unwrap_or(&Value::Null))
+                    .map(|e| e == latest)
+                    .unwrap_or(false)
+            })
+            .collect();
+        let total: f64 = scoped
+            .iter()
+            .filter_map(|row| {
+                let m = data.row_map(row);
+                f64_of(m.get("bz_sales").unwrap_or(&Value::Null))
+            })
+            .sum();
+        Ok(scoped
+            .iter()
+            .map(|row| {
+                let m = data.row_map(row);
+                let sales = f64_of(m.get("bz_sales").unwrap_or(&Value::Null));
+                let cost = f64_of(m.get("bz_cost").unwrap_or(&Value::Null));
+                let gm = match (sales, cost) {
+                    (Some(s), Some(c)) if s > 0.0 => Some((s - c) / s * 100.0),
+                    _ => None,
+                };
+                let pct = sales.and_then(|s| {
+                    if total > 0.0 {
+                        Some(s / total * 100.0)
+                    } else {
+                        None
+                    }
+                });
+                super::types::BusinessRow {
+                    dimension: dim.to_string(),
+                    item: str_of(m.get("bz_item").unwrap_or(&Value::Null))
+                        .unwrap_or_else(|| "(未知)".into()),
+                    revenue_yuan: sales,
+                    pct_of_total: pct,
+                    gross_margin_pct: gm,
+                    period_end: iso_date(&latest),
+                }
+            })
+            .collect())
+    }
+
+    /// `top10_holders` — newest period top-10 (vendor returns multiple
+    /// historical periods; we keep latest).
+    pub async fn top10_holders(
+        &self,
+        symbol: &Symbol,
+        kind: &str,
+    ) -> Result<(String, Vec<HolderRow>), VendorError> {
+        let api = match kind {
+            "total" => "top10_holders",
+            "float" => "top10_floatholders",
+            other => {
+                return Err(VendorError::fatal(
+                    VENDOR,
+                    format!("unsupported holders kind '{other}' (try total/float)"),
+                ))
+            }
+        };
+        let resp = self
+            .post(
+                api,
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,end_date,holder_name,holder_type,hold_amount,hold_ratio,hold_change",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, format!("{api}: empty data envelope"))
+        })?;
+        if data.items.is_empty() {
+            return Err(VendorError::recoverable(
+                VENDOR,
+                format!("{api}: no holder rows"),
+            ));
+        }
+        let latest = data
+            .items
+            .iter()
+            .filter_map(|row| {
+                let m = data.row_map(row);
+                str_of(m.get("end_date").unwrap_or(&Value::Null))
+            })
+            .max()
+            .unwrap_or_default();
+        let holders: Vec<HolderRow> = data
+            .items
+            .iter()
+            .filter(|row| {
+                let m = data.row_map(row);
+                str_of(m.get("end_date").unwrap_or(&Value::Null))
+                    .map(|e| e == latest)
+                    .unwrap_or(false)
+            })
+            .enumerate()
+            .map(|(idx, row)| {
+                let m = data.row_map(row);
+                HolderRow {
+                    rank: (idx + 1) as u32,
+                    holder_name: str_of(m.get("holder_name").unwrap_or(&Value::Null))
+                        .unwrap_or_else(|| "(未知)".into()),
+                    holder_type: str_of(m.get("holder_type").unwrap_or(&Value::Null)),
+                    shares: f64_of(m.get("hold_amount").unwrap_or(&Value::Null)),
+                    pct: f64_of(m.get("hold_ratio").unwrap_or(&Value::Null)),
+                    change_qoq_shares: f64_of(m.get("hold_change").unwrap_or(&Value::Null)),
+                }
+            })
+            .take(10)
+            .collect();
+        Ok((iso_date(&latest), holders))
+    }
+
+    /// `stk_holdernumber` — total shareholder count history (newest first).
+    pub async fn stk_holdernumber(
+        &self,
+        symbol: &Symbol,
+        rows: usize,
+    ) -> Result<Vec<HolderCountObs>, VendorError> {
+        let resp = self
+            .post(
+                "stk_holdernumber",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,ann_date,end_date,holder_num",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "stk_holdernumber: empty data envelope")
+        })?;
+        Ok(rows_take(&data, rows)
+            .map(|m| HolderCountObs {
+                end_date: iso_date(
+                    &str_of(m.get("end_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                ),
+                holder_count: f64_of(m.get("holder_num").unwrap_or(&Value::Null)),
+            })
+            .collect())
+    }
+
+    /// `daily` — OHLCV bars (count-capped). Newest first per vendor.
+    pub async fn daily(
+        &self,
+        symbol: &Symbol,
+        count: usize,
+    ) -> Result<Vec<Candle>, VendorError> {
+        let resp = self
+            .post(
+                "daily",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,trade_date,open,high,low,close,vol,amount",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "daily: empty data envelope")
+        })?;
+        let mut candles: Vec<Candle> = data
+            .items
+            .iter()
+            .take(count)
+            .filter_map(|row| {
+                let m = data.row_map(row);
+                let date = str_of(m.get("trade_date").unwrap_or(&Value::Null))?;
+                Some(Candle {
+                    date: iso_date(&date),
+                    open: f64_of(m.get("open").unwrap_or(&Value::Null))?,
+                    high: f64_of(m.get("high").unwrap_or(&Value::Null))?,
+                    low: f64_of(m.get("low").unwrap_or(&Value::Null))?,
+                    close: f64_of(m.get("close").unwrap_or(&Value::Null))?,
+                    volume: f64_of(m.get("vol").unwrap_or(&Value::Null))
+                        .map(|v| v * 100.0)
+                        .unwrap_or(0.0),
+                    turnover: f64_of(m.get("amount").unwrap_or(&Value::Null)).map(|v| v * 1000.0),
+                })
+            })
+            .collect();
+        candles.reverse();
+        if candles.is_empty() {
+            return Err(VendorError::recoverable(VENDOR, "daily: no candles"));
+        }
+        Ok(candles)
+    }
+
+    /// `weekly` / `monthly` OHLCV (count-capped).
+    pub async fn period_candles(
+        &self,
+        symbol: &Symbol,
+        period: &str,
+        count: usize,
+    ) -> Result<Vec<Candle>, VendorError> {
+        let api = match period {
+            "weekly" => "weekly",
+            "monthly" => "monthly",
+            other => {
+                return Err(VendorError::fatal(
+                    VENDOR,
+                    format!("unsupported candle period '{other}' (try weekly/monthly)"),
+                ))
+            }
+        };
+        let resp = self
+            .post(
+                api,
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,trade_date,open,high,low,close,vol,amount",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, format!("{api}: empty data envelope"))
+        })?;
+        let mut candles: Vec<Candle> = data
+            .items
+            .iter()
+            .take(count)
+            .filter_map(|row| {
+                let m = data.row_map(row);
+                let date = str_of(m.get("trade_date").unwrap_or(&Value::Null))?;
+                Some(Candle {
+                    date: iso_date(&date),
+                    open: f64_of(m.get("open").unwrap_or(&Value::Null))?,
+                    high: f64_of(m.get("high").unwrap_or(&Value::Null))?,
+                    low: f64_of(m.get("low").unwrap_or(&Value::Null))?,
+                    close: f64_of(m.get("close").unwrap_or(&Value::Null))?,
+                    volume: f64_of(m.get("vol").unwrap_or(&Value::Null))
+                        .map(|v| v * 100.0)
+                        .unwrap_or(0.0),
+                    turnover: f64_of(m.get("amount").unwrap_or(&Value::Null)).map(|v| v * 1000.0),
+                })
+            })
+            .collect();
+        candles.reverse();
+        if candles.is_empty() {
+            return Err(VendorError::recoverable(VENDOR, format!("{api}: no candles")));
+        }
+        Ok(candles)
+    }
+
+    /// `stk_factor` — technical indicators row stream.
+    pub async fn stk_factor(
+        &self,
+        symbol: &Symbol,
+        rows: usize,
+    ) -> Result<Vec<TechRow>, VendorError> {
+        let resp = self
+            .post(
+                "stk_factor",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,trade_date,close,macd_dif,macd_dea,macd,kdj_k,kdj_d,kdj_j,rsi_6,rsi_12,rsi_24,boll_upper,boll_mid,boll_lower",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "stk_factor: empty data envelope")
+        })?;
+        let mut out: Vec<TechRow> = rows_take(&data, rows)
+            .map(|m| TechRow {
+                date: iso_date(
+                    &str_of(m.get("trade_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                ),
+                close: f64_of(m.get("close").unwrap_or(&Value::Null)),
+                macd_dif: f64_of(m.get("macd_dif").unwrap_or(&Value::Null)),
+                macd_dea: f64_of(m.get("macd_dea").unwrap_or(&Value::Null)),
+                macd: f64_of(m.get("macd").unwrap_or(&Value::Null)),
+                kdj_k: f64_of(m.get("kdj_k").unwrap_or(&Value::Null)),
+                kdj_d: f64_of(m.get("kdj_d").unwrap_or(&Value::Null)),
+                kdj_j: f64_of(m.get("kdj_j").unwrap_or(&Value::Null)),
+                rsi_6: f64_of(m.get("rsi_6").unwrap_or(&Value::Null)),
+                rsi_12: f64_of(m.get("rsi_12").unwrap_or(&Value::Null)),
+                rsi_24: f64_of(m.get("rsi_24").unwrap_or(&Value::Null)),
+                boll_upper: f64_of(m.get("boll_upper").unwrap_or(&Value::Null)),
+                boll_mid: f64_of(m.get("boll_mid").unwrap_or(&Value::Null)),
+                boll_lower: f64_of(m.get("boll_lower").unwrap_or(&Value::Null)),
+            })
+            .collect();
+        out.reverse();
+        Ok(out)
     }
 }
 
-// ── VendorFinancial ───────────────────────────────────────────────────
+// ── E. Recent actions (`recent_actions`) ─────────────────────────────
 
-impl VendorFinancial for TushareClient {
-    fn vendor_name(&self) -> &'static str {
-        VENDOR
-    }
-    fn fetch_financials<'a>(
-        &'a self,
-        symbol: &'a Symbol,
-        statement: &'a str,
-        period: &'a str,
-        count: usize,
-    ) -> BoxFuture<'a, Result<FinancialReport, VendorError>> {
-        Box::pin(async move {
-            // Each statement maps to a different Tushare endpoint with a
-            // distinct field surface. We translate vendor-specific names
-            // to the neutral metric keys promised in `FinancialRow`.
-            let (api, fields, key_map): (
-                &str,
-                &str,
-                &[(&str, &str)],
-            ) = match statement {
-                "income" => (
-                    "income",
-                    "ts_code,end_date,total_revenue,revenue,oper_cost,operate_profit,total_profit,n_income,n_income_attr_p,basic_eps",
-                    &[
-                        ("revenue", "total_revenue"),
-                        ("operating_revenue", "revenue"),
-                        ("operating_cost", "oper_cost"),
-                        ("operating_profit", "operate_profit"),
-                        ("total_profit", "total_profit"),
-                        ("net_profit", "n_income"),
-                        ("net_profit_to_parent", "n_income_attr_p"),
-                        ("eps_basic", "basic_eps"),
-                    ],
-                ),
-                "balance" => (
-                    "balancesheet",
-                    "ts_code,end_date,total_assets,total_liab,total_hldr_eqy_inc_min_int,money_cap,total_cur_assets,total_cur_liab",
-                    &[
-                        ("total_assets", "total_assets"),
-                        ("total_liabilities", "total_liab"),
-                        ("total_equity", "total_hldr_eqy_inc_min_int"),
-                        ("cash_and_equivalents", "money_cap"),
-                        ("current_assets", "total_cur_assets"),
-                        ("current_liabilities", "total_cur_liab"),
-                    ],
-                ),
-                "cashflow" => (
-                    "cashflow",
-                    "ts_code,end_date,n_cashflow_act,n_cashflow_inv_act,n_cash_flows_fnc_act,free_cashflow",
-                    &[
-                        ("cf_operating", "n_cashflow_act"),
-                        ("cf_investing", "n_cashflow_inv_act"),
-                        ("cf_financing", "n_cash_flows_fnc_act"),
-                        ("free_cash_flow", "free_cashflow"),
-                    ],
-                ),
-                "ratios" => (
-                    "fina_indicator",
-                    "ts_code,end_date,roe,roa,grossprofit_margin,netprofit_margin,debt_to_assets,current_ratio,quick_ratio",
-                    &[
-                        ("roe", "roe"),
-                        ("roa", "roa"),
-                        ("gross_margin", "grossprofit_margin"),
-                        ("net_margin", "netprofit_margin"),
-                        // tushare gives debt-to-assets; we expose as
-                        // debt_to_equity-like ratio (note semantic
-                        // difference is documented downstream).
-                        ("debt_to_assets", "debt_to_assets"),
-                        ("current_ratio", "current_ratio"),
-                        ("quick_ratio", "quick_ratio"),
-                    ],
-                ),
-                other => {
-                    return Err(VendorError::fatal(
-                        VENDOR,
-                        format!(
-                            "unsupported statement '{other}' (try income/balance/cashflow/ratios)"
-                        ),
-                    ));
-                }
-            };
-
-            let params = if period == "year" {
+impl TushareClient {
+    /// `anns_d` — A-share announcement bulletin board for one symbol.
+    pub async fn anns_d(
+        &self,
+        symbol: &Symbol,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<AnnouncementItem>, VendorError> {
+        let resp = self
+            .post(
+                "anns_d",
                 serde_json::json!({
                     "ts_code": symbol.to_dotted(),
-                    "period": "1231",
+                    "start_date": start,
+                    "end_date": end,
+                }),
+                "ts_code,ann_date,title,url",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "anns_d: empty data envelope")
+        })?;
+        Ok(data
+            .items
+            .iter()
+            .filter_map(|row| {
+                let m = data.row_map(row);
+                let title = str_of(m.get("title").unwrap_or(&Value::Null))?;
+                let date = iso_date(
+                    &str_of(m.get("ann_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                );
+                let url = str_of(m.get("url").unwrap_or(&Value::Null));
+                Some(AnnouncementItem {
+                    date,
+                    category: Some(classify_announcement(&title)),
+                    title,
+                    url,
+                    pdf_url: None,
                 })
-            } else {
-                serde_json::json!({ "ts_code": symbol.to_dotted() })
-            };
+            })
+            .collect())
+    }
 
-            let resp = self.post(api, params, fields).await?;
-            let data = resp.data.ok_or_else(|| {
-                VendorError::recoverable(VENDOR, format!("{api}: empty data envelope"))
-            })?;
+    /// `stk_holdertrade` — 股东增减持.
+    pub async fn stk_holdertrade(
+        &self,
+        symbol: &Symbol,
+        rows: usize,
+    ) -> Result<Vec<InsiderTradeItem>, VendorError> {
+        let resp = self
+            .post(
+                "stk_holdertrade",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,ann_date,holder_name,in_de,change_vol,change_ratio,after_share,after_ratio",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "stk_holdertrade: empty data envelope")
+        })?;
+        Ok(rows_take(&data, rows)
+            .map(|m| InsiderTradeItem {
+                ann_date: iso_date(
+                    &str_of(m.get("ann_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                ),
+                holder_name: str_of(m.get("holder_name").unwrap_or(&Value::Null))
+                    .unwrap_or_default(),
+                direction: str_of(m.get("in_de").unwrap_or(&Value::Null)),
+                change_vol_shares: f64_of(m.get("change_vol").unwrap_or(&Value::Null)),
+                change_ratio_pct: f64_of(m.get("change_ratio").unwrap_or(&Value::Null)),
+                after_shares: f64_of(m.get("after_share").unwrap_or(&Value::Null)),
+                after_ratio_pct: f64_of(m.get("after_ratio").unwrap_or(&Value::Null)),
+            })
+            .collect())
+    }
 
-            // Filter to annual rows if `period == "year"` — Tushare's
-            // returns include all quarters; annual ones end on 1231.
-            let filter_annual = period == "year";
-            let rows: Vec<FinancialRow> = data
-                .items
-                .iter()
-                .filter_map(|row| {
-                    let m = data.row_map(row);
-                    let end = str_of(m.get("end_date").unwrap_or(&Value::Null))?;
-                    if filter_annual && !end.ends_with("1231") {
+    /// `dividend` — 分红送股 events.
+    pub async fn dividend(
+        &self,
+        symbol: &Symbol,
+        rows: usize,
+    ) -> Result<Vec<DividendItem>, VendorError> {
+        let resp = self
+            .post(
+                "dividend",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,end_date,ann_date,div_proc,stk_div,cash_div,ex_date,pay_date",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "dividend: empty data envelope")
+        })?;
+        Ok(rows_take(&data, rows)
+            .map(|m| DividendItem {
+                end_date: iso_date(
+                    &str_of(m.get("end_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                ),
+                ann_date: iso_date(
+                    &str_of(m.get("ann_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                ),
+                process: str_of(m.get("div_proc").unwrap_or(&Value::Null)),
+                stk_div: f64_of(m.get("stk_div").unwrap_or(&Value::Null)),
+                cash_div_pretax: f64_of(m.get("cash_div").unwrap_or(&Value::Null)),
+                ex_date: str_of(m.get("ex_date").unwrap_or(&Value::Null)).map(|s| iso_date(&s)),
+                pay_date: str_of(m.get("pay_date").unwrap_or(&Value::Null)).map(|s| iso_date(&s)),
+            })
+            .collect())
+    }
+
+    /// `share_float` — 限售解禁 events.
+    pub async fn share_float(
+        &self,
+        symbol: &Symbol,
+        rows: usize,
+    ) -> Result<Vec<ShareUnlockItem>, VendorError> {
+        let resp = self
+            .post(
+                "share_float",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,ann_date,float_date,float_share,float_ratio,holder_name,share_type",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "share_float: empty data envelope")
+        })?;
+        Ok(rows_take(&data, rows)
+            .map(|m| ShareUnlockItem {
+                ann_date: iso_date(
+                    &str_of(m.get("ann_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                ),
+                float_date: iso_date(
+                    &str_of(m.get("float_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                ),
+                float_share: f64_of(m.get("float_share").unwrap_or(&Value::Null)),
+                float_ratio: f64_of(m.get("float_ratio").unwrap_or(&Value::Null)),
+                holder_name: str_of(m.get("holder_name").unwrap_or(&Value::Null)),
+                share_type: str_of(m.get("share_type").unwrap_or(&Value::Null)),
+            })
+            .collect())
+    }
+
+    /// `block_trade` — 大宗交易 records.
+    pub async fn block_trade(
+        &self,
+        symbol: &Symbol,
+        rows: usize,
+    ) -> Result<Vec<BlockTradeItem>, VendorError> {
+        let resp = self
+            .post(
+                "block_trade",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,trade_date,price,vol,amount,buyer,seller",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "block_trade: empty data envelope")
+        })?;
+        Ok(rows_take(&data, rows)
+            .map(|m| BlockTradeItem {
+                trade_date: iso_date(
+                    &str_of(m.get("trade_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                ),
+                price: f64_of(m.get("price").unwrap_or(&Value::Null)),
+                vol_wan_shares: f64_of(m.get("vol").unwrap_or(&Value::Null)),
+                amount_wan_yuan: f64_of(m.get("amount").unwrap_or(&Value::Null)),
+                buyer: str_of(m.get("buyer").unwrap_or(&Value::Null)),
+                seller: str_of(m.get("seller").unwrap_or(&Value::Null)),
+            })
+            .collect())
+    }
+
+    /// `top_list` — 龙虎榜 entries. Filter mode = per-symbol.
+    pub async fn top_list_symbol(
+        &self,
+        symbol: &Symbol,
+        rows: usize,
+    ) -> Result<Vec<TopListItem>, VendorError> {
+        let resp = self
+            .post(
+                "top_list",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,trade_date,close,pct_change,turnover_rate,net_amount,l_buy,l_sell,reason",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "top_list: empty data envelope")
+        })?;
+        Ok(rows_take(&data, rows)
+            .map(|m| TopListItem {
+                trade_date: iso_date(
+                    &str_of(m.get("trade_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                ),
+                close: f64_of(m.get("close").unwrap_or(&Value::Null)),
+                pct_change: f64_of(m.get("pct_change").unwrap_or(&Value::Null)),
+                turnover_rate: f64_of(m.get("turnover_rate").unwrap_or(&Value::Null)),
+                net_amount: f64_of(m.get("net_amount").unwrap_or(&Value::Null)),
+                l_buy: f64_of(m.get("l_buy").unwrap_or(&Value::Null)),
+                l_sell: f64_of(m.get("l_sell").unwrap_or(&Value::Null)),
+                reason: str_of(m.get("reason").unwrap_or(&Value::Null)),
+            })
+            .collect())
+    }
+
+    /// `pledge_stat` — 股权质押 status.
+    pub async fn pledge_stat(
+        &self,
+        symbol: &Symbol,
+        rows: usize,
+    ) -> Result<Vec<PledgeStatItem>, VendorError> {
+        let resp = self
+            .post(
+                "pledge_stat",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,end_date,pledge_count,unrest_pledge,rest_pledge,total_share,pledge_ratio",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "pledge_stat: empty data envelope")
+        })?;
+        Ok(rows_take(&data, rows)
+            .map(|m| PledgeStatItem {
+                end_date: iso_date(
+                    &str_of(m.get("end_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                ),
+                pledge_count: f64_of(m.get("pledge_count").unwrap_or(&Value::Null)),
+                unrest_pledge_wan: f64_of(m.get("unrest_pledge").unwrap_or(&Value::Null)),
+                rest_pledge_wan: f64_of(m.get("rest_pledge").unwrap_or(&Value::Null)),
+                total_share_wan: f64_of(m.get("total_share").unwrap_or(&Value::Null)),
+                pledge_ratio_pct: f64_of(m.get("pledge_ratio").unwrap_or(&Value::Null)),
+            })
+            .collect())
+    }
+
+    /// `repurchase` — 公司回购 records.
+    pub async fn repurchase(
+        &self,
+        symbol: &Symbol,
+        rows: usize,
+    ) -> Result<Vec<RepurchaseItem>, VendorError> {
+        let resp = self
+            .post(
+                "repurchase",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,ann_date,end_date,proc,vol,amount,high_limit,low_limit",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "repurchase: empty data envelope")
+        })?;
+        Ok(rows_take(&data, rows)
+            .map(|m| RepurchaseItem {
+                ann_date: iso_date(
+                    &str_of(m.get("ann_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                ),
+                end_date: str_of(m.get("end_date").unwrap_or(&Value::Null)).map(|s| iso_date(&s)),
+                proc: str_of(m.get("proc").unwrap_or(&Value::Null)),
+                vol_share: f64_of(m.get("vol").unwrap_or(&Value::Null)),
+                amount_yuan: f64_of(m.get("amount").unwrap_or(&Value::Null)),
+                high_limit: f64_of(m.get("high_limit").unwrap_or(&Value::Null)),
+                low_limit: f64_of(m.get("low_limit").unwrap_or(&Value::Null)),
+            })
+            .collect())
+    }
+
+    /// `stk_surv` — institution visit log. Per the audit, the only
+    /// dependable axis is `trade_date` / range; ts_code single-shot
+    /// returns 0 rows. We pull by date window then filter to symbol.
+    pub async fn stk_surv_window(
+        &self,
+        symbol_filter: Option<&Symbol>,
+        start_date: &str,
+        end_date: &str,
+    ) -> Result<Vec<InstitutionVisitItem>, VendorError> {
+        let resp = self
+            .post(
+                "stk_surv",
+                serde_json::json!({ "start_date": start_date, "end_date": end_date }),
+                "ts_code,name,surv_date,fund_visitors,rece_place,rece_mode,rece_org,org_type,comp_rece",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "stk_surv: empty data envelope")
+        })?;
+        let want = symbol_filter.map(|s| s.to_dotted());
+        Ok(data
+            .items
+            .iter()
+            .filter_map(|row| {
+                let m = data.row_map(row);
+                let ts = str_of(m.get("ts_code").unwrap_or(&Value::Null))?;
+                if let Some(w) = &want {
+                    if &ts != w {
                         return None;
                     }
-                    let mut metrics = BTreeMap::new();
-                    for (neutral, tushare_key) in key_map {
-                        let v = m.get(*tushare_key).cloned().unwrap_or(Value::Null);
-                        metrics.insert((*neutral).into(), f64_of(&v));
-                    }
-                    Some(FinancialRow {
-                        period_end: iso_date(&end),
-                        label: derive_label(&end, period),
-                        metrics,
-                    })
+                }
+                Some(InstitutionVisitItem {
+                    surv_date: iso_date(
+                        &str_of(m.get("surv_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                    ),
+                    receivers: str_of(m.get("fund_visitors").unwrap_or(&Value::Null)),
+                    place: str_of(m.get("rece_place").unwrap_or(&Value::Null)),
+                    mode: str_of(m.get("rece_mode").unwrap_or(&Value::Null)),
+                    visiting_org: str_of(m.get("rece_org").unwrap_or(&Value::Null)),
+                    org_type: str_of(m.get("org_type").unwrap_or(&Value::Null)),
+                    host: str_of(m.get("comp_rece").unwrap_or(&Value::Null)),
                 })
-                .take(count)
-                .collect();
-
-            if rows.is_empty() {
-                return Err(VendorError::recoverable(
-                    VENDOR,
-                    format!("{api}: no rows for symbol/period"),
-                ));
-            }
-            Ok(FinancialReport {
-                symbol: symbol.to_dotted(),
-                statement: statement.into(),
-                period: period.into(),
-                rows,
             })
-        })
+            .collect())
     }
 }
 
+// ── F. Research / sentiment (`research_sentiment`) ───────────────────
+
+impl TushareClient {
+    /// `report_rc` — sell-side consensus. **Rate-limited 1/min** — tool
+    /// layer must hold a token bucket; this method does not.
+    pub async fn report_rc(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<(Vec<YearForecast>, RatingMix, usize), VendorError> {
+        let resp = self
+            .post(
+                "report_rc",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,name,report_date,report_title,quarter,eps,pe,np,rating,max_price",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "report_rc: empty data envelope")
+        })?;
+        let mut eps_by_year: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        let mut np_by_year: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        let mut size_by_year: BTreeMap<String, usize> = BTreeMap::new();
+        let mut rating_mix = RatingMix::default();
+        for row in &data.items {
+            let m = data.row_map(row);
+            let quarter = str_of(m.get("quarter").unwrap_or(&Value::Null)).unwrap_or_default();
+            let year = if quarter.len() >= 4 {
+                quarter[..4].to_string()
+            } else {
+                continue;
+            };
+            *size_by_year.entry(year.clone()).or_default() += 1;
+            if let Some(eps) = f64_of(m.get("eps").unwrap_or(&Value::Null)) {
+                eps_by_year.entry(year.clone()).or_default().push(eps);
+            }
+            if let Some(np) = f64_of(m.get("np").unwrap_or(&Value::Null)) {
+                np_by_year.entry(year).or_default().push(np);
+            }
+            let rating = str_of(m.get("rating").unwrap_or(&Value::Null)).unwrap_or_default();
+            bump_rating(&mut rating_mix, &rating);
+        }
+        let mut years: std::collections::BTreeSet<String> =
+            eps_by_year.keys().chain(np_by_year.keys()).cloned().collect();
+        let _ = years.insert("".to_string());
+        let mut out: Vec<YearForecast> = Vec::new();
+        for year in size_by_year.keys() {
+            let eps = eps_by_year.get(year).cloned().unwrap_or_default();
+            let np = np_by_year.get(year).cloned().unwrap_or_default();
+            let sample = *size_by_year.get(year).unwrap_or(&0);
+            out.push(YearForecast {
+                year: year.clone(),
+                eps_mean: mean(&eps),
+                eps_high: eps.iter().cloned().reduce(f64::max),
+                eps_low: eps.iter().cloned().reduce(f64::min),
+                net_profit_mean_yi_yuan: mean(&np),
+                net_profit_high_yi_yuan: np.iter().cloned().reduce(f64::max),
+                net_profit_low_yi_yuan: np.iter().cloned().reduce(f64::min),
+                sample_size: sample,
+            });
+        }
+        Ok((out, rating_mix, data.items.len()))
+    }
+
+    /// `research_report` — listing of broker research reports.
+    pub async fn research_report(
+        &self,
+        symbol: &Symbol,
+        rows: usize,
+    ) -> Result<Vec<ResearchReportItem>, VendorError> {
+        let resp = self
+            .post(
+                "research_report",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "trade_date,title,report_type,author,name,ts_code,inst_csname,url",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "research_report: empty data envelope")
+        })?;
+        Ok(rows_take(&data, rows)
+            .map(|m| ResearchReportItem {
+                date: iso_date(
+                    &str_of(m.get("trade_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                ),
+                title: str_of(m.get("title").unwrap_or(&Value::Null)).unwrap_or_default(),
+                org_name: str_of(m.get("inst_csname").unwrap_or(&Value::Null)),
+                author: str_of(m.get("author").unwrap_or(&Value::Null)),
+                rating: None,
+                target_price: None,
+                pdf_url: str_of(m.get("url").unwrap_or(&Value::Null)),
+            })
+            .collect())
+    }
+
+    /// `broker_recommend` — monthly broker top picks.
+    pub async fn broker_recommend(
+        &self,
+        month: &str,
+    ) -> Result<Vec<BrokerMonthlyPick>, VendorError> {
+        let resp = self
+            .post(
+                "broker_recommend",
+                serde_json::json!({ "month": month }),
+                "month,broker,ts_code,name",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "broker_recommend: empty data envelope")
+        })?;
+        Ok(data
+            .items
+            .iter()
+            .map(|row| {
+                let m = data.row_map(row);
+                BrokerMonthlyPick {
+                    month: str_of(m.get("month").unwrap_or(&Value::Null)).unwrap_or_default(),
+                    broker: str_of(m.get("broker").unwrap_or(&Value::Null)).unwrap_or_default(),
+                    ts_code: str_of(m.get("ts_code").unwrap_or(&Value::Null)).unwrap_or_default(),
+                    name: str_of(m.get("name").unwrap_or(&Value::Null)).unwrap_or_default(),
+                }
+            })
+            .collect())
+    }
+
+    /// `forecast` — 业绩预告.
+    pub async fn forecast(
+        &self,
+        symbol: &Symbol,
+        rows: usize,
+    ) -> Result<Vec<BTreeMap<String, Value>>, VendorError> {
+        let resp = self
+            .post(
+                "forecast",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,ann_date,end_date,type,p_change_min,p_change_max,net_profit_min,net_profit_max,summary",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "forecast: empty data envelope")
+        })?;
+        Ok(rows_take(&data, rows).collect())
+    }
+
+    /// `express` — 业绩快报.
+    pub async fn express(
+        &self,
+        symbol: &Symbol,
+        rows: usize,
+    ) -> Result<Vec<BTreeMap<String, Value>>, VendorError> {
+        let resp = self
+            .post(
+                "express",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,ann_date,end_date,revenue,operate_profit,total_profit,n_income,yoy_net_profit",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "express: empty data envelope")
+        })?;
+        Ok(rows_take(&data, rows).collect())
+    }
+
+    /// `disclosure_date` — 财报披露日历.
+    pub async fn disclosure_date(
+        &self,
+        symbol: &Symbol,
+        rows: usize,
+    ) -> Result<Vec<BTreeMap<String, Value>>, VendorError> {
+        let resp = self
+            .post(
+                "disclosure_date",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,ann_date,end_date,pre_date,actual_date,modify_date",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "disclosure_date: empty data envelope")
+        })?;
+        Ok(rows_take(&data, rows).collect())
+    }
+}
+
+// ── Shared helpers ───────────────────────────────────────────────────
+
 fn derive_label(end_date: &str, period: &str) -> String {
-    // `20241231` → `2024` (annual) or `2024Q4` (quarter).
     if end_date.len() != 8 {
         return end_date.into();
     }
@@ -450,688 +1815,15 @@ fn derive_label(end_date: &str, period: &str) -> String {
     format!("{year}{q}")
 }
 
-// ── VendorCompanyInfo ─────────────────────────────────────────────────
-
-impl VendorCompanyInfo for TushareClient {
-    fn vendor_name(&self) -> &'static str {
-        VENDOR
+fn mean(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
     }
-    fn fetch_company_info<'a>(
-        &'a self,
-        symbol: &'a Symbol,
-    ) -> BoxFuture<'a, Result<CompanyInfo, VendorError>> {
-        Box::pin(async move {
-            // stock_basic: name, industry, list_date, exchange
-            let basic = self
-                .post(
-                    "stock_basic",
-                    serde_json::json!({ "ts_code": symbol.to_dotted() }),
-                    "ts_code,name,area,industry,fullname,exchange,list_date",
-                )
-                .await?;
-            let basic_data = basic.data.ok_or_else(|| {
-                VendorError::recoverable(VENDOR, "stock_basic: empty data envelope")
-            })?;
-            let basic_row = basic_data.items.first().ok_or_else(|| {
-                VendorError::recoverable(VENDOR, "stock_basic: no rows")
-            })?;
-            let bm = basic_data.row_map(basic_row);
-
-            // daily_basic: market cap + P/E + P/B + dividend yield (latest).
-            // Best-effort — if it fails we still return the basic profile.
-            let mut indicators = BTreeMap::new();
-            match self
-                .post(
-                    "daily_basic",
-                    serde_json::json!({ "ts_code": symbol.to_dotted() }),
-                    "ts_code,trade_date,total_mv,circ_mv,pe_ttm,pb,dv_ttm",
-                )
-                .await
-            {
-                Ok(db) => {
-                    if let Some(d) = db.data {
-                        if let Some(row) = d.items.first() {
-                            let dm = d.row_map(row);
-                            // Tushare returns in 万元 — convert to 元.
-                            indicators.insert(
-                                "market_cap".into(),
-                                f64_of(dm.get("total_mv").unwrap_or(&Value::Null))
-                                    .map(|v| v * 10_000.0),
-                            );
-                            indicators.insert(
-                                "float_market_cap".into(),
-                                f64_of(dm.get("circ_mv").unwrap_or(&Value::Null))
-                                    .map(|v| v * 10_000.0),
-                            );
-                            indicators.insert(
-                                "pe_ttm".into(),
-                                f64_of(dm.get("pe_ttm").unwrap_or(&Value::Null)),
-                            );
-                            indicators.insert(
-                                "pb".into(),
-                                f64_of(dm.get("pb").unwrap_or(&Value::Null)),
-                            );
-                            indicators.insert(
-                                "dividend_yield_pct".into(),
-                                f64_of(dm.get("dv_ttm").unwrap_or(&Value::Null)),
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        vendor = VENDOR,
-                        symbol = %symbol.to_dotted(),
-                        error = %e.message,
-                        "daily_basic enrichment failed; returning bare profile",
-                    );
-                }
-            }
-
-            let exchange_label = str_of(bm.get("exchange").unwrap_or(&Value::Null)).map(|raw| {
-                match raw.as_str() {
-                    "SSE" => "上海证券交易所".into(),
-                    "SZSE" => "深圳证券交易所".into(),
-                    "BSE" => "北京证券交易所".into(),
-                    _ => raw,
-                }
-            });
-
-            Ok(CompanyInfo {
-                symbol: symbol.to_dotted(),
-                name: str_of(bm.get("name").unwrap_or(&Value::Null))
-                    .unwrap_or_default(),
-                industry: str_of(bm.get("industry").unwrap_or(&Value::Null)),
-                sector: str_of(bm.get("area").unwrap_or(&Value::Null)),
-                exchange: exchange_label,
-                list_date: str_of(bm.get("list_date").unwrap_or(&Value::Null))
-                    .map(|s| iso_date(&s)),
-                business_scope: None, // stock_company endpoint; not all free quotas include
-                latest_indicators: indicators,
-            })
-        })
-    }
+    Some(values.iter().sum::<f64>() / values.len() as f64)
 }
 
-// ── VendorCapitalFlow ─────────────────────────────────────────────────
-
-impl VendorCapitalFlow for TushareClient {
-    fn vendor_name(&self) -> &'static str {
-        VENDOR
-    }
-    fn fetch_capital_flow<'a>(
-        &'a self,
-        symbol: &'a Symbol,
-        period: &'a str,
-    ) -> BoxFuture<'a, Result<CapitalFlow, VendorError>> {
-        Box::pin(async move {
-            let window = match period {
-                "1d" => 1usize,
-                "5d" => 5,
-                "20d" => 20,
-                other => {
-                    return Err(VendorError::fatal(
-                        VENDOR,
-                        format!("unsupported capital-flow period '{other}' (try 1d/5d/20d)"),
-                    ))
-                }
-            };
-            // `moneyflow`: per-day buy/sell broken into trade sizes.
-            // Tushare lumps `xl` (extra large) + `lg` (large) as the
-            // "main force"; `md` (medium) + `sm` (small) as retail.
-            let resp = self
-                .post(
-                    "moneyflow",
-                    serde_json::json!({ "ts_code": symbol.to_dotted() }),
-                    "ts_code,trade_date,buy_lg_amount,sell_lg_amount,buy_md_amount,sell_md_amount,buy_sm_amount,sell_sm_amount,buy_elg_amount,sell_elg_amount,net_mf_amount",
-                )
-                .await?;
-            let data = resp.data.ok_or_else(|| {
-                VendorError::recoverable(VENDOR, "moneyflow: empty data envelope")
-            })?;
-            let rows: Vec<_> = data.items.iter().take(window).collect();
-            if rows.is_empty() {
-                return Err(VendorError::recoverable(
-                    VENDOR,
-                    "moneyflow: no rows for symbol",
-                ));
-            }
-            // Tushare amounts are in 万元 — convert to 元.
-            let to_yuan = |v: Option<f64>| v.map(|n| n * 10_000.0);
-            let mut main_net = 0.0f64;
-            let mut retail_net = 0.0f64;
-            let mut total_net = 0.0f64;
-            for row in &rows {
-                let m = data.row_map(row);
-                let main = (to_yuan(f64_of(m.get("buy_elg_amount").unwrap_or(&Value::Null)))
-                    .unwrap_or(0.0)
-                    - to_yuan(f64_of(m.get("sell_elg_amount").unwrap_or(&Value::Null)))
-                        .unwrap_or(0.0))
-                    + (to_yuan(f64_of(m.get("buy_lg_amount").unwrap_or(&Value::Null)))
-                        .unwrap_or(0.0)
-                        - to_yuan(f64_of(m.get("sell_lg_amount").unwrap_or(&Value::Null)))
-                            .unwrap_or(0.0));
-                let retail = (to_yuan(f64_of(m.get("buy_md_amount").unwrap_or(&Value::Null)))
-                    .unwrap_or(0.0)
-                    - to_yuan(f64_of(m.get("sell_md_amount").unwrap_or(&Value::Null)))
-                        .unwrap_or(0.0))
-                    + (to_yuan(f64_of(m.get("buy_sm_amount").unwrap_or(&Value::Null)))
-                        .unwrap_or(0.0)
-                        - to_yuan(f64_of(m.get("sell_sm_amount").unwrap_or(&Value::Null)))
-                            .unwrap_or(0.0));
-                let net = to_yuan(f64_of(m.get("net_mf_amount").unwrap_or(&Value::Null)))
-                    .unwrap_or(main + retail);
-                main_net += main;
-                retail_net += retail;
-                total_net += net;
-            }
-
-            // Northbound (`hsgt_top10` is per-day per-stock from Stock
-            // Connect). Most free tokens don't have access; treat any
-            // error as "unavailable" rather than fatal.
-            let (north_avail, north_flow, mut warnings) = self
-                .try_north_flow(symbol, window)
-                .await
-                .map(|v| (true, Some(v), vec![]))
-                .unwrap_or_else(|e| {
-                    (false, None, vec![format!("northbound flow unavailable: {}", e.message)])
-                });
-            if window > 1 {
-                warnings.push(format!(
-                    "period={period} aggregates {window} trading days; rolling totals."
-                ));
-            }
-            Ok(CapitalFlow {
-                symbol: symbol.to_dotted(),
-                period: period.into(),
-                net_inflow: total_net,
-                main_flow: Some(main_net),
-                retail_flow: Some(retail_net),
-                north_flow_available: north_avail,
-                north_flow,
-                warnings,
-            })
-        })
-    }
-}
-
-impl TushareClient {
-    /// Best-effort northbound aggregation. `hsgt_top10` requires a
-    /// higher quota than the free tier and is frequently denied — any
-    /// error here is treated as "unavailable" by the caller.
-    async fn try_north_flow(
-        &self,
-        symbol: &Symbol,
-        window: usize,
-    ) -> Result<f64, VendorError> {
-        let resp = self
-            .post(
-                "hsgt_top10",
-                serde_json::json!({ "ts_code": symbol.to_dotted() }),
-                "ts_code,trade_date,net_amount",
-            )
-            .await?;
-        let data = resp
-            .data
-            .ok_or_else(|| VendorError::recoverable(VENDOR, "hsgt_top10: empty"))?;
-        let sum: f64 = data
-            .items
-            .iter()
-            .take(window)
-            .filter_map(|row| {
-                let m = data.row_map(row);
-                f64_of(m.get("net_amount").unwrap_or(&Value::Null)).map(|v| v * 10_000.0)
-            })
-            .sum();
-        Ok(sum)
-    }
-}
-
-// ── M4.1: industry peers ──────────────────────────────────────────────
-//
-// Tushare exposes industry classification on `stock_basic` (one row per
-// listed company). We pull the whole listed-stock table once per call,
-// filter to the same industry, then enrich with `daily_basic` (latest
-// valuation snapshot per ts_code) or `fina_indicator` (latest annual
-// ratios) depending on the dimension. None of these are paid-tier-only.
-
-impl VendorIndustryPeers for TushareClient {
-    fn vendor_name(&self) -> &'static str {
-        VENDOR
-    }
-    fn fetch_industry_peers<'a>(
-        &'a self,
-        symbol: &'a Symbol,
-        dimension: &'a str,
-    ) -> BoxFuture<'a, Result<IndustryPeers, VendorError>> {
-        Box::pin(async move {
-            // 1. Get the target's industry tag.
-            let basic = self
-                .post(
-                    "stock_basic",
-                    serde_json::json!({ "ts_code": symbol.to_dotted() }),
-                    "ts_code,name,industry,market",
-                )
-                .await?;
-            let basic_data = basic.data.ok_or_else(|| {
-                VendorError::recoverable(VENDOR, "stock_basic: empty data envelope")
-            })?;
-            let basic_row = basic_data
-                .items
-                .first()
-                .ok_or_else(|| VendorError::recoverable(VENDOR, "stock_basic: no rows for symbol"))?;
-            let bm = basic_data.row_map(basic_row);
-            let industry = str_of(bm.get("industry").unwrap_or(&Value::Null))
-                .ok_or_else(|| {
-                    VendorError::recoverable(
-                        VENDOR,
-                        "stock_basic: symbol has no industry classification",
-                    )
-                })?;
-
-            // 2. Pull every listed company that shares the industry tag.
-            // Tushare's `stock_basic` supports an `industry` filter; we
-            // ask for status='L' (listed) only.
-            let peers_resp = self
-                .post(
-                    "stock_basic",
-                    serde_json::json!({
-                        "industry": industry,
-                        "list_status": "L",
-                    }),
-                    "ts_code,name,industry",
-                )
-                .await?;
-            let peers_data = peers_resp.data.ok_or_else(|| {
-                VendorError::recoverable(VENDOR, "stock_basic peers: empty data envelope")
-            })?;
-            if peers_data.items.is_empty() {
-                return Err(VendorError::recoverable(
-                    VENDOR,
-                    format!("no peers in industry '{industry}'"),
-                ));
-            }
-            // Limit peers to a manageable set; spec says 8-12. We pick
-            // up to 24 then trim to the requested 12 (the target plus
-            // 11) — but we always include the target.
-            let target_ts = symbol.to_dotted();
-            let mut peer_codes: Vec<(String, String)> = peers_data
-                .items
-                .iter()
-                .filter_map(|row| {
-                    let m = peers_data.row_map(row);
-                    let ts = str_of(m.get("ts_code").unwrap_or(&Value::Null))?;
-                    let name = str_of(m.get("name").unwrap_or(&Value::Null))
-                        .unwrap_or_else(|| ts.clone());
-                    Some((ts, name))
-                })
-                .collect();
-            // Bring the target to the front.
-            if let Some(idx) = peer_codes.iter().position(|(ts, _)| ts == &target_ts) {
-                let target_pair = peer_codes.remove(idx);
-                peer_codes.insert(0, target_pair);
-            }
-            // Cap to 12 entries to keep one tool call cheap.
-            peer_codes.truncate(12);
-
-            // 3. Enrich based on the dimension.
-            let (principal_metric, metric_keys): (&str, Vec<&str>) = match dimension {
-                "valuation" => (
-                    "pe_ttm",
-                    vec!["pe_ttm", "pb", "ps_ttm", "dv_ttm", "total_mv"],
-                ),
-                "growth" => (
-                    "or_yoy",
-                    vec!["or_yoy", "netprofit_yoy"],
-                ),
-                "profitability" => (
-                    "roe",
-                    vec!["roe", "grossprofit_margin", "netprofit_margin"],
-                ),
-                other => {
-                    return Err(VendorError::fatal(
-                        VENDOR,
-                        format!(
-                            "unsupported peer dimension '{other}' (try valuation/growth/profitability)"
-                        ),
-                    ))
-                }
-            };
-            // We fetch per ts_code rather than once with a multi-code
-            // query because Tushare's daily_basic returns one row per
-            // trade_date per ts_code — multi-code calls bundle multiple
-            // dates by accident. Looping is also more forgiving when
-            // some peers' calls fail (we just skip).
-            let mut peer_rows: Vec<PeerRow> = Vec::new();
-            for (ts_code, name) in &peer_codes {
-                let metrics = match dimension {
-                    "valuation" => {
-                        match self
-                            .post(
-                                "daily_basic",
-                                serde_json::json!({ "ts_code": ts_code }),
-                                "ts_code,trade_date,pe_ttm,pb,ps_ttm,dv_ttm,total_mv",
-                            )
-                            .await
-                        {
-                            Ok(resp) => extract_metric_row(resp, &metric_keys),
-                            Err(e) => {
-                                tracing::warn!(
-                                    vendor = VENDOR,
-                                    ts_code = %ts_code,
-                                    error = %e.message,
-                                    "industry peers: daily_basic enrichment failed",
-                                );
-                                std::collections::BTreeMap::new()
-                            }
-                        }
-                    }
-                    _ => {
-                        match self
-                            .post(
-                                "fina_indicator",
-                                serde_json::json!({ "ts_code": ts_code }),
-                                "ts_code,end_date,roe,grossprofit_margin,netprofit_margin,or_yoy,netprofit_yoy",
-                            )
-                            .await
-                        {
-                            Ok(resp) => extract_metric_row(resp, &metric_keys),
-                            Err(e) => {
-                                tracing::warn!(
-                                    vendor = VENDOR,
-                                    ts_code = %ts_code,
-                                    error = %e.message,
-                                    "industry peers: fina_indicator enrichment failed",
-                                );
-                                std::collections::BTreeMap::new()
-                            }
-                        }
-                    }
-                };
-                peer_rows.push(PeerRow {
-                    symbol: ts_code.clone(),
-                    name: name.clone(),
-                    is_target: ts_code == &target_ts,
-                    metrics,
-                });
-            }
-            if peer_rows.is_empty() {
-                return Err(VendorError::recoverable(
-                    VENDOR,
-                    "industry peers: no enrichable peer rows",
-                ));
-            }
-
-            // 4. Median + target quantile on the principal metric.
-            let mut principal_values: Vec<f64> = peer_rows
-                .iter()
-                .filter_map(|p| p.metrics.get(principal_metric).and_then(|v| *v))
-                .collect();
-            principal_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median = if principal_values.is_empty() {
-                None
-            } else {
-                let mid = principal_values.len() / 2;
-                Some(if principal_values.len() % 2 == 0 {
-                    (principal_values[mid - 1] + principal_values[mid]) / 2.0
-                } else {
-                    principal_values[mid]
-                })
-            };
-            let target_value = peer_rows
-                .iter()
-                .find(|p| p.is_target)
-                .and_then(|p| p.metrics.get(principal_metric).and_then(|v| *v));
-            let target_quantile = match (target_value, principal_values.len() >= 3) {
-                (Some(tv), true) => {
-                    let lower = principal_values.iter().filter(|v| **v <= tv).count();
-                    Some(lower as f64 / principal_values.len() as f64)
-                }
-                _ => None,
-            };
-
-            Ok(IndustryPeers {
-                symbol: target_ts,
-                industry,
-                sub_industry: None, // tushare's stock_basic doesn't ship sub-industry on free tier
-                dimension: dimension.to_string(),
-                peers: peer_rows,
-                principal_metric: principal_metric.to_string(),
-                median,
-                target_quantile,
-            })
-        })
-    }
-}
-
-/// Take the first row of a Tushare matrix response and project the
-/// requested keys into a metrics map.
-fn extract_metric_row(
-    resp: TushareResponse,
-    keys: &[&str],
-) -> std::collections::BTreeMap<String, Option<f64>> {
-    let mut out = std::collections::BTreeMap::new();
-    if let Some(data) = resp.data {
-        if let Some(row) = data.items.first() {
-            let m = data.row_map(row);
-            for k in keys {
-                let raw = m.get(*k).cloned().unwrap_or(Value::Null);
-                let value = f64_of(&raw).map(|v| {
-                    // Convert `total_mv` (Tushare: 万元) to 元 so callers
-                    // see a single canonical unit.
-                    if *k == "total_mv" || *k == "circ_mv" {
-                        v * 10_000.0
-                    } else {
-                        v
-                    }
-                });
-                out.insert((*k).to_string(), value);
-            }
-        }
-    }
-    out
-}
-
-// ── M4.1: business breakdown ──────────────────────────────────────────
-//
-// Tushare's `fina_mainbz` is a high-tier endpoint (>= 5000 积分). When
-// the quota check fails we surface a recoverable error so the dispatch
-// chain can fall through to the EastMoney F10 fallback.
-
-impl VendorBusinessBreakdown for TushareClient {
-    fn vendor_name(&self) -> &'static str {
-        VENDOR
-    }
-    fn fetch_business_breakdown<'a>(
-        &'a self,
-        symbol: &'a Symbol,
-        period: &'a str,
-        dim: &'a str,
-    ) -> BoxFuture<'a, Result<BusinessBreakdown, VendorError>> {
-        Box::pin(async move {
-            // Tushare's `bz_item` enum: P=product, I=industry, R=region.
-            let bz_item = match dim {
-                "product" => "P",
-                "industry" => "I",
-                "region" => "R",
-                other => {
-                    return Err(VendorError::fatal(
-                        VENDOR,
-                        format!(
-                            "unsupported breakdown dim '{other}' (try product/industry/region)"
-                        ),
-                    ))
-                }
-            };
-            let mut params = serde_json::json!({
-                "ts_code": symbol.to_dotted(),
-                "type": bz_item,
-            });
-            if !period.is_empty() {
-                params["period"] = period.into();
-            }
-            let resp = self
-                .post(
-                    "fina_mainbz",
-                    params,
-                    "ts_code,end_date,bz_item,bz_sales,bz_profit,bz_cost,bz_code,curr_type",
-                )
-                .await?;
-            let data = resp.data.ok_or_else(|| {
-                VendorError::recoverable(VENDOR, "fina_mainbz: empty data envelope")
-            })?;
-            if data.items.is_empty() {
-                return Err(VendorError::recoverable(
-                    VENDOR,
-                    "fina_mainbz: no rows for symbol/period",
-                ));
-            }
-            // Take the most recent period_end represented in the rows.
-            let latest_end = data
-                .items
-                .iter()
-                .filter_map(|row| {
-                    let m = data.row_map(row);
-                    str_of(m.get("end_date").unwrap_or(&Value::Null))
-                })
-                .max()
-                .unwrap_or_default();
-            let rows_for_period: Vec<_> = data
-                .items
-                .iter()
-                .filter(|row| {
-                    let m = data.row_map(row);
-                    str_of(m.get("end_date").unwrap_or(&Value::Null))
-                        .map(|e| e == latest_end)
-                        .unwrap_or(false)
-                })
-                .collect();
-            let total_sales: f64 = rows_for_period
-                .iter()
-                .filter_map(|row| {
-                    let m = data.row_map(row);
-                    f64_of(m.get("bz_sales").unwrap_or(&Value::Null))
-                })
-                .sum();
-            let items: Vec<BusinessBreakdownRow> = rows_for_period
-                .iter()
-                .map(|row| {
-                    let m = data.row_map(row);
-                    let item = str_of(m.get("bz_item").unwrap_or(&Value::Null))
-                        .unwrap_or_else(|| "(未知)".into());
-                    let sales = f64_of(m.get("bz_sales").unwrap_or(&Value::Null));
-                    let cost = f64_of(m.get("bz_cost").unwrap_or(&Value::Null));
-                    let gm = match (sales, cost) {
-                        (Some(s), Some(c)) if s > 0.0 => Some((s - c) / s * 100.0),
-                        _ => None,
-                    };
-                    let pct = sales.and_then(|s| {
-                        if total_sales > 0.0 {
-                            Some(s / total_sales * 100.0)
-                        } else {
-                            None
-                        }
-                    });
-                    BusinessBreakdownRow {
-                        item,
-                        revenue_yuan: sales,
-                        pct_of_total: pct,
-                        gross_margin_pct: gm,
-                        yoy_change_pct: None, // Tushare's fina_mainbz doesn't expose YoY in one call
-                    }
-                })
-                .collect();
-            Ok(BusinessBreakdown {
-                symbol: symbol.to_dotted(),
-                period_end: iso_date(&latest_end),
-                dimension: dim.to_string(),
-                items,
-            })
-        })
-    }
-}
-
-// ── M4.1: announcements ──────────────────────────────────────────────
-
-impl VendorAnnouncements for TushareClient {
-    fn vendor_name(&self) -> &'static str {
-        VENDOR
-    }
-    fn fetch_announcements<'a>(
-        &'a self,
-        symbol: &'a Symbol,
-        days: usize,
-        category: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<AnnouncementList, VendorError>> {
-        Box::pin(async move {
-            // Tushare exposes `anns_d` (daily announcement matrix). The
-            // free tier is point-limited but normally allowed for daily
-            // pulls. We compute a date window (today − `days`) and ask
-            // tushare for that range; the upstream filters per ts_code.
-            let now = chrono::Utc::now().naive_utc().date();
-            let start = now - chrono::Duration::days(days as i64);
-            let resp = self
-                .post(
-                    "anns_d",
-                    serde_json::json!({
-                        "ts_code": symbol.to_dotted(),
-                        "start_date": start.format("%Y%m%d").to_string(),
-                        "end_date": now.format("%Y%m%d").to_string(),
-                    }),
-                    "ts_code,ann_date,title,url",
-                )
-                .await?;
-            let data = resp.data.ok_or_else(|| {
-                VendorError::recoverable(VENDOR, "anns_d: empty data envelope")
-            })?;
-            let mut items: Vec<AnnouncementItem> = data
-                .items
-                .iter()
-                .filter_map(|row| {
-                    let m = data.row_map(row);
-                    let title = str_of(m.get("title").unwrap_or(&Value::Null))?;
-                    let date = str_of(m.get("ann_date").unwrap_or(&Value::Null))
-                        .map(|d| iso_date(&d))
-                        .unwrap_or_default();
-                    let url = str_of(m.get("url").unwrap_or(&Value::Null));
-                    let category = classify_announcement(&title);
-                    Some(AnnouncementItem {
-                        date,
-                        title,
-                        category: Some(category),
-                        url,
-                        abstract_text: None,
-                    })
-                })
-                .collect();
-            // De-dupe by title (same announcement frequently appears
-            // across multiple exchanges' bulletins).
-            let mut seen = std::collections::HashSet::new();
-            items.retain(|a| seen.insert(a.title.clone()));
-            // Apply optional category filter case-insensitively.
-            if let Some(cat) = category {
-                items.retain(|a| {
-                    a.category
-                        .as_deref()
-                        .map(|c| c.contains(cat))
-                        .unwrap_or(false)
-                });
-            }
-            Ok(AnnouncementList {
-                symbol: symbol.to_dotted(),
-                days,
-                category_filter: category.map(|s| s.to_string()),
-                items,
-            })
-        })
-    }
-}
-
-/// Best-effort categorization by title keywords. Covers the most common
-/// announcement types so users can filter on `type` even when the
-/// upstream doesn't tag rows. Pub-in-crate so the EastMoney fallback
-/// uses the same taxonomy.
-pub(super) fn classify_announcement(title: &str) -> String {
+/// Best-effort categorization by title keywords.
+pub(crate) fn classify_announcement(title: &str) -> String {
     let pairs: &[(&str, &str)] = &[
         ("分红", "分红配股"),
         ("配股", "分红配股"),
@@ -1157,106 +1849,15 @@ pub(super) fn classify_announcement(title: &str) -> String {
     "其它".to_string()
 }
 
-// ── M4.1: consensus ──────────────────────────────────────────────────
-//
-// Tushare's `report_rc` requires 5000+ 积分. Treat any quota refusal as
-// recoverable so the dispatch chain can try EastMoney F10.
-
-impl VendorConsensus for TushareClient {
-    fn vendor_name(&self) -> &'static str {
-        VENDOR
-    }
-    fn fetch_consensus<'a>(
-        &'a self,
-        symbol: &'a Symbol,
-    ) -> BoxFuture<'a, Result<AnalystConsensus, VendorError>> {
-        Box::pin(async move {
-            let resp = self
-                .post(
-                    "report_rc",
-                    serde_json::json!({ "ts_code": symbol.to_dotted() }),
-                    "ts_code,report_date,quarter,rating,eps,pe,rd,roe,np",
-                )
-                .await?;
-            let data = resp.data.ok_or_else(|| {
-                VendorError::recoverable(VENDOR, "report_rc: empty data envelope")
-            })?;
-            if data.items.is_empty() {
-                return Err(VendorError::recoverable(
-                    VENDOR,
-                    "report_rc: no analyst reports for symbol",
-                ));
-            }
-            // Group by fiscal-year quarter prefix; the upstream
-            // `quarter` field looks like `2026Q4`.
-            let mut by_year: std::collections::BTreeMap<String, Vec<f64>> =
-                std::collections::BTreeMap::new();
-            let mut np_by_year: std::collections::BTreeMap<String, Vec<f64>> =
-                std::collections::BTreeMap::new();
-            let mut rating_mix = ConsensusRatingMix::default();
-            for row in &data.items {
-                let m = data.row_map(row);
-                let quarter =
-                    str_of(m.get("quarter").unwrap_or(&Value::Null)).unwrap_or_default();
-                let year = if quarter.len() >= 4 {
-                    quarter[..4].to_string()
-                } else {
-                    continue;
-                };
-                if let Some(eps) = f64_of(m.get("eps").unwrap_or(&Value::Null)) {
-                    by_year.entry(year.clone()).or_default().push(eps);
-                }
-                if let Some(np) = f64_of(m.get("np").unwrap_or(&Value::Null)) {
-                    np_by_year.entry(year).or_default().push(np);
-                }
-                let rating = str_of(m.get("rating").unwrap_or(&Value::Null))
-                    .unwrap_or_default();
-                bump_rating(&mut rating_mix, &rating);
-            }
-            let forecasts: Vec<ConsensusForecast> = by_year
-                .iter()
-                .map(|(year, eps_values)| {
-                    let np_values = np_by_year.get(year).cloned().unwrap_or_default();
-                    ConsensusForecast {
-                        year: year.clone(),
-                        revenue_mean_yuan: None,
-                        revenue_high_yuan: None,
-                        revenue_low_yuan: None,
-                        net_profit_mean_yuan: mean(&np_values).map(|v| v * 1.0e8),
-                        net_profit_high_yuan: np_values.iter().cloned().reduce(f64::max).map(|v| v * 1.0e8),
-                        net_profit_low_yuan: np_values.iter().cloned().reduce(f64::min).map(|v| v * 1.0e8),
-                        eps_mean: mean(eps_values),
-                        eps_high: eps_values.iter().cloned().reduce(f64::max),
-                        eps_low: eps_values.iter().cloned().reduce(f64::min),
-                    }
-                })
-                .collect();
-            Ok(AnalystConsensus {
-                symbol: symbol.to_dotted(),
-                forecasts,
-                rating_mix,
-                report_count: Some(data.items.len()),
-            })
-        })
-    }
-}
-
-fn mean(values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-    Some(values.iter().sum::<f64>() / values.len() as f64)
-}
-
-pub(super) fn bump_rating(mix: &mut ConsensusRatingMix, rating: &str) {
+pub(crate) fn bump_rating(mix: &mut RatingMix, rating: &str) {
     let r = rating.to_lowercase();
-    // Tushare's rating column is free text — common values include
-    // "买入"/"增持"/"中性"/"减持"/"卖出" or English. Map both.
     if r.contains("buy") || rating.contains("买入") || rating.contains("强烈推荐") {
         mix.buy += 1;
     } else if r.contains("overweight") || rating.contains("增持") || rating.contains("推荐") {
         mix.overweight += 1;
-    } else if r.contains("hold") || r.contains("neutral") || rating.contains("中性") || rating.contains("持有") {
+    } else if r.contains("hold") || r.contains("neutral") || rating.contains("中性")
+        || rating.contains("持有")
+    {
         mix.hold += 1;
     } else if r.contains("underweight") || rating.contains("减持") {
         mix.underweight += 1;
@@ -1265,138 +1866,47 @@ pub(super) fn bump_rating(mix: &mut ConsensusRatingMix, rating: &str) {
     }
 }
 
-// ── M4.1: top holders ────────────────────────────────────────────────
-
-impl VendorTopHolders for TushareClient {
-    fn vendor_name(&self) -> &'static str {
-        VENDOR
-    }
-    fn fetch_top_holders<'a>(
-        &'a self,
-        symbol: &'a Symbol,
-        kind: &'a str,
-    ) -> BoxFuture<'a, Result<TopHolders, VendorError>> {
-        Box::pin(async move {
-            let api = match kind {
-                "total" => "top10_holders",
-                "float" => "top10_floatholders",
-                other => {
-                    return Err(VendorError::fatal(
-                        VENDOR,
-                        format!("unsupported top-holders kind '{other}' (try total/float)"),
-                    ))
-                }
-            };
-            let resp = self
-                .post(
-                    api,
-                    serde_json::json!({ "ts_code": symbol.to_dotted() }),
-                    "ts_code,ann_date,end_date,holder_name,hold_amount,hold_ratio,hold_change",
-                )
-                .await?;
-            let data = resp.data.ok_or_else(|| {
-                VendorError::recoverable(VENDOR, format!("{api}: empty data envelope"))
-            })?;
-            if data.items.is_empty() {
-                return Err(VendorError::recoverable(
-                    VENDOR,
-                    format!("{api}: no holder rows for symbol"),
-                ));
-            }
-            // Find the most recent end_date — that's the reporting period
-            // for the top-10 cohort.
-            let latest_end = data
-                .items
-                .iter()
-                .filter_map(|row| {
-                    let m = data.row_map(row);
-                    str_of(m.get("end_date").unwrap_or(&Value::Null))
-                })
-                .max()
-                .unwrap_or_default();
-            let mut holders: Vec<HolderRow> = data
-                .items
-                .iter()
-                .filter(|row| {
-                    let m = data.row_map(row);
-                    str_of(m.get("end_date").unwrap_or(&Value::Null))
-                        .map(|e| e == latest_end)
-                        .unwrap_or(false)
-                })
-                .enumerate()
-                .map(|(idx, row)| {
-                    let m = data.row_map(row);
-                    HolderRow {
-                        rank: (idx + 1) as u32,
-                        holder_name: str_of(m.get("holder_name").unwrap_or(&Value::Null))
-                            .unwrap_or_else(|| "(未知)".into()),
-                        shares: f64_of(m.get("hold_amount").unwrap_or(&Value::Null)),
-                        pct: f64_of(m.get("hold_ratio").unwrap_or(&Value::Null)),
-                        change_qoq_shares: f64_of(
-                            m.get("hold_change").unwrap_or(&Value::Null),
-                        ),
-                    }
-                })
-                .collect();
-            holders.truncate(10);
-            Ok(TopHolders {
-                symbol: symbol.to_dotted(),
-                kind: kind.to_string(),
-                period_end: iso_date(&latest_end),
-                holders,
-            })
-        })
-    }
+/// Public access for the eastmoney module (re-uses our taxonomy).
+pub(crate) fn classify_ann_title(title: &str) -> String {
+    classify_announcement(title)
 }
 
-// ── M4.1: concepts ───────────────────────────────────────────────────
-//
-// `concept_detail` is high-tier. Recoverable on quota refusal → fall
-// through to EastMoney's concept page.
+// ── Unused helpers that fan-out tools want — `LiveQuote` is filled by
+// the eastmoney module, not tushare. ─────────────────────────────────
 
-impl VendorConcepts for TushareClient {
-    fn vendor_name(&self) -> &'static str {
-        VENDOR
-    }
-    fn fetch_concepts<'a>(
-        &'a self,
-        symbol: &'a Symbol,
-    ) -> BoxFuture<'a, Result<ConceptList, VendorError>> {
-        Box::pin(async move {
-            let resp = self
-                .post(
-                    "concept_detail",
-                    serde_json::json!({ "ts_code": symbol.to_dotted() }),
-                    "id,concept_name,ts_code,name",
-                )
-                .await?;
-            let data = resp.data.ok_or_else(|| {
-                VendorError::recoverable(VENDOR, "concept_detail: empty data envelope")
-            })?;
-            let concepts: Vec<ConceptTag> = data
-                .items
-                .iter()
-                .filter_map(|row| {
-                    let m = data.row_map(row);
-                    let name = str_of(m.get("concept_name").unwrap_or(&Value::Null))?;
-                    let code = str_of(m.get("id").unwrap_or(&Value::Null));
-                    Some(ConceptTag {
-                        name,
-                        code,
-                        heat_rank: None, // tushare doesn't surface concept popularity ranking here
-                    })
-                })
-                .collect();
-            if concepts.is_empty() {
-                return Err(VendorError::recoverable(
-                    VENDOR,
-                    "concept_detail: no concepts for symbol",
-                ));
-            }
-            Ok(ConceptList {
-                symbol: symbol.to_dotted(),
-                concepts,
-            })
+impl TushareClient {
+    /// `daily` snapshot → coerce into a LiveQuote (last EOD close).
+    /// Used as the offline fallback for market_pulse / stock_overview
+    /// when the eastmoney push2 endpoint is unreachable.
+    pub async fn live_quote_eod(&self, symbol: &Symbol) -> Result<LiveQuote, VendorError> {
+        let resp = self
+            .post(
+                "daily",
+                serde_json::json!({ "ts_code": symbol.to_dotted() }),
+                "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "daily: empty data envelope")
+        })?;
+        let Some(row) = data.items.first() else {
+            return Err(VendorError::recoverable(VENDOR, "daily: no rows"));
+        };
+        let m = data.row_map(row);
+        Ok(LiveQuote {
+            symbol: symbol.to_dotted(),
+            name: None,
+            price: f64_of(m.get("close").unwrap_or(&Value::Null)),
+            change: f64_of(m.get("change").unwrap_or(&Value::Null)),
+            change_pct: f64_of(m.get("pct_chg").unwrap_or(&Value::Null)),
+            open: f64_of(m.get("open").unwrap_or(&Value::Null)),
+            high: f64_of(m.get("high").unwrap_or(&Value::Null)),
+            low: f64_of(m.get("low").unwrap_or(&Value::Null)),
+            prev_close: f64_of(m.get("pre_close").unwrap_or(&Value::Null)),
+            volume_shares: f64_of(m.get("vol").unwrap_or(&Value::Null)).map(|v| v * 100.0),
+            turnover_yuan: f64_of(m.get("amount").unwrap_or(&Value::Null)).map(|v| v * 1000.0),
+            turnover_rate: None,
+            timestamp_unix: None,
         })
     }
 }
@@ -1427,14 +1937,18 @@ mod tests {
     #[test]
     fn iso_date_normalizes_compact_form() {
         assert_eq!(iso_date("20260520"), "2026-05-20");
-        assert_eq!(iso_date("2026-05-20"), "2026-05-20"); // pass-through
+        assert_eq!(iso_date("2026-05-20"), "2026-05-20");
     }
 
     #[test]
     fn row_map_zips_fields_and_values() {
         let data = fake_response(
             vec!["a", "b", "c"],
-            vec![vec![Value::Number(1.into()), Value::String("x".into()), Value::Null]],
+            vec![vec![
+                Value::Number(1.into()),
+                Value::String("x".into()),
+                Value::Null,
+            ]],
         )
         .data
         .unwrap();
@@ -1453,11 +1967,25 @@ mod tests {
     }
 
     #[test]
-    fn f64_of_parses_number_and_string() {
-        assert_eq!(f64_of(&Value::Number(serde_json::Number::from(42))), Some(42.0));
-        // `1825.30` (茅台's order of magnitude, not a math constant) so
-        // clippy doesn't flag `3.14` as approximating PI.
-        assert_eq!(f64_of(&Value::String("1825.30".into())), Some(1825.30));
-        assert_eq!(f64_of(&Value::Null), None);
+    fn classify_announcement_routes_keywords() {
+        assert_eq!(classify_announcement("XX 年度分红预案"), "分红配股");
+        assert_eq!(classify_announcement("董事会会议决议"), "高管/治理");
+        assert_eq!(classify_announcement("关于回购股份的进展"), "回购");
+        assert_eq!(classify_announcement("XX 年报全文"), "财报");
+        assert_eq!(classify_announcement("无关公告"), "其它");
+    }
+
+    #[test]
+    fn bump_rating_normalizes_brokerage_taxonomy() {
+        let mut mix = RatingMix::default();
+        bump_rating(&mut mix, "Buy");
+        bump_rating(&mut mix, "买入");
+        bump_rating(&mut mix, "增持");
+        bump_rating(&mut mix, "Hold");
+        bump_rating(&mut mix, "Sell");
+        assert_eq!(mix.buy, 2);
+        assert_eq!(mix.overweight, 1);
+        assert_eq!(mix.hold, 1);
+        assert_eq!(mix.sell, 1);
     }
 }

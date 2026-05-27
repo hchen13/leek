@@ -605,21 +605,24 @@ mod tests {
         let ce = reg.get("corpus-expert").unwrap();
         assert!(ce.allowed_tools.contains(&"corpus_search".to_string()));
         assert!(ce.allowed_tools.contains(&"corpus_read".to_string()));
-        // quick-screen restricts to the three A-share snapshot tools.
+        // quick-screen restricts to the two A-share snapshot tools.
         let qs = reg.get("quick-screen").unwrap();
-        for t in ["market_quote", "get_company_info", "get_capital_flow"] {
+        for t in ["stock_overview", "market_pulse"] {
             assert!(
                 qs.allowed_tools.contains(&t.to_string()),
                 "quick-screen missing tool '{t}' in allow-list",
             );
         }
-        // deep-review explicitly opts into the full tool surface — its
-        // allowed_tools is empty (the loader's "empty = no restriction" rule).
-        assert!(reg.get("deep-review").unwrap().allowed_tools.is_empty());
+        // deep-review opts into the full facts-only kit + corpus + web.
+        let dr = reg.get("deep-review").unwrap();
+        assert!(dr.allowed_tools.contains(&"stock_overview".to_string()));
+        assert!(dr.allowed_tools.contains(&"recent_actions".to_string()));
+        assert!(dr.allowed_tools.contains(&"read_pdf".to_string()));
         // comparison spawns subagents and reads light data, so it owns
         // task + the cheap getters.
         let cmp = reg.get("comparison").unwrap();
         assert!(cmp.allowed_tools.contains(&"task".to_string()));
-        assert!(cmp.allowed_tools.contains(&"market_quote".to_string()));
+        assert!(cmp.allowed_tools.contains(&"stock_overview".to_string()));
+        assert!(cmp.allowed_tools.contains(&"market_pulse".to_string()));
     }
 }
