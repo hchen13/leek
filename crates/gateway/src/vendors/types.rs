@@ -56,12 +56,32 @@ impl Symbol {
 
     /// Parse `600519`, `600519.SH`, `sh600519`, etc. Exchange is inferred
     /// from the leading code digits when missing.
+    ///
+    /// **UTF-8 safety:** `raw` may originate from agent input or vendor
+    /// fields that legitimately carry CJK strings (industry names like
+    /// `化学制药`, company names like `恒瑞医药`). The byte-indexing
+    /// branches below MUST be reached only after we confirm the input is
+    /// pure ASCII — otherwise `split_at(2)` panics inside a multi-byte
+    /// character (`thread 'tokio-rt-worker' panicked at ... byte index 2
+    /// is not a char boundary; it is inside '化'`). Callers like
+    /// `industry_landscape` deliberately try `parse` on industry names
+    /// and fall back when it returns `Err`, so a non-ASCII input here is
+    /// a structured failure, not a panic.
     pub fn parse(raw: &str) -> Result<Self, String> {
         let s = raw.trim();
         if s.is_empty() {
             return Err("symbol is empty".into());
         }
-        // sh600519 / sz000001
+        // All branches below assume an ASCII layout (letters + digits +
+        // a single dot). Non-ASCII input cannot be a symbol — bail fast
+        // so byte indexing later is safe.
+        if !s.is_ascii() {
+            return Err(format!(
+                "'{raw}' is not a valid A-share symbol (try 600519.SH or 600519)"
+            ));
+        }
+        // sh600519 / sz000001 — `is_ascii` above guarantees `s.len()` is
+        // the char count, so `split_at(2)` lands on a char boundary.
         if s.len() >= 8 {
             let (head, tail) = s.split_at(2);
             let head_low = head.to_ascii_lowercase();
@@ -734,6 +754,21 @@ mod tests {
         assert!(Symbol::parse("123").is_err());
         assert!(Symbol::parse("999999").is_err());
         assert!(Symbol::parse("600519.XX").is_err());
+    }
+
+    /// Regression: tokio-rt-worker panic. An industry name like
+    /// `化学制药` (12 bytes, 4 chars) used to reach `split_at(2)` via
+    /// the `s.len() >= 8` guard and crash inside `化`. Now the ASCII
+    /// guard short-circuits before any byte indexing.
+    #[test]
+    fn rejects_cjk_industry_name_without_panic() {
+        assert!(Symbol::parse("化学制药").is_err());
+        assert!(Symbol::parse("恒瑞医药").is_err());
+        assert!(Symbol::parse("白酒Ⅱ").is_err());
+        assert!(Symbol::parse("  化学制药  ").is_err());
+        // A long Chinese string that comfortably exceeds the 8-byte
+        // gate — would have hit the buggy `split_at(2)` branch first.
+        assert!(Symbol::parse("化学制药行业龙头").is_err());
     }
 
     #[test]

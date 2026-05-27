@@ -31,6 +31,7 @@ mod loop_core;
 mod prompt;
 mod subagent;
 mod tools;
+pub(crate) mod util;
 
 pub use guards::GuardConfig;
 

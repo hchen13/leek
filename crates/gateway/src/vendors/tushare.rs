@@ -1821,11 +1821,16 @@ impl TushareClient {
         for row in &data.items {
             let m = data.row_map(row);
             let quarter = str_of(m.get("quarter").unwrap_or(&Value::Null)).unwrap_or_default();
-            let year = if quarter.len() >= 4 {
-                quarter[..4].to_string()
-            } else {
+            // `report_rc.quarter` is normally an ASCII string like
+            // "2024Q3" or "2024". A non-ASCII value here would be a
+            // schema surprise — `truncate_chars` keeps us safe either
+            // way (no panic on a CJK boundary; the parse below either
+            // succeeds or the year is dropped).
+            let year_pfx = crate::agent::util::truncate_chars(&quarter, 4);
+            if year_pfx.chars().count() < 4 || !year_pfx.chars().all(|c| c.is_ascii_digit()) {
                 continue;
-            };
+            }
+            let year = year_pfx.to_string();
             *size_by_year.entry(year.clone()).or_default() += 1;
             if let Some(eps) = f64_of(m.get("eps").unwrap_or(&Value::Null)) {
                 eps_by_year.entry(year.clone()).or_default().push(eps);
@@ -1980,7 +1985,11 @@ impl TushareClient {
 // ── Shared helpers ───────────────────────────────────────────────────
 
 fn derive_label(end_date: &str, period: &str) -> String {
-    if end_date.len() != 8 {
+    // `end_date` is a tushare-compact date like "20241231". Defend
+    // against a schema surprise (or an agent-shaped CJK leak) by
+    // confirming the field is the expected 8 ASCII digits before
+    // byte-indexing into it — otherwise pass the raw value through.
+    if end_date.len() != 8 || !end_date.chars().all(|c| c.is_ascii_digit()) {
         return end_date.into();
     }
     let year = &end_date[..4];
@@ -2147,6 +2156,24 @@ mod tests {
         assert_eq!(derive_label("20240630", "quarter"), "2024Q2");
         assert_eq!(derive_label("20240930", "quarter"), "2024Q3");
         assert_eq!(derive_label("20241231", "quarter"), "2024Q4");
+    }
+
+    /// Regression: `derive_label`'s byte-slicing path used to fire on
+    /// any 8-byte string. A CJK substring like `化学制` is 9 bytes so
+    /// would have escaped — but a 2-char string of 4-byte emoji
+    /// (`🇨🇳🇨🇳` is 16 bytes, but `🚀🚀` is 8 bytes) would have
+    /// landed in the buggy path. The fixed branch returns the raw
+    /// string for anything that is not 8 ASCII digits.
+    #[test]
+    fn derive_label_safe_for_non_ascii_eight_bytes() {
+        // 8 bytes, 2 chars — would have crashed at `&end_date[..4]`.
+        let s = "🚀🚀";
+        assert_eq!(s.len(), 8);
+        assert_eq!(derive_label(s, "year"), s);
+        // CJK string that happens to have a sensible byte length.
+        assert_eq!(derive_label("化学制药", "year"), "化学制药");
+        // ASCII but not all-digits.
+        assert_eq!(derive_label("abcdefgh", "year"), "abcdefgh");
     }
 
     #[test]
