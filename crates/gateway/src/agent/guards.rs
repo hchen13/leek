@@ -73,6 +73,19 @@ pub struct GuardConfig {
     /// config layer, then the built-in default. Subagents can override
     /// per-loop via `apply_agent_overrides` from AGENT.md frontmatter.
     pub reasoning_effort: String,
+    /// M4.1.5: hard cap on tool calls per turn. The loop increments a
+    /// turn-local `tool_call_count` for every dispatched tool call;
+    /// when the count crosses the cap, the loop sets
+    /// `stop_reason = "tool_call_cap_exceeded"` and breaks. `None`
+    /// disables the cap. Default 30 for main-agent (stress round 3 A4
+    /// showed 14 tool calls without converging on a single 60-day
+    /// events question — 30 gives a wide enough margin for normal deep
+    /// work but catches an over-thinking turn). Subagents override via
+    /// the AGENT.md `max_tool_calls` frontmatter — `apply_agent_overrides`
+    /// swaps this for the per-worker value (quick-screen: 8, comparison:
+    /// 25, deep-review: 40, corpus-expert: 12, general-purpose: 30).
+    /// Env override: `LEEK_MAX_TOOL_CALLS_PER_TURN`.
+    pub max_tool_calls: Option<usize>,
 }
 
 impl GuardConfig {
@@ -150,6 +163,18 @@ impl GuardConfig {
                 // off. The deep-review subagent still runs at xhigh on
                 // its isolated context.
                 super::REASONING_EFFORT_DEFAULT,
+            ),
+            // M4.1.5: main-agent failsafe — 30 tool calls per turn.
+            // Stress round 3 A4 over-thought a single 60-day events
+            // question into 14 tool calls without converging; 30 is
+            // wide enough for normal deep work, narrow enough to catch
+            // the over-thinking shape. Subagents override per-AGENT.md.
+            // 0 in env/config disables the cap (mirrors max_iterations
+            // / cost_cap "0 = 不限" idiom).
+            max_tool_calls: opt_usize_layered(
+                "LEEK_MAX_TOOL_CALLS_PER_TURN",
+                config.max_tool_calls_per_turn,
+                Some(30),
             ),
         }
     }

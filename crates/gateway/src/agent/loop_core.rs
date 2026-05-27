@@ -462,6 +462,14 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
         // main agent registers an abort signal — a subagent sees `None`
         // and falls into the simpler stream-only path.
         let mut user_aborted = false;
+        // M4.1.5 Task 2: set when `wall_deadline` trips mid-stream (in
+        // the select! poll). Pre-M4.1.5 the wall_clock guard only fired
+        // at the iter top, so a stuck mid-stream codex (round 3 C2:
+        // 12+ min of dead air past a 1800s budget) outran the cap. The
+        // post-stream cleanup path reads this and breaks 'turn with
+        // stop_reason = "wall_clock_exceeded" — same shape as the
+        // iter-top check.
+        let mut wall_clock_hit = false;
         // M3.3: substantive-only idle deadline. Pre-M3.3 every byte —
         // including reasoning_summary lifecycle frames that flow steadily
         // during long silent reasoning — reset the timer, so a genuinely
@@ -511,6 +519,15 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
                 Heartbeat,
                 IdleHit,
                 Aborted,
+                /// M4.1.5 Task 2: turn-level `wall_deadline` tripped while
+                /// inside the stream poll. Pre-M4.1.5 the wall_clock was
+                /// only checked at the iter top, so a stuck mid-stream
+                /// codex (round 3 C2: 12+ min of dead air past a 1800s
+                /// budget) outran the cap entirely. Adding it to the
+                /// select! arms lets the loop break the moment the
+                /// deadline crosses, regardless of whether codex is
+                /// silent (no stream items) or chatty (Pings only).
+                WallClockHit,
             }
             // Build the optional `notified()` future as either the real
             // one or a never-ready `pending` so the select! shape stays
@@ -530,10 +547,28 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
                     None => std::future::pending().await,
                 }
             };
+            // M4.1.5 Task 2: wall_deadline arm. The outer iter-top check
+            // still runs (defense in depth — a turn with no stream yet
+            // hits the cap there), but the in-stream check is the one
+            // that actually fires when codex is mid-iter and silent.
+            // `wall_deadline` is `Option<std::time::Instant>` (built at
+            // turn start from `started + p.guards.wall_clock`); convert
+            // to a `tokio::time::Instant` for `sleep_until` so the same
+            // monotonic clock the iter-top comparison uses also drives
+            // the await here.
+            let wall_fut = async {
+                match wall_deadline {
+                    Some(d) => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
             let outcome = tokio::select! {
                 biased;
                 _ = notify_fut => PollOutcome::Aborted,
                 _ = idle_fut => PollOutcome::IdleHit,
+                _ = wall_fut => PollOutcome::WallClockHit,
                 _ = tokio::time::sleep_until(heartbeat_deadline) => PollOutcome::Heartbeat,
                 item = stream.next() => PollOutcome::Item(item),
             };
@@ -544,6 +579,16 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
                 }
                 PollOutcome::IdleHit => {
                     idle_hit = true;
+                    break 'stream;
+                }
+                PollOutcome::WallClockHit => {
+                    // M4.1.5 Task 2: mid-stream wall_clock trip. We set
+                    // a turn-local flag that the post-stream cleanup path
+                    // reads to break 'turn with stop_reason +
+                    // first_guard = "wall_clock_exceeded" (same payload
+                    // as the iter-top check, just produced from inside
+                    // the stream poll instead).
+                    wall_clock_hit = true;
                     break 'stream;
                 }
                 PollOutcome::Heartbeat => {
@@ -773,6 +818,22 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
             }
             break 'turn;
         }
+        // M4.1.5 Task 2: mid-stream wall_clock trip. Same first_guard +
+        // stop_reason shape as the iter-top check (lines 264-268); the
+        // user-facing effect is identical, just produced from inside
+        // the stream poll so a stuck iter cannot outrun the deadline.
+        if wall_clock_hit {
+            tracing::info!(
+                session_id = p.session_id,
+                turn_id = p.turn_id,
+                iteration = iteration_count,
+                "turn exceeded wall_clock during stream poll"
+            );
+            final_reply = iter_text;
+            stop_reason = "wall_clock_exceeded".into();
+            first_guard.get_or_insert("wall_clock_exceeded");
+            break 'turn;
+        }
         // M3.2: user clicked abort mid-stream. We drop `stream` by
         // letting it fall out of scope at loop end (the codex client
         // closes the upstream HTTP connection on drop), keep whatever
@@ -833,8 +894,29 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
 
         // ── dispatch tool calls, re-inject results, loop ────────────────
         let mut doom_hit = false;
+        // M4.1.5 Task 3: set when `tool_call_count` crosses the cap.
+        // Read after the dispatch loop to break 'turn before the next
+        // iter starts. Pre-M4.1.5 a main-agent at medium effort could
+        // over-think a single question into 14+ tool calls without
+        // converging (round 3 A4); iter / cost / wall-clock caps never
+        // fired because each call individually was cheap and fast.
+        let mut tool_cap_hit = false;
         for (call_id, name, arguments) in pending {
             tool_call_count += 1;
+
+            // M4.1.5 Task 3: hard cap on tool calls per turn. The
+            // increment above is unconditional (matches the doom-loop
+            // window) so the count stays consistent with the
+            // `LoopOutcome.tool_call_count` returned to the caller.
+            // The break is deferred — the in-flight call still gets
+            // dispatched + persisted (the model already invoked it,
+            // and we want the output in the transcript), but no
+            // further iter runs.
+            if let Some(cap) = p.guards.max_tool_calls {
+                if tool_call_count >= cap {
+                    tool_cap_hit = true;
+                }
+            }
 
             if let Some(threshold) = p.guards.doom_loop_threshold {
                 doom_window.push_back((name.clone(), arguments.clone()));
@@ -1018,6 +1100,24 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
         if doom_hit {
             stop_reason = "doom_loop".into();
             first_guard.get_or_insert("doom_loop");
+            break 'turn;
+        }
+        // M4.1.5 Task 3: tool-call cap. Checked after the dispatch loop
+        // so every tool call that was in `pending` (the batch the model
+        // emitted this iter) runs to completion + persists its result
+        // before we break the turn. The next iter is skipped entirely
+        // — the model has already had enough rope, the cap exists to
+        // force a wrap-up.
+        if tool_cap_hit {
+            tracing::info!(
+                session_id = p.session_id,
+                turn_id = p.turn_id,
+                tool_call_count,
+                cap = p.guards.max_tool_calls.unwrap_or(0),
+                "turn hit tool_call cap — breaking 'turn"
+            );
+            stop_reason = "tool_call_cap_exceeded".into();
+            first_guard.get_or_insert("tool_call_cap_exceeded");
             break 'turn;
         }
     }
@@ -1775,5 +1875,174 @@ mod tests {
 
         assert_eq!(stop_reason, Some("wall_clock_exceeded"));
         assert_eq!(first_guard, Some("wall_clock_exceeded"));
+    }
+
+    // ─── M4.1.5 Task 2: wall_clock mid-stream in select! ───────────────
+    //
+    // The full stream-poll select! needs a real codex client to drive
+    // end-to-end, but the new arm's shape — `wall_fut` racing against
+    // `notify_fut` / `idle_fut` / heartbeat / `stream.next()` — can be
+    // pinned in isolation here. Round 3 C2 stuck mid-stream past the
+    // 1800s budget without firing the iter-top check; the new arm fires
+    // the moment the deadline passes regardless of stream state.
+
+    /// `wall_deadline = Some(past instant)` must win the select! the
+    /// moment it's polled — no stream item is forthcoming and the
+    /// other arms (notify / idle / heartbeat) are all set to never
+    /// resolve. This mirrors the in-stream shape `run_loop` uses
+    /// post-M4.1.5: if codex went silent past the wall_clock, the
+    /// poll exits immediately with `WallClockHit`.
+    #[tokio::test]
+    async fn wall_fut_wins_select_over_pending_stream() {
+        use tokio::sync::mpsc;
+        let (_tx, mut rx) = mpsc::channel::<Result<LlmEvent>>(8);
+
+        // Synthetic wall_deadline already in the past — sleep_until
+        // resolves immediately.
+        let wall_deadline: Option<std::time::Instant> =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+
+        let wall_fut = async {
+            match wall_deadline {
+                Some(d) => {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await;
+                }
+                None => std::future::pending().await,
+            }
+        };
+
+        let mut wall_clock_hit = false;
+        let mut item_seen = false;
+        tokio::select! {
+            biased;
+            _ = wall_fut => {
+                wall_clock_hit = true;
+            }
+            item = rx.recv() => {
+                item_seen = item.is_some();
+            }
+        }
+
+        assert!(wall_clock_hit, "wall_fut should have won the select");
+        assert!(!item_seen, "no stream item was sent");
+    }
+
+    /// `wall_deadline = None` (wall_clock disabled by setting secs=0)
+    /// must NOT block the select! — the `pending()` shape stays in the
+    /// `None` branch so other arms keep firing normally. Verifies the
+    /// optional-future shape doesn't introduce a regression for users
+    /// who explicitly disabled wall_clock.
+    #[tokio::test]
+    async fn wall_fut_none_does_not_block_select() {
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::channel::<Result<LlmEvent>>(8);
+        tx.send(Ok(LlmEvent::Ping)).await.unwrap();
+
+        let wall_deadline: Option<std::time::Instant> = None;
+        let wall_fut = async {
+            match wall_deadline {
+                Some(d) => {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await;
+                }
+                None => std::future::pending().await,
+            }
+        };
+
+        let mut wall_clock_hit = false;
+        let mut item_seen = false;
+        tokio::select! {
+            biased;
+            _ = wall_fut => {
+                wall_clock_hit = true;
+            }
+            item = rx.recv() => {
+                item_seen = item.is_some();
+            }
+        }
+
+        assert!(!wall_clock_hit, "None wall_deadline must not fire");
+        assert!(item_seen, "stream arm should have won when wall_fut is pending");
+    }
+
+    // ─── M4.1.5 Task 3: tool_call_cap_exceeded ────────────────────────
+    //
+    // The full guard check needs the dispatch loop running with a real
+    // tool surface; we synthesize the cap arithmetic + control flow
+    // here to pin the exact shape `run_loop` executes.
+
+    /// 31 tool calls against a cap of 30 → cap trips on the 30th call,
+    /// `tool_cap_hit = true`, post-dispatch check produces
+    /// `stop_reason = "tool_call_cap_exceeded"` + matching first_guard.
+    #[test]
+    fn tool_call_cap_breaks_turn_after_threshold() {
+        let max_tool_calls: Option<usize> = Some(30);
+        let mut tool_call_count: usize = 0;
+        let mut tool_cap_hit = false;
+
+        // Simulate 31 dispatches — the increment + cap check shape
+        // mirrors run_loop's dispatch body.
+        for _ in 0..31 {
+            tool_call_count += 1;
+            if let Some(cap) = max_tool_calls {
+                if tool_call_count >= cap {
+                    tool_cap_hit = true;
+                }
+            }
+        }
+
+        // Cap = 30; after 31 calls, count >= cap on call 30 and beyond.
+        assert_eq!(tool_call_count, 31);
+        assert!(tool_cap_hit, "31 calls past cap=30 must trip the flag");
+
+        // Post-dispatch break shape (matches run_loop):
+        let mut stop_reason: Option<&'static str> = None;
+        let mut first_guard: Option<&'static str> = None;
+        if tool_cap_hit {
+            stop_reason = Some("tool_call_cap_exceeded");
+            first_guard.get_or_insert("tool_call_cap_exceeded");
+        }
+        assert_eq!(stop_reason, Some("tool_call_cap_exceeded"));
+        assert_eq!(first_guard, Some("tool_call_cap_exceeded"));
+    }
+
+    /// `max_tool_calls = None` → cap never trips regardless of count.
+    /// Matches the "0 = disabled" user-facing idiom — env / config 0
+    /// becomes `None` in the resolver, then the loop never sets
+    /// `tool_cap_hit`.
+    #[test]
+    fn tool_call_cap_disabled_never_fires() {
+        let max_tool_calls: Option<usize> = None;
+        let mut tool_call_count: usize = 0;
+        let mut tool_cap_hit = false;
+
+        for _ in 0..100 {
+            tool_call_count += 1;
+            if let Some(cap) = max_tool_calls {
+                if tool_call_count >= cap {
+                    tool_cap_hit = true;
+                }
+            }
+        }
+        assert!(!tool_cap_hit, "None cap must never trip");
+    }
+
+    /// Just-under-cap (29 calls against cap=30) does NOT trip. Off-by-one
+    /// guard — `>=` semantics mean the 30th call trips; 29 stay quiet.
+    #[test]
+    fn tool_call_cap_under_threshold_quiet() {
+        let max_tool_calls: Option<usize> = Some(30);
+        let mut tool_call_count: usize = 0;
+        let mut tool_cap_hit = false;
+
+        for _ in 0..29 {
+            tool_call_count += 1;
+            if let Some(cap) = max_tool_calls {
+                if tool_call_count >= cap {
+                    tool_cap_hit = true;
+                }
+            }
+        }
+        assert_eq!(tool_call_count, 29);
+        assert!(!tool_cap_hit, "29 calls under cap=30 must stay quiet");
     }
 }

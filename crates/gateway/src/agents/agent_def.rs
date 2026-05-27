@@ -75,6 +75,15 @@ pub struct AgentDef {
     /// (general-purpose), the failsafe kicks in within reason.
     /// `None` = inherit whatever the main agent's resolved cap is.
     pub default_max_iterations: Option<u32>,
+    /// M4.1.5: per-subagent tool-call cap. Read from the
+    /// `max_tool_calls` frontmatter field. When set, the subagent
+    /// loop's `GuardConfig.max_tool_calls` is overridden to this
+    /// value — the AGENT.md author knows the worker's expected tool
+    /// budget better than the main agent's user-tuned cap. Built-in
+    /// values: quick-screen=8, comparison=25, deep-review=40,
+    /// corpus-expert=12, general-purpose=30. `None` = inherit whatever
+    /// the main agent's resolved cap is.
+    pub default_max_tool_calls: Option<u32>,
     /// Discovery layer this agent was loaded from.
     pub source_layer: AgentLayer,
 }
@@ -135,6 +144,7 @@ mod tests {
             cost_cap_usd: None,
             reasoning_effort: None,
             default_max_iterations: None,
+            default_max_tool_calls: None,
             source_layer: layer,
         }
     }

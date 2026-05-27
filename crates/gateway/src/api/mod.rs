@@ -33,19 +33,23 @@ use crate::skills::SkillRegistry;
 use crate::vault::events::Event;
 use crate::vendors::VendorRegistry;
 
-/// M4.1.4: hard cap on simultaneous codex POSTs in flight. The codex
+/// M4.1.5: hard cap on simultaneous codex POSTs in flight. The codex
 /// backend rate-limits aggressive burst loads (M4.1.3 stress round 2:
 /// 5-lane concurrent burst → 1-2 lanes hit `Retry-After 60s+` while the
-/// other 3 ran free). Bounding the concurrency to 3 stops the rate-limit
-/// thundering-herd from ever firing — 3 in-flight × the codex backend's
-/// per-account throughput is comfortably under the threshold the live
-/// stress hit. The 4th+ caller waits at `acquire_owned().await`; the
-/// waiter emits one `agent_queued` event so the frontend can render
-/// "排队中" instead of looking frozen.
+/// other 3 ran free). M4.1.4 bounded the concurrency to 3, but stress
+/// round 3 showed that was too tight for nested-subagent shapes: a
+/// `comparison` worker fanning out into 3 `quick-screen` children plus
+/// the main agent itself wants 5 codex slots simultaneously and the
+/// 4th/5th caller spent up to 23 `agent_queued` events waiting. 5 slot
+/// matches the natural nested fan-out (main + comparison + 3 quick
+/// children) while still bounding burst against the per-account rate
+/// limit. The 6th+ caller waits at `acquire_owned().await`; the waiter
+/// emits one `agent_queued` event so the frontend can render "排队中"
+/// instead of looking frozen.
 ///
-/// Not user-tunable today — the value is spec-fixed at 3 by the M4.1.4
+/// Not user-tunable today — the value is spec-fixed at 5 by the M4.1.5
 /// dispatch. If the codex backend's threshold changes, bump here.
-pub const CODEX_MAX_CONCURRENT: usize = 3;
+pub const CODEX_MAX_CONCURRENT: usize = 5;
 
 /// M3.2: per-turn user-abort registry. The agent loop registers an
 /// `Arc<Notify>` keyed by `turn_id` on entry and drops the entry on

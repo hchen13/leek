@@ -181,6 +181,7 @@ mod tests {
                 cost_cap_usd: None,
                 reasoning_effort: None,
                 default_max_iterations: None,
+                default_max_tool_calls: None,
                 source_layer: AgentLayer::Builtin,
             },
         );

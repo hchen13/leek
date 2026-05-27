@@ -383,6 +383,10 @@ pub fn subagent_web_search_allowed(agent: &AgentDef) -> bool {
 ///   better than the main agent's user-tuned cap. The loader already
 ///   drops `0` / negatives, but the defensive check stays so a future
 ///   in-memory AgentDef construction does not poison the guard.
+/// - `default_max_tool_calls` (M4.1.5) — per-subagent tool-call cap.
+///   Mirrors `default_max_iterations` exactly: AGENT.md author knows
+///   the worker's tool budget shape; built-ins ship 8 / 12 / 25 / 30 /
+///   40 so an over-thinking turn has a hard ceiling.
 pub fn apply_agent_overrides(guards: &mut GuardConfig, agent: &AgentDef) {
     if let Some(cap) = agent.cost_cap_usd {
         guards.cost_cap_usd = if cap > 0.0 && cap.is_finite() {
@@ -402,6 +406,11 @@ pub fn apply_agent_overrides(guards: &mut GuardConfig, agent: &AgentDef) {
     if let Some(iter_cap) = agent.default_max_iterations {
         if iter_cap > 0 {
             guards.max_iterations = Some(iter_cap as usize);
+        }
+    }
+    if let Some(tool_cap) = agent.default_max_tool_calls {
+        if tool_cap > 0 {
+            guards.max_tool_calls = Some(tool_cap as usize);
         }
     }
 }
@@ -531,6 +540,9 @@ fn compose_subagent_final_text(
         "wall_clock_exceeded" => Some("subagent stopped: wall_clock_exceeded"),
         "max_iterations" => Some("subagent stopped: max_iterations"),
         "cost_cap_exceeded" => Some("subagent stopped: cost_cap_exceeded"),
+        // M4.1.5 Task 3: tool-call cap. Parent agent reads the digest +
+        // gets to decide whether to re-task with a wider cap.
+        "tool_call_cap_exceeded" => Some("subagent stopped: tool_call_cap_exceeded"),
         "doom_loop" => Some("subagent stopped: doom_loop"),
         _ => Some("subagent stopped early"),
     };
@@ -605,6 +617,7 @@ mod tests {
             cost_cap_usd,
             reasoning_effort: None,
             default_max_iterations: None,
+            default_max_tool_calls: None,
             source_layer: crate::agents::AgentLayer::Builtin,
         }
     }
@@ -792,6 +805,7 @@ mod tests {
                 cost_cap_usd: None,
                 reasoning_effort: None,
                 default_max_iterations: None,
+                default_max_tool_calls: None,
                 source_layer: crate::agents::AgentLayer::Builtin,
             },
         );
@@ -814,6 +828,7 @@ mod tests {
                 cost_cap_usd: None,
                 reasoning_effort: None,
                 default_max_iterations: None,
+                default_max_tool_calls: None,
                 source_layer: crate::agents::AgentLayer::Builtin,
             },
         );
@@ -821,6 +836,44 @@ mod tests {
         let err = resolve_agent(&reg, "ghost").unwrap_err();
         assert!(err.contains("unknown agent 'ghost'"));
         assert!(err.contains("Available: alpha"));
+    }
+
+    #[test]
+    fn agent_override_replaces_main_max_tool_calls() {
+        // M4.1.5: AGENT.md `max_tool_calls: 8` replaces whatever cap
+        // the main agent's `GuardConfig` carries — the subagent gets
+        // its own tool-call ceiling. Twin of the max_iterations
+        // override above.
+        let mut agent = mk_agent("quick-screen", None);
+        agent.default_max_tool_calls = Some(8);
+        let mut guards = baseline_guards();
+        guards.max_tool_calls = Some(30);
+        apply_agent_overrides(&mut guards, &agent);
+        assert_eq!(guards.max_tool_calls, Some(8));
+    }
+
+    #[test]
+    fn agent_override_absent_keeps_main_max_tool_calls() {
+        // No `max_tool_calls` declared (None) → subagent inherits
+        // whatever the main agent's resolver produced.
+        let agent = mk_agent("inherit-tool", None);
+        let mut guards = baseline_guards();
+        guards.max_tool_calls = Some(30);
+        apply_agent_overrides(&mut guards, &agent);
+        assert_eq!(guards.max_tool_calls, Some(30));
+    }
+
+    #[test]
+    fn agent_override_zero_tool_cap_ignored() {
+        // Defensive: a future in-memory AgentDef constructed with 0
+        // should not silently disable the inherited cap. The loader
+        // already strips 0, but this is the last line of defense.
+        let mut agent = mk_agent("zero-tool", None);
+        agent.default_max_tool_calls = Some(0);
+        let mut guards = baseline_guards();
+        guards.max_tool_calls = Some(30);
+        apply_agent_overrides(&mut guards, &agent);
+        assert_eq!(guards.max_tool_calls, Some(30));
     }
 
     #[test]

@@ -5,6 +5,7 @@ allowed_tools: [corpus_search, corpus_read]
 cost_cap_usd: 0.50
 reasoning_effort: medium
 default_max_iterations: 12
+max_tool_calls: 12
 ---
 
 你是 leek corpus 的领域专家。**你只有两个工具：`corpus_search` 和 `corpus_read`。**

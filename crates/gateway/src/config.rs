@@ -91,6 +91,15 @@ pub struct Config {
     /// frontmatter field (see `agents::AgentDef`); this field only
     /// affects the main agent's loop.
     pub reasoning_effort: Option<String>,
+    /// M4.1.5: hard cap on tool calls per turn. `None` falls back to the
+    /// built-in default (30 — see `agent::guards::resolve`). `0` disables
+    /// the cap (mirrors the `max_iterations` idiom). Stress round 3 A4
+    /// showed the main agent at medium effort over-thinking a single
+    /// 60-day events question into 14 tool calls without converging;
+    /// iter / cost / wall-clock caps did not catch it. Per-subagent
+    /// overrides come from the AGENT.md `max_tool_calls` frontmatter
+    /// field (see `agents::AgentDef`).
+    pub max_tool_calls_per_turn: Option<usize>,
 }
 
 impl Config {
@@ -211,6 +220,9 @@ impl Config {
         if patch.reasoning_effort.is_some() {
             self.reasoning_effort = patch.reasoning_effort;
         }
+        if patch.max_tool_calls_per_turn.is_some() {
+            self.max_tool_calls_per_turn = patch.max_tool_calls_per_turn;
+        }
     }
 
     /// M3.6: PATCH-style merge that distinguishes **absent** field
@@ -258,6 +270,9 @@ impl Config {
         }
         if let Some(v) = patch.reasoning_effort {
             self.reasoning_effort = v;
+        }
+        if let Some(v) = patch.max_tool_calls_per_turn {
+            self.max_tool_calls_per_turn = v;
         }
     }
 
@@ -314,6 +329,10 @@ impl Config {
                 ));
             }
         }
+        // M4.1.5: max_tool_calls_per_turn — `0` is the user-facing
+        // "disable" idiom (mirrors max_iterations); negative is impossible
+        // because the type is `usize`. Nothing to reject here beyond shape,
+        // but the field still flows through the standard layered resolver.
         if errs.is_empty() {
             Ok(())
         } else {
@@ -379,6 +398,8 @@ pub struct ConfigPatch {
     pub builtin_url_abort_threshold: Option<Option<u32>>,
     #[serde(deserialize_with = "double_option", default)]
     pub reasoning_effort: Option<Option<String>>,
+    #[serde(deserialize_with = "double_option", default)]
+    pub max_tool_calls_per_turn: Option<Option<usize>>,
 }
 
 impl ConfigPatch {

@@ -2122,24 +2122,24 @@ mod tests {
         assert_eq!(events[0]["attempt"], 5); // attempt-about-to-run is 5.
     }
 
-    // ─── M4.1.4 Task 1: codex concurrency semaphore ───────────────────
+    // ─── M4.1.4 Task 1 / M4.1.5: codex concurrency semaphore ──────────
     //
     // These exercise `acquire_codex_permit` directly. Production wiring
     // (`call_codex_with_retry` / `call_codex_with_stream_retry`) is
     // covered indirectly by the existing retry tests above — the new
     // permit is acquired before each test's scripted closure runs.
 
-    /// Build a 3-permit semaphore (matching `CODEX_MAX_CONCURRENT`) and
+    /// Build a 5-permit semaphore (matching `CODEX_MAX_CONCURRENT`) and
     /// the AppState pieces `acquire_codex_permit` reads. We reuse the
     /// `test_app_state` builder from earlier in the file — it already
     /// wires the semaphore field.
     ///
-    /// 4 concurrent callers: 3 should win permits immediately, the 4th
-    /// must block until one of the first three drops. We assert both the
-    /// permit count (only 3 in flight at once) and the `agent_queued`
-    /// event (emitted exactly once for the 4th).
+    /// 6 concurrent callers: 5 should win permits immediately, the 6th
+    /// must block until one of the first five drops. We assert both the
+    /// permit count (only 5 in flight at once) and the `agent_queued`
+    /// event (emitted exactly once for the 6th).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn codex_semaphore_caps_at_three_concurrent() {
+    async fn codex_semaphore_caps_at_five_concurrent() {
         // No `pause` — we need real-time concurrency to assert the
         // contention behavior.
         let st = test_app_state().await;
@@ -2154,7 +2154,7 @@ mod tests {
             CODEX_MAX_CONCURRENT,
         );
 
-        // Three holders win immediately + 1 contender blocks.
+        // Five holders win immediately + 1 contender blocks.
         let p1 = acquire_codex_permit(&st, session_id, Some("t-1"), 1)
             .await
             .unwrap();
@@ -2164,14 +2164,20 @@ mod tests {
         let p3 = acquire_codex_permit(&st, session_id, Some("t-3"), 1)
             .await
             .unwrap();
+        let p4 = acquire_codex_permit(&st, session_id, Some("t-4"), 1)
+            .await
+            .unwrap();
+        let p5 = acquire_codex_permit(&st, session_id, Some("t-5"), 1)
+            .await
+            .unwrap();
         assert_eq!(st.codex_sem.available_permits(), 0);
 
-        // The 4th must wait. Spawn it; assert it's still waiting after
+        // The 6th must wait. Spawn it; assert it's still waiting after
         // a brief yield to the scheduler, and that the wait emitted one
         // `agent_queued` event.
         let st_for_wait = st.clone();
         let wait_handle = tokio::spawn(async move {
-            acquire_codex_permit(&st_for_wait, "s-codex-sem", Some("t-4"), 1)
+            acquire_codex_permit(&st_for_wait, "s-codex-sem", Some("t-6"), 1)
                 .await
                 .unwrap()
         });
@@ -2194,14 +2200,14 @@ mod tests {
         assert_eq!(
             queued_rows.len(),
             1,
-            "expected exactly one agent_queued event for the 4th waiter"
+            "expected exactly one agent_queued event for the 6th waiter"
         );
         let queued = queued_rows[0];
         assert_eq!(queued.payload["session_id"], session_id);
-        assert_eq!(queued.payload["turn_id"], "t-4");
+        assert_eq!(queued.payload["turn_id"], "t-6");
         assert_eq!(queued.payload["iteration"], 1);
         // queue_position is approximate — assert it's positive (at least
-        // the waiter itself + the 3 that took permits).
+        // the waiter itself + the 5 that took permits).
         assert!(queued.payload["queue_position"].as_u64().unwrap() > 0);
         // Surface is lifecycle (frontend renders as a pill badge).
         assert_eq!(queued.payload["surface"], "lifecycle");
@@ -2209,7 +2215,7 @@ mod tests {
         // Releasing one permit unblocks the waiter — drop p1 and assert
         // wait_handle finishes.
         drop(p1);
-        let _p4 = tokio::time::timeout(
+        let _p6 = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             wait_handle,
         )
@@ -2217,11 +2223,13 @@ mod tests {
         .expect("waiter should have unblocked within 2s after a drop")
         .unwrap();
 
-        // Sanity: 2 of the original 3 are still held (p2, p3); the
-        // newcomer holds the 3rd; total available = 0.
+        // Sanity: 4 of the original 5 are still held (p2..p5); the
+        // newcomer holds the 5th; total available = 0.
         assert_eq!(st.codex_sem.available_permits(), 0);
         drop(p2);
         drop(p3);
+        drop(p4);
+        drop(p5);
     }
 
     /// Acquiring a permit when the semaphore has capacity available MUST

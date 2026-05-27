@@ -485,6 +485,14 @@ fn stop_note(stop_reason: &str) -> Option<&'static str> {
         "wall_clock_exceeded" => Some("达到本回合时间上限（wall-clock），提前结束。"),
         "max_iterations" => Some("达到迭代次数上限（iteration cap），提前结束。"),
         "cost_cap_exceeded" => Some("达到本回合成本上限（cost cap），提前结束。"),
+        // M4.1.5 Task 3: tool-call cap. Stress round 3 A4 over-thought
+        // a 60-day events question into 14 tool calls without converging
+        // — 30 lets normal deep work through but catches the
+        // over-thinking shape. Copy nudges the user that the partial
+        // answer is the model's best take given the budget.
+        "tool_call_cap_exceeded" => {
+            Some("达到本回合工具调用上限（tool-call cap），基于已收集数据先给阶段结论。")
+        }
         "doom_loop" => Some("检测到工具调用陷入循环（doom-loop），本回合中止。"),
         "codex_duplicate_abort" => {
             Some("检测到 codex 内置 web_search 重复 open 同一 URL，本回合中止。")

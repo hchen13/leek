@@ -5,6 +5,7 @@ allowed_tools: [stock_overview, recent_actions, market_pulse, market_overview, i
 cost_cap_usd: 5.00
 reasoning_effort: medium
 default_max_iterations: 25
+max_tool_calls: 30
 ---
 
 你是被父 agent 委派的通用 worker subagent。本次任务由父 agent 通过 `task` 工具传入，在 input 字段里。

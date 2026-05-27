@@ -220,6 +220,27 @@ fn load_one(dir: &Path, agent_md: &Path, layer: AgentLayer) -> Result<AgentDef, 
         }
     });
 
+    // M4.1.5: optional `max_tool_calls` frontmatter — per-subagent
+    // tool-call cap. Same handling as `default_max_iterations` above:
+    // bad value warns + drops to None, `0` treated as omitted.
+    let default_max_tool_calls = frontmatter.get("max_tool_calls").and_then(|raw| {
+        let s = raw.trim();
+        if s.is_empty() {
+            return None;
+        }
+        match s.parse::<u32>() {
+            Ok(v) if v > 0 => Some(v),
+            _ => {
+                tracing::warn!(
+                    path = %agent_md.display(),
+                    value = s,
+                    "AGENT.md max_tool_calls is not a positive integer — ignoring"
+                );
+                None
+            }
+        }
+    });
+
     let system_prompt = body.trim().to_string();
     if system_prompt.is_empty() {
         return Err(AgentLoadError {
@@ -237,6 +258,7 @@ fn load_one(dir: &Path, agent_md: &Path, layer: AgentLayer) -> Result<AgentDef, 
         cost_cap_usd,
         reasoning_effort,
         default_max_iterations,
+        default_max_tool_calls,
         source_layer: layer,
     })
 }
@@ -568,6 +590,73 @@ mod tests {
                 got,
                 Some(*cap),
                 "built-in {name} should carry default_max_iterations = {cap}",
+            );
+        }
+    }
+
+    #[test]
+    fn max_tool_calls_frontmatter_loads() {
+        // M4.1.5: AGENT.md may carry an optional `max_tool_calls` field.
+        // Loader parses it into `AgentDef.default_max_tool_calls`; an
+        // absent field stays None (= inherit the main agent's cap).
+        let root = temp_root("tool-cap");
+        write_agent(
+            &root,
+            "capped",
+            "---\ndescription: capped tools\nmax_tool_calls: 15\n---\nbody",
+        );
+        write_agent(&root, "uncapped", "---\ndescription: no cap\n---\nbody");
+        let (reg, errs) = load_layered(&[(root.as_path(), AgentLayer::Builtin)]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(reg.get("capped").unwrap().default_max_tool_calls, Some(15));
+        assert_eq!(reg.get("uncapped").unwrap().default_max_tool_calls, None);
+    }
+
+    #[test]
+    fn max_tool_calls_invalid_falls_through_to_none() {
+        // Bad value warns + ignores. Zero is treated as "no cap" by
+        // dropping the value (same idiom as the user-facing knob).
+        let root = temp_root("tool-cap-bad");
+        write_agent(
+            &root,
+            "bad",
+            "---\ndescription: bad\nmax_tool_calls: not-a-number\n---\nbody",
+        );
+        write_agent(
+            &root,
+            "zero",
+            "---\ndescription: zero\nmax_tool_calls: 0\n---\nbody",
+        );
+        let (reg, errs) = load_layered(&[(root.as_path(), AgentLayer::Builtin)]);
+        assert!(errs.is_empty(), "agent should still load: {errs:?}");
+        assert_eq!(reg.get("bad").unwrap().default_max_tool_calls, None);
+        assert_eq!(reg.get("zero").unwrap().default_max_tool_calls, None);
+    }
+
+    #[test]
+    fn shipped_builtin_agents_have_max_tool_calls() {
+        // M4.1.5 ships per-subagent tool-call caps on every built-in
+        // worker so an over-thinking turn has a hard ceiling
+        // independent of whatever the user did (or did not) set as a
+        // main-agent cap. Values from the M4.1.5 dispatch.
+        let dir = builtin_agents_dir();
+        if !dir.exists() {
+            return;
+        }
+        let (reg, _errs) = load_layered(&[(dir.as_path(), AgentLayer::Builtin)]);
+        let expect: &[(&str, u32)] = &[
+            ("quick-screen", 8),
+            ("comparison", 25),
+            ("deep-review", 40),
+            ("corpus-expert", 12),
+            ("general-purpose", 30),
+        ];
+        for (name, cap) in expect {
+            let got = reg.get(name).and_then(|a| a.default_max_tool_calls);
+            assert_eq!(
+                got,
+                Some(*cap),
+                "built-in {name} should carry max_tool_calls = {cap}",
             );
         }
     }
