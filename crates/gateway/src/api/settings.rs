@@ -358,13 +358,17 @@ mod tests {
         let _l = TEST_LOCK.lock().await;
         let st = fixture().await;
         let resp = read(State(st.st.clone())).await.unwrap().0;
-        // Default Config: every field is null.
+        // Default Config: every user-set field is null (the user has
+        // not picked a value yet).
         assert!(resp["config"]["cost_cap_usd"].is_null());
         assert!(resp["config"]["idle_timeout_secs"].is_null());
-        // Effective: idle_timeout uses the M3.6 180s built-in default,
-        // cost cap stays off.
+        // Effective: idle_timeout uses the M3.6 180s built-in default.
         assert_eq!(resp["effective"]["idle_timeout_secs"]["value"], 180);
-        assert!(resp["effective"]["cost_cap_usd"]["value"].is_null());
+        // M4.1.3 (P0-4): cost cap defaults to $5/turn (was None /
+        // opt-in). User can still explicitly clear via PATCH 0 or null.
+        assert_eq!(resp["effective"]["cost_cap_usd"]["value"], 5.0);
+        // M4.1.3 (P0-3): max_iterations defaults to 50 (was None).
+        assert_eq!(resp["effective"]["max_iterations"]["value"], 50);
         // No env vars set in this fixture.
         assert_eq!(resp["effective"]["cost_cap_usd"]["overridden_by_env"], false);
         // config_path points into our temp dir.
@@ -483,9 +487,9 @@ mod tests {
         assert!(resp.0["config"]["cost_cap_usd"].is_null());
         // … and the live snapshot agrees.
         assert_eq!(st.st.config_snapshot().cost_cap_usd, None);
-        // … and the effective value is back to the built-in default
-        // (cost cap stays off when stored = None).
-        assert!(resp.0["effective"]["cost_cap_usd"]["value"].is_null());
+        // … and the effective value is back to the built-in default.
+        // M4.1.3 (P0-4): default is now $5, no longer None.
+        assert_eq!(resp.0["effective"]["cost_cap_usd"]["value"], 5.0);
     }
 
     #[tokio::test]

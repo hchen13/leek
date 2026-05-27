@@ -9,8 +9,11 @@
 //! | `idle_timeout`         | 180 s, on      | M3.6: doubled from 90s — xhigh reasoning + 20+ tool turns regularly  |
 //! |                        |                | go silent past 90s in the wild; T31b deep-dive prompts fataled.      |
 //! | `wall_clock`           | 30 min, on     | claude-code removed a 5-min version as a bug; this is an edge ceiling |
-//! | `max_iterations`       | none, opt-in   | codex / claude-code do not enforce one                               |
-//! | `cost_cap_usd`         | none, opt-in   | codex does not track cost                                            |
+//! | `max_iterations`       | 50, on         | M4.1.3 (P0-3): no longer opt-in. Main-agent failsafe — stress runs   |
+//! |                        |                | hit 88+ tool calls before any natural stop; 50 lets normal deep work |
+//! |                        |                | through but catches runaway loops. Subagents override per-AGENT.md.  |
+//! | `cost_cap_usd`         | 5.0, on        | M4.1.3 (P0-4): no longer opt-in. Stress C1 ran 1500s with no cap;    |
+//! |                        |                | $5/turn lets normal research through, catches the worst runaways.    |
 //! | `doom_loop_threshold`  | 3, on          | leek-original; nobody else has it                                    |
 //! | `auto_compact_threshold` | 0.90, on     | mirrors codex's `(context_window * 9) / 10`                          |
 //! | `builtin_url_warn_threshold`  | 3, on   | warn at 3 repeats of the same `(action, url)` from codex builtin     |
@@ -95,8 +98,27 @@ impl GuardConfig {
                 config.wall_clock_secs,
                 30 * 60,
             ),
-            max_iterations: opt_usize_layered("LEEK_MAX_ITERATIONS", config.max_iterations),
-            cost_cap_usd: opt_f64_layered("LEEK_COST_CAP_USD", config.cost_cap_usd),
+            // M4.1.3 (P0-3): main-agent failsafe — was opt-in (None
+            // default); now ships at 50 so a runaway loop has a hard
+            // ceiling. Stress runs saw 88+ tool calls before any
+            // natural stop; 50 lets normal deep work through but
+            // catches the runaway shape. User can still set explicit
+            // 0 (or omit) to disable, via the resolver layering below.
+            max_iterations: opt_usize_layered(
+                "LEEK_MAX_ITERATIONS",
+                config.max_iterations,
+                Some(50),
+            ),
+            // M4.1.3 (P0-4): main-agent failsafe — was opt-in (None
+            // default); now ships at $5/turn so the worst runaway
+            // (stress C1 ran 1500s with no cap) hits a hard ceiling.
+            // Subagents have their own per-AGENT.md caps that override
+            // this in `apply_agent_overrides`.
+            cost_cap_usd: opt_f64_layered(
+                "LEEK_COST_CAP_USD",
+                config.cost_cap_usd,
+                Some(5.0),
+            ),
             doom_loop_threshold: doom_threshold_layered(config.doom_loop_threshold),
             auto_compact_threshold: f32_layered(
                 "LEEK_AUTO_COMPACT_THRESHOLD",
@@ -159,22 +181,49 @@ fn duration_layered(env_key: &str, config_secs: Option<u64>, default_secs: u64) 
     Some(Duration::from_secs(default_secs))
 }
 
-/// Opt-in iteration cap. Env > config > off; an explicit `0` in the config
-/// is treated as "no cap" (consistent with absence).
-fn opt_usize_layered(env_key: &str, config_value: Option<usize>) -> Option<usize> {
+/// Iteration cap. Env > config > built-in. An explicit `0` in env or
+/// config is the product-defined "off" sentinel (mirrors the cost-cap
+/// idiom): it disables the guard even if the built-in default would
+/// have set one. M4.1.3 (P0-3): `built_in_default = Some(50)` for the
+/// main-agent resolver makes 50 the failsafe; pass `None` for legacy
+/// "opt-in" semantics.
+fn opt_usize_layered(
+    env_key: &str,
+    config_value: Option<usize>,
+    built_in_default: Option<usize>,
+) -> Option<usize> {
     if let Some(v) = usize_env(env_key) {
         return if v > 0 { Some(v) } else { None };
     }
-    config_value.filter(|&n| n > 0)
+    if let Some(v) = config_value {
+        return if v > 0 { Some(v) } else { None };
+    }
+    built_in_default.filter(|&n| n > 0)
 }
 
-/// Opt-in USD cost cap. Env > config > off; both `None` and `Some(0.0)`
-/// mean "guard off" (product decision 2026-05-22: 0 = 不限).
-fn opt_f64_layered(env_key: &str, config_value: Option<f64>) -> Option<f64> {
+/// USD cost cap. Env > config > built-in. Both `None` and explicit
+/// `Some(0.0)` mean "guard off" at the env/config layer (product
+/// decision 2026-05-22: 0 = 不限). M4.1.3 (P0-4): `built_in_default =
+/// Some(5.0)` for the main-agent resolver makes $5 the failsafe; pass
+/// `None` for legacy "opt-in" semantics.
+fn opt_f64_layered(
+    env_key: &str,
+    config_value: Option<f64>,
+    built_in_default: Option<f64>,
+) -> Option<f64> {
     if let Some(v) = f64_env(env_key) {
         return if v > 0.0 && v.is_finite() { Some(v) } else { None };
     }
-    config_value.filter(|v| *v > 0.0 && v.is_finite())
+    if let Some(v) = config_value {
+        return if v > 0.0 && v.is_finite() {
+            Some(v)
+        } else {
+            // User picked 0 (or NaN) to explicitly disable — built-in
+            // default does not get a second chance.
+            None
+        };
+    }
+    built_in_default.filter(|v| *v > 0.0 && v.is_finite())
 }
 
 /// Doom-loop threshold: env > config > default 3, must be ≥ 2.
@@ -456,13 +505,17 @@ mod tests {
         let _g1 = EnvGuard::unset("LEEK_IDLE_TIMEOUT_SECS");
         let _g2 = EnvGuard::unset("LEEK_COST_CAP_USD");
         let _g3 = EnvGuard::unset("LEEK_AUTO_COMPACT_THRESHOLD");
+        let _g4 = EnvGuard::unset("LEEK_MAX_ITERATIONS");
 
         let cfg = Config::default();
         let g = GuardConfig::resolve(&cfg);
         // M3.6: 180s built-in default (doubled from 90s for xhigh
         // reasoning + long-tool-batch turns; see resolve() comment).
         assert_eq!(g.idle_timeout, Some(Duration::from_secs(180)));
-        assert_eq!(g.cost_cap_usd, None);
+        // M4.1.3 (P0-4): cost_cap default = $5/turn, no longer None.
+        assert_eq!(g.cost_cap_usd, Some(5.0));
+        // M4.1.3 (P0-3): max_iterations default = 50, no longer None.
+        assert_eq!(g.max_iterations, Some(50));
         assert!((g.auto_compact_threshold - 0.90).abs() < 1e-6);
     }
 
@@ -508,8 +561,26 @@ mod tests {
         let _g = EnvGuard::unset("LEEK_COST_CAP_USD");
 
         let cfg = Config { cost_cap_usd: Some(0.0), ..Config::default() };
-        // 0 is the product-defined "off" value (see config.rs).
+        // 0 is the product-defined "off" value (see config.rs). The
+        // M4.1.3 built-in default ($5) does NOT get a second chance —
+        // explicit 0 from the user means "no cap, period".
         assert_eq!(GuardConfig::resolve(&cfg).cost_cap_usd, None);
+    }
+
+    #[test]
+    fn resolve_treats_zero_max_iterations_as_disabled() {
+        // M4.1.3 (P0-3) symmetry: explicit 0 from env or config means
+        // "no iteration cap" — overriding the new built-in 50 default.
+        let _l = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::unset("LEEK_MAX_ITERATIONS");
+
+        let cfg = Config { max_iterations: None, ..Config::default() };
+        // Sanity: with default cfg, the failsafe applies.
+        assert_eq!(GuardConfig::resolve(&cfg).max_iterations, Some(50));
+
+        // 0 via env disables the cap.
+        let _g_env = EnvGuard::set("LEEK_MAX_ITERATIONS", "0");
+        assert_eq!(GuardConfig::resolve(&cfg).max_iterations, None);
     }
 
     #[test]

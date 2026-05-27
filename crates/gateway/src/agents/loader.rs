@@ -196,6 +196,30 @@ fn load_one(dir: &Path, agent_md: &Path, layer: AgentLayer) -> Result<AgentDef, 
         }
     });
 
+    // M4.1.3 (P0-3): optional `default_max_iterations` frontmatter —
+    // per-subagent iteration cap. Bad value warns + drops to None so
+    // one typo doesn't take the worker out of service. Must be > 0;
+    // `0` is treated as "no cap" by the same idiom as the user-facing
+    // config (mirrors `opt_usize_layered`), but expressed in the
+    // frontmatter as just omitting the field.
+    let default_max_iterations = frontmatter.get("default_max_iterations").and_then(|raw| {
+        let s = raw.trim();
+        if s.is_empty() {
+            return None;
+        }
+        match s.parse::<u32>() {
+            Ok(v) if v > 0 => Some(v),
+            _ => {
+                tracing::warn!(
+                    path = %agent_md.display(),
+                    value = s,
+                    "AGENT.md default_max_iterations is not a positive integer — ignoring"
+                );
+                None
+            }
+        }
+    });
+
     let system_prompt = body.trim().to_string();
     if system_prompt.is_empty() {
         return Err(AgentLoadError {
@@ -212,6 +236,7 @@ fn load_one(dir: &Path, agent_md: &Path, layer: AgentLayer) -> Result<AgentDef, 
         model,
         cost_cap_usd,
         reasoning_effort,
+        default_max_iterations,
         source_layer: layer,
     })
 }
@@ -449,20 +474,22 @@ mod tests {
     fn shipped_builtin_agents_have_cost_caps() {
         // M3.6 §E ships per-subagent caps on every built-in worker so
         // a default-config user can rely on quick-screen never running
-        // away into a multi-dollar tab. The values are spec-fixed
-        // (dispatch §E): if any of them drift, both spec + this test
-        // need an update.
+        // away into a multi-dollar tab. M4.1.3 (P0-4) raised the caps
+        // after stress runs showed the prior values were too tight on
+        // legitimate deep-dive work — values are spec-fixed (dispatch
+        // M4.1.3): if any of them drift, both spec + this test need an
+        // update.
         let dir = builtin_agents_dir();
         if !dir.exists() {
             return;
         }
         let (reg, _errs) = load_layered(&[(dir.as_path(), AgentLayer::Builtin)]);
         let expect: &[(&str, f64)] = &[
-            ("quick-screen", 0.20),
-            ("deep-review", 5.00),
-            ("comparison", 3.00),
-            ("general-purpose", 2.00),
-            ("corpus-expert", 1.50),
+            ("quick-screen", 0.30),
+            ("deep-review", 8.00),
+            ("comparison", 5.00),
+            ("general-purpose", 5.00),
+            ("corpus-expert", 0.50),
         ];
         for (name, cap) in expect {
             let got = reg.get(name).and_then(|a| a.cost_cap_usd);
@@ -470,6 +497,77 @@ mod tests {
                 got,
                 Some(*cap),
                 "built-in {name} should carry cost_cap_usd = {cap}",
+            );
+        }
+    }
+
+    #[test]
+    fn default_max_iterations_frontmatter_loads() {
+        // M4.1.3 (P0-3): AGENT.md may carry an optional
+        // `default_max_iterations` field. Loader parses it into
+        // `AgentDef.default_max_iterations`; an absent field stays
+        // None (= inherit the main agent's resolved cap).
+        let root = temp_root("iter-cap");
+        write_agent(
+            &root,
+            "capped",
+            "---\ndescription: capped iter\ndefault_max_iterations: 10\n---\nbody",
+        );
+        write_agent(&root, "uncapped", "---\ndescription: no cap\n---\nbody");
+        let (reg, errs) = load_layered(&[(root.as_path(), AgentLayer::Builtin)]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(reg.get("capped").unwrap().default_max_iterations, Some(10));
+        assert_eq!(reg.get("uncapped").unwrap().default_max_iterations, None);
+    }
+
+    #[test]
+    fn default_max_iterations_invalid_falls_through_to_none() {
+        // Bad value warns + ignores — one typo must not take the
+        // subagent out of service. Zero is treated as "no cap" by
+        // dropping the value (same idiom as the user-facing knob).
+        let root = temp_root("iter-cap-bad");
+        write_agent(
+            &root,
+            "bad",
+            "---\ndescription: bad\ndefault_max_iterations: not-a-number\n---\nbody",
+        );
+        write_agent(
+            &root,
+            "zero",
+            "---\ndescription: zero\ndefault_max_iterations: 0\n---\nbody",
+        );
+        let (reg, errs) = load_layered(&[(root.as_path(), AgentLayer::Builtin)]);
+        // The agent still loads — only the bad value is dropped.
+        assert!(errs.is_empty(), "agent should still load: {errs:?}");
+        assert_eq!(reg.get("bad").unwrap().default_max_iterations, None);
+        assert_eq!(reg.get("zero").unwrap().default_max_iterations, None);
+    }
+
+    #[test]
+    fn shipped_builtin_agents_have_default_max_iterations() {
+        // M4.1.3 (P0-3) ships per-subagent iteration caps on every
+        // built-in worker so a runaway subagent has a hard ceiling
+        // independent of whatever the user did (or did not) set as a
+        // main-agent cap. Values from the M4.1.3 dispatch: if any
+        // drift, both spec + this test need an update.
+        let dir = builtin_agents_dir();
+        if !dir.exists() {
+            return;
+        }
+        let (reg, _errs) = load_layered(&[(dir.as_path(), AgentLayer::Builtin)]);
+        let expect: &[(&str, u32)] = &[
+            ("quick-screen", 8),
+            ("comparison", 20),
+            ("deep-review", 30),
+            ("corpus-expert", 12),
+            ("general-purpose", 25),
+        ];
+        for (name, cap) in expect {
+            let got = reg.get(name).and_then(|a| a.default_max_iterations);
+            assert_eq!(
+                got,
+                Some(*cap),
+                "built-in {name} should carry default_max_iterations = {cap}",
             );
         }
     }

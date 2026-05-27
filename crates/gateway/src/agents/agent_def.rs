@@ -63,6 +63,18 @@ pub struct AgentDef {
     /// for that loop only — the main agent's value (Settings-driven)
     /// is untouched. `None` = inherit whatever the main agent uses.
     pub reasoning_effort: Option<String>,
+    /// M4.1.3 (P0-3): per-subagent default iteration cap. Read from the
+    /// `default_max_iterations` frontmatter field. When set, the
+    /// subagent loop's `GuardConfig.max_iterations` is overridden to
+    /// this value — the AGENT.md author knows the worker's expected
+    /// shape better than the main agent's user-tuned cap. A failsafe:
+    /// pre-M4.1.3, `max_iterations` was main-agent-default = 50; a
+    /// runaway quick-screen subagent could burn through ~50 iters
+    /// before tripping. With this set to 8 (quick-screen), 12
+    /// (corpus-expert), 20 (comparison), 30 (deep-review), 25
+    /// (general-purpose), the failsafe kicks in within reason.
+    /// `None` = inherit whatever the main agent's resolved cap is.
+    pub default_max_iterations: Option<u32>,
     /// Discovery layer this agent was loaded from.
     pub source_layer: AgentLayer,
 }
@@ -122,6 +134,7 @@ mod tests {
             model: None,
             cost_cap_usd: None,
             reasoning_effort: None,
+            default_max_iterations: None,
             source_layer: layer,
         }
     }

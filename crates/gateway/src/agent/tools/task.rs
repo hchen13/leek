@@ -209,6 +209,7 @@ mod tests {
                 model: None,
                 cost_cap_usd: None,
                 reasoning_effort: None,
+                default_max_iterations: None,
                 source_layer: AgentLayer::Builtin,
             },
         );
@@ -222,6 +223,7 @@ mod tests {
                 model: None,
                 cost_cap_usd: None,
                 reasoning_effort: None,
+                default_max_iterations: None,
                 source_layer: AgentLayer::Builtin,
             },
         );

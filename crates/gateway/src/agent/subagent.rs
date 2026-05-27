@@ -362,9 +362,9 @@ pub fn subagent_web_search_allowed(agent: &AgentDef) -> bool {
         .any(|t| t.starts_with("web_") || t == "web_search" || t == "web_fetch")
 }
 
-/// M3.6 §E + M3.7 §C: layer per-subagent overrides from `AgentDef`
-/// onto the main agent's `GuardConfig`. Today two fields are
-/// overridable:
+/// M3.6 §E + M3.7 §C + M4.1.3 §P0-3: layer per-subagent overrides
+/// from `AgentDef` onto the main agent's `GuardConfig`. Three fields
+/// are overridable today:
 ///
 /// - `cost_cap_usd` — a deep-dive worker can carry a $5 budget while
 ///   a quick-screen worker is locked to $0.20, both independent of
@@ -377,6 +377,12 @@ pub fn subagent_web_search_allowed(agent: &AgentDef) -> bool {
 ///   main agent drops to medium (its isolated context can afford
 ///   the depth). The loader validates the whitelist; a `None` here
 ///   means "inherit whatever the main agent currently uses".
+/// - `default_max_iterations` (M4.1.3 P0-3) — per-subagent iteration
+///   cap. Always wins when present; same posture as `cost_cap_usd`,
+///   because the AGENT.md author knows the worker's expected shape
+///   better than the main agent's user-tuned cap. The loader already
+///   drops `0` / negatives, but the defensive check stays so a future
+///   in-memory AgentDef construction does not poison the guard.
 pub fn apply_agent_overrides(guards: &mut GuardConfig, agent: &AgentDef) {
     if let Some(cap) = agent.cost_cap_usd {
         guards.cost_cap_usd = if cap > 0.0 && cap.is_finite() {
@@ -391,6 +397,11 @@ pub fn apply_agent_overrides(guards: &mut GuardConfig, agent: &AgentDef) {
         // AgentDef in memory and skips the loader.
         if crate::config::is_valid_reasoning_effort(effort) {
             guards.reasoning_effort = effort.to_string();
+        }
+    }
+    if let Some(iter_cap) = agent.default_max_iterations {
+        if iter_cap > 0 {
+            guards.max_iterations = Some(iter_cap as usize);
         }
     }
 }
@@ -593,6 +604,7 @@ mod tests {
             model: None,
             cost_cap_usd,
             reasoning_effort: None,
+            default_max_iterations: None,
             source_layer: crate::agents::AgentLayer::Builtin,
         }
     }
@@ -727,6 +739,46 @@ mod tests {
     }
 
     #[test]
+    fn agent_override_replaces_main_max_iterations() {
+        // M4.1.3 (P0-3): AGENT.md `default_max_iterations: 8` replaces
+        // whatever cap the main agent's `GuardConfig` carries — the
+        // subagent gets its own iteration ceiling. This is the failsafe
+        // that prevents a runaway quick-screen from burning through
+        // ~50 main-agent iters.
+        let mut agent = mk_agent("quick-screen", None);
+        agent.default_max_iterations = Some(8);
+        let mut guards = baseline_guards();
+        // Sanity-check baseline so the override is observable.
+        guards.max_iterations = Some(50);
+        apply_agent_overrides(&mut guards, &agent);
+        assert_eq!(guards.max_iterations, Some(8));
+    }
+
+    #[test]
+    fn agent_override_absent_keeps_main_max_iterations() {
+        // No `default_max_iterations` declared (None) → subagent
+        // inherits whatever the main agent's resolver produced.
+        let agent = mk_agent("inherit-iter", None);
+        let mut guards = baseline_guards();
+        guards.max_iterations = Some(50);
+        apply_agent_overrides(&mut guards, &agent);
+        assert_eq!(guards.max_iterations, Some(50));
+    }
+
+    #[test]
+    fn agent_override_zero_iter_cap_ignored() {
+        // Defensive: a future in-memory AgentDef constructed with 0
+        // should not silently disable the inherited cap. The loader
+        // already strips 0, but this is the last line of defense.
+        let mut agent = mk_agent("zero-iter", None);
+        agent.default_max_iterations = Some(0);
+        let mut guards = baseline_guards();
+        guards.max_iterations = Some(50);
+        apply_agent_overrides(&mut guards, &agent);
+        assert_eq!(guards.max_iterations, Some(50));
+    }
+
+    #[test]
     fn resolve_returns_loaded_agent() {
         let mut m = std::collections::HashMap::new();
         m.insert(
@@ -739,6 +791,7 @@ mod tests {
                 model: None,
                 cost_cap_usd: None,
                 reasoning_effort: None,
+                default_max_iterations: None,
                 source_layer: crate::agents::AgentLayer::Builtin,
             },
         );
@@ -760,6 +813,7 @@ mod tests {
                 model: None,
                 cost_cap_usd: None,
                 reasoning_effort: None,
+                default_max_iterations: None,
                 source_layer: crate::agents::AgentLayer::Builtin,
             },
         );

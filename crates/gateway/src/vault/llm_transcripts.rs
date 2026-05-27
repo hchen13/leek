@@ -18,6 +18,15 @@
 //!    status, and the finish timestamp. The `(turn_id, iteration)` UNIQUE
 //!    constraint makes a double finalize a hard error rather than silent
 //!    data loss.
+//!
+//! M4.1.3 (P0-1): `insert_request` uses `INSERT OR REPLACE` so a same-iter
+//! retry (e.g. the stream-retry wrapper in `llm::retry`) overwrites the
+//! prior row instead of WARN-spamming the log with UNIQUE-violation
+//! failures. Operationally we want "latest retry wins" for archive — the
+//! debug view should show the request/response that actually succeeded
+//! (or last failed), not the noisy first attempt. SQLite's REPLACE is
+//! DELETE+INSERT so the returned `id` is a fresh row id; the caller's
+//! `finalize` writes against that new id, so semantics are preserved.
 
 use anyhow::Result;
 use serde::Serialize;
@@ -54,7 +63,12 @@ pub async fn insert_request(
     started_at: &str,
 ) -> Result<i64> {
     let row = sqlx::query(
-        "INSERT INTO llm_transcripts \
+        // M4.1.3 (P0-1): `INSERT OR REPLACE` — same-turn-iter retries
+        // overwrite the prior archive row instead of hitting the
+        // `(turn_id, iteration)` UNIQUE constraint. Returns the new row
+        // id (SQLite REPLACE = DELETE then INSERT), which the caller
+        // hands to `finalize` so the response side lands on the same row.
+        "INSERT OR REPLACE INTO llm_transcripts \
            (session_id, turn_id, iteration, model, request_body, started_at) \
          VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
     )
@@ -249,14 +263,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_iteration_uniqueness() {
+    async fn turn_iteration_retry_overwrites_prior_row() {
+        // M4.1.3 (P0-1): a same-(turn_id, iteration) re-insert (the
+        // stream-retry wrapper's second attempt on the same iter) must
+        // overwrite the prior row, NOT trip the UNIQUE constraint and
+        // WARN-spam the log. Operationally: debug view should reflect
+        // the last attempt's request bytes, not the first failure.
         let pool = fresh_pool().await;
-        insert_request(&pool, "s1", "t-1", 1, "m", b"a", "2026-05-20T00:00:00Z")
+        insert_request(&pool, "s1", "t-1", 1, "m", b"first", "2026-05-20T00:00:00Z")
+            .await
+            .expect("first insert should succeed");
+        // Same (turn_id, iteration) — the M4.1.3 INSERT OR REPLACE makes
+        // this a successful overwrite, not a UNIQUE violation.
+        let new_id =
+            insert_request(&pool, "s1", "t-1", 1, "m", b"second", "2026-05-20T00:00:01Z")
+                .await
+                .expect("retry insert should overwrite, not fail");
+
+        // Exactly one row remains for (turn_id, iteration).
+        let cnt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM llm_transcripts WHERE turn_id = ? AND iteration = ?",
+        )
+        .bind("t-1")
+        .bind(1_i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cnt, 1, "only the latest retry row should survive");
+
+        // …and its content is the retry's bytes, not the first attempt's.
+        let bytes = get_request_body(&pool, "s1", "t-1", 1).await.unwrap().unwrap();
+        assert_eq!(bytes, b"second");
+
+        // `finalize` against the returned new_id still works — the row
+        // exists at that id and the response side lands on it.
+        finalize(&pool, new_id, b"response", 200, "2026-05-20T00:00:02Z")
             .await
             .unwrap();
-        // Duplicate (turn_id, iteration) — UNIQUE rejects it.
-        let dup = insert_request(&pool, "s1", "t-1", 1, "m", b"b", "2026-05-20T00:00:00Z").await;
-        assert!(dup.is_err(), "expected UNIQUE violation, got {dup:?}");
+        let resp = get_response_stream(&pool, "s1", "t-1", 1).await.unwrap().unwrap();
+        assert_eq!(resp, b"response");
     }
 
     #[tokio::test]

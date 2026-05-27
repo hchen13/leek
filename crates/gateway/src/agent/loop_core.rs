@@ -44,6 +44,16 @@ use super::guards::{self, GuardConfig};
 use super::tools;
 use crate::llm::codex::CodexCallError;
 
+/// M4.1.3 (P0-2): heartbeat cadence for the `agent_thinking` lifecycle
+/// event. Every `HEARTBEAT_INTERVAL` of silence (no event, including
+/// codex's own `Ping` keepalive) we emit one heartbeat so the frontend
+/// can render a "still thinking N seconds" badge — the M3.3
+/// substantive-only idle_timeout (180s default) still gates whether the
+/// turn lives or dies, this just keeps the user informed in between.
+/// 60s matches the operational pain point from the M4.1.1 stress (B2:
+/// 14 minutes of dead air looked like a hung gateway).
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// One run of the inner loop — what the caller hands in.
 pub struct LoopParams<'a> {
     pub st: &'a AppState,
@@ -465,56 +475,117 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
             .guards
             .idle_timeout
             .map(|d| tokio::time::Instant::now() + d);
+        // M4.1.3 (P0-2): heartbeat clock. Independent from the idle
+        // deadline above — this one re-arms on *any* arrival (including
+        // Ping) AND also re-arms when we emit a heartbeat, so we never
+        // double-fire. `iter_start` is captured for the user-visible
+        // `elapsed_silent_s` payload (seconds since the last event we
+        // saw this iter, not since iter start).
+        let mut heartbeat_deadline = tokio::time::Instant::now() + HEARTBEAT_INTERVAL;
+        let mut last_activity_at = tokio::time::Instant::now();
+        let mut last_activity_kind: &'static str = "none";
         'stream: loop {
-            // The poll fans out to three sources: a stream item, the
-            // optional idle deadline, and the optional user-abort notify.
-            // We `select!` only when at least one of the latter two is
-            // active; otherwise we keep the bare `stream.next().await`
-            // so a turn with neither guard nor abort signal stays cheap.
+            // The poll fans out to four sources: stream item, optional
+            // idle deadline, optional user-abort notify, and the
+            // M4.1.3 heartbeat. The heartbeat tick is always active —
+            // a `sleep_until` is essentially free, and the user-facing
+            // "still alive" badge needs to fire even on a turn with
+            // no other guards set.
             //
-            // M3.3 key change: use `timeout_at(deadline, …)` instead of
-            // `timeout(duration, …)` so the budget persists across
-            // heartbeat-only polls (Pings just continue the loop without
-            // advancing the deadline).
-            let item = match (idle_deadline, &p.abort_signal) {
-                (Some(deadline), Some(notify)) => {
-                    tokio::select! {
-                        biased;
-                        _ = notify.notified() => {
-                            user_aborted = true;
-                            break 'stream;
-                        }
-                        res = tokio::time::timeout_at(deadline, stream.next()) => match res {
-                            Ok(item) => item,
-                            Err(_) => {
-                                idle_hit = true;
-                                break 'stream;
-                            }
-                        }
-                    }
+            // M3.3: use `timeout_at(deadline, …)` so the substantive-only
+            // idle budget persists across heartbeat-only polls (Pings
+            // just continue the loop without advancing the deadline).
+            //
+            // M4.1.3: we emit the heartbeat **inside** the select! match
+            // branch and `continue 'stream` so we never break the stream
+            // poll just to say "still alive". The deadline is reset to
+            // `now + HEARTBEAT_INTERVAL` whether by event arrival
+            // (always) or by heartbeat fire (the continue path).
+            //
+            // Borrow note: `&p.abort_signal` is read each iteration so
+            // the `select!` arm sees a fresh `Option<&Arc<Notify>>` —
+            // `.notified()` needs `&Arc<Notify>` and we cannot hold a
+            // long-lived borrow across awaits without grief.
+            enum PollOutcome {
+                Item(Option<Result<LlmEvent>>),
+                Heartbeat,
+                IdleHit,
+                Aborted,
+            }
+            // Build the optional `notified()` future as either the real
+            // one or a never-ready `pending` so the select! shape stays
+            // uniform across the (abort_signal Some/None) cases.
+            let notify_fut = async {
+                match &p.abort_signal {
+                    Some(n) => n.notified().await,
+                    None => std::future::pending().await,
                 }
-                (Some(deadline), None) => {
-                    match tokio::time::timeout_at(deadline, stream.next()).await {
-                        Ok(item) => item,
-                        Err(_) => {
-                            idle_hit = true;
-                            break 'stream;
-                        }
+            };
+            // Same trick for the idle deadline.
+            let idle_fut = async {
+                match idle_deadline {
+                    Some(d) => {
+                        tokio::time::sleep_until(d).await;
                     }
+                    None => std::future::pending().await,
                 }
-                (None, Some(notify)) => {
-                    tokio::select! {
-                        biased;
-                        _ = notify.notified() => {
-                            user_aborted = true;
-                            break 'stream;
-                        }
-                        item = stream.next() => item,
-                    }
+            };
+            let outcome = tokio::select! {
+                biased;
+                _ = notify_fut => PollOutcome::Aborted,
+                _ = idle_fut => PollOutcome::IdleHit,
+                _ = tokio::time::sleep_until(heartbeat_deadline) => PollOutcome::Heartbeat,
+                item = stream.next() => PollOutcome::Item(item),
+            };
+            let item = match outcome {
+                PollOutcome::Aborted => {
+                    user_aborted = true;
+                    break 'stream;
                 }
-                (None, None) => stream.next().await,
+                PollOutcome::IdleHit => {
+                    idle_hit = true;
+                    break 'stream;
+                }
+                PollOutcome::Heartbeat => {
+                    // M4.1.3 (P0-2): emit "still thinking" lifecycle
+                    // event, reset the heartbeat deadline, and loop. We
+                    // do NOT touch `idle_deadline` here — substantive
+                    // idle is the real death threshold; heartbeat is
+                    // purely informational.
+                    let elapsed_silent_s = last_activity_at.elapsed().as_secs();
+                    let mut payload = serde_json::json!({
+                        "turn_id": p.turn_id,
+                        "iteration": iteration_count,
+                        "elapsed_silent_s": elapsed_silent_s,
+                        "last_activity_kind": last_activity_kind,
+                    });
+                    events::stamp_parent_in_place(&mut payload, p.parent_turn_id, p.depth);
+                    p.st.emit(p.session_id, events::kind::AGENT_THINKING, payload)
+                        .await;
+                    heartbeat_deadline =
+                        tokio::time::Instant::now() + HEARTBEAT_INTERVAL;
+                    continue 'stream;
+                }
+                PollOutcome::Item(item) => item,
             };
             let Some(event) = item else { break 'stream };
+            // M4.1.3 (P0-2): any event arrival — substantive OR a Ping
+            // OR an Err that's about to break us — resets the heartbeat
+            // clock and updates `last_activity_kind`. We want the next
+            // heartbeat (if any) to count silence from THIS event
+            // forward, not from the previous one. `last_activity_at`
+            // feeds the user-visible `elapsed_silent_s` payload.
+            heartbeat_deadline = tokio::time::Instant::now() + HEARTBEAT_INTERVAL;
+            last_activity_at = tokio::time::Instant::now();
+            last_activity_kind = match &event {
+                Ok(LlmEvent::TextDelta { .. }) => "text",
+                Ok(LlmEvent::FunctionCall { .. }) => "tool_call",
+                Ok(LlmEvent::WebSearch { .. }) => "search",
+                Ok(LlmEvent::Usage(_)) => "usage",
+                Ok(LlmEvent::MessageEnd { .. }) => "message_end",
+                Ok(LlmEvent::Ping) => "ping",
+                Err(_) => "error",
+            };
             // M3.3: only substantive events (text / tool / search / usage /
             // message_end) advance the idle deadline; `Ping` does not. The
             // check is on `Ok(...)` only — an `Err` is about to terminate
@@ -1474,5 +1545,142 @@ mod tests {
         assert!(delta_seen, "the substantive delta should have been received");
         assert!(idle_hit, "Pings after substantive must still trip idle");
         assert!(ping_count >= 1, "at least one heartbeat Ping arrived");
+    }
+
+    /// M4.1.3 (P0-2): the heartbeat constant exists and is the 60s the
+    /// dispatch fixed. A drift here means either the spec or the test
+    /// got out of sync — keep them coupled so a future "let's tune this"
+    /// PR is forced to update both at once.
+    #[test]
+    fn heartbeat_interval_is_60_seconds() {
+        assert_eq!(HEARTBEAT_INTERVAL.as_secs(), 60);
+    }
+
+    /// M4.1.3 (P0-2): drive the heartbeat algorithm in isolation — a
+    /// stream that goes totally silent past the interval fires exactly
+    /// one heartbeat per interval, and an event arrival resets the
+    /// clock so a subsequent silent period that's shorter than the
+    /// interval emits zero heartbeats. The real `run_loop` is async +
+    /// needs a CodexClient stub we don't have; this pins the shape that
+    /// `select! { _ = sleep_until(heartbeat_deadline) => emit; reset; }`
+    /// produces, so a future refactor that breaks the cadence is caught.
+    #[tokio::test]
+    async fn heartbeat_fires_on_silent_period_and_resets_on_event() {
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::channel::<Result<LlmEvent>>(8);
+
+        // Producer: send one Ping at 30ms, then go silent for 250ms.
+        // Heartbeat interval below is 100ms — we expect 2 heartbeats
+        // in the silent stretch (at ~130ms and ~230ms post-event), no
+        // heartbeat before the event lands, because the clock was
+        // armed at iter-start (now+100ms) and the event arrived at
+        // 30ms < 100ms.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let _ = tx.send(Ok(LlmEvent::Ping)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+            // Drop tx → stream closes.
+        });
+
+        let interval = std::time::Duration::from_millis(100);
+        let mut heartbeat_deadline = tokio::time::Instant::now() + interval;
+        let mut heartbeats = 0u32;
+        let mut events_seen = 0u32;
+        let deadline_total = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(320);
+
+        loop {
+            if tokio::time::Instant::now() >= deadline_total {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(heartbeat_deadline) => {
+                    heartbeats += 1;
+                    heartbeat_deadline =
+                        tokio::time::Instant::now() + interval;
+                }
+                item = rx.recv() => {
+                    match item {
+                        Some(_) => {
+                            events_seen += 1;
+                            heartbeat_deadline =
+                                tokio::time::Instant::now() + interval;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        assert_eq!(events_seen, 1, "exactly one Ping should have arrived");
+        // After the event at ~30ms, the clock re-arms to +100ms. From
+        // ~30ms we have ~290ms of silent budget → two ticks at 130ms
+        // and 230ms, third tick at 330ms is past our 320ms total
+        // budget. Allow a small slack for scheduler jitter — at least
+        // one fired, at most three.
+        assert!(
+            (1..=3).contains(&heartbeats),
+            "expected 1-3 heartbeats in 290ms silent stretch, got {heartbeats}"
+        );
+    }
+
+    /// M4.1.3 (P0-2): a stream with continuous activity (event every
+    /// 20ms over 200ms, heartbeat 100ms) emits ZERO heartbeats — each
+    /// event resets the clock before it expires, so the silent budget
+    /// never elapses. Mirror of the test above but checking the
+    /// "active" half of the cadence.
+    #[tokio::test]
+    async fn heartbeat_silent_on_continuous_activity() {
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::channel::<Result<LlmEvent>>(32);
+
+        // 10 events spaced 20ms apart → 200ms of activity, each event
+        // arrives before the 100ms heartbeat clock fires.
+        tokio::spawn(async move {
+            for _ in 0..10 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                if tx.send(Ok(LlmEvent::Ping)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let interval = std::time::Duration::from_millis(100);
+        let mut heartbeat_deadline = tokio::time::Instant::now() + interval;
+        let mut heartbeats = 0u32;
+        let mut events_seen = 0u32;
+        let deadline_total = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(230);
+
+        loop {
+            if tokio::time::Instant::now() >= deadline_total {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(heartbeat_deadline) => {
+                    heartbeats += 1;
+                    heartbeat_deadline =
+                        tokio::time::Instant::now() + interval;
+                }
+                item = rx.recv() => {
+                    match item {
+                        Some(_) => {
+                            events_seen += 1;
+                            heartbeat_deadline =
+                                tokio::time::Instant::now() + interval;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        assert_eq!(events_seen, 10, "all 10 Pings should have landed");
+        assert_eq!(
+            heartbeats, 0,
+            "continuous activity must not emit heartbeats"
+        );
     }
 }

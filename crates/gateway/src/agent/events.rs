@@ -74,6 +74,22 @@ pub mod kind {
     /// for the auto-compaction summary call (it summarizes a turn, but
     /// is not itself a turn).
     pub const PROVIDER_RETRY_ATTEMPT: &str = "provider_retry_attempt";
+    /// M4.1.3 (P0-2): user-facing "still alive" heartbeat. Emitted from
+    /// `loop_core` once per `HEARTBEAT_INTERVAL` (60s) when the codex
+    /// stream has gone silent — no substantive event AND no Ping. A
+    /// substantive event resets the heartbeat clock; a Ping does NOT
+    /// (Pings already flow during long silent reasoning, so resetting
+    /// off them would mask the deep-think dead-air the user is seeing).
+    /// Schema: `{ turn_id, iteration, elapsed_silent_s, last_activity_kind,
+    /// parent_turn_id?, depth? }`. M3.3 substantive-only idle_timeout
+    /// (180s default) still kills the turn on the substantive-silent
+    /// budget — this event is purely user-visible: "still thinking, not
+    /// dead". `last_activity_kind` is one of `text`, `tool_call`,
+    /// `search`, `usage`, `message_end`, `ping`, or `none` (no event
+    /// has arrived yet this iter). Frontend renders as a transient
+    /// "思考中 N 秒" badge — surface is Lifecycle so it stays out of
+    /// the canvas/chat content.
+    pub const AGENT_THINKING: &str = "agent_thinking";
     pub const ERROR: &str = "error";
 }
 
@@ -119,6 +135,7 @@ pub fn surface_for(event_kind: &str) -> Surface {
         | kind::COMPACTION_COMPLETED
         | kind::TURN_COST_CAPPED
         | kind::PROVIDER_RETRY_ATTEMPT
+        | kind::AGENT_THINKING
         | kind::ERROR => Surface::Lifecycle,
         _ => Surface::Lifecycle,
     }
@@ -312,6 +329,9 @@ mod tests {
             surface_for(kind::PROVIDER_RETRY_ATTEMPT),
             Surface::Lifecycle,
         );
+        // M4.1.3 (P0-2): agent_thinking is lifecycle — same pill badge,
+        // not a canvas card; the user reads "still thinking N seconds".
+        assert_eq!(surface_for(kind::AGENT_THINKING), Surface::Lifecycle);
     }
 
     #[test]
