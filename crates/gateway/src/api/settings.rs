@@ -349,6 +349,7 @@ mod tests {
             agents: Arc::new(crate::agents::AgentRegistry::default()),
             vendors: Arc::new(crate::vendors::VendorRegistry::for_test()),
             abort_signals: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            codex_sem: Arc::new(tokio::sync::Semaphore::new(crate::api::CODEX_MAX_CONCURRENT)),
         };
         TestState { st, _scratch: ScratchDir { path: dir }, _env: env }
     }

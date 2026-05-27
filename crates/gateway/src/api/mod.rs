@@ -21,7 +21,7 @@ use tower_http::cors::{Any, CorsLayer};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 
 use crate::agents::AgentRegistry;
 use crate::bus::EventBus;
@@ -32,6 +32,20 @@ use crate::llm::codex::CodexClient;
 use crate::skills::SkillRegistry;
 use crate::vault::events::Event;
 use crate::vendors::VendorRegistry;
+
+/// M4.1.4: hard cap on simultaneous codex POSTs in flight. The codex
+/// backend rate-limits aggressive burst loads (M4.1.3 stress round 2:
+/// 5-lane concurrent burst → 1-2 lanes hit `Retry-After 60s+` while the
+/// other 3 ran free). Bounding the concurrency to 3 stops the rate-limit
+/// thundering-herd from ever firing — 3 in-flight × the codex backend's
+/// per-account throughput is comfortably under the threshold the live
+/// stress hit. The 4th+ caller waits at `acquire_owned().await`; the
+/// waiter emits one `agent_queued` event so the frontend can render
+/// "排队中" instead of looking frozen.
+///
+/// Not user-tunable today — the value is spec-fixed at 3 by the M4.1.4
+/// dispatch. If the codex backend's threshold changes, bump here.
+pub const CODEX_MAX_CONCURRENT: usize = 3;
 
 /// M3.2: per-turn user-abort registry. The agent loop registers an
 /// `Arc<Notify>` keyed by `turn_id` on entry and drops the entry on
@@ -89,6 +103,21 @@ pub struct AppState {
     pub vendors: Arc<VendorRegistry>,
     /// M3.2: per-turn user-abort registry. See `AbortRegistry` docs.
     pub abort_signals: AbortRegistry,
+    /// M4.1.4: concurrency cap for in-flight codex POSTs. Initialized with
+    /// `CODEX_MAX_CONCURRENT` permits at startup. Each `CodexClient::chat`
+    /// (wrapped by the retry layer) acquires an owned permit before the
+    /// HTTP request; the permit is held until the returned stream is
+    /// dropped, so concurrent callers can't stampede the codex backend's
+    /// per-account rate limit. When all permits are taken the next caller
+    /// emits one `agent_queued` event with `queue_position` and awaits its
+    /// permit at `acquire_owned().await`.
+    ///
+    /// `Arc` is required because `Semaphore::acquire_owned` consumes one
+    /// `Arc<Semaphore>` to hand back an `OwnedSemaphorePermit` that lives
+    /// independently of the AppState clone — this is what lets the permit
+    /// stay alive inside an `async_stream::stream!` body that outlives the
+    /// retry call frame.
+    pub codex_sem: Arc<Semaphore>,
 }
 
 impl AppState {

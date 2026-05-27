@@ -90,6 +90,30 @@ pub mod kind {
     /// "思考中 N 秒" badge — surface is Lifecycle so it stays out of
     /// the canvas/chat content.
     pub const AGENT_THINKING: &str = "agent_thinking";
+    /// M4.1.4 Task 1: emitted from the retry wrapper when a codex call
+    /// arrives at a full semaphore and has to wait. The caller is about
+    /// to block on `Semaphore::acquire_owned().await` for the next
+    /// available permit. Fires exactly once per blocked call (NOT on a
+    /// happy-path acquire that completed without waiting). Payload:
+    /// `{ turn_id, iteration, queued_at, queue_position }` —
+    /// `queue_position` is approximate (computed from `available_permits`
+    /// just before the await; another caller may slip in between the
+    /// estimate and the actual queue). Frontend renders as a transient
+    /// "排队中 (位 N)" pill — surface is Lifecycle so it stays out of the
+    /// canvas/chat content.
+    pub const AGENT_QUEUED: &str = "agent_queued";
+    /// M4.1.4 Task 2: emitted from the retry wrapper *during* a backoff
+    /// sleep, every `RETRY_BACKOFF_HEARTBEAT` (30s). The existing
+    /// `provider_retry_attempt` event fires once per retry attempt before
+    /// the sleep starts; this heartbeat keeps the frontend status pill
+    /// alive across long backoff windows (5min on the 4th retry would
+    /// look like a dead gateway without it). Payload:
+    /// `{ turn_id, iteration, attempt, backoff_remaining_s, retry_kind }`
+    /// — `backoff_remaining_s` is decremented per tick, `attempt` is the
+    /// 1-indexed attempt about to run, `retry_kind` is the FatalReason
+    /// kind we're backing off for. Surface is Lifecycle (same as the
+    /// retry-attempt event).
+    pub const AGENT_RETRYING_UPSTREAM: &str = "agent_retrying_upstream";
     pub const ERROR: &str = "error";
 }
 
@@ -136,6 +160,8 @@ pub fn surface_for(event_kind: &str) -> Surface {
         | kind::TURN_COST_CAPPED
         | kind::PROVIDER_RETRY_ATTEMPT
         | kind::AGENT_THINKING
+        | kind::AGENT_QUEUED
+        | kind::AGENT_RETRYING_UPSTREAM
         | kind::ERROR => Surface::Lifecycle,
         _ => Surface::Lifecycle,
     }
@@ -332,6 +358,15 @@ mod tests {
         // M4.1.3 (P0-2): agent_thinking is lifecycle — same pill badge,
         // not a canvas card; the user reads "still thinking N seconds".
         assert_eq!(surface_for(kind::AGENT_THINKING), Surface::Lifecycle);
+        // M4.1.4 Task 1: agent_queued is lifecycle — renders as a "排队中"
+        // pill on the running turn's status row.
+        assert_eq!(surface_for(kind::AGENT_QUEUED), Surface::Lifecycle);
+        // M4.1.4 Task 2: agent_retrying_upstream is lifecycle — extends
+        // the M3.4 provider_retry_attempt pill across the backoff sleep.
+        assert_eq!(
+            surface_for(kind::AGENT_RETRYING_UPSTREAM),
+            Surface::Lifecycle,
+        );
     }
 
     #[test]

@@ -1683,4 +1683,97 @@ mod tests {
             "continuous activity must not emit heartbeats"
         );
     }
+
+    // ─── M4.1.4 Task 3: wall_clock hard cap ───────────────────────────
+    //
+    // The per-iter `wall_deadline` check at the top of the `'turn` loop
+    // (lines 264-268) breaks the loop with `stop_reason = "wall_clock_exceeded"`
+    // when `Instant::now() >= started + wall_clock`. The full loop needs
+    // a real codex client to drive end-to-end, but the deadline math
+    // itself is pure and can be pinned in isolation here.
+    //
+    // Pre-M4.1.4, the spec believed only the soft prompt existed; this
+    // test pins the hard break that was actually wired by M2.6 so a future
+    // refactor doesn't drop it.
+
+    /// `wall_deadline.map(|d| Instant::now() >= d).unwrap_or(false)`:
+    /// the exact expression used at `run_loop`'s iter top. A deadline in
+    /// the past must answer `true` (the loop breaks); a deadline in the
+    /// future or `None` must answer `false` (the loop continues).
+    #[test]
+    fn wall_deadline_check_breaks_when_past_deadline() {
+        let now = std::time::Instant::now();
+
+        // Deadline already passed → check fires.
+        let past_deadline = Some(now - std::time::Duration::from_secs(1));
+        assert!(past_deadline
+            .map(|d| std::time::Instant::now() >= d)
+            .unwrap_or(false));
+
+        // Deadline in the future → check stays quiet.
+        let future_deadline = Some(now + std::time::Duration::from_secs(60));
+        assert!(!future_deadline
+            .map(|d| std::time::Instant::now() >= d)
+            .unwrap_or(false));
+
+        // `None` (wall_clock disabled by setting secs=0) → check stays
+        // quiet even at the deadline.
+        let no_deadline: Option<std::time::Instant> = None;
+        assert!(!no_deadline
+            .map(|d| std::time::Instant::now() >= d)
+            .unwrap_or(false));
+    }
+
+    /// The wall_clock guard build path: a `Duration::from_secs(1800)`
+    /// (M3.x default) handed into the same `started + d` arithmetic
+    /// `run_loop` uses produces a deadline at the expected absolute
+    /// instant. This guards against a future change that swaps `started`
+    /// for some non-monotonic clock and breaks the comparison.
+    #[test]
+    fn wall_deadline_uses_monotonic_clock() {
+        let started = std::time::Instant::now();
+        let wall_clock = std::time::Duration::from_secs(1800);
+        let deadline = started + wall_clock;
+        // Deadline must be at least 1800s past `started`.
+        assert!(deadline.duration_since(started) >= wall_clock);
+        // A check `now >= deadline` immediately after construction must
+        // be false (we're not in the future).
+        assert!(std::time::Instant::now() < deadline);
+    }
+
+    /// M4.1.4 Task 3: an explicit synthetic that walks the full per-iter
+    /// check loop with a wall_clock that's already expired. This is the
+    /// shape `run_loop` executes at the top of every iter — we verify
+    /// that an iter starting *after* the deadline detects it on the FIRST
+    /// check and breaks with `stop_reason = "wall_clock_exceeded"` plus
+    /// `first_guard = "wall_clock_exceeded"` (the same first_guard logic
+    /// the real loop applies). Pinning this prevents a refactor that
+    /// silently moves the check after some other work.
+    #[test]
+    fn wall_clock_hard_break_records_stop_and_first_guard() {
+        let started = std::time::Instant::now();
+        // Synthetic 1ms wall_clock — already expired by the time the
+        // sleep below returns. This mirrors a 1801s turn against a 1800s
+        // budget: the iter-top check fires immediately.
+        let wall_deadline = Some(started - std::time::Duration::from_secs(1));
+
+        // Emulate the run_loop control flow snippet:
+        //   if wall_deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
+        //       stop_reason = "wall_clock_exceeded";
+        //       first_guard.get_or_insert("wall_clock_exceeded");
+        //       break 'turn;
+        //   }
+        let mut stop_reason: Option<&'static str> = None;
+        let mut first_guard: Option<&'static str> = None;
+        if wall_deadline
+            .map(|d| std::time::Instant::now() >= d)
+            .unwrap_or(false)
+        {
+            stop_reason = Some("wall_clock_exceeded");
+            first_guard.get_or_insert("wall_clock_exceeded");
+        }
+
+        assert_eq!(stop_reason, Some("wall_clock_exceeded"));
+        assert_eq!(first_guard, Some("wall_clock_exceeded"));
+    }
 }

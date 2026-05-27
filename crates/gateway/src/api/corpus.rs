@@ -69,6 +69,9 @@ mod tests {
             abort_signals: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            codex_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::api::CODEX_MAX_CONCURRENT,
+            )),
         }
     }
 
@@ -133,6 +136,9 @@ mod tests {
             vendors: std::sync::Arc::new(crate::vendors::VendorRegistry::for_test()),
             abort_signals: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
+            )),
+            codex_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::api::CODEX_MAX_CONCURRENT,
             )),
         };
         let resp = graph(axum::extract::State(st)).await;

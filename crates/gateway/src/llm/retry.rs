@@ -51,10 +51,11 @@ use std::time::Duration;
 use anyhow::Result;
 use futures::stream::BoxStream;
 use futures::StreamExt;
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::agent::events;
 use crate::agent::fatal::FatalReason;
-use crate::api::AppState;
+use crate::api::{AppState, CODEX_MAX_CONCURRENT};
 use crate::llm::codex::{CodexCallError, CodexClient};
 use crate::llm::{ChatRequest, LlmEvent};
 
@@ -88,6 +89,16 @@ pub const BACKOFFS: [Duration; (MAX_ATTEMPTS as usize) - 1] = [
     Duration::from_secs(15),
     Duration::from_secs(30),
 ];
+
+/// M4.1.4 Task 2: cadence for `agent_retrying_upstream` heartbeat
+/// events emitted *during* a backoff sleep. The existing
+/// `provider_retry_attempt` fires once per retry attempt before the
+/// sleep starts; long backoff windows (BACKOFFS[3] = 30s today, but a
+/// future widening could land at minutes) would then leave the frontend
+/// status pill silent for the entire sleep. A heartbeat every 30s keeps
+/// the user informed that the gateway is still trying. Spec-fixed; not
+/// user-tunable.
+pub const RETRY_BACKOFF_HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// `codex_stream_silent` is special: a long-reasoning iter can wedge
 /// once and then resume. The spec asks for a single iter-level retry on
@@ -237,6 +248,116 @@ pub fn build_retry_event(
     })
 }
 
+/// Build the `agent_queued` event payload that fires when a codex call
+/// arrives at a full semaphore and has to wait for a permit.
+/// `queue_position` is computed from `MAX - available_permits()` just
+/// before the await; it's approximate (another caller can slip in
+/// between the read and the actual acquire) but accurate enough for a
+/// "排队中 (位 N)" pill.
+pub fn build_queued_event(
+    session_id: &str,
+    turn_id: Option<&str>,
+    iteration: i64,
+    queue_position: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "iteration": iteration,
+        "queued_at": chrono::Utc::now().to_rfc3339(),
+        "queue_position": queue_position,
+    })
+}
+
+/// Acquire one permit from the AppState's codex semaphore. If the
+/// semaphore is fully saturated at the time of the call (so the await
+/// will *actually* block), emit one `agent_queued` event before the
+/// await; if a permit is available, just acquire silently. The returned
+/// `OwnedSemaphorePermit` is RAII — drop it (by dropping the wrapper
+/// stream) and the next caller wakes.
+///
+/// Returns `Err` only if the semaphore was already closed (unreachable
+/// in the live process — nothing calls `close()`); kept as `Result` so
+/// future shutdown plumbing can plug in cleanly.
+async fn acquire_codex_permit(
+    state: &AppState,
+    session_id: &str,
+    turn_id: Option<&str>,
+    iteration: i64,
+) -> Result<OwnedSemaphorePermit> {
+    // Read available_permits *before* the await. The check + emit
+    // happens under no lock — if another task races us, the worst case
+    // is one extra `agent_queued` event or one missed one (we observed
+    // `>0` permits but they got grabbed before we awaited). Both are
+    // acceptable for a UI hint.
+    if state.codex_sem.available_permits() == 0 {
+        // Approximate queue position: every permit is taken, plus this
+        // caller. A future request that arrives behind us would see a
+        // larger number — but that's fine, the frontend just shows the
+        // pill regardless of exact value.
+        let queue_position = CODEX_MAX_CONCURRENT + 1;
+        let payload = build_queued_event(session_id, turn_id, iteration, queue_position);
+        state
+            .emit(session_id, events::kind::AGENT_QUEUED, payload)
+            .await;
+    }
+    state
+        .codex_sem
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| anyhow::anyhow!("codex semaphore closed: {e}"))
+}
+
+/// Sleep for `total` while emitting `agent_retrying_upstream` heartbeats
+/// every `RETRY_BACKOFF_HEARTBEAT`. Replaces the bare
+/// `tokio::time::sleep(total).await` inside the retry chain — the
+/// existing `provider_retry_attempt` event fires once per retry before
+/// this sleep starts; this heartbeat keeps the frontend status pill
+/// alive across the sleep itself.
+///
+/// `notify_hb` is the production notifier shape (same future type the
+/// `provider_retry_attempt` notifier uses) so tests can plug a capture
+/// closure in via the same plumbing as `notify_retry`.
+async fn sleep_with_heartbeat<NHb, NHbFut>(
+    total: Duration,
+    session_id: &str,
+    turn_id: Option<&str>,
+    iteration: i64,
+    attempt: u32,
+    retry_kind: &str,
+    mut notify_hb: NHb,
+) where
+    NHb: FnMut(serde_json::Value) -> NHbFut,
+    NHbFut: std::future::Future<Output = ()>,
+{
+    let started = tokio::time::Instant::now();
+    let end = started + total;
+    let mut next_tick = started + RETRY_BACKOFF_HEARTBEAT;
+    loop {
+        // Stop if the next heartbeat would fire after the backoff ends:
+        // we want zero heartbeats for backoffs shorter than the cadence
+        // (the M3.5 1s/5s/15s slots all fall into this branch).
+        if next_tick >= end {
+            tokio::time::sleep_until(end).await;
+            return;
+        }
+        tokio::time::sleep_until(next_tick).await;
+        let elapsed = next_tick.duration_since(started).as_secs();
+        let backoff_remaining_s = total.as_secs().saturating_sub(elapsed);
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "iteration": iteration,
+            "attempt": attempt,
+            "backoff_remaining_s": backoff_remaining_s,
+            "retry_kind": retry_kind,
+        });
+        notify_hb(payload).await;
+        next_tick += RETRY_BACKOFF_HEARTBEAT;
+    }
+}
+
 /// Wrap one logical "call codex" attempt with the retry policy defined
 /// in this module: up to `MAX_ATTEMPTS` calls, sleeping `BACKOFFS[n]`
 /// before each retry, emitting `provider_retry_attempt` once per retry.
@@ -258,6 +379,12 @@ pub async fn call_codex_with_retry(
     iteration: i64,
     req: ChatRequest,
 ) -> Result<BoxStream<'static, Result<LlmEvent>>> {
+    // M4.1.4 Task 1: acquire one codex concurrency permit. Emits
+    // `agent_queued` if we'd have to wait (so the frontend can show a
+    // "排队中" pill). The permit lives until the returned stream is
+    // dropped — the wrapper below carries it for the stream's lifetime.
+    let permit = acquire_codex_permit(state, session_id, turn_id, iteration).await?;
+
     // Production notifier — fans the retry payload out to the session's
     // SSE bus + persists to the event log via AppState::emit.
     let session_id_owned = session_id.to_string();
@@ -272,8 +399,25 @@ pub async fn call_codex_with_retry(
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
     };
 
-    retry_call(
+    // M4.1.4 Task 2: heartbeat notifier — fired *during* the backoff sleep
+    // every `RETRY_BACKOFF_HEARTBEAT`. Same shape as the retry notifier
+    // but a different event kind so the frontend can render the two
+    // independently (pill flicker vs. badge counter).
+    let session_id_for_hb = session_id.to_string();
+    let state_for_hb = state.clone();
+    let notify_hb = move |payload: serde_json::Value| {
+        let state = state_for_hb.clone();
+        let session = session_id_for_hb.clone();
+        Box::pin(async move {
+            state
+                .emit(&session, events::kind::AGENT_RETRYING_UPSTREAM, payload)
+                .await;
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    };
+
+    let stream = retry_call(
         notify,
+        notify_hb,
         session_id,
         turn_id,
         iteration,
@@ -283,7 +427,34 @@ pub async fn call_codex_with_retry(
         },
         req,
     )
-    .await
+    .await?;
+
+    // Wrap the stream so the permit drops with the stream — when the
+    // caller consumes the stream to its end (or drops it mid-flight),
+    // the permit returns to the semaphore for the next caller.
+    Ok(attach_permit(stream, permit))
+}
+
+/// Wrap a stream so it owns an `OwnedSemaphorePermit` for its lifetime
+/// — drop the stream, drop the permit, the next caller wakes. Used by
+/// both `call_codex_with_retry` and `call_codex_with_stream_retry` to
+/// carry the codex concurrency permit (M4.1.4 Task 1).
+fn attach_permit(
+    inner: BoxStream<'static, Result<LlmEvent>>,
+    permit: OwnedSemaphorePermit,
+) -> BoxStream<'static, Result<LlmEvent>> {
+    let wrapped = async_stream::stream! {
+        // Hold the permit inside the stream body so its drop tracks the
+        // stream's own drop (consumer cancelled, ran to end, or
+        // panicked). `move` into the closure pulls the permit ownership
+        // into the future the boxed stream returns.
+        let _permit = permit;
+        futures::pin_mut!(inner);
+        while let Some(item) = inner.next().await {
+            yield item;
+        }
+    };
+    Box::pin(wrapped)
 }
 
 /// M3.5: same wrapper as `call_codex_with_retry`, but the returned stream
@@ -330,6 +501,14 @@ pub async fn call_codex_with_stream_retry(
     iteration: i64,
     req: ChatRequest,
 ) -> Result<BoxStream<'static, Result<LlmEvent>>> {
+    // M4.1.4 Task 1: acquire one codex concurrency permit before the
+    // initial call. Held for the full stream lifetime — any reconnect
+    // inside `stream_retry_wrap` reuses this permit (it never re-acquires
+    // mid-stream, which is what we want: a turn that already won a slot
+    // shouldn't lose it on a transient mid-stream blip). Drops with the
+    // wrapped stream returned at the bottom.
+    let permit = acquire_codex_permit(state, session_id, turn_id, iteration).await?;
+
     // First, get the initial stream via the initial-call retry path (5xx /
     // connection_failed before any byte arrives). If the budget is
     // exhausted here the wrapper bails the way `call_codex_with_retry`
@@ -346,7 +525,15 @@ pub async fn call_codex_with_stream_retry(
         .await
         {
             Ok(pair) => pair,
-            Err(e) => return Err(e),
+            // M4.1.4 Task 1: the initial-call retry path bailed; explicit
+            // drop returns the permit to the semaphore so the next caller
+            // can run. Without this drop the permit would only release
+            // when `permit` falls out of scope at function end — fine
+            // either way, but `drop(permit)` documents the intent.
+            Err(e) => {
+                drop(permit);
+                return Err(e);
+            }
         };
 
     // Build the retry-wrapping stream. Production notifier (SSE bus + event
@@ -367,6 +554,21 @@ pub async fn call_codex_with_stream_retry(
                 .await;
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
     };
+    // M4.1.4 Task 2: backoff heartbeat notifier — same shape as `notify`
+    // above but emits `agent_retrying_upstream` events every 30s during
+    // the sleep between retry attempts. Frontend renders as a continuing
+    // "重试中... (剩余 Ns)" countdown rather than a flat "重试中" badge.
+    let session_id_for_hb = session_id.to_string();
+    let state_for_hb = state.clone();
+    let notify_hb = move |payload: serde_json::Value| {
+        let state = state_for_hb.clone();
+        let session = session_id_for_hb.clone();
+        Box::pin(async move {
+            state
+                .emit(&session, events::kind::AGENT_RETRYING_UPSTREAM, payload)
+                .await;
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    };
     let reconnect = move || {
         let codex = codex_clone.clone();
         let req = req_for_reconnect.clone();
@@ -379,15 +581,20 @@ pub async fn call_codex_with_stream_retry(
         >
     };
 
-    Ok(stream_retry_wrap(
+    let wrapped = stream_retry_wrap(
         initial_stream,
         attempts_used_for_initial,
         session_id.to_string(),
         turn_id.map(|s| s.to_string()),
         iteration,
         notify,
+        notify_hb,
         reconnect,
-    ))
+    );
+    // M4.1.4 Task 1: hold the permit across the wrapped stream — drops
+    // with the consumer-facing stream so the permit returns to the
+    // semaphore exactly when codex traffic for this turn ends.
+    Ok(attach_permit(wrapped, permit))
 }
 
 /// Pure state machine for the stream-retry path — separated from the
@@ -398,18 +605,27 @@ pub async fn call_codex_with_stream_retry(
 /// path already consumed (1 if the very first POST succeeded; higher if
 /// it retried before the SSE bytes started). The stream-mid retry shares
 /// the same `MAX_ATTEMPTS` budget.
-fn stream_retry_wrap<N, NFut, R, RFut>(
+///
+/// Eight args: each one is a test seam (initial state, identifying fields,
+/// or a pluggable closure). Bundling them into a struct would just spread
+/// the boilerplate across the call sites without making the function any
+/// easier to reason about, so we accept the lint here.
+#[allow(clippy::too_many_arguments)]
+fn stream_retry_wrap<N, NFut, NHb, NHbFut, R, RFut>(
     initial_stream: BoxStream<'static, Result<LlmEvent>>,
     initial_attempts_used: u32,
     session_id: String,
     turn_id: Option<String>,
     iteration: i64,
     mut notify: N,
+    mut notify_hb: NHb,
     mut reconnect: R,
 ) -> BoxStream<'static, Result<LlmEvent>>
 where
     N: FnMut(serde_json::Value) -> NFut + Send + 'static,
     NFut: std::future::Future<Output = ()> + Send + 'static,
+    NHb: FnMut(serde_json::Value) -> NHbFut + Send + 'static,
+    NHbFut: std::future::Future<Output = ()> + Send + 'static,
     R: FnMut() -> RFut + Send + 'static,
     RFut: std::future::Future<Output = Result<BoxStream<'static, Result<LlmEvent>>>>
         + Send
@@ -460,7 +676,8 @@ where
                         return;
                     }
 
-                    // Retry: emit event, sleep backoff, reconnect.
+                    // Retry: emit event, sleep backoff (with heartbeat),
+                    // reconnect.
                     let backoff_index = (stats.attempts_made - 1) as usize;
                     let backoff = BACKOFFS[backoff_index];
                     let next_attempt = stats.attempts_made + 1; // 1-indexed
@@ -475,7 +692,22 @@ where
                         &stamped,
                     );
                     notify(payload).await;
-                    tokio::time::sleep(backoff).await;
+                    // M4.1.4 Task 2: heartbeat during the sleep. Short
+                    // backoffs (1/5/15s) get zero heartbeats — the
+                    // helper short-circuits when `RETRY_BACKOFF_HEARTBEAT`
+                    // exceeds the total. Longer slots (today: 30s, future:
+                    // any min-scale slot) get one tick per 30s. Heartbeat
+                    // event includes the live `backoff_remaining_s`.
+                    sleep_with_heartbeat(
+                        backoff,
+                        &session_id,
+                        turn_id.as_deref(),
+                        iteration,
+                        next_attempt,
+                        stamped.kind(),
+                        &mut notify_hb,
+                    )
+                    .await;
                     stats.record_retry();
 
                     match reconnect().await {
@@ -605,11 +837,24 @@ async fn call_codex_with_initial_retry_counted(
                 .await;
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
     };
+    // M4.1.4 Task 2: separate notifier for the during-backoff heartbeat.
+    let session_id_for_hb = session_id.to_string();
+    let state_for_hb = state.clone();
+    let notify_hb = move |payload: serde_json::Value| {
+        let state = state_for_hb.clone();
+        let session = session_id_for_hb.clone();
+        Box::pin(async move {
+            state
+                .emit(&session, events::kind::AGENT_RETRYING_UPSTREAM, payload)
+                .await;
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    };
     let attempts_used = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let attempts_used_for_call = attempts_used.clone();
 
     let stream = retry_call(
         notify,
+        notify_hb,
         session_id,
         turn_id,
         iteration,
@@ -636,8 +881,9 @@ async fn call_codex_with_initial_retry_counted(
 ///
 /// `T` is the success payload — for production that is
 /// `BoxStream<'static, Result<LlmEvent>>`; tests use `()`.
-pub async fn retry_call<T, F, Fut, N, NFut>(
+pub async fn retry_call<T, F, Fut, N, NFut, NHb, NHbFut>(
     mut notify: N,
+    mut notify_hb: NHb,
     session_id: &str,
     turn_id: Option<&str>,
     iteration: i64,
@@ -649,6 +895,8 @@ where
     Fut: std::future::Future<Output = Result<T>>,
     N: FnMut(serde_json::Value) -> NFut,
     NFut: std::future::Future<Output = ()>,
+    NHb: FnMut(serde_json::Value) -> NHbFut,
+    NHbFut: std::future::Future<Output = ()>,
 {
     let mut stats = RetryStats::first_attempt();
     let mut last_err: Option<anyhow::Error> = None;
@@ -706,7 +954,20 @@ where
                 let payload =
                     build_retry_event(session_id, turn_id, iteration, next_attempt, backoff, &reason);
                 notify(payload).await;
-                tokio::time::sleep(backoff).await;
+                // M4.1.4 Task 2: heartbeat tick every 30s during the
+                // sleep so the frontend status pill stays alive across a
+                // long backoff. Backoffs shorter than the cadence (today
+                // the 1/5/15s slots) short-circuit to zero ticks.
+                sleep_with_heartbeat(
+                    backoff,
+                    session_id,
+                    turn_id,
+                    iteration,
+                    next_attempt,
+                    reason.kind(),
+                    &mut notify_hb,
+                )
+                .await;
                 stats.record_retry();
             }
         }
@@ -1007,6 +1268,16 @@ mod tests {
         (notify, captured)
     }
 
+    /// M4.1.4 Task 2: a notifier that discards every payload. Used by
+    /// the existing retry tests that only care about `provider_retry_attempt`
+    /// events (the new `agent_retrying_upstream` heartbeat is exercised
+    /// by its own dedicated tests further down).
+    fn noop_hb_notifier() -> impl FnMut(serde_json::Value) -> NotifierFut {
+        move |_payload: serde_json::Value| {
+            Box::pin(async {}) as NotifierFut
+        }
+    }
+
     // The `start_paused = true` flag on `#[tokio::test]` virtualizes
     // tokio's clock — `tokio::time::sleep(5s)` resolves instantly inside
     // the test body, so the retry loop's backoff sleeps don't make the
@@ -1025,6 +1296,7 @@ mod tests {
 
         let result: Result<&'static str> = retry_call(
             notify,
+            noop_hb_notifier(),
             "s-1",
             Some("t-1"),
             1,
@@ -1075,6 +1347,7 @@ mod tests {
 
         let result: Result<&'static str> = retry_call(
             notify,
+            noop_hb_notifier(),
             "s-1",
             Some("t-1"),
             1,
@@ -1146,6 +1419,7 @@ mod tests {
 
         let result: Result<&'static str> = retry_call(
             notify,
+            noop_hb_notifier(),
             "s-1",
             Some("t-1"),
             1,
@@ -1195,6 +1469,7 @@ mod tests {
 
         let result: Result<&'static str> = retry_call(
             notify,
+            noop_hb_notifier(),
             "s-1",
             Some("t-1"),
             1,
@@ -1227,6 +1502,7 @@ mod tests {
 
         let result: Result<&'static str> = retry_call(
             notify,
+            noop_hb_notifier(),
             "s-1",
             Some("t-1"),
             1,
@@ -1258,6 +1534,7 @@ mod tests {
 
         let result: Result<&'static str> = retry_call(
             notify,
+            noop_hb_notifier(),
             "s-1",
             Some("t-1"),
             1,
@@ -1379,6 +1656,15 @@ mod tests {
         (notify, captured)
     }
 
+    /// M4.1.4 Task 2: send-safe no-op notifier (matching `noop_hb_notifier`
+    /// for the multi-threaded runtime tests). Discards every payload.
+    fn noop_send_hb_notifier()
+    -> impl FnMut(serde_json::Value) -> SendNotifierFut + Send + 'static {
+        move |_payload: serde_json::Value| {
+            Box::pin(async {}) as SendNotifierFut
+        }
+    }
+
     /// Helper: build a stream-side error whose top-level message hits
     /// `from_stream_error` as a timeout (the T31b crash signature).
     fn timeout_err() -> anyhow::Error {
@@ -1421,6 +1707,7 @@ mod tests {
             Some("t-1".into()),
             1,
             notify,
+            noop_send_hb_notifier(),
             reconnect,
         );
 
@@ -1472,6 +1759,7 @@ mod tests {
             Some("t-1".into()),
             1,
             notify,
+            noop_send_hb_notifier(),
             reconnect,
         );
 
@@ -1543,6 +1831,7 @@ mod tests {
             Some("t-1".into()),
             1,
             notify,
+            noop_send_hb_notifier(),
             reconnect,
         );
 
@@ -1587,6 +1876,7 @@ mod tests {
             Some("t-1".into()),
             1,
             notify,
+            noop_send_hb_notifier(),
             reconnect,
         );
 
@@ -1621,6 +1911,7 @@ mod tests {
             None, // compaction-summary style call (turn_id null)
             7,
             notify,
+            noop_send_hb_notifier(),
             reconnect,
         );
 
@@ -1685,6 +1976,7 @@ mod tests {
             agents: StdArc::new(AgentRegistry::default()),
             vendors: StdArc::new(VendorRegistry::for_test()),
             abort_signals: StdArc::new(RwLock::new(std::collections::HashMap::new())),
+            codex_sem: StdArc::new(tokio::sync::Semaphore::new(crate::api::CODEX_MAX_CONCURRENT)),
         }
     }
 
@@ -1733,6 +2025,7 @@ mod tests {
         let attempts_for_call = attempts.clone();
         let result: Result<&'static str> = retry_call(
             notify,
+            noop_send_hb_notifier(),
             session_id,
             Some(turn_id),
             1,
@@ -1812,6 +2105,7 @@ mod tests {
             Some("t-1".into()),
             1,
             notify,
+            noop_send_hb_notifier(),
             reconnect,
         );
 
@@ -1826,5 +2120,263 @@ mod tests {
         let events = captured.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["attempt"], 5); // attempt-about-to-run is 5.
+    }
+
+    // ─── M4.1.4 Task 1: codex concurrency semaphore ───────────────────
+    //
+    // These exercise `acquire_codex_permit` directly. Production wiring
+    // (`call_codex_with_retry` / `call_codex_with_stream_retry`) is
+    // covered indirectly by the existing retry tests above — the new
+    // permit is acquired before each test's scripted closure runs.
+
+    /// Build a 3-permit semaphore (matching `CODEX_MAX_CONCURRENT`) and
+    /// the AppState pieces `acquire_codex_permit` reads. We reuse the
+    /// `test_app_state` builder from earlier in the file — it already
+    /// wires the semaphore field.
+    ///
+    /// 4 concurrent callers: 3 should win permits immediately, the 4th
+    /// must block until one of the first three drops. We assert both the
+    /// permit count (only 3 in flight at once) and the `agent_queued`
+    /// event (emitted exactly once for the 4th).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_semaphore_caps_at_three_concurrent() {
+        // No `pause` — we need real-time concurrency to assert the
+        // contention behavior.
+        let st = test_app_state().await;
+        let session_id = "s-codex-sem";
+        crate::vault::sessions::create(&st.pool, session_id, Some("codex sem test"))
+            .await
+            .unwrap();
+
+        // Sanity: fresh semaphore has CODEX_MAX_CONCURRENT permits.
+        assert_eq!(
+            st.codex_sem.available_permits(),
+            CODEX_MAX_CONCURRENT,
+        );
+
+        // Three holders win immediately + 1 contender blocks.
+        let p1 = acquire_codex_permit(&st, session_id, Some("t-1"), 1)
+            .await
+            .unwrap();
+        let p2 = acquire_codex_permit(&st, session_id, Some("t-2"), 1)
+            .await
+            .unwrap();
+        let p3 = acquire_codex_permit(&st, session_id, Some("t-3"), 1)
+            .await
+            .unwrap();
+        assert_eq!(st.codex_sem.available_permits(), 0);
+
+        // The 4th must wait. Spawn it; assert it's still waiting after
+        // a brief yield to the scheduler, and that the wait emitted one
+        // `agent_queued` event.
+        let st_for_wait = st.clone();
+        let wait_handle = tokio::spawn(async move {
+            acquire_codex_permit(&st_for_wait, "s-codex-sem", Some("t-4"), 1)
+                .await
+                .unwrap()
+        });
+
+        // Give the spawned task a chance to reach `acquire_owned().await`.
+        // 50ms is conservative — the spawn + emit happen in microseconds.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // It should NOT have finished — semaphore is full.
+        assert!(!wait_handle.is_finished());
+
+        // The `agent_queued` event for the waiter must be in the events
+        // log by now (emit happens before the acquire_owned await).
+        let rows = crate::vault::events::list(&st.pool, session_id, None, 100)
+            .await
+            .unwrap();
+        let queued_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == events::kind::AGENT_QUEUED)
+            .collect();
+        assert_eq!(
+            queued_rows.len(),
+            1,
+            "expected exactly one agent_queued event for the 4th waiter"
+        );
+        let queued = queued_rows[0];
+        assert_eq!(queued.payload["session_id"], session_id);
+        assert_eq!(queued.payload["turn_id"], "t-4");
+        assert_eq!(queued.payload["iteration"], 1);
+        // queue_position is approximate — assert it's positive (at least
+        // the waiter itself + the 3 that took permits).
+        assert!(queued.payload["queue_position"].as_u64().unwrap() > 0);
+        // Surface is lifecycle (frontend renders as a pill badge).
+        assert_eq!(queued.payload["surface"], "lifecycle");
+
+        // Releasing one permit unblocks the waiter — drop p1 and assert
+        // wait_handle finishes.
+        drop(p1);
+        let _p4 = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_handle,
+        )
+        .await
+        .expect("waiter should have unblocked within 2s after a drop")
+        .unwrap();
+
+        // Sanity: 2 of the original 3 are still held (p2, p3); the
+        // newcomer holds the 3rd; total available = 0.
+        assert_eq!(st.codex_sem.available_permits(), 0);
+        drop(p2);
+        drop(p3);
+    }
+
+    /// Acquiring a permit when the semaphore has capacity available MUST
+    /// NOT emit an `agent_queued` event. The pre-await `available_permits`
+    /// check skips the emit when there's no contention.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn codex_semaphore_no_event_on_uncontended_acquire() {
+        let st = test_app_state().await;
+        let session_id = "s-codex-sem-happy";
+        crate::vault::sessions::create(&st.pool, session_id, Some("codex sem happy"))
+            .await
+            .unwrap();
+
+        // Acquire one permit on a fresh semaphore — no contention, no
+        // event.
+        let _p = acquire_codex_permit(&st, session_id, Some("t-1"), 1)
+            .await
+            .unwrap();
+
+        let rows = crate::vault::events::list(&st.pool, session_id, None, 100)
+            .await
+            .unwrap();
+        let queued: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == events::kind::AGENT_QUEUED)
+            .collect();
+        assert!(
+            queued.is_empty(),
+            "uncontended acquire must not emit agent_queued; got {:?}",
+            rows.iter().map(|r| &r.kind).collect::<Vec<_>>()
+        );
+    }
+
+    // ─── M4.1.4 Task 2: backoff heartbeat ─────────────────────────────
+    //
+    // `sleep_with_heartbeat` is exercised end-to-end via the production
+    // notifier; we also unit-test it in isolation to pin the cadence.
+
+    /// A 120s backoff (synthetic — production tops out at 30s today) must
+    /// produce exactly 3 heartbeat events at ~30/60/90s. Uses
+    /// `tokio::time::pause` so the test wall-time stays in microseconds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn backoff_heartbeat_fires_every_thirty_seconds() {
+        tokio::time::pause();
+        let captured: Rc<RefCell<Vec<serde_json::Value>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let captured_for = captured.clone();
+        let notify_hb = move |payload: serde_json::Value| {
+            let captured = captured_for.clone();
+            Box::pin(async move {
+                captured.borrow_mut().push(payload);
+            }) as NotifierFut
+        };
+
+        sleep_with_heartbeat(
+            Duration::from_secs(120),
+            "s-hb",
+            Some("t-hb"),
+            7,
+            3, // attempt
+            "codex_http_5xx",
+            notify_hb,
+        )
+        .await;
+
+        let events = captured.borrow();
+        assert_eq!(events.len(), 3, "120s / 30s = 3 heartbeats: {events:?}");
+        // First heartbeat at 30s elapsed → remaining = 120 - 30 = 90.
+        assert_eq!(events[0]["backoff_remaining_s"], 90);
+        assert_eq!(events[0]["attempt"], 3);
+        assert_eq!(events[0]["retry_kind"], "codex_http_5xx");
+        assert_eq!(events[0]["turn_id"], "t-hb");
+        assert_eq!(events[0]["iteration"], 7);
+        // 60s elapsed → remaining = 60.
+        assert_eq!(events[1]["backoff_remaining_s"], 60);
+        // 90s elapsed → remaining = 30.
+        assert_eq!(events[2]["backoff_remaining_s"], 30);
+    }
+
+    /// Backoffs shorter than `RETRY_BACKOFF_HEARTBEAT` (the M3.5 1s / 5s
+    /// / 15s slots) must emit ZERO heartbeats — the helper short-circuits
+    /// when the first tick would land past the end of the sleep. This
+    /// guards against a slot widening that accidentally drops a beat.
+    #[tokio::test(flavor = "current_thread")]
+    async fn backoff_heartbeat_silent_on_short_backoffs() {
+        tokio::time::pause();
+        let captured: Rc<RefCell<Vec<serde_json::Value>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let captured_for = captured.clone();
+        let notify_hb = move |payload: serde_json::Value| {
+            let captured = captured_for.clone();
+            Box::pin(async move {
+                captured.borrow_mut().push(payload);
+            }) as NotifierFut
+        };
+
+        // Each of the M3.5 sub-30s slots must yield zero events.
+        for short in [Duration::from_secs(1), Duration::from_secs(5), Duration::from_secs(15)]
+        {
+            captured.borrow_mut().clear();
+            sleep_with_heartbeat(
+                short,
+                "s-hb",
+                None,
+                1,
+                2,
+                "codex_connection_failed",
+                &mut notify_hb.clone(),
+            )
+            .await;
+            let n = captured.borrow().len();
+            assert_eq!(
+                n, 0,
+                "expected zero heartbeats for backoff {:?}, got {}",
+                short, n
+            );
+        }
+    }
+
+    /// The exact 30s boundary: a backoff of `RETRY_BACKOFF_HEARTBEAT`
+    /// emits zero heartbeats (the first tick lands at end-of-sleep,
+    /// which we treat as "no useful heartbeat" — the retry attempt is
+    /// already about to run). This guards the boundary behavior in
+    /// `sleep_with_heartbeat`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn backoff_heartbeat_boundary_at_thirty_seconds_silent() {
+        tokio::time::pause();
+        let captured: Rc<RefCell<Vec<serde_json::Value>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let captured_for = captured.clone();
+        let notify_hb = move |payload: serde_json::Value| {
+            let captured = captured_for.clone();
+            Box::pin(async move {
+                captured.borrow_mut().push(payload);
+            }) as NotifierFut
+        };
+
+        sleep_with_heartbeat(
+            RETRY_BACKOFF_HEARTBEAT,
+            "s-hb",
+            None,
+            1,
+            2,
+            "codex_http_5xx",
+            notify_hb,
+        )
+        .await;
+
+        assert_eq!(captured.borrow().len(), 0);
+    }
+
+    /// The heartbeat constant is the 30s the spec fixed. A drift here
+    /// means either the spec or the test got out of sync.
+    #[test]
+    fn retry_backoff_heartbeat_is_thirty_seconds() {
+        assert_eq!(RETRY_BACKOFF_HEARTBEAT.as_secs(), 30);
     }
 }

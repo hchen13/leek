@@ -919,6 +919,7 @@ mod tests {
             agents: Arc::new(AgentRegistry::default()),
             vendors: Arc::new(VendorRegistry::for_test()),
             abort_signals: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            codex_sem: Arc::new(tokio::sync::Semaphore::new(crate::api::CODEX_MAX_CONCURRENT)),
         }
     }
 }

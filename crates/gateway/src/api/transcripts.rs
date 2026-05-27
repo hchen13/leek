@@ -132,6 +132,9 @@ mod tests {
             agents: std::sync::Arc::new(crate::agents::AgentRegistry::default()),
             vendors: std::sync::Arc::new(crate::vendors::VendorRegistry::for_test()),
             abort_signals: std::sync::Arc::new(RwLock::new(std::collections::HashMap::new())),
+            codex_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::api::CODEX_MAX_CONCURRENT,
+            )),
         }
     }
 

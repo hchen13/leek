@@ -145,6 +145,7 @@ mod tests {
             agents: Arc::new(crate::agents::AgentRegistry::default()),
             vendors: Arc::new(crate::vendors::VendorRegistry::for_test()),
             abort_signals: Arc::new(RwLock::new(HashMap::new())),
+            codex_sem: Arc::new(tokio::sync::Semaphore::new(crate::api::CODEX_MAX_CONCURRENT)),
         }
     }
 

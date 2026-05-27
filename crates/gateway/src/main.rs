@@ -210,6 +210,10 @@ async fn serve(vault_path: &Path, corpus_root: &Path, port: u16) -> Result<()> {
         // M3.2: per-turn user-abort registry. Starts empty; the agent
         // loop populates / clears entries per turn.
         abort_signals: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        // M4.1.4: codex concurrency semaphore — caps in-flight chat
+        // requests at `CODEX_MAX_CONCURRENT` to stop the rate-limit
+        // thundering-herd that the M4.1.3 5-lane stress hit.
+        codex_sem: Arc::new(tokio::sync::Semaphore::new(api::CODEX_MAX_CONCURRENT)),
     };
 
     let app = api::router(state);
