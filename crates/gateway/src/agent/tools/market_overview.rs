@@ -399,6 +399,7 @@ pub async fn run(vendors: &Arc<VendorRegistry>, args: &serde_json::Value) -> Too
     if !sources.is_empty() {
         final_md.push_str(&format!("\n数据来源: {}\n", sources.join("; ")));
     }
+    final_md.push_str(focus_hint_for(&focus));
     let display = serde_json::json!({
         "kind": "market_overview",
         "focus": focus,
@@ -408,6 +409,46 @@ pub async fn run(vendors: &Arc<VendorRegistry>, args: &serde_json::Value) -> Too
     });
     let debug = serde_json::json!({ "focus": focus });
     ToolOutcome::ok(final_md, display, debug)
+}
+
+/// Append a "其他视角" cross-link block to every focus output. The
+/// snapshot focus (default) gets the full menu so the agent learns the
+/// whole tool surface on its first call. Every other focus gets a
+/// shorter pointer back to the siblings — one-line nudges, not full
+/// menus, to stay out of the way.
+fn focus_hint_for(focus: &str) -> &'static str {
+    match focus {
+        "snapshot" => {
+            "\n---\n\
+             **其他视角**(用同一工具不同 focus):\n\
+             - 主力资金 / 北向当日:`market_overview(focus=\"capital_flow\")`\n\
+             - 行业 top/bot 5:`market_overview(focus=\"hot_industries\")`\n\
+             - 涨停 / 跌停 / 连板:`market_overview(focus=\"extreme_movers\")`\n\
+             - 北向资金(2024-08-19 起逐日个股停披露,仅当日合计 + 季频持股):\
+             `market_overview(focus=\"north_money\")`\n"
+        }
+        "capital_flow" => {
+            "\n---\n\
+             **互为补充**:`focus=\"hot_industries\"` 看资金落在哪些行业; \
+             `focus=\"north_money\"` 看北向当日明细; `focus=\"snapshot\"` 回到指数 + 涨跌家数。\n"
+        }
+        "hot_industries" => {
+            "\n---\n\
+             **互为补充**:行业资金背后看大盘资金面用 `focus=\"capital_flow\"`; \
+             看具体行业内龙头股用 `industry_landscape(target=\"<行业名>\")`。\n"
+        }
+        "extreme_movers" => {
+            "\n---\n\
+             **互为补充**:`focus=\"hot_industries\"` 看涨停板背后的行业资金; \
+             `focus=\"snapshot\"` 看大盘整体气氛。\n"
+        }
+        "north_money" => {
+            "\n---\n\
+             **互为补充**:`focus=\"capital_flow\"` 看大盘整体资金面; \
+             个股北向只剩季频(港交所 2024-08-19 起停披露逐日),工具不会伪造。\n"
+        }
+        _ => "",
+    }
 }
 
 fn fmt_num(v: Option<f64>) -> String {
@@ -445,5 +486,28 @@ mod tests {
             &serde_json::json!({ "focus": "vibes" }),
         ));
         assert!(out.is_error);
+    }
+
+    #[test]
+    fn focus_hint_snapshot_full_menu() {
+        // Direct unit test for the cross-link block (no HTTP / runtime
+        // dance). Run-path coverage of `snapshot` is exercised end-to-end
+        // by the PM acceptance prompts.
+        let h = focus_hint_for("snapshot");
+        assert!(h.contains("其他视角"));
+        assert!(h.contains("focus=\"capital_flow\""));
+        assert!(h.contains("focus=\"hot_industries\""));
+        assert!(h.contains("focus=\"extreme_movers\""));
+        assert!(h.contains("focus=\"north_money\""));
+    }
+
+    #[test]
+    fn focus_hint_non_snapshot_short_hint() {
+        for f in ["capital_flow", "hot_industries", "extreme_movers", "north_money"] {
+            let h = focus_hint_for(f);
+            assert!(h.contains("互为补充"), "focus={f} missing cross-link");
+        }
+        // Unknown focus → empty (nothing to append).
+        assert!(focus_hint_for("zzz_unknown").is_empty());
     }
 }

@@ -35,12 +35,12 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::types::{
-    AnnouncementItem, BlockTradeItem, BrokerMonthlyPick, Candle, CompanyProfile, CpiPpiObs,
-    DividendItem, FinancialRow, GdpObs, HolderCountObs, HolderRow, HsgtFlow, IndexBasic,
-    IndustryFlowRow, InsiderTradeItem, InstitutionVisitItem, LimitCapt, LimitListRow,
-    LiveQuote, MarketTotals, MoneyObs, PledgeStatItem, PmiObs, RatingMix, RepurchaseItem,
-    ResearchReportItem, ShareUnlockItem, ShiborLprObs, SocialFinancingObs, Symbol, TechRow,
-    TopListItem, UsTbrObs, VendorError, YearForecast,
+    AnnouncementItem, BlockTradeItem, BrokerMonthlyPick, Candle, CompanyProfile, ConceptConstituent,
+    ConceptItem, CpiPpiObs, DividendItem, FinancialRow, GdpObs, HolderCountObs, HolderRow,
+    HsgtFlow, IndexBasic, IndustryFlowRow, InsiderTradeItem, InstitutionVisitItem, LimitCapt,
+    LimitListRow, LiveQuote, MacroEventItem, MarketTotals, MoneyObs, PledgeStatItem, PmiObs,
+    PolicyItem, RatingMix, RepurchaseItem, ResearchReportItem, ShareUnlockItem, ShiborLprObs,
+    SocialFinancingObs, Symbol, TechRow, TopListItem, UsTbrObs, VendorError, YearForecast,
 };
 
 const VENDOR: &str = "tushare";
@@ -352,6 +352,116 @@ impl TushareClient {
                 w52_bd: f64_of(m.get("w52_bd").unwrap_or(&Value::Null)),
             })
             .collect())
+    }
+
+    /// `npr` — State Council policy library (国务院政策文件库).
+    ///
+    /// Tushare returns rows ordered newest-first. The `pubtime` field
+    /// carries a full datetime (`2026-05-22 17:00:00`); we trim to the
+    /// date portion for `PolicyItem.publish_date`. A `start_date` /
+    /// `end_date` filter (`YYYYMMDD`) is honored by upstream when both
+    /// are supplied.
+    pub async fn npr(
+        &self,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PolicyItem>, VendorError> {
+        let mut params = serde_json::json!({});
+        if let Some(s) = start_date {
+            params["start_date"] = s.into();
+        }
+        if let Some(e) = end_date {
+            params["end_date"] = e.into();
+        }
+        let resp = self
+            .post("npr", params, "pubtime,title,pcode,puborg,ptype")
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "npr: empty data envelope")
+        })?;
+        Ok(rows_take(&data, limit)
+            .map(|m| {
+                let raw_time =
+                    str_of(m.get("pubtime").unwrap_or(&Value::Null)).unwrap_or_default();
+                // `2026-05-22 17:00:00` → `2026-05-22`. Already-iso
+                // dates pass through unchanged.
+                let publish_date = raw_time
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(&raw_time)
+                    .to_string();
+                PolicyItem {
+                    publish_date,
+                    title: str_of(m.get("title").unwrap_or(&Value::Null)).unwrap_or_default(),
+                    publish_org: str_of(m.get("puborg").unwrap_or(&Value::Null)),
+                    policy_id: str_of(m.get("pcode").unwrap_or(&Value::Null)),
+                    category: str_of(m.get("ptype").unwrap_or(&Value::Null)),
+                }
+            })
+            .collect())
+    }
+
+    /// `cn_schedule` — Chinese macro data release calendar.
+    ///
+    /// Note (M4.1.2): upstream currently ignores `start_date` / `end_date`
+    /// filters under our token tier and returns the oldest entries first.
+    /// We pass the filters through anyway (so any future fix is picked
+    /// up automatically), then post-filter on the date window and trim
+    /// to `limit`. Callers should sort the returned vec by date if a
+    /// specific ordering matters.
+    pub async fn cn_schedule(
+        &self,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MacroEventItem>, VendorError> {
+        let mut params = serde_json::json!({});
+        if let Some(s) = start_date {
+            params["start_date"] = s.into();
+        }
+        if let Some(e) = end_date {
+            params["end_date"] = e.into();
+        }
+        let resp = self
+            .post(
+                "cn_schedule",
+                params,
+                "month,publish_date,title,issuing_org,data_api",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "cn_schedule: empty data envelope")
+        })?;
+        // Pull ALL rows first because upstream may ignore the window
+        // filter; we'll narrow client-side.
+        let mut all: Vec<MacroEventItem> = data
+            .items
+            .iter()
+            .map(|row| {
+                let m = data.row_map(row);
+                let pub_raw =
+                    str_of(m.get("publish_date").unwrap_or(&Value::Null)).unwrap_or_default();
+                MacroEventItem {
+                    publish_date: iso_date(&pub_raw),
+                    title: str_of(m.get("title").unwrap_or(&Value::Null)).unwrap_or_default(),
+                    issuing_org: str_of(m.get("issuing_org").unwrap_or(&Value::Null)),
+                    period: str_of(m.get("month").unwrap_or(&Value::Null)),
+                    data_api: str_of(m.get("data_api").unwrap_or(&Value::Null)),
+                }
+            })
+            .collect();
+        // Client-side window filter when the caller supplied bounds.
+        if let (Some(s), Some(e)) = (start_date, end_date) {
+            let s = iso_date(s);
+            let e = iso_date(e);
+            all.retain(|r| r.publish_date.as_str() >= s.as_str()
+                && r.publish_date.as_str() <= e.as_str());
+        }
+        // Newest first inside the window.
+        all.sort_by(|a, b| b.publish_date.cmp(&a.publish_date));
+        all.truncate(limit);
+        Ok(all)
     }
 }
 
@@ -822,6 +932,79 @@ impl TushareClient {
                     "pe": f64_of(m.get("pe").unwrap_or(&Value::Null)),
                     "pb": f64_of(m.get("pb").unwrap_or(&Value::Null)),
                 })
+            })
+            .collect())
+    }
+
+    /// `dc_concept` — EastMoney concept-board universe (~5000+ boards).
+    /// Returns the full snapshot of the last trade day (newest first).
+    /// Callers filter / rank client-side because the upstream only
+    /// exposes name-equality and is missing a free-text search.
+    pub async fn dc_concept(&self, limit: usize) -> Result<Vec<ConceptItem>, VendorError> {
+        let resp = self
+            .post(
+                "dc_concept",
+                serde_json::json!({ "src": "dc" }),
+                "theme_code,trade_date,name,pct_change,hot,lead_stock,lead_stock_code,\
+                 lead_stock_pct_change,main_change,z_t_num",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "dc_concept: empty data envelope")
+        })?;
+        Ok(rows_take(&data, limit)
+            .map(|m| ConceptItem {
+                theme_code: str_of(m.get("theme_code").unwrap_or(&Value::Null))
+                    .unwrap_or_default(),
+                trade_date: iso_date(
+                    &str_of(m.get("trade_date").unwrap_or(&Value::Null)).unwrap_or_default(),
+                ),
+                name: str_of(m.get("name").unwrap_or(&Value::Null)).unwrap_or_default(),
+                pct_change: f64_of(m.get("pct_change").unwrap_or(&Value::Null)),
+                hot: f64_of(m.get("hot").unwrap_or(&Value::Null)),
+                lead_stock: str_of(m.get("lead_stock").unwrap_or(&Value::Null)),
+                lead_stock_code: str_of(m.get("lead_stock_code").unwrap_or(&Value::Null)),
+                lead_stock_pct: f64_of(m.get("lead_stock_pct_change").unwrap_or(&Value::Null)),
+                main_change: f64_of(m.get("main_change").unwrap_or(&Value::Null)),
+                z_t_num: f64_of(m.get("z_t_num").unwrap_or(&Value::Null)),
+            })
+            .collect())
+    }
+
+    /// `dc_concept_cons` — constituent stocks for one concept board.
+    ///
+    /// Audit caveat: this endpoint accepts ONLY `name` (the exact concept
+    /// name string); passing `ts_code` returns 0 rows. We surface the
+    /// raw count plus a small projection — callers truncate further if
+    /// they don't need the entire member list.
+    ///
+    /// Held as `dead_code` for now: the M4.1.2 `industry_landscape`
+    /// concepts focus uses the `lead_stock` already carried on the
+    /// `dc_concept` row, so we avoid the extra per-pick HTTP round.
+    /// Kept on the surface because a future "drill into a single concept
+    /// board" tool would want it.
+    #[allow(dead_code)]
+    pub async fn dc_concept_cons(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<ConceptConstituent>, VendorError> {
+        let resp = self
+            .post(
+                "dc_concept_cons",
+                serde_json::json!({ "name": name }),
+                "ts_code,name,industry,reason",
+            )
+            .await?;
+        let data = resp.data.ok_or_else(|| {
+            VendorError::recoverable(VENDOR, "dc_concept_cons: empty data envelope")
+        })?;
+        Ok(rows_take(&data, limit)
+            .map(|m| ConceptConstituent {
+                ts_code: str_of(m.get("ts_code").unwrap_or(&Value::Null)).unwrap_or_default(),
+                name: str_of(m.get("name").unwrap_or(&Value::Null)).unwrap_or_default(),
+                industry: str_of(m.get("industry").unwrap_or(&Value::Null)),
+                reason: str_of(m.get("reason").unwrap_or(&Value::Null)),
             })
             .collect())
     }

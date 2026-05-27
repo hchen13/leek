@@ -597,6 +597,88 @@ pub struct LimitListRow {
     pub limit: Option<String>,
 }
 
+// ── Policy / calendar (macro_indicators policy + calendar focus) ──────
+
+/// One official-policy entry from the State Council policy library.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PolicyItem {
+    /// Publication date (ISO 8601, e.g. `2026-05-22`). Source field may
+    /// carry a full datetime — the adapter trims to the date.
+    pub publish_date: String,
+    /// Title / headline.
+    pub title: String,
+    /// Issuing organ (e.g. 国务院, 财政部).
+    pub publish_org: Option<String>,
+    /// Vendor policy id / document number (e.g. 国发〔2026〕11号). Used
+    /// for de-duplication and as a stable reference.
+    pub policy_id: Option<String>,
+    /// Category path (e.g. `综合政务\其他`). Echoed verbatim — the agent
+    /// decides whether it's relevant.
+    pub category: Option<String>,
+}
+
+/// One upcoming macro-economic data release on the official calendar.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MacroEventItem {
+    /// Scheduled publication date (ISO 8601). The upstream field is the
+    /// expected release date, not the data period it covers.
+    pub publish_date: String,
+    /// Indicator title (e.g. `居民消费价格指数月度报告`).
+    pub title: String,
+    /// Issuing organ (e.g. `国家统计局`, `中国人民银行`).
+    pub issuing_org: Option<String>,
+    /// Data period the release covers (`YYYYMM`, e.g. `202604`).
+    pub period: Option<String>,
+    /// The tushare `api_name` that holds the actual numbers once the
+    /// release is published; `待上线` if no API maps yet. The agent can
+    /// use this as a follow-up hint without us having to inline it.
+    pub data_api: Option<String>,
+}
+
+// ── Concepts (industry_landscape concepts focus) ──────────────────────
+
+/// One entry from the EastMoney concept-board universe (`dc_concept`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConceptItem {
+    /// EastMoney theme code (e.g. `000008.DC`).
+    pub theme_code: String,
+    /// Concept board name (e.g. `雄安新区`).
+    pub name: String,
+    /// Last refresh date of the row (ISO 8601).
+    pub trade_date: String,
+    /// Daily change percent for the board.
+    pub pct_change: Option<f64>,
+    /// Vendor's daily heat score (positional — higher is hotter).
+    pub hot: Option<f64>,
+    /// Lead stock for the board.
+    pub lead_stock: Option<String>,
+    /// Lead stock ts_code (`603098.SH`).
+    pub lead_stock_code: Option<String>,
+    /// Lead stock daily change percent.
+    pub lead_stock_pct: Option<f64>,
+    /// Net main-force capital change for the board (yuan, may be negative).
+    pub main_change: Option<f64>,
+    /// Number of constituent stocks currently at the daily up-limit.
+    pub z_t_num: Option<f64>,
+}
+
+/// One constituent of a concept board (`dc_concept_cons`).
+///
+/// Held alongside `dc_concept_cons` (see tushare.rs) as `dead_code` for
+/// now — kept on the surface for the next "drill into a concept board"
+/// caller.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConceptConstituent {
+    pub ts_code: String,
+    pub name: String,
+    /// SW industry of the constituent (used to filter relevance).
+    pub industry: Option<String>,
+    /// Free-text reason the stock is in the concept (often very long —
+    /// the tool trims before surfacing to model output).
+    pub reason: Option<String>,
+}
+
 /// `hsgt` total-flow snapshot.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HsgtFlow {

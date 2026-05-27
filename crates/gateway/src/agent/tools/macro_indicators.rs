@@ -15,8 +15,8 @@ use std::sync::Arc;
 use super::{ResultArtifact, ToolOutcome, ToolUi};
 use crate::llm::ToolSpec;
 use crate::vendors::{
-    CpiPpiObs, GdpObs, MoneyObs, PmiObs, ShiborLprObs, SocialFinancingObs, UsTbrObs,
-    VendorRegistry,
+    CpiPpiObs, GdpObs, MacroEventItem, MoneyObs, PmiObs, PolicyItem, ShiborLprObs,
+    SocialFinancingObs, UsTbrObs, VendorRegistry,
 };
 
 const DEFAULT_FOCUS: &str = "inflation";
@@ -41,12 +41,14 @@ pub fn spec() -> ToolSpec {
              Inputs:\n\
              - focus (optional, default 'inflation') — one of: 'inflation' \
              (CPI + PPI), 'growth' (GDP + PMI), 'money' (M0/M1/M2 + 社融 + \
-             LPR), 'policy' (官方政策库, not yet implemented — surfaces empty), \
-             'calendar' (重要经济数据公布日历, not yet implemented), \
+             LPR), 'policy' (国务院政策文件库, 近 30 天最多 20 条), \
+             'calendar' (中国宏观数据发布日历, 未来 14 天重要指标), \
              'intl_rates' (US T-bill yields).\n\
              \n\
              Examples: 'CPI 怎么样' → focus='inflation'; 'M2 同比多少' → \
-             focus='money'; 'GDP 跟 PMI 给我看' → focus='growth'.\n\
+             focus='money'; 'GDP 跟 PMI 给我看' → focus='growth'; \
+             '近期国务院政策' → focus='policy'; '下周哪些数据公布' → \
+             focus='calendar'.\n\
              \n\
              Limits: returns ≤ 24 monthly / 12 quarterly rows; no forecasts. \
              Some focus modes surface `empty_dimensions` when the upstream \
@@ -345,17 +347,100 @@ pub async fn run(vendors: &Arc<VendorRegistry>, args: &serde_json::Value) -> Too
             }
             (md, serde_json::json!({ "us_tbr": tbr }))
         }
-        // Policy + calendar focus modes don't have shipping vendor calls
-        // yet — surface as empty_dimensions so the model knows to skip.
-        other => {
-            empty_dimensions.push(format!("{other}:not_implemented_yet"));
-            (
-                format!(
-                    "## {other}\n\n该 focus 暂未接入数据源 (`{other}` 在 M4.1.1 范围外)。\n"
-                ),
-                serde_json::json!({}),
-            )
+        "policy" => {
+            // 30 day window ending today. tushare's `npr` honors
+            // start_date / end_date in YYYYMMDD; rows come back
+            // newest first.
+            let start = (today - chrono::Duration::days(30))
+                .format("%Y%m%d")
+                .to_string();
+            let end = today.format("%Y%m%d").to_string();
+            let policies: Vec<PolicyItem> =
+                match t.npr(Some(&start), Some(&end), 20).await {
+                    Ok(rows) if !rows.is_empty() => {
+                        sources.push(format!("Tushare npr @ {today}"));
+                        rows
+                    }
+                    Ok(_) => {
+                        empty_dimensions.push("npr".into());
+                        Vec::new()
+                    }
+                    Err(e) => {
+                        empty_dimensions.push(format!("npr:{}", e.message));
+                        Vec::new()
+                    }
+                };
+            let mut md = String::new();
+            md.push_str("## 国务院政策文件库(近 30 天)\n\n");
+            if policies.is_empty() {
+                md.push_str("窗口内未拉到政策条目。\n");
+            } else {
+                md.push_str(&format!("共 {} 条,按发布日倒序:\n\n", policies.len()));
+                for p in &policies {
+                    md.push_str(&format!(
+                        "- **{}** · {} · {}{}\n",
+                        p.publish_date,
+                        p.publish_org.clone().unwrap_or_else(|| "-".into()),
+                        p.title,
+                        p.policy_id
+                            .as_deref()
+                            .map(|c| format!(" ({c})"))
+                            .unwrap_or_default(),
+                    ));
+                }
+            }
+            (md, serde_json::json!({ "policies": policies }))
         }
+        "calendar" => {
+            // Look at the next 14 days. tushare currently ignores the
+            // filter under our token tier, so the adapter falls back
+            // to whatever the latest snapshot returns; we surface that
+            // honestly rather than fake-empty.
+            let start = today.format("%Y%m%d").to_string();
+            let end = (today + chrono::Duration::days(14))
+                .format("%Y%m%d")
+                .to_string();
+            let events: Vec<MacroEventItem> =
+                match t.cn_schedule(Some(&start), Some(&end), 30).await {
+                    Ok(rows) if !rows.is_empty() => {
+                        sources.push(format!("Tushare cn_schedule @ {today}"));
+                        rows
+                    }
+                    Ok(_) => {
+                        empty_dimensions.push("cn_schedule".into());
+                        Vec::new()
+                    }
+                    Err(e) => {
+                        empty_dimensions.push(format!("cn_schedule:{}", e.message));
+                        Vec::new()
+                    }
+                };
+            let mut md = String::new();
+            md.push_str("## 中国宏观数据发布日历(未来 14 天)\n\n");
+            if events.is_empty() {
+                md.push_str(
+                    "窗口内未拉到日历项(上游 token 当前对 start/end 过滤支持有限)。\n",
+                );
+            } else {
+                md.push_str("| 公布日 | 指标 | 发布单位 | 数据期 | 上游 API |\n|---|---|---|---|---|\n");
+                for ev in &events {
+                    md.push_str(&format!(
+                        "| {} | {} | {} | {} | {} |\n",
+                        ev.publish_date,
+                        ev.title,
+                        ev.issuing_org.clone().unwrap_or_else(|| "-".into()),
+                        ev.period.clone().unwrap_or_else(|| "-".into()),
+                        ev.data_api.clone().unwrap_or_else(|| "-".into()),
+                    ));
+                }
+            }
+            (md, serde_json::json!({ "events": events }))
+        }
+        // Unreachable because FOCUS_CHOICES validates above, but keep a
+        // wildcard so adding a new focus to the enum without updating
+        // this match is a compile error (`unreachable_patterns`) only
+        // when truly dead.
+        _ => unreachable!("focus already validated against FOCUS_CHOICES"),
     };
 
     let mut md = model_md;
@@ -428,5 +513,55 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert!(!dims.is_empty(), "expected empty_dimensions to be populated");
+    }
+
+    #[test]
+    fn policy_focus_returns_structured_output_when_vendor_silent() {
+        // No tushare token → npr call errors recoverably → policy focus
+        // still returns an OK outcome with an empty `policies` array
+        // and an `npr:*` entry under `empty_dimensions`. Critically
+        // the markdown does NOT claim "no policy published" — it
+        // surfaces the access state honestly.
+        let vendors = Arc::new(VendorRegistry::for_test());
+        let out = futures::executor::block_on(run(
+            &vendors,
+            &serde_json::json!({ "focus": "policy" }),
+        ));
+        assert!(!out.is_error);
+        assert_eq!(out.display_payload["focus"], "policy");
+        let policies = out.display_payload["data"]["policies"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(policies.is_empty());
+        let dims: Vec<String> = out.display_payload["empty_dimensions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert!(dims.iter().any(|d| d.starts_with("npr")));
+        assert!(out.model_output.contains("国务院政策文件库"));
+    }
+
+    #[test]
+    fn calendar_focus_returns_structured_output_when_vendor_silent() {
+        let vendors = Arc::new(VendorRegistry::for_test());
+        let out = futures::executor::block_on(run(
+            &vendors,
+            &serde_json::json!({ "focus": "calendar" }),
+        ));
+        assert!(!out.is_error);
+        assert_eq!(out.display_payload["focus"], "calendar");
+        let dims: Vec<String> = out.display_payload["empty_dimensions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert!(dims.iter().any(|d| d.starts_with("cn_schedule")));
+        assert!(out.model_output.contains("发布日历"));
     }
 }

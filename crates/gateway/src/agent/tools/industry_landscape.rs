@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::{ResultArtifact, ToolOutcome, ToolUi};
 use crate::llm::ToolSpec;
-use crate::vendors::{IndustryFlowRow, IndustryLeaderRow, Symbol, VendorRegistry};
+use crate::vendors::{ConceptItem, IndustryFlowRow, IndustryLeaderRow, Symbol, VendorRegistry};
 
 const DEFAULT_FOCUS: &str = "leaders";
 const FOCUS_CHOICES: &[&str] = &[
@@ -32,8 +32,9 @@ pub fn spec() -> ToolSpec {
                companies + market cap + PE/PB/ROE), 'valuation' (industry \
                PE/PB median + dispersion), 'capital_flow' (today's main \
                net inflow ranking + the target industry's rank), \
-               'concepts' (concept boards related to the industry), \
-               'index' (industry-index quote).\n\
+               'concepts' (concept boards whose name overlaps the \
+               industry, ranked by daily heat, with the lead stock for \
+               each), 'index' (industry-index quote).\n\
              \n\
              Examples: '茅台所在行业的龙头有哪些' → \
              target='600519.SH', focus='leaders'; '工业金属今天主力进出多少' \
@@ -286,13 +287,89 @@ pub async fn run(vendors: &Arc<VendorRegistry>, args: &serde_json::Value) -> Too
             })
         }
         "concepts" => {
-            // Spec: `dc_concept` ordered by hot; we don't actually have
-            // a fully shipping endpoint for that in this milestone.
-            empty_dimensions.push("concepts:not_implemented_yet".into());
-            md.push_str(
-                "概念板块归属 / 龙头股映射在 M4.1.1 范围内未接入(避开 dc_hot/ths_hot 半僵尸)。\n",
-            );
-            serde_json::json!({})
+            // Two-step fan-out: pull the full concept universe (5000+
+            // rows), score each by substring overlap with the industry
+            // name, keep the top-N hottest matches. We don't call
+            // `dc_concept_cons` per match — concept rows already carry
+            // `lead_stock`, and the constituent count is a separate
+            // call we skip to keep latency bounded.
+            const TOP_N: usize = 10;
+            let concepts_all = match t.dc_concept(6000).await {
+                Ok(rows) if !rows.is_empty() => {
+                    sources.push(format!("Tushare dc_concept @ {today}"));
+                    rows
+                }
+                Ok(_) => {
+                    empty_dimensions.push("dc_concept".into());
+                    Vec::new()
+                }
+                Err(e) => {
+                    empty_dimensions.push(format!("dc_concept:{}", e.message));
+                    Vec::new()
+                }
+            };
+
+            // Build a small candidate set: prefer keyword overlap with
+            // the industry name. Fall back to first 30 concepts when no
+            // keyword match exists so the agent at least sees the
+            // hottest boards of the day.
+            let keyword = industry_keyword(&industry);
+            let mut candidates: Vec<ConceptItem> = concepts_all
+                .iter()
+                .filter(|c| !keyword.is_empty() && c.name.contains(&keyword))
+                .cloned()
+                .collect();
+            let fell_back = candidates.is_empty();
+            if fell_back && !concepts_all.is_empty() {
+                empty_dimensions.push("concept_keyword_match".into());
+            }
+            if fell_back {
+                candidates = concepts_all.iter().take(30).cloned().collect();
+            }
+            // Sort by heat (desc) — higher hot is hotter; missing hot
+            // sorts last.
+            candidates.sort_by(|a, b| {
+                b.hot
+                    .unwrap_or(f64::MIN)
+                    .partial_cmp(&a.hot.unwrap_or(f64::MIN))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let picks: Vec<ConceptItem> = candidates.into_iter().take(TOP_N).collect();
+
+            md.push_str(&if fell_back && !picks.is_empty() {
+                format!(
+                    "**与 '{industry}' 关键字匹配为空 — fall back: 当日全市场最热 {} 个概念板**\n\n",
+                    picks.len()
+                )
+            } else if !picks.is_empty() {
+                format!(
+                    "**与 '{industry}' 名字相关的概念板(按当日 hot 倒序,取前 {})**\n\n",
+                    picks.len()
+                )
+            } else {
+                format!("**'{industry}' 未匹配到任何概念板。**\n\n")
+            });
+            if !picks.is_empty() {
+                md.push_str("| 概念名 | hot | 当日% | 龙头 | 龙头% | 涨停成员 |\n|---|---|---|---|---|---|\n");
+                for c in &picks {
+                    md.push_str(&format!(
+                        "| {} | {} | {} | {} | {} | {} |\n",
+                        c.name,
+                        fmt_num(c.hot),
+                        fmt_pct(c.pct_change),
+                        c.lead_stock.clone().unwrap_or_else(|| "-".into()),
+                        fmt_pct(c.lead_stock_pct),
+                        c.z_t_num
+                            .map(|n| format!("{}", n as i64))
+                            .unwrap_or_else(|| "-".into()),
+                    ));
+                }
+            }
+            serde_json::json!({
+                "concepts": picks,
+                "fell_back_to_market_hot": fell_back,
+                "keyword_used": keyword,
+            })
         }
         "index" => {
             let rows = match t.sw_daily(&today_compact).await {
@@ -363,6 +440,24 @@ pub async fn run(vendors: &Arc<VendorRegistry>, args: &serde_json::Value) -> Too
     ToolOutcome::ok(md, display, debug)
 }
 
+/// Strip the SW industry-name suffixes the upstream taxonomy uses
+/// (`Ⅱ`, `Ⅲ`, `2`, etc.) so the keyword survives a substring match
+/// against EastMoney concept names. We keep the result on the original
+/// string when it doesn't end in a known suffix.
+fn industry_keyword(industry: &str) -> String {
+    let mut s = industry.trim().to_string();
+    // Trim trailing Roman / Arabic tier markers like `白酒Ⅱ` → `白酒`.
+    while let Some(last) = s.chars().last() {
+        let is_tier = matches!(last, 'Ⅰ' | 'Ⅱ' | 'Ⅲ' | 'Ⅳ' | 'Ⅴ')
+            || (last.is_ascii_digit() && s.chars().count() > 2);
+        if !is_tier {
+            break;
+        }
+        s.pop();
+    }
+    s.trim().to_string()
+}
+
 fn fmt_num(v: Option<f64>) -> String {
     v.map(|n| format!("{n:.2}")).unwrap_or_else(|| "-".into())
 }
@@ -417,5 +512,42 @@ mod tests {
         let vendors = Arc::new(VendorRegistry::for_test());
         let out = futures::executor::block_on(run(&vendors, &serde_json::json!({})));
         assert!(out.is_error);
+    }
+
+    #[test]
+    fn industry_keyword_strips_sw_tier_suffixes() {
+        assert_eq!(industry_keyword("白酒Ⅱ"), "白酒");
+        assert_eq!(industry_keyword("半导体Ⅲ"), "半导体");
+        assert_eq!(industry_keyword("工业金属"), "工业金属");
+        // Don't strip when the suffix is meaningful (3-char name).
+        assert_eq!(industry_keyword("化学制品"), "化学制品");
+    }
+
+    #[test]
+    fn concepts_focus_returns_structured_output_when_vendor_silent() {
+        // No tushare token → industry resolution via stock_basic errors,
+        // returning the structured "industry_unknown / stock_basic:..."
+        // payload before we even reach dc_concept. Either way the tool
+        // must come back ok=true with a kind=industry_landscape envelope
+        // and surface a non-error model output.
+        let vendors = Arc::new(VendorRegistry::for_test());
+        let out = futures::executor::block_on(run(
+            &vendors,
+            &serde_json::json!({ "target": "白酒", "focus": "concepts" }),
+        ));
+        assert!(!out.is_error);
+        assert_eq!(out.display_payload["kind"], "industry_landscape");
+        assert_eq!(out.display_payload["focus"], "concepts");
+        let dims: Vec<String> = out.display_payload["empty_dimensions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert!(
+            dims.iter().any(|d| d.starts_with("dc_concept")),
+            "expected dc_concept entry in empty_dimensions, got {dims:?}"
+        );
     }
 }
