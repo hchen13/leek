@@ -169,6 +169,13 @@ fn effective_body(_cfg: &Config, eff: &GuardConfig) -> serde_json::Value {
             "value": eff.max_iterations,
             "overridden_by_env": env_set("LEEK_MAX_ITERATIONS"),
         },
+        // M4.1.5 (Task 3): per-turn tool-call hard cap. Default 30 main
+        // agent / per-subagent override in AGENT.md frontmatter. Surface
+        // here for parity with `max_iterations` / `cost_cap_usd`.
+        "max_tool_calls_per_turn": {
+            "value": eff.max_tool_calls,
+            "overridden_by_env": env_set("LEEK_MAX_TOOL_CALLS_PER_TURN"),
+        },
         "cost_cap_usd": {
             "value": eff.cost_cap_usd,
             "overridden_by_env": env_set("LEEK_COST_CAP_USD"),
