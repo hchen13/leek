@@ -495,21 +495,18 @@ mod tests {
     #[test]
     fn shipped_builtin_agents_have_cost_caps() {
         // M3.6 §E ships per-subagent caps on every built-in worker so
-        // a default-config user can rely on quick-screen never running
+        // a default-config user can rely on the subagent never running
         // away into a multi-dollar tab. M4.1.3 (P0-4) raised the caps
-        // after stress runs showed the prior values were too tight on
-        // legitimate deep-dive work — values are spec-fixed (dispatch
-        // M4.1.3): if any of them drift, both spec + this test need an
-        // update.
+        // after stress runs; M4.2 trimmed the worker roster to two
+        // (corpus-expert pure-corpus + general-purpose default). Values
+        // are spec-fixed: if any of them drift, both spec + this test
+        // need an update.
         let dir = builtin_agents_dir();
         if !dir.exists() {
             return;
         }
         let (reg, _errs) = load_layered(&[(dir.as_path(), AgentLayer::Builtin)]);
         let expect: &[(&str, f64)] = &[
-            ("quick-screen", 0.30),
-            ("deep-review", 8.00),
-            ("comparison", 5.00),
             ("general-purpose", 5.00),
             ("corpus-expert", 0.50),
         ];
@@ -578,9 +575,6 @@ mod tests {
         }
         let (reg, _errs) = load_layered(&[(dir.as_path(), AgentLayer::Builtin)]);
         let expect: &[(&str, u32)] = &[
-            ("quick-screen", 8),
-            ("comparison", 20),
-            ("deep-review", 30),
             ("corpus-expert", 12),
             ("general-purpose", 25),
         ];
@@ -645,9 +639,6 @@ mod tests {
         }
         let (reg, _errs) = load_layered(&[(dir.as_path(), AgentLayer::Builtin)]);
         let expect: &[(&str, u32)] = &[
-            ("quick-screen", 8),
-            ("comparison", 25),
-            ("deep-review", 40),
             ("corpus-expert", 12),
             ("general-purpose", 30),
         ];
@@ -712,9 +703,6 @@ mod tests {
         }
         let (reg, _errs) = load_layered(&[(dir.as_path(), AgentLayer::Builtin)]);
         let expect: &[(&str, &str)] = &[
-            ("deep-review", "xhigh"),
-            ("comparison", "high"),
-            ("quick-screen", "medium"),
             ("corpus-expert", "medium"),
             ("general-purpose", "medium"),
         ];
@@ -775,13 +763,14 @@ mod tests {
         let (reg, errs) = load_layered(&[(dir.as_path(), AgentLayer::Builtin)]);
         assert!(errs.is_empty(), "built-in AGENT.md errors: {errs:?}");
         let names = reg.names();
-        for required in [
-            "general-purpose",
-            "corpus-expert",
-            "quick-screen",
-            "deep-review",
-            "comparison",
-        ] {
+        // M4.2 trimmed the worker roster to two:
+        //   - corpus-expert: pure-corpus visibility, no A-share tools
+        //   - general-purpose: default fallback with the full surface
+        // The 3 prior workers (quick-screen / deep-review / comparison)
+        // overlapped with the main agent's own ability to pick tools
+        // and added more "did the right agent get dispatched" reasoning
+        // cost than they saved.
+        for required in ["general-purpose", "corpus-expert"] {
             assert!(
                 names.contains(&required.to_string()),
                 "missing built-in agent '{required}'; loaded: {names:?}"
@@ -792,24 +781,5 @@ mod tests {
         let ce = reg.get("corpus-expert").unwrap();
         assert!(ce.allowed_tools.contains(&"corpus_search".to_string()));
         assert!(ce.allowed_tools.contains(&"corpus_read".to_string()));
-        // quick-screen restricts to the two A-share snapshot tools.
-        let qs = reg.get("quick-screen").unwrap();
-        for t in ["stock_overview", "market_pulse"] {
-            assert!(
-                qs.allowed_tools.contains(&t.to_string()),
-                "quick-screen missing tool '{t}' in allow-list",
-            );
-        }
-        // deep-review opts into the full facts-only kit + corpus + web.
-        let dr = reg.get("deep-review").unwrap();
-        assert!(dr.allowed_tools.contains(&"stock_overview".to_string()));
-        assert!(dr.allowed_tools.contains(&"recent_actions".to_string()));
-        assert!(dr.allowed_tools.contains(&"read_pdf".to_string()));
-        // comparison spawns subagents and reads light data, so it owns
-        // task + the cheap getters.
-        let cmp = reg.get("comparison").unwrap();
-        assert!(cmp.allowed_tools.contains(&"task".to_string()));
-        assert!(cmp.allowed_tools.contains(&"stock_overview".to_string()));
-        assert!(cmp.allowed_tools.contains(&"market_pulse".to_string()));
     }
 }
