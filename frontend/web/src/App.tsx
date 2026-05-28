@@ -1,27 +1,26 @@
-// L.E.E.K — the research workbench (M1.9.6 / M1.9.7).
+// App — top-level shell (M4.2.1).
 //
-// A chat-led research workbench: a session list, the Chat column, the
-// Canvas execution trace, and a floating Plan / TODO widget. The gateway
-// streams the M1.9 event contract over SSE; `store.ts` routes each event to
-// its panel by the event's `surface`. This shell owns sessions, the message
-// list, the SSE wiring, and the cross-panel "focus a canvas card" action.
+// 3-column layout (DESIGN.md §4.3): Rail · Chat · Canvas · Sidebar.
+// The rail's bottom slot switches the main area between "chat workbench"
+// and "settings page" — both share the rail but only the chat workbench
+// shows the right sidebar.
+//
+// SSE wiring + session list management stay here (same pattern as the
+// pre-M4.2 App): the store reduces events into reactive state, the
+// columns are pure readers. The store API (createWorkbench) is unchanged.
 
-import { createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import { createMemo, createSignal, onCleanup, Show } from "solid-js";
 
-import { Canvas } from "./Canvas";
-import { Chat } from "./Chat";
+import { CanvasColumn } from "./components/CanvasColumn";
+import { ChatColumn } from "./components/ChatColumn";
 import { CorpusBrain } from "./CorpusBrain";
-import { PlanWidget } from "./PlanWidget";
-import { Settings } from "./Settings";
+import { Rail, type RailTab } from "./components/Rail";
+import { SessionDrawer } from "./components/SessionDrawer";
+import { SettingsPage } from "./components/SettingsPage";
+import { Sidebar } from "./components/Sidebar";
 import { createWorkbench } from "./store";
 import type { EventRow, Message, Session } from "./types";
 
-/** Tab identity for the right column (canvas vs corpus brain) — they
- *  share the same space so each takes the full panel when active. */
-type RightTab = "canvas" | "brain";
-
-// SSE event kinds to subscribe to — a subscription detail only. Which panel
-// an event lands in is decided by its `surface`, never by this list.
 const EVENT_KINDS = [
   "message_created",
   "assistant_delta",
@@ -33,31 +32,39 @@ const EVENT_KINDS = [
   "turn_metrics_recorded",
   "compaction_started",
   "compaction_completed",
-  // M2.6: emitted just before a turn is soft-stopped for crossing the
-  // cost cap — chat surface uses it to render an in-turn warning bar.
   "turn_cost_capped",
+  "subagent_lifecycle",
+  "codex_duplicate_url_warning",
+  "provider_retry_attempt",
   "error",
 ];
 
 export default function App() {
   const [sessions, setSessions] = createSignal<Session[]>([]);
+  const [sessionsLoading, setSessionsLoading] = createSignal(true);
   const [current, setCurrent] = createSignal<string | null>(null);
   const [messages, setMessages] = createSignal<Message[]>([]);
   const [sending, setSending] = createSignal(false);
   const [showFailed, setShowFailed] = createSignal(false);
   const [highlight, setHighlight] = createSignal<string | null>(null);
-  const [rightTab, setRightTab] = createSignal<RightTab>("canvas");
-  // M2.6: the settings modal is a plain show/hide flag — no router, the
-  // panel renders on top of the workbench when this is true.
-  const [showSettings, setShowSettings] = createSignal(false);
+  const [railTab, setRailTab] = createSignal<RailTab>("chat");
+  const [drawerOpen, setDrawerOpen] = createSignal(false);
+  const [corpusFullscreen, setCorpusFullscreen] = createSignal(false);
 
   const wb = createWorkbench();
   let stream: EventSource | undefined;
 
   const loadSessions = async () => {
-    const res = await fetch("/api/v1/sessions");
-    const body = await res.json();
-    setSessions(body.items ?? []);
+    setSessionsLoading(true);
+    try {
+      const res = await fetch("/api/v1/sessions");
+      const body = await res.json();
+      setSessions(body.items ?? []);
+    } catch {
+      // Empty list is the visible result.
+    } finally {
+      setSessionsLoading(false);
+    }
   };
 
   const loadMessages = async (id: string) => {
@@ -66,8 +73,6 @@ export default function App() {
     if (current() === id) setMessages(body.items ?? []);
   };
 
-  /** Apply one event — from history replay or the live stream. Persisted
-   *  events carry a unique `seq`; `seen` drops any duplicate. */
   const applyOne = (row: EventRow, seen: Set<number>, id: string) => {
     if (typeof row.seq === "number" && row.seq >= 0) {
       if (seen.has(row.seq)) return;
@@ -82,6 +87,7 @@ export default function App() {
 
   const openSession = async (id: string) => {
     setCurrent(id);
+    setRailTab("chat");
     stream?.close();
     stream = undefined;
     wb.reset();
@@ -93,15 +99,14 @@ export default function App() {
     const seen = new Set<number>();
     await loadMessages(id);
 
-    // Replay durable event history so past turns' canvas is rebuilt.
     try {
       const res = await fetch(`/api/v1/sessions/${id}/events?limit=1000`);
       const body = await res.json();
       for (const row of (body.items ?? []) as EventRow[]) applyOne(row, seen, id);
     } catch {
-      // A missing history endpoint is non-fatal — the live stream still runs.
+      // history endpoint optional
     }
-    if (current() !== id) return; // the user switched sessions mid-load
+    if (current() !== id) return;
 
     const es = new EventSource(`/stream/sessions/${id}/events`);
     stream = es;
@@ -111,7 +116,7 @@ export default function App() {
         try {
           applyOne(JSON.parse((ev as MessageEvent).data) as EventRow, seen, id);
         } catch {
-          // ignore a malformed frame
+          // ignore malformed frame
         }
       });
     }
@@ -140,8 +145,6 @@ export default function App() {
     void loadMessages(id);
   };
 
-  /** Scroll to and flash a canvas card — the chat tool summary's click
-   *  target. A failed card is hidden by default, so reveal it first. */
   const focusCard = (artifactId: string, isError: boolean) => {
     if (isError) setShowFailed(true);
     setHighlight(artifactId);
@@ -153,117 +156,104 @@ export default function App() {
     window.setTimeout(() => setHighlight((h) => (h === artifactId ? null : h)), 2200);
   };
 
-  // Badge above the "脑图" tab — count of wikis the agent is touching
-  // right now plus those already used in the current turn. Lets the
-  // user notice corpus activity without leaving Canvas.
-  const brainBadge = createMemo(() => {
-    const a = wb.activation();
-    if (!a.currentTurn) return 0;
-    let n = 0;
-    for (const ref of a.byNode.values()) {
-      if (ref.liveTurns.has(a.currentTurn) || ref.completedTurns.has(a.currentTurn)) n += 1;
-    }
-    return n;
+  // Title for the chat header — pull from the session list, fall back to
+  // a friendly placeholder.
+  const sessionTitle = createMemo(() => {
+    const id = current();
+    if (!id) return "L.E.E.K · 投研工作台";
+    const s = sessions().find((x) => x.id === id);
+    return s?.title ?? "(未命名)";
   });
 
   onCleanup(() => stream?.close());
   void loadSessions();
 
-  return (
-    <div class="app">
-      <aside class="sidebar">
-        <header class="sidebar-head">
-          <h1>
-            L.E.E.K <span>· workbench</span>
-          </h1>
-          {/* M2.6 ⚙ — opens the settings modal. Plain unicode glyph keeps
-              the dependency surface zero; the title attribute is the
-              accessible label since the visible glyph is decorative. */}
-          <button
-            class="settings-gear"
-            onClick={() => setShowSettings(true)}
-            title="设置"
-            aria-label="打开设置"
-          >
-            ⚙
-          </button>
-        </header>
-        <button class="new" onClick={() => void newSession()}>
-          + 新会话
-        </button>
-        <ul class="sessions">
-          <For each={sessions()} fallback={<li class="muted">还没有会话</li>}>
-            {(s) => (
-              <li
-                classList={{ session: true, active: s.id === current() }}
-                onClick={() => void openSession(s.id)}
-              >
-                <span class="title">{s.title ?? "(未命名)"}</span>
-                <span class="id">{s.id}</span>
-              </li>
-            )}
-          </For>
-        </ul>
-      </aside>
+  const onRailTab = (t: RailTab) => {
+    setRailTab(t);
+    if (t === "chat") setDrawerOpen(false);
+  };
 
-      <main class="workbench">
+  return (
+    <div class="lk-app">
+      <Rail active={railTab} onTab={onRailTab} />
+      <main class="lk-main">
         <Show
-          when={current()}
-          fallback={<div class="empty-main">选择左侧的会话，或新建一个。</div>}
+          when={railTab() === "chat"}
+          fallback={<SettingsPage onBack={() => setRailTab("chat")} />}
         >
-          <Chat
-            messages={messages}
-            turns={() => wb.state.turns}
-            streaming={() => wb.state.streaming}
-            noted={() => wb.state.noted}
-            sending={sending}
-            send={(t) => void send(t)}
-            focusCard={focusCard}
-            openSettings={() => setShowSettings(true)}
-            sessionId={current}
-          />
-          <section class="right-rail">
-            <nav class="right-tabs">
-              <button
-                classList={{ "right-tab": true, active: rightTab() === "canvas" }}
-                onClick={() => setRightTab("canvas")}
-              >
-                Canvas
-              </button>
-              <button
-                classList={{ "right-tab": true, active: rightTab() === "brain" }}
-                onClick={() => setRightTab("brain")}
-              >
-                脑图
-                <Show when={brainBadge() > 0}>
-                  <span class="right-tab-badge">{brainBadge()}</span>
-                </Show>
-              </button>
-            </nav>
-            <Show
-              when={rightTab() === "canvas"}
-              fallback={
-                <CorpusBrain
-                  activation={wb.activation}
-                  sessionId={current}
-                />
-              }
-            >
-              <Canvas
-                turns={() => wb.state.turns}
-                messages={messages}
-                showFailed={showFailed}
-                setShowFailed={setShowFailed}
-                highlight={highlight}
-              />
-            </Show>
-          </section>
-          <PlanWidget plan={() => wb.state.plan} />
+          <Show
+            when={current()}
+            fallback={
+              <div class="lk-empty lk-main-empty">
+                <span class="lk-empty-title">选择一个会话开始</span>
+                <span class="lk-empty-hint">
+                  点击左侧聊天图标边的历史按钮, 或新建一个会话。
+                </span>
+                <button
+                  class="lk-btn lk-btn--primary"
+                  type="button"
+                  onClick={() => void newSession()}
+                >
+                  新建会话
+                </button>
+              </div>
+            }
+          >
+            <ChatColumn
+              messages={messages}
+              turns={() => wb.state.turns}
+              streaming={() => wb.state.streaming}
+              noted={() => wb.state.noted}
+              sending={sending}
+              send={(t) => void send(t)}
+              focusCard={focusCard}
+              openSettings={() => setRailTab("settings")}
+              sessionId={current}
+              sessionTitle={sessionTitle}
+              onOpenDrawer={() => setDrawerOpen(true)}
+              onNewSession={() => void newSession()}
+            />
+            <CanvasColumn
+              turns={() => wb.state.turns}
+              messages={messages}
+              showFailed={showFailed}
+              setShowFailed={setShowFailed}
+              highlight={highlight}
+              sessionTitle={sessionTitle}
+            />
+            <Sidebar
+              activation={wb.activation}
+              plan={() => wb.state.plan}
+              onFullscreenCorpus={() => setCorpusFullscreen(true)}
+            />
+          </Show>
         </Show>
       </main>
 
-      <Show when={showSettings()}>
-        <Settings onClose={() => setShowSettings(false)} />
+      <SessionDrawer
+        open={drawerOpen}
+        sessions={sessions}
+        loading={sessionsLoading}
+        currentId={current}
+        onClose={() => setDrawerOpen(false)}
+        onPick={(id) => void openSession(id)}
+        onNew={() => void newSession()}
+      />
+
+      {/* Corpus fullscreen overlay — uses the original CorpusBrain. */}
+      <Show when={corpusFullscreen()}>
+        <div class="lk-corpus-fullscreen" role="dialog" aria-label="corpus 全图">
+          <button
+            class="lk-icon-btn lk-corpus-fullscreen-close"
+            type="button"
+            onClick={() => setCorpusFullscreen(false)}
+            title="关闭"
+            aria-label="关闭 corpus 全图"
+          >
+            ✕
+          </button>
+          <CorpusBrain activation={wb.activation} sessionId={current} />
+        </div>
       </Show>
     </div>
   );

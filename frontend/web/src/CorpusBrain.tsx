@@ -426,7 +426,7 @@ export function CorpusBrain(props: CorpusBrainProps) {
                       <text
                         text-anchor="middle"
                         font-size="13"
-                        fill="var(--text)"
+                        fill="var(--fg)"
                         style="paint-order: stroke; stroke: var(--bg); stroke-width: 4; stroke-linejoin: round;"
                       >
                         {node.title}
