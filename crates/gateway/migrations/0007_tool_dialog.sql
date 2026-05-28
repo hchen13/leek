@@ -1,0 +1,15 @@
+-- M4.1.7: persist cross-turn tool history.
+--
+-- The `additional_inputs` items (Codex Responses API `function_call` +
+-- `function_call_output`) that a turn accumulated across its iters were
+-- previously thrown away when the turn ended. Next turn started with an
+-- empty Vec, so the model could not see what its prior turns called or
+-- what came back — leading to duplicate `market_overview` / etc calls.
+--
+-- Standard agent-loop practice (Claude Code, OpenAI Assistants threads)
+-- is to keep the full tool_use + tool_result chain across turns, sliding
+-- window or summarizing only when the context window overflows. This
+-- column stores those items as a JSON array on the assistant row that
+-- terminated the turn. NULL for user rows + pre-migration historical
+-- rows (drive() handles both as no-prior-dialog).
+ALTER TABLE messages ADD COLUMN tool_dialog TEXT NULL;

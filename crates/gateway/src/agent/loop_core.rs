@@ -100,6 +100,13 @@ pub struct LoopParams<'a> {
     /// agent, defeating AGENT.md allow-lists like `corpus-expert`'s
     /// `[corpus_search, corpus_read]`.
     pub web_search: bool,
+    /// M4.1.7: pre-seed `additional_inputs` with the function_call +
+    /// function_call_output items the **prior turns** in this session
+    /// accumulated. drive() reconstructs this from a sliding window
+    /// of recent assistant rows' `tool_dialog` column; subagent loops
+    /// always pass `Vec::new()` (subagents are stateless across the
+    /// parent turn — see `subagent::dispatch_subagent`).
+    pub prior_tool_dialog: Vec<serde_json::Value>,
 }
 
 /// Which tools the inner loop is willing to dispatch. Constructed once
@@ -144,6 +151,13 @@ pub struct LoopOutcome {
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub ended_at: chrono::DateTime<chrono::Utc>,
     pub wall_clock_ms: i64,
+    /// M4.1.7: the full `additional_inputs` accumulated across all
+    /// iters of this run. `drive()` serializes this into the
+    /// `messages.tool_dialog` column on the assistant row that
+    /// terminates the turn, so the next turn's `drive()` can
+    /// reconstruct the conversation's tool history. Empty for a turn
+    /// that called no tools.
+    pub tool_dialog: Vec<serde_json::Value>,
     /// M3.7 §D: every `TextDelta` the model yielded across the **whole
     /// turn** — accumulated across iterations, not just the final
     /// (potentially fatal) iter. `final_reply` only carries the *last*
@@ -178,7 +192,10 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
         .unwrap_or_else(|| pricing::context_window(super::MODEL));
     let compact_trigger = (p.guards.auto_compact_threshold as f64 * context_window as f64) as u32;
 
-    let mut additional_inputs: Vec<serde_json::Value> = Vec::new();
+    // M4.1.7: pre-seed with prior turns' tool dialog so the model sees
+    // what it called and what came back across turn boundaries.
+    // Subagent always passes `Vec::new()` — see `subagent.rs`.
+    let mut additional_inputs: Vec<serde_json::Value> = p.prior_tool_dialog.clone();
     let mut final_reply = String::new();
     // M3.7 §D: turn-level accumulator for every `TextDelta` the model
     // emitted across all iters. The fault-tolerant final composer uses
@@ -1141,6 +1158,11 @@ pub async fn run_loop(mut p: LoopParams<'_>) -> Result<LoopOutcome> {
         started_at,
         ended_at,
         wall_clock_ms,
+        // M4.1.7: hand the full dialog back so drive() can persist it
+        // on the assistant row. Subagent loops also produce a dialog
+        // here, but `dispatch_subagent` simply drops it (subagent state
+        // is opaque outside its own task).
+        tool_dialog: additional_inputs,
         yielded_assistant_text,
     })
 }

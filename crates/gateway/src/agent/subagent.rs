@@ -218,6 +218,13 @@ pub async fn spawn(
         // drops the subagent's stream and ends its loop cooperatively.
         abort_signal: None,
         web_search,
+        // M4.1.7: subagents are stateless across the parent turn — the
+        // parent's tool dialog is OPAQUE to a freshly-spawned subagent
+        // (it gets a single user-role message with the parent's `input`
+        // text and starts fresh). Subagent's own dialog is dropped
+        // here too; only its digest comes back to the parent via
+        // `outcome.final_reply`.
+        prior_tool_dialog: Vec::new(),
     };
 
     // `loop_core::run_loop` may indirectly call `task::run` → `spawn` →

@@ -64,6 +64,16 @@ pub(super) const VERBOSITY: &str = "low";
 /// (see `compaction`), which folds the early context and continues.
 const HISTORY_LIMIT: i64 = 400;
 
+/// M4.1.7: cap on how many prior turns' `tool_dialog` rows we
+/// re-hydrate at the start of each turn. The cumulative bytes
+/// can balloon (a deep-review turn can produce 50+ tool calls × a few
+/// KB each), and unbounded growth eats the model's context window.
+/// Older turns drop their tool-dialog but their final assistant text
+/// stays in `chat_messages`, so the model still has a summary view.
+/// Tune via experiment if context starts overflowing inside long
+/// sessions before M1.8 compaction kicks in.
+const PRIOR_TOOL_DIALOG_TURN_CAP: usize = 5;
+
 /// Run one agent turn to completion. Spawned fire-and-forget by the message
 /// endpoint, so it owns all of its error handling: every exit path persists
 /// an assistant message, a `turn_metrics` row, and an `assistant_done` event.
@@ -104,6 +114,45 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
             })
         })
         .collect();
+
+    // M4.1.7: rebuild prior turns' tool dialog so the model can see
+    // what it called across turn boundaries. Standard agent-loop
+    // practice (Claude Code / OpenAI Assistants); pre-M4.1.7 this was
+    // dropped on the floor every turn, causing `market_overview` etc.
+    // to be called fresh in turn N+1 even when turn N already had it.
+    //
+    // Cap to the most recent PRIOR_TOOL_DIALOG_TURN_CAP assistant rows
+    // so a deep-review turn that accumulated 50 tool calls does not
+    // blow the next turn's context budget. JSON parse errors are
+    // logged and skipped — one corrupted row must not poison the whole
+    // history reconstruction.
+    let prior_tool_dialog: Vec<serde_json::Value> = {
+        let mut by_turn: Vec<Vec<serde_json::Value>> = history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .filter_map(|m| m.tool_dialog.as_deref())
+            .filter_map(|s| match serde_json::from_str::<Vec<serde_json::Value>>(s) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(
+                        session_id,
+                        error = %e,
+                        "skipping corrupted tool_dialog row during turn-start rebuild",
+                    );
+                    None
+                }
+            })
+            .collect();
+        // Sliding window: keep at most PRIOR_TOOL_DIALOG_TURN_CAP most
+        // recent turns. Older turns' tool dialog is dropped (their
+        // final assistant text still informs the model through
+        // chat_messages above).
+        if by_turn.len() > PRIOR_TOOL_DIALOG_TURN_CAP {
+            let drop_n = by_turn.len() - PRIOR_TOOL_DIALOG_TURN_CAP;
+            by_turn.drain(0..drop_n);
+        }
+        by_turn.into_iter().flatten().collect()
+    };
 
     // ── lifecycle hooks: SessionStart (first turn only) + UserPromptSubmit ─
     // SessionStart fires once per session — we detect "first turn" by the
@@ -200,6 +249,10 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
         abort_signal: Some(abort_signal),
         // Main agent inherits the env-resolved capability flag.
         web_search: st.web_search,
+        // M4.1.7: pre-seed prior turns' tool dialog (rebuilt above)
+        // so the model sees what it called and what came back across
+        // turn boundaries. Standard agent-loop practice.
+        prior_tool_dialog,
     })
     .await?;
 
@@ -217,7 +270,35 @@ async fn drive(st: &AppState, session_id: &str, turn_id: &str) -> Result<()> {
         // for the conditions under which it's surfaced.
         &outcome.yielded_assistant_text,
     );
-    let assistant = messages::insert(&st.pool, session_id, "assistant", &final_text).await?;
+    // M4.1.7: persist the turn's tool dialog so the next turn can rebuild
+    // it (see PRIOR_TOOL_DIALOG_TURN_CAP). Empty dialog → store NULL.
+    // JSON serialize failure is treated as "no dialog to persist" + warn,
+    // so a malformed value (should be unreachable — we built it ourselves)
+    // does not abort the turn finalize.
+    let tool_dialog_json = if outcome.tool_dialog.is_empty() {
+        None
+    } else {
+        match serde_json::to_string(&outcome.tool_dialog) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(
+                    session_id,
+                    turn_id,
+                    error = %e,
+                    "tool_dialog JSON serialize failed; persisting NULL",
+                );
+                None
+            }
+        }
+    };
+    let assistant = messages::insert_with_tool_dialog(
+        &st.pool,
+        session_id,
+        "assistant",
+        &final_text,
+        tool_dialog_json.as_deref(),
+    )
+    .await?;
     st.emit(
         session_id,
         events::kind::MESSAGE_CREATED,
