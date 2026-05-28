@@ -1,0 +1,245 @@
+/* ─────────────────────────────────────────────────────────────────────────
+ * frontend/web/src/design-system/tokens.css
+ *
+ * L.E.E.K design tokens — machine-readable form of DESIGN.md. Paste this
+ * file's `:root` block into the app's root stylesheet; all components
+ * reference values via `var(--*)`.
+ *
+ * Direction: modern-minimal (Linear / Vercel / Notion 系)
+ * Base: forked from open-design/design-systems/linear-app, adapted for
+ *       Chinese A-share research conventions:
+ *         - 红涨绿跌 (Chinese market color convention overrides the
+ *           default success-green / danger-red mapping for financial
+ *           data tokens `--up` / `--down`; `--ok` / `--danger` remain
+ *           for non-financial status signals).
+ *         - Chinese font stack additions ("PingFang SC" / "Hiragino Sans
+ *           GB" / "Microsoft YaHei") prepended into body fonts so CJK
+ *           text never falls back to system mono.
+ *         - tabular-nums opt-in is a body-level rule applied to every
+ *           financial number context.
+ *
+ * IMPORTANT: do NOT invent new token names here. Any new color or scale
+ * step must first be documented in DESIGN.md §2-§4 and then bound here.
+ * ───────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* ─── Background surfaces (4-level dark) ─────────────────────────── */
+  --bg:           #08090a;                    /* workbench canvas */
+  --surface:      #191a1b;                    /* cards / dropdowns / chat bubble */
+  --surface-2:    #28282c;                    /* hover / nested cards */
+  --panel:        #0f1011;                    /* Rail / sidebar background */
+
+  /* ─── Text (4-level luminance) ───────────────────────────────────── */
+  --fg:           #f7f8f8;                    /* primary */
+  --fg-2:         #d0d6e0;                    /* secondary / body */
+  --muted:        #8a8f98;                    /* tertiary / metadata */
+  --meta:         #62666d;                    /* quaternary / timestamps */
+
+  /* ─── Border (semi-transparent white) ────────────────────────────── */
+  --border:         rgba(255, 255, 255, 0.08);
+  --border-soft:    rgba(255, 255, 255, 0.05);
+  --border-strong:  rgba(255, 255, 255, 0.12);
+
+  /* ─── Brand & accent (Linear indigo retained) ────────────────────── */
+  --accent:         #5e6ad2;                  /* leek brand indigo */
+  --accent-on:      #ffffff;
+  --accent-hover:   #828fff;
+  --accent-active:  #4752c4;
+  --accent-tint:    rgba(94, 106, 210, 0.12);
+
+  /* ─── Financial data colors (A-share 红涨绿跌) ───────────────────── */
+  --up:        #ef4444;                       /* 涨 (price up) */
+  --up-tint:   rgba(239, 68, 68, 0.14);
+  --down:      #10b981;                       /* 跌 (price down) */
+  --down-tint: rgba(16, 185, 129, 0.14);
+  --flat:      var(--muted);
+
+  /* ─── Status signals (non-financial — keep separate from up/down) ─ */
+  --ok:        #10b981;                       /* tool success / corpus write done */
+  --warn:      #eab308;                       /* data missing / cost cap near */
+  --danger:    #dc2626;                       /* tool fail / fatal / abort */
+  --info:      var(--accent);                 /* agent thinking / queued / retrying */
+
+  /* ─── Typography: fonts ──────────────────────────────────────────── */
+  --font-display:
+    "Inter Variable", "Inter",
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+    -apple-system, BlinkMacSystemFont, "SF Pro Display",
+    system-ui, "Segoe UI", Roboto, sans-serif;
+  --font-body:
+    "Inter Variable", "Inter",
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+    -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    system-ui, "Segoe UI", Roboto, sans-serif;
+  --font-mono:
+    "Berkeley Mono", ui-monospace, "SF Mono",
+    Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+
+  /* ─── Typography: scale (px) ─────────────────────────────────────── */
+  --text-xs:   12px;
+  --text-sm:   13px;
+  --text-base: 14px;                          /* workbench body default */
+  --text-md:   15px;
+  --text-lg:   18px;
+  --text-xl:   22px;
+  --text-2xl:  28px;
+  --text-3xl:  36px;
+
+  /* ─── Line height & tracking ─────────────────────────────────────── */
+  --leading-body:    1.55;
+  --leading-compact: 1.4;
+  --leading-tight:   1.15;
+  --tracking-display: -0.018em;
+
+  /* ─── Weight (Linear convention: 510 for tight medium) ───────────── */
+  --weight-body:     400;
+  --weight-ui:       510;
+  --weight-emphasis: 590;
+  --weight-display:  650;
+
+  /* ─── Spacing scale ──────────────────────────────────────────────── */
+  --space-1:  4px;
+  --space-2:  8px;
+  --space-3:  12px;
+  --space-4:  16px;
+  --space-5:  20px;
+  --space-6:  24px;
+  --space-8:  32px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* ─── Radius ──────────────────────────────────────────────────────── */
+  --radius-sm:   4px;
+  --radius-md:   6px;
+  --radius-lg:   8px;
+  --radius-xl:   12px;
+  --radius-pill: 9999px;
+
+  /* ─── Elevation (shadow-as-border philosophy, like Vercel) ───────── */
+  --elev-flat:   none;
+  --elev-ring:   0 0 0 1px var(--border);
+  --elev-raised:
+    0 0 0 1px var(--border),
+    0 4px 16px rgba(0, 0, 0, 0.4);
+  --elev-overlay:
+    0 0 0 1px var(--border-strong),
+    0 12px 40px rgba(0, 0, 0, 0.6);
+  --focus-ring: 0 0 0 3px var(--accent-tint);
+
+  /* ─── Motion ──────────────────────────────────────────────────────── */
+  --motion-fast:  150ms;
+  --motion-base:  250ms;
+  --motion-slow:  400ms;
+  --motion-pulse: 1500ms;
+  --easing-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --easing-emphasis: cubic-bezier(0.2, 0, 0.0, 1);
+
+  /* ─── Layout constants ───────────────────────────────────────────── */
+  --rail-width:    48px;
+  --chat-width:    380px;
+  --sidebar-width: 280px;
+  --corpus-map-size: 256px;
+}
+
+/* ─── Light mode override (toggled via [data-theme="light"] on <html>) ──
+ * Same token names, different values. Linear's dark-first design language
+ * inverts cleanly when surface luminance flips. Financial data colors
+ * (`--up` red / `--down` green) stay the same — Chinese market convention
+ * is direction-agnostic, not mode-agnostic.
+ *
+ * Light mode is a polish layer (Phase 4) — Phase 1 may ship without it.
+ */
+:root[data-theme="light"] {
+  --bg:           #fafafa;
+  --surface:      #ffffff;
+  --surface-2:    #f3f4f6;
+  --panel:        #f7f8f9;
+
+  --fg:           #111213;
+  --fg-2:         #3a3f47;
+  --muted:        #6b7280;
+  --meta:         #9ca3af;
+
+  --border:         rgba(17, 18, 19, 0.08);
+  --border-soft:    rgba(17, 18, 19, 0.05);
+  --border-strong:  rgba(17, 18, 19, 0.14);
+
+  /* Brand stays the same hue; just slightly darker for AA contrast on light bg */
+  --accent:         #4752c4;
+  --accent-hover:   #5e6ad2;
+  --accent-active:  #3a44a8;
+  --accent-tint:    rgba(94, 106, 210, 0.10);
+
+  /* Financial up/down keep China convention; light variants */
+  --up:        #dc2626;
+  --up-tint:   rgba(220, 38, 38, 0.10);
+  --down:      #059669;
+  --down-tint: rgba(5, 150, 105, 0.10);
+
+  /* Status signal recolor for light bg */
+  --ok:        #059669;
+  --warn:      #ca8a04;
+  --danger:    #b91c1c;
+
+  --elev-raised:
+    0 0 0 1px var(--border),
+    0 2px 8px rgba(17, 18, 19, 0.08);
+  --elev-overlay:
+    0 0 0 1px var(--border-strong),
+    0 12px 40px rgba(17, 18, 19, 0.18);
+}
+
+/* ─── Global resets + font + financial-number convention ────────────── */
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  line-height: var(--leading-body);
+  color: var(--fg);
+  background: var(--bg);
+  font-feature-settings: "cv01", "ss03";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* All financial numbers — apply via `class="lk-num"` or wrap in element */
+.lk-num,
+[data-num] {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "cv01", "ss03", "tnum";
+}
+
+/* Display heading */
+.lk-display {
+  font-family: var(--font-display);
+  font-weight: var(--weight-display);
+  line-height: var(--leading-tight);
+  letter-spacing: var(--tracking-display);
+}
+
+/* Mono — for ticker codes (`600519.SH`), code blocks, debug payloads */
+.lk-mono {
+  font-family: var(--font-mono);
+  font-feature-settings: "cv01", "ss03";
+}
+
+/* Up / down — financial direction signals.
+ * Use these classes on cells / chips that carry price change, NOT on
+ * generic status pills. Status pills go through `--ok` / `--danger`. */
+.lk-up   { color: var(--up); }
+.lk-down { color: var(--down); }
+.lk-flat { color: var(--flat); }
+
+/* Reduce motion for accessibility */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
