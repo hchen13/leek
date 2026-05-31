@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 
@@ -76,16 +76,6 @@ enum CorpusAction {
         #[arg(long, default_value = "./crates/gateway/assets/corpus.graph.json")]
         output: PathBuf,
     },
-
-    /// 把 corpus/wikis/principles 蒸馏成 system-prompt 可嵌入的单一 markdown blob
-    Distill {
-        /// corpus 仓库根目录
-        #[arg(long, default_value = "./corpus")]
-        root: PathBuf,
-        /// 输出 markdown 文件路径
-        #[arg(long, default_value = "./crates/gateway/assets/corpus_distilled.md")]
-        output: PathBuf,
-    },
 }
 
 #[derive(Subcommand)]
@@ -147,26 +137,8 @@ async fn main() -> Result<()> {
         Command::Chat { prompt, model } => run_chat(&cli.vault, prompt, model).await,
         Command::Corpus { action } => match action {
             CorpusAction::RebuildGraph { root, output } => run_corpus_rebuild(&root, &output),
-            CorpusAction::Distill { root, output } => run_corpus_distill(&root, &output),
         },
     }
-}
-
-fn run_corpus_distill(root: &Path, output: &Path) -> Result<()> {
-    let (blob, report) = corpus::distill::distill(root)?;
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(output, &blob).with_context(|| format!("writing {}", output.display()))?;
-    println!(
-        "\x1b[92m✓\x1b[0m distilled {} pages → {} ({} bytes)",
-        report.pages_in,
-        output.display(),
-        report.bytes_out
-    );
-    println!("    input_hash {}", &report.input_hash[..16]);
-    Ok(())
 }
 
 fn run_corpus_rebuild(root: &Path, output: &Path) -> Result<()> {

@@ -9,17 +9,21 @@ import { InsightSidebar, type AgentPlanView } from "./BrainWidget";
 import { canvasFor } from "./CanvasScenes";
 import { transcriptFor } from "./Transcripts";
 
-export function TopBar(props: { route: string }) {
+export function TopBar(props: { route: string; demo?: boolean }) {
   return (
     <div class="lk-top">
-      <span class="lk-top-brand"><b>L.E.E.K</b> · LOGIC-ENHANCED EQUITY KERNEL</span>
+      <span class="lk-top-brand"><b>L.E.E.K</b> · 老韭菜投研内核</span>
       <span class="lk-top-sep">/</span>
       <span class="lk-top-route">{props.route}</span>
       <div class="lk-top-spacer" />
-      <span class="lk-top-stat"><span class="lk-pulse" /> MKT OPEN · NYSE</span>
-      <span class="lk-top-stat">SPX <b>5,612.41</b> <span style={{ color: "var(--up)" }}>+0.42%</span></span>
-      <span class="lk-top-stat">NDX <b>19,884.10</b> <span style={{ color: "var(--up)" }}>+0.71%</span></span>
-      <span class="lk-top-stat">VIX <b>14.62</b> <span style={{ color: "var(--down)" }}>−1.8%</span></span>
+      {/* Fixture index strip — demo only. The live shell has no realtime index
+          feed wired here, so we don't fabricate numbers in production. */}
+      <Show when={props.demo}>
+        <span class="lk-top-stat"><span class="lk-pulse" /> 沪深 · 交易中</span>
+        <span class="lk-top-stat">上证 <b>3,412.18</b> <span style={{ color: "var(--up)" }}>+0.42%</span></span>
+        <span class="lk-top-stat">深成 <b>10,884.10</b> <span style={{ color: "var(--up)" }}>+0.71%</span></span>
+        <span class="lk-top-stat">创业板 <b>2,146.62</b> <span style={{ color: "var(--down)" }}>−1.8%</span></span>
+      </Show>
     </div>
   );
 }
@@ -121,7 +125,7 @@ export function Workbench(props: { scene: Scene }) {
       <div class="lk-app" data-screen-label={`L.E.E.K · ${props.scene}`}>
         <Rail active="chat" />
         <div class="lk-main">
-          <TopBar route={props.scene === "idle" ? "~/sessions/2026-04-29/scratch" : "~/sessions/2026-04-29/nvda-thesis"} />
+          <TopBar route={props.scene === "idle" ? "~/sessions/2026-04-29/scratch" : "~/sessions/2026-04-29/nvda-thesis"} demo />
           <section class="lk-chat">
             <div class="lk-chat-head">
               <span class="lk-chat-head-title">{headTitle()}</span>

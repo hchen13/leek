@@ -1,13 +1,13 @@
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::ToolSpec;
 
-use super::{ToolHandler, data_provider_tokens};
+use super::{data_provider_tokens, ToolHandler};
 
 const TOOL_NAME: &str = "get_company_info";
 const ENDPOINT: &str = "https://api.tushare.pro";
@@ -245,10 +245,6 @@ impl ToolHandler for GetCompanyInfoTool {
                 end_date.clone()
             };
 
-            out.push_str(&format!("\n**最新财务指标** ({end_date_fmt})\n"));
-            out.push_str("| 指标 | 值 |\n");
-            out.push_str("|------|-----|\n");
-
             let metrics = [
                 ("eps", "EPS", ""),
                 ("bps", "BPS", ""),
@@ -264,22 +260,35 @@ impl ToolHandler for GetCompanyInfoTool {
                 ("profit_yoy", "净利润同比", "%"),
             ];
 
+            let mut rendered_metrics = Vec::new();
             for (field, label, suffix) in &metrics {
                 let val = extract_field(&fina_fields, &fina_items, field);
                 if !val.is_empty() && val != "None" {
                     if suffix == &"%" {
                         let f: f64 = val.parse().unwrap_or(0.0);
                         if *field == "revenue_yoy" || *field == "profit_yoy" {
-                            out.push_str(&format!("| {} | {:+.2}% |\n", label, f));
+                            rendered_metrics.push(format!("| {} | {:+.2}% |", label, f));
                         } else {
-                            out.push_str(&format!("| {} | {:.2}% |\n", label, f));
+                            rendered_metrics.push(format!("| {} | {:.2}% |", label, f));
                         }
                     } else if suffix == &"x" {
                         let f: f64 = val.parse().unwrap_or(0.0);
-                        out.push_str(&format!("| {} | {:.1}x |\n", label, f));
+                        rendered_metrics.push(format!("| {} | {:.1}x |", label, f));
                     } else {
-                        out.push_str(&format!("| {} | {} |\n", label, val));
+                        rendered_metrics.push(format!("| {} | {} |", label, val));
                     }
+                }
+            }
+            if rendered_metrics.is_empty() {
+                out.push_str(&format!("\n**最新财务指标** ({end_date_fmt})\n"));
+                out.push_str("- 当前财务指标来源返回了记录，但常用指标字段为空；这是有效数据缺口，不代表公司没有财务指标。\n");
+            } else {
+                out.push_str(&format!("\n**最新财务指标** ({end_date_fmt})\n"));
+                out.push_str("| 指标 | 值 |\n");
+                out.push_str("|------|-----|\n");
+                for line in rendered_metrics {
+                    out.push_str(&line);
+                    out.push('\n');
                 }
             }
         } else {

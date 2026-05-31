@@ -10,7 +10,7 @@ use crate::{
     tushare::{TushareClient, TushareResponse},
 };
 
-use super::{ToolContext, ToolHandler, data_provider_tokens};
+use super::{data_provider_tokens, ToolContext, ToolHandler};
 
 const TOOL_NAME: &str = "get_china_macro_context";
 const REQUEST_TIMEOUT_SECS: u64 = 30;

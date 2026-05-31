@@ -1,13 +1,13 @@
 use std::{collections::HashSet, time::Duration};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::ToolSpec;
 
-use super::{ToolContext, ToolHandler, data_provider_tokens};
+use super::{data_provider_tokens, ToolContext, ToolHandler};
 
 const TOOL_NAME: &str = "get_financials";
 const TUSHARE_ENDPOINT: &str = "https://api.tushare.pro";
@@ -141,11 +141,15 @@ async fn fetch_a_share(
         "ratios" => {
             parts.push(fetch_ashare_ratios(http, ts_code, periods, &token, &cancel).await?);
         }
+        "dividends" => {
+            parts.push(fetch_ashare_dividend(http, ts_code, periods, &token, &cancel).await?);
+        }
         "all" => {
             parts.push(fetch_ashare_income(http, ts_code, periods, &token, &cancel).await?);
             parts.push(fetch_ashare_balance(http, ts_code, periods, &token, &cancel).await?);
             parts.push(fetch_ashare_cashflow(http, ts_code, periods, &token, &cancel).await?);
             parts.push(fetch_ashare_ratios(http, ts_code, periods, &token, &cancel).await?);
+            parts.push(fetch_ashare_dividend(http, ts_code, periods, &token, &cancel).await?);
         }
         _ => bail!("unknown report_type: {report_type}"),
     }
@@ -318,7 +322,7 @@ async fn fetch_ashare_income(
     token: &str,
     cancel: &CancellationToken,
 ) -> Result<String> {
-    let fields = "ts_code,end_date,total_revenue,revenue,operate_profit,n_income,n_income_attr_p,basic_eps,diluted_eps,ebit,ebitda";
+    let fields = "ts_code,end_date,total_revenue,revenue,oper_cost,operate_profit,total_profit,n_income,n_income_attr_p,basic_eps,diluted_eps,ebit,ebitda";
     let body = tushare_call(
         http,
         token,
@@ -337,18 +341,23 @@ async fn fetch_ashare_income(
     }
 
     let mut out = format!("## {ts_code} · 利润表（近{periods}期）\n\n");
-    out.push_str("| 报告期 | 营业总收入（亿） | 营业收入（亿） | 营业利润（亿） | 净利润（亿） | 归母净利（亿） | 基本EPS |\n");
-    out.push_str("|--------|---------------|-------------|--------------|------------|--------------|--------|\n");
+    out.push_str("| 报告期 | 营业总收入（亿） | 营业收入（亿） | 营业成本（亿） | 营业利润（亿） | 利润总额（亿） | 净利润（亿） | 归母净利（亿） | 基本EPS | 稀释EPS | EBIT（亿） | EBITDA（亿） |\n");
+    out.push_str("|--------|---------------|-------------|-------------|--------------|--------------|------------|--------------|--------|--------|----------|------------|\n");
     for row in &items {
         let period = ashare_period(col(row, &field_names, "end_date"));
         let total_revenue = fmt_yi(col(row, &field_names, "total_revenue"));
         let revenue = fmt_yi(col(row, &field_names, "revenue"));
+        let oper_cost = fmt_yi(col(row, &field_names, "oper_cost"));
         let op_profit = fmt_yi(col(row, &field_names, "operate_profit"));
+        let total_profit = fmt_yi(col(row, &field_names, "total_profit"));
         let net_profit = fmt_yi(col(row, &field_names, "n_income"));
         let net_income = fmt_yi(col(row, &field_names, "n_income_attr_p"));
         let eps = fmt_f2(col(row, &field_names, "basic_eps"));
+        let diluted_eps = fmt_f2(col(row, &field_names, "diluted_eps"));
+        let ebit = fmt_yi(col(row, &field_names, "ebit"));
+        let ebitda = fmt_yi(col(row, &field_names, "ebitda"));
         out.push_str(&format!(
-            "| {period} | {total_revenue} | {revenue} | {op_profit} | {net_profit} | {net_income} | {eps} |\n"
+            "| {period} | {total_revenue} | {revenue} | {oper_cost} | {op_profit} | {total_profit} | {net_profit} | {net_income} | {eps} | {diluted_eps} | {ebit} | {ebitda} |\n"
         ));
     }
     append_ashare_income_metadata(&mut out);
@@ -367,7 +376,7 @@ async fn fetch_ashare_balance(
     token: &str,
     cancel: &CancellationToken,
 ) -> Result<String> {
-    let fields = "ts_code,end_date,total_assets,total_liab,total_hldr_eqy_exc_min_int,money_cap,accounts_receiv,inventories";
+    let fields = "ts_code,end_date,total_assets,total_cur_assets,total_liab,total_cur_liab,total_hldr_eqy_exc_min_int,money_cap,accounts_receiv,inventories,fix_assets,goodwill";
     let body = tushare_call(
         http,
         token,
@@ -388,16 +397,22 @@ async fn fetch_ashare_balance(
     }
 
     let mut out = format!("## {ts_code} · 资产负债表（近{periods}期）\n\n");
-    out.push_str("| 报告期 | 总资产（亿） | 总负债（亿） | 股东权益（亿） | 货币资金（亿） |\n");
-    out.push_str("|--------|------------|------------|--------------|-------------|\n");
+    out.push_str("| 报告期 | 总资产（亿） | 流动资产（亿） | 总负债（亿） | 流动负债（亿） | 股东权益（亿） | 货币资金（亿） | 应收账款（亿） | 存货（亿） | 固定资产（亿） | 商誉（亿） |\n");
+    out.push_str("|--------|------------|-------------|------------|-------------|--------------|-------------|-------------|----------|-------------|----------|\n");
     for row in &items {
         let period = ashare_period(col(row, &field_names, "end_date"));
         let assets = fmt_yi(col(row, &field_names, "total_assets"));
+        let cur_assets = fmt_yi(col(row, &field_names, "total_cur_assets"));
         let liab = fmt_yi(col(row, &field_names, "total_liab"));
+        let cur_liab = fmt_yi(col(row, &field_names, "total_cur_liab"));
         let equity = fmt_yi(col(row, &field_names, "total_hldr_eqy_exc_min_int"));
         let cash = fmt_yi(col(row, &field_names, "money_cap"));
+        let ar = fmt_yi(col(row, &field_names, "accounts_receiv"));
+        let inv = fmt_yi(col(row, &field_names, "inventories"));
+        let fix = fmt_yi(col(row, &field_names, "fix_assets"));
+        let goodwill = fmt_yi(col(row, &field_names, "goodwill"));
         out.push_str(&format!(
-            "| {period} | {assets} | {liab} | {equity} | {cash} |\n"
+            "| {period} | {assets} | {cur_assets} | {liab} | {cur_liab} | {equity} | {cash} | {ar} | {inv} | {fix} | {goodwill} |\n"
         ));
     }
     out.push_str("\n_来源: Tushare Pro (balancesheet)_");
@@ -412,7 +427,7 @@ async fn fetch_ashare_cashflow(
     cancel: &CancellationToken,
 ) -> Result<String> {
     let fields =
-        "ts_code,end_date,n_cashflow_act,n_cashflow_inv_act,n_cash_flows_fnc_act,free_cashflow";
+        "ts_code,end_date,n_cashflow_act,n_cashflow_inv_act,n_cash_flows_fnc_act,free_cashflow,c_pay_acq_const_fiolta,n_incr_cash_cash_equ";
     let body = tushare_call(
         http,
         token,
@@ -432,16 +447,20 @@ async fn fetch_ashare_cashflow(
 
     let mut out = format!("## {ts_code} · 现金流量表（近{periods}期）\n\n");
     out.push_str(
-        "| 报告期 | 经营活动CF（亿） | 投资活动CF（亿） | 筹资活动CF（亿） | 自由CF（亿） |\n",
+        "| 报告期 | 经营活动CF（亿） | 投资活动CF（亿） | 筹资活动CF（亿） | 自由CF（亿） | 资本开支（亿） | 现金净增加（亿） |\n",
     );
-    out.push_str("|--------|---------------|---------------|---------------|------------|\n");
+    out.push_str("|--------|---------------|---------------|---------------|------------|-------------|---------------|\n");
     for row in &items {
         let period = ashare_period(col(row, &field_names, "end_date"));
         let oper = fmt_yi(col(row, &field_names, "n_cashflow_act"));
         let inv = fmt_yi(col(row, &field_names, "n_cashflow_inv_act"));
         let fin = fmt_yi(col(row, &field_names, "n_cash_flows_fnc_act"));
         let free = fmt_yi(col(row, &field_names, "free_cashflow"));
-        out.push_str(&format!("| {period} | {oper} | {inv} | {fin} | {free} |\n"));
+        let capex = fmt_yi(col(row, &field_names, "c_pay_acq_const_fiolta"));
+        let net_incr = fmt_yi(col(row, &field_names, "n_incr_cash_cash_equ"));
+        out.push_str(&format!(
+            "| {period} | {oper} | {inv} | {fin} | {free} | {capex} | {net_incr} |\n"
+        ));
     }
     out.push_str("\n_来源: Tushare Pro (cashflow_vip)_");
     Ok(out)
@@ -454,7 +473,7 @@ async fn fetch_ashare_ratios(
     token: &str,
     cancel: &CancellationToken,
 ) -> Result<String> {
-    let fields = "ts_code,end_date,ann_date,eps,bps,roe,roa,grossprofit_margin,debt_to_assets,current_ratio,quick_ratio,revenue_yoy,profit_yoy";
+    let fields = "ts_code,end_date,ann_date,eps,bps,roe,roa,netprofit_margin,grossprofit_margin,debt_to_assets,assets_turn,current_ratio,quick_ratio,or_yoy,netprofit_yoy";
     let body = tushare_call(
         http,
         token,
@@ -473,22 +492,79 @@ async fn fetch_ashare_ratios(
     }
 
     let mut out = format!("## {ts_code} · 财务指标（近{periods}期）\n\n");
-    out.push_str("| 报告期 | EPS | BPS | ROE% | ROA% | 毛利率% | 资产负债率% | 流动比率 |\n");
-    out.push_str("|--------|-----|-----|------|------|--------|-----------|--------|\n");
+    out.push_str("| 报告期 | EPS | BPS | ROE% | ROA% | 净利率% | 毛利率% | 资产负债率% | 总资产周转 | 流动比率 | 速动比率 | 营收同比% | 净利同比% |\n");
+    out.push_str("|--------|-----|-----|------|------|--------|--------|-----------|----------|--------|--------|---------|---------|\n");
     for row in &items {
         let period = ashare_period(col(row, &field_names, "end_date"));
         let eps = fmt_f2(col(row, &field_names, "eps"));
         let bps = fmt_f2(col(row, &field_names, "bps"));
         let roe = fmt_pct(col(row, &field_names, "roe"));
         let roa = fmt_pct(col(row, &field_names, "roa"));
+        let npm = fmt_pct(col(row, &field_names, "netprofit_margin"));
         let gpm = fmt_pct(col(row, &field_names, "grossprofit_margin"));
         let d2a = fmt_pct(col(row, &field_names, "debt_to_assets"));
+        let at = fmt_f2(col(row, &field_names, "assets_turn"));
         let cr = fmt_f2(col(row, &field_names, "current_ratio"));
+        let qr = fmt_f2(col(row, &field_names, "quick_ratio"));
+        let ry = fmt_pct(col(row, &field_names, "or_yoy"));
+        let py = fmt_pct(col(row, &field_names, "netprofit_yoy"));
         out.push_str(&format!(
-            "| {period} | {eps} | {bps} | {roe} | {roa} | {gpm} | {d2a} | {cr} |\n"
+            "| {period} | {eps} | {bps} | {roe} | {roa} | {npm} | {gpm} | {d2a} | {at} | {cr} | {qr} | {ry} | {py} |\n"
         ));
     }
     out.push_str("\n_来源: Tushare Pro (fina_indicator_vip)_");
+    Ok(out)
+}
+
+async fn fetch_ashare_dividend(
+    http: &Client,
+    ts_code: &str,
+    periods: usize,
+    token: &str,
+    cancel: &CancellationToken,
+) -> Result<String> {
+    let fields = "ts_code,end_date,ann_date,div_proc,stk_div,cash_div,cash_div_tax";
+    // `dividend` returns one row per announcement stage (预案 / 股东大会通过 / 实施);
+    // fetch a wider window, keep only implemented payouts, dedup by report period.
+    let body = tushare_call(
+        http,
+        token,
+        "dividend",
+        ts_code,
+        periods * 4 + 24,
+        fields,
+        cancel,
+    )
+    .await?;
+    let (field_names, items) = tushare_extract(&body);
+    let implemented: Vec<Vec<serde_json::Value>> = items
+        .into_iter()
+        .filter(|row| {
+            col(row, &field_names, "div_proc")
+                .as_str()
+                .map(|s| s.contains("实施"))
+                .unwrap_or(false)
+        })
+        .collect();
+    let items = unique_rows_by_field(implemented, &field_names, "end_date", periods);
+
+    if items.is_empty() {
+        return Ok(format!(
+            "## {ts_code} · 分红\n\n[get_financials: 该标的近年无已实施分红记录（或 Tushare 无数据）]"
+        ));
+    }
+
+    let mut out = format!("## {ts_code} · 分红（近{periods}期已实施）\n\n");
+    out.push_str("| 报告期 | 每股现金分红税前（元） | 每股现金分红税后（元） | 每股送转（股） |\n");
+    out.push_str("|--------|--------------------|--------------------|--------------|\n");
+    for row in &items {
+        let period = ashare_period(col(row, &field_names, "end_date"));
+        let pre = fmt_f2(col(row, &field_names, "cash_div_tax"));
+        let post = fmt_f2(col(row, &field_names, "cash_div"));
+        let stk = fmt_f2(col(row, &field_names, "stk_div"));
+        out.push_str(&format!("| {period} | {pre} | {post} | {stk} |\n"));
+    }
+    out.push_str("\n_来源: Tushare Pro (dividend)；仅含 div_proc=实施 的记录，按报告期去重_");
     Ok(out)
 }
 

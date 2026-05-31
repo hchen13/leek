@@ -5,10 +5,10 @@
 //! (corpus authoring) trigger a manual rebuild; we don't watch the corpus
 //! directory at runtime.
 
-use axum::Json;
 use axum::extract::Query;
-use axum::http::{StatusCode, header};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::Deserialize;
 
 use crate::agent::tools::corpus_search;

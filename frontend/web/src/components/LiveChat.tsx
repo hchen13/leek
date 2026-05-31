@@ -681,12 +681,18 @@ function ClarificationRequestCard(props: {
 interface UsageInfo {
   inTokens: number;
   outTokens: number;
+  cacheReadTokens: number;
 }
 
 interface ProviderRetryNotice {
   retry: number;
   max: number;
   delaySec: number;
+  message: string;
+}
+
+interface ProviderRecoveryNotice {
+  retries: number;
   message: string;
 }
 
@@ -714,6 +720,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
   const [usage, setUsage] = createSignal<UsageInfo | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const [providerRetry, setProviderRetry] = createSignal<ProviderRetryNotice | null>(null);
+  const [providerRecovery, setProviderRecovery] = createSignal<ProviderRecoveryNotice | null>(null);
   const [pending, setPending] = createSignal(false);
   const [stopping, setStopping] = createSignal(false);
   const [connected, setConnected] = createSignal(false);
@@ -771,21 +778,59 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
 
   let evtSrc: EventSource | undefined;
   let agentBuffer = "";
+  let deltaFlushTimer: number | undefined;
+  let providerRecoveryTimer: number | undefined;
   let chatScrollEl: HTMLDivElement | undefined;
   let agentStartTs = 0;
   let elapsedTimer: number | undefined;
+  let creatingSession = false;
+  // Set when connect() re-attaches to a reply that was already streaming
+  // (switched away mid-turn, reloaded, or driven via the API). Tells the
+  // agent_message_end handler to pull the final persisted text, since the
+  // deltas we missed before re-subscribing are gone.
+  let resumedMidStream = false;
 
-  async function refreshSessions() {
+  async function refreshSessions(): Promise<SessionRow[]> {
     try {
       const r = await fetch("/api/v1/sessions");
       if (r.ok) {
         const j = await r.json();
-        setSessions(j.items ?? []);
+        const items: SessionRow[] = j.items ?? [];
+        setSessions(items);
+        return items;
       }
+    } catch {/* ignore */}
+    return sessions();
+  }
+
+  // After re-attaching mid-stream, replace the (partial / empty) streamed text
+  // with the authoritative persisted message once the turn ends.
+  async function reconcileAgentText(sid: string, seq: number) {
+    try {
+      const r = await fetch(`/api/v1/sessions/${sid}/messages?since_seq=${seq - 1}&limit=1`);
+      if (!r.ok) return;
+      const j = await r.json();
+      const row = (j.items ?? [])[0];
+      if (!row || row.role !== "agent") return;
+      let text = "";
+      try { text = JSON.parse(row.content_json).text ?? ""; } catch {/* ignore */}
+      if (!text) return;
+      setMessages((prev) => {
+        const out = [...prev];
+        for (let i = out.length - 1; i >= 0; i--) {
+          if (out[i].role === "agent" && (out[i].msg_seq === seq || out[i].msg_seq == null)) {
+            out[i] = { ...out[i], text, msg_seq: seq };
+            return out;
+          }
+        }
+        return out;
+      });
     } catch {/* ignore */}
   }
 
   async function createSession() {
+    if (creatingSession) return;
+    creatingSession = true;
     try {
       const r = await fetch("/api/v1/sessions", {
         method: "POST",
@@ -794,9 +839,12 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
       });
       if (!r.ok) return;
       const j = await r.json();
-      await refreshSessions();
       switchSession(j.id);
+      await refreshSessions();
     } catch {/* ignore */}
+    finally {
+      creatingSession = false;
+    }
   }
 
   async function renameSession(id: string, title: string) {
@@ -828,6 +876,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
   }
 
   function emitTick(e: MessageEvent, kind: string, payload: unknown) {
+    if (kind === "agent_message_delta") return;
     // The SSE `id` field carries the backend-assigned vault.events.seq —
     // EventsPanel dedupes against that so live ticks merge cleanly with
     // history reloads.
@@ -838,6 +887,16 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
 
   function clearProviderRetry() {
     if (providerRetry()) setProviderRetry(null);
+  }
+
+  function showProviderRecovered(notice: ProviderRecoveryNotice) {
+    setProviderRetry(null);
+    setProviderRecovery(notice);
+    if (providerRecoveryTimer) clearTimeout(providerRecoveryTimer);
+    providerRecoveryTimer = window.setTimeout(() => {
+      setProviderRecovery(null);
+      providerRecoveryTimer = undefined;
+    }, 2600);
   }
 
   // Auto-scroll to bottom whenever messages change (length OR last text changes
@@ -853,8 +912,11 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
     }
   });
 
-  function appendDelta(text: string) {
-    agentBuffer += text;
+  function flushAgentBuffer() {
+    if (deltaFlushTimer) {
+      clearTimeout(deltaFlushTimer);
+      deltaFlushTimer = undefined;
+    }
     setMessages((prev) => {
       const out = [...prev];
       const last = out[out.length - 1];
@@ -865,14 +927,36 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
     });
   }
 
+  function appendDelta(text: string) {
+    agentBuffer += text;
+    if (deltaFlushTimer) return;
+    deltaFlushTimer = window.setTimeout(flushAgentBuffer, 120);
+  }
+
   async function connect(id: string) {
     // 1. Load message + event history. Messages give us the chat backbone
     //    (text, role, ts); events give us the tool_call / web_search /
     //    narration trail we want to keep visible across reloads.
     setMessages([]);
+    if (deltaFlushTimer) {
+      clearTimeout(deltaFlushTimer);
+      deltaFlushTimer = undefined;
+    }
+    agentBuffer = "";
     setUsage(null);
     setPending(false);
     setAgentPlan(null);
+    setProviderRetry(null);
+    setProviderRecovery(null);
+    resumedMidStream = false;
+    if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = undefined; }
+    setElapsedSec(0);
+
+    // Whether a reply is still streaming for this session — derived from the
+    // event log tail (an agent_message_start with no terminal after it) and
+    // confirmed against the backend `running` flag below.
+    let replyInFlight = false;
+    let inFlightStartTs = "";
 
     let hist: LiveMsg[] = [];
     try {
@@ -910,6 +994,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
         const agentIdxs: number[] = [];
         let cursor = -1; // index into event-created agent slots
         let usageSnap: UsageInfo | null = null;
+        let retrySnap: ProviderRetryNotice | null = null;
         let lastSec: number | undefined;
         let planSnap: AgentPlanView | null = null;
         const mergeAgentActivity = (fromIdx: number, toIdx: number) => {
@@ -935,6 +1020,8 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
           switch (row.kind) {
             case "agent_message_start":
               cursor++;
+              replyInFlight = true;
+              inFlightStartTs = row.ts ?? row.created_at ?? "";
               hist.push({
                 role: "agent",
                 text: "",
@@ -948,6 +1035,8 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
               agentIdxs.push(hist.length - 1);
               break;
             case "agent_message_end":
+              retrySnap = null;
+              replyInFlight = false;
               if (cursor >= 0 && cursor < agentIdxs.length) {
                 const currentIdx = agentIdxs[cursor];
                 if (typeof lastSec === "number") hist[currentIdx].total_sec = lastSec;
@@ -1027,7 +1116,29 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
               usageSnap = {
                 inTokens: typeof p.input_tokens === "number" ? p.input_tokens : 0,
                 outTokens: typeof p.output_tokens === "number" ? p.output_tokens : 0,
+                cacheReadTokens: typeof p.cache_read_tokens === "number" ? p.cache_read_tokens : 0,
               };
+              break;
+            case "provider_retry":
+              retrySnap = {
+                retry: Number(p.retry ?? 0),
+                max: Number(p.max_retries ?? 10),
+                delaySec: Math.max(0, Math.round(Number(p.delay_ms ?? 0) / 1000)),
+                message: typeof p.message === "string" ? p.message : "provider temporarily unavailable",
+              };
+              break;
+            case "provider_recovered":
+              retrySnap = null;
+              break;
+            case "agent_message_failed":
+            case "error":
+              retrySnap = null;
+              replyInFlight = false;
+              break;
+            case "session_renamed":
+              if (typeof p.title === "string" && p.title.trim()) {
+                setSessions((prev) => prev.map((s) => s.id === id ? { ...s, title: p.title } : s));
+              }
               break;
             case "decision_draft_ready":
               hist.push({
@@ -1041,6 +1152,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
           }
         }
         if (usageSnap) setUsage(usageSnap);
+        if (retrySnap) setProviderRetry(retrySnap);
         if (planSnap) setAgentPlan(planSnap);
 
         // Restore compaction state: if the most recent compaction.started has
@@ -1065,6 +1177,38 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
       .sort((a, b) => (a.raw_ts ?? "").localeCompare(b.raw_ts ?? ""));
     setMessages(hist);
 
+    // Re-attach to a reply that is still streaming — switched away mid-turn,
+    // reloaded the page, or the message was sent via the API. The event log
+    // shows an agent_message_start with no terminal; confirm against the
+    // backend `running` flag, then restore the streaming bubble + pending +
+    // elapsed clock so the UI tracks the live agent instead of looking idle.
+    // (Must run before subscribe so delta handlers see `streaming: true`.)
+    if (replyInFlight && !compacting()) {
+      const stillRunning = (await refreshSessions()).find((s) => s.id === id)?.running ?? false;
+      if (stillRunning) {
+        resumedMidStream = true;
+        setMessages((prev) => {
+          const out = [...prev];
+          for (let i = out.length - 1; i >= 0; i--) {
+            if (out[i].role === "agent") {
+              out[i] = { ...out[i], streaming: true };
+              agentBuffer = out[i].text ?? "";
+              break;
+            }
+          }
+          return out;
+        });
+        setPending(true);
+        const startMs = Date.parse(inFlightStartTs);
+        agentStartTs = Number.isFinite(startMs) ? startMs : Date.now();
+        setElapsedSec(Math.max(0, Math.floor((Date.now() - agentStartTs) / 1000)));
+        if (elapsedTimer) clearInterval(elapsedTimer);
+        elapsedTimer = window.setInterval(() => {
+          setElapsedSec(Math.max(0, Math.floor((Date.now() - agentStartTs) / 1000)));
+        }, 1000);
+      }
+    }
+
     // 3. Subscribe to live event stream
     evtSrc = new EventSource(`/stream/sessions/${id}/events`);
 
@@ -1078,14 +1222,50 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
       setError("stream reconnecting…");
     };
 
-    // Server echoes user_message — we already added it optimistically on send,
-    // so we dedupe in the chat view but still forward to EventsPanel.
+    // Server echoes every user_message. For in-app sends we already added the
+    // bubble optimistically, so reconcile by seq/text and skip the dup. For
+    // messages that originated elsewhere (the API, another tab) there is no
+    // optimistic bubble — render it so the chat tracks what the agent is
+    // actually replying to.
     evtSrc.addEventListener("user_message", (e: MessageEvent) => {
-      try { emitTick(e, "user_message", JSON.parse(e.data)); } catch { /* skip */ }
+      let data: any = {};
+      try { data = JSON.parse(e.data); } catch { return; }
+      emitTick(e, "user_message", data);
+      const seq = typeof data.seq === "number" ? data.seq : undefined;
+      const text = typeof data.text === "string" ? data.text : "";
+      setMessages((prev) => {
+        // already rendered (by seq)?
+        if (seq != null && prev.some((m) => m.role === "user" && m.msg_seq === seq)) return prev;
+        // reconcile the most recent optimistic (untagged) bubble with the same text
+        for (let i = prev.length - 1; i >= 0; i--) {
+          const m = prev[i];
+          if (m.role === "user" && m.msg_seq == null && m.text === text) {
+            const out = [...prev];
+            out[i] = { ...m, msg_seq: seq };
+            return out;
+          }
+        }
+        // genuinely new — insert before a trailing streaming agent bubble if any
+        const tailStreaming = prev.length > 0 && prev[prev.length - 1].role === "agent" && prev[prev.length - 1].streaming;
+        const insertAt = tailStreaming ? prev.length - 1 : prev.length;
+        const out = [...prev];
+        out.splice(insertAt, 0, {
+          role: "user",
+          text,
+          ts: fmtTime(),
+          msg_seq: seq,
+          raw_ts: new Date().toISOString(),
+        });
+        return out;
+      });
     });
 
     evtSrc.addEventListener("agent_message_start", (e: MessageEvent) => {
       agentBuffer = "";
+      if (deltaFlushTimer) {
+        clearTimeout(deltaFlushTimer);
+        deltaFlushTimer = undefined;
+      }
       setPending(true);
       setStopping(false);
       // send() already inserted a streaming placeholder when the user hit
@@ -1124,7 +1304,6 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
           return out;
         });
       } catch {
-        // skip malformed
       }
     });
 
@@ -1184,6 +1363,10 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
 
     evtSrc.addEventListener("agent_message_reset", (e: MessageEvent) => {
       agentBuffer = "";
+      if (deltaFlushTimer) {
+        clearTimeout(deltaFlushTimer);
+        deltaFlushTimer = undefined;
+      }
       setMessages((prev) => {
         const out = [...prev];
         const last = out[out.length - 1];
@@ -1236,7 +1419,11 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
       try {
         const u = JSON.parse(e.data);
         clearProviderRetry();
-        setUsage({ inTokens: u.input_tokens ?? 0, outTokens: u.output_tokens ?? 0 });
+        setUsage({
+          inTokens: u.input_tokens ?? 0,
+          outTokens: u.output_tokens ?? 0,
+          cacheReadTokens: u.cache_read_tokens ?? 0,
+        });
         emitTick(e, "llm_usage", u);
       } catch {
         // skip malformed
@@ -1249,6 +1436,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
         const retry = Number(data.retry ?? 0);
         const max = Number(data.max_retries ?? 10);
         const delaySec = Math.max(0, Math.round(Number(data.delay_ms ?? 0) / 1000));
+        setProviderRecovery(null);
         setProviderRetry({
           retry,
           max,
@@ -1257,12 +1445,38 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
         });
         emitTick(e, "provider_retry", data);
       } catch {
+        setProviderRecovery(null);
         setProviderRetry({
           retry: 0,
           max: 10,
           delaySec: 0,
           message: "provider temporarily unavailable",
         });
+      }
+    });
+
+    evtSrc.addEventListener("provider_recovered", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        showProviderRecovered({
+          retries: Number(data.retries ?? 0),
+          message: typeof data.message === "string" ? data.message : "provider recovered",
+        });
+        emitTick(e, "provider_recovered", data);
+      } catch {
+        showProviderRecovered({ retries: 0, message: "provider recovered" });
+      }
+    });
+
+    evtSrc.addEventListener("session_renamed", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (typeof data.title !== "string" || !data.title.trim()) return;
+        setSessions((prev) => prev.map((s) => s.id === id ? { ...s, title: data.title } : s));
+        emitTick(e, "session_renamed", data);
+        void refreshSessions();
+      } catch {
+        // skip malformed
       }
     });
 
@@ -1275,6 +1489,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
       }
       const stopReason = String(data.stop_reason ?? "");
       const wasStopping = stopping();
+      flushAgentBuffer();
       setPending(false);
       setStopping(false);
       clearProviderRetry();
@@ -1283,6 +1498,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
         clearInterval(elapsedTimer);
         elapsedTimer = undefined;
       }
+      flushAgentBuffer();
       const finalSec = agentStartTs ? Math.max(0, Math.floor((Date.now() - agentStartTs) / 1000)) : 0;
       setMessages((prev) => {
         const out = [...prev];
@@ -1295,6 +1511,13 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
         return out;
       });
       setElapsedSec(0);
+      // If we re-attached mid-stream, the streamed text is missing the prefix
+      // produced before we re-subscribed — pull the authoritative final text.
+      if (resumedMidStream && typeof data.message_seq === "number") {
+        resumedMidStream = false;
+        void reconcileAgentText(id, data.message_seq);
+      }
+      void refreshSessions();
       emitTick(e, "agent_message_end", data);
     });
 
@@ -1482,6 +1705,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
   onCleanup(() => {
     evtSrc?.close();
     if (elapsedTimer) clearInterval(elapsedTimer);
+    if (providerRecoveryTimer) clearTimeout(providerRecoveryTimer);
   });
 
   // Cmd+E / Ctrl+E toggles the events timeline drawer.
@@ -1765,12 +1989,12 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
   );
 
   const headTitle = () => messages().length === 0
-    ? "NEW SESSION"
-    : "CHAT · LIVE";
+    ? "新会话"
+    : "实时对话";
   const headMeta = () => {
     const turns = messages().filter((m) => m.role === "user").length;
-    if (turns === 0) return "0 turns";
-    return `${turns} turn${turns > 1 ? "s" : ""} · ${pending() ? "live" : "ready"}`;
+    if (turns === 0) return "0 轮";
+    return `${turns} 轮 · ${pending() ? "进行中" : "就绪"}`;
   };
   const route = () => `~/sessions/${sessionId()}`;
 
@@ -1794,8 +2018,8 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
             />
             <div style={{ display: "flex", gap: "12px", "align-items": "center", "margin-left": "auto" }}>
               <Show when={usage()}>
-                <span style={{ color: "var(--ink-3)", "font-size": "11px", "font-family": "var(--font-mono)" }}>
-                  in={usage()!.inTokens} · out={usage()!.outTokens}
+                <span style={{ color: "var(--ink-3)", "font-size": "11.5px", "font-family": "var(--font-mono)" }} title="本轮 token 用量:输入 / 输出 / 缓存命中">
+                  输入 {usage()!.inTokens} · 输出 {usage()!.outTokens} · 缓存 {usage()!.cacheReadTokens}
                 </span>
               </Show>
               <button
@@ -1809,9 +2033,9 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
                   padding: "2px 10px",
                   cursor: "pointer",
                   "font-family": "var(--font-mono)",
-                  "font-size": "11px",
+                  "font-size": "11.5px",
                 }}
-              >events</button>
+              >事件</button>
               <span class="lk-chat-head-meta">
                 <span style={{
                   "display": "inline-block",
@@ -1836,7 +2060,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
                 padding: "32px 0",
                 "text-align": "center",
               }}>
-                No messages yet. Type below to start a conversation.
+                还没有消息。在下方输入,给团队下达第一个任务。
               </div>
             </Show>
             <For each={messages()}>{(m) => (
@@ -1943,6 +2167,23 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
               )}
             </Show>
 
+            <Show when={providerRecovery()}>
+              {(recovery) => (
+                <div style={{
+                  color: "#6fb98a",
+                  "font-size": "11px",
+                  "font-family": "var(--font-mono)",
+                  padding: "6px 10px",
+                  margin: "8px 0",
+                  background: "rgba(111,185,138,0.10)",
+                  border: "1px solid rgba(111,185,138,0.22)",
+                  "border-radius": "6px",
+                }} title={recovery().message}>
+                  provider 已恢复，继续执行 · 已重试 {recovery().retries} 次
+                </div>
+              )}
+            </Show>
+
             <Show when={error()}>
               <div style={{
                 color: "#d97070",
@@ -1981,7 +2222,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
           searches={sessionSearches()}
           narrations={sessionNarrations()}
           artifactEvents={sessionArtifactEvents()}
-          currentTurn={sessionAgentTurn()}
+          currentTurn={pending() ? Math.max(0, sessionAgentTurn() - 1) : sessionAgentTurn()}
           corpusTools={corpusTools()}
           plan={agentPlan()}
           onOpenDoc={openWiki}
@@ -2024,10 +2265,10 @@ function CanvasArea(props: {
   onOpenDoc: (id: string, title?: string) => void;
 }) {
   const subtitle = () => props.scene === "thinking-shallow"
-    ? "reasoning · live"
+    ? "推理中 · 实时"
     : props.scene === "delivered"
-    ? "ready · cached"
-    : "no thread";
+    ? "已就绪"
+    : "暂无线程";
 
   const hasArtifacts = () =>
     props.artifactEvents.length > 0 || props.tools.length + props.searches.length + props.narrations.length > 0;
@@ -2037,7 +2278,7 @@ function CanvasArea(props: {
       <Show when={props.scene !== "idle"}>
         <div class="lk-canvas-head">
           <span class="crumb">
-            <b>Live session</b>
+            <b>实时会话</b>
             <span class="sep">/</span>
             {subtitle()}
           </span>
@@ -2049,7 +2290,7 @@ function CanvasArea(props: {
         fallback={
           <div class="lk-canvas-empty">
             <div class="label">CANVAS · {props.scene === "idle" ? "IDLE" : "QUIET"}</div>
-            <div class="sub">Tool outputs and reasoning artifacts materialize here as the agent works.</div>
+            <div class="sub">L.E.E.K 工作时,工具结果与推理过程会在这里实时浮现。</div>
           </div>
         }
       >

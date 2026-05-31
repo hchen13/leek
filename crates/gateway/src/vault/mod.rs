@@ -15,8 +15,8 @@ pub mod subagents;
 pub mod tool_runs;
 
 use anyhow::{Context, Result};
-use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::SqlitePool;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;

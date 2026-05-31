@@ -5,7 +5,7 @@
 //! even on cold reload.
 
 use axum::body::Body;
-use axum::http::{StatusCode, Uri, header};
+use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 

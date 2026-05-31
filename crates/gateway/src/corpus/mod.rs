@@ -6,7 +6,7 @@
 //! binary at build time and served via `GET /api/v1/corpus/graph`.
 
 pub mod build;
-pub mod distill;
+pub mod kernel;
 
 use serde::Serialize;
 

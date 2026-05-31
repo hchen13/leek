@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset};
 use reqwest::Client;
@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::llm::ToolSpec;
 
-use super::{ToolContext, ToolHandler, data_provider_tokens};
+use super::{data_provider_tokens, ToolContext, ToolHandler};
 
 const TOOL_NAME: &str = "get_capital_flow";
 const ENDPOINT: &str = "https://api.tushare.pro";

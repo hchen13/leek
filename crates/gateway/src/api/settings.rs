@@ -1,7 +1,7 @@
-use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::vault::data_provider_configs;
@@ -156,13 +156,13 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use axum::body::{Body, to_bytes};
+    use axum::body::{to_bytes, Body};
     use axum::http::{Method, Request};
     use futures::stream::{self, BoxStream};
     use tower::ServiceExt;
 
     use crate::agent::tools::ToolRegistry;
-    use crate::api::{AppState, router};
+    use crate::api::{router, AppState};
     use crate::events::EventBus;
     use crate::llm::{ChatRequest, LlmEvent, LlmProvider};
 

@@ -5,7 +5,7 @@
 //! - identity.md — who leek is + mission
 //! - corpus_orientation.md — how to use corpus as the reasoning substrate
 //! - discipline.md — evidence, tool, output, and citation posture
-//! - distilled corpus principles
+//! - the runtime kernel page, read live from the embedded corpus
 //!
 //! Per-tool "when to use / when not to" lives in each tool's `description`
 //! field (tools/*.rs) — not in this builder. The 60-line ad-hoc SYSTEM_PROMPT
@@ -16,11 +16,21 @@ const IDENTITY: &str = include_str!("../../../../harness/identity.md");
 const DISCIPLINE: &str = include_str!("../../../../harness/discipline.md");
 const CORPUS_ORIENTATION: &str = include_str!("../../../../harness/corpus_orientation.md");
 
-use std::path::PathBuf;
+use crate::agent::tools::corpus_search;
+use crate::corpus::kernel;
 
-const DEFAULT_CORPUS_PROMPT_PATH: &str = "crates/gateway/assets/corpus_distilled.md";
-const ENV_CORPUS_PROMPT_PATH: &str = "LEEK_CORPUS_PROMPT_PATH";
 const MAX_CORPUS_PROMPT_CHARS: usize = 14_000;
+
+/// Frames the runtime kernel page for the model. The body itself is the corpus
+/// `principles-runtime-kernel` page, read live and cleaned at build time — there
+/// is no separate distilled artifact to keep in sync.
+const KERNEL_PREAMBLE: &str = "# Principles runtime kernel (your default mind)\n\n\
+This is the compact operating kernel you start every investment conversation \
+with: the 7-step reasoning ladder, Core propositions, and productive tensions \
+shared by Buffett, Munger, Dalio, and Duan Yongping. Use it as an orientation \
+layer; use `corpus_search` and `corpus_read` when the task needs a specific \
+concept page, source quote, knowledge page, company fact, or current-world \
+evidence.\n\n---\n\n";
 
 /// Build the stable system prompt. Runtime state such as compaction handoff,
 /// plans, and tool outputs belongs in input messages so
@@ -42,35 +52,19 @@ pub fn build_system_prompt() -> String {
     prompt
 }
 
+/// Read the runtime kernel page live from the embedded corpus, clean it, and
+/// frame it with the preamble. Returns `None` only if the corpus checkout is
+/// missing the kernel page (e.g. an empty / placeholder corpus).
 fn load_corpus_prompt() -> Option<String> {
-    corpus_prompt_candidates()
-        .into_iter()
-        .find_map(|path| read_corpus_prompt(&path))
-}
-
-fn corpus_prompt_candidates() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(path) = std::env::var(ENV_CORPUS_PROMPT_PATH) {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            out.push(PathBuf::from(trimmed));
-        }
+    let doc = corpus_search::lookup_doc(kernel::RUNTIME_KERNEL_ID)?;
+    let cleaned = kernel::clean_page(&doc.body);
+    if cleaned.is_empty() {
+        return None;
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        out.push(cwd.join(DEFAULT_CORPUS_PROMPT_PATH));
-    }
-    out.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/corpus_distilled.md"));
-    out
-}
-
-fn read_corpus_prompt(path: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.starts_with("<!-- placeholder") {
-        None
-    } else {
-        Some(limit_corpus_prompt(trimmed))
-    }
+    let mut blob = String::with_capacity(KERNEL_PREAMBLE.len() + cleaned.len());
+    blob.push_str(KERNEL_PREAMBLE);
+    blob.push_str(&cleaned);
+    Some(limit_corpus_prompt(&blob))
 }
 
 fn limit_corpus_prompt(trimmed: &str) -> String {
@@ -109,6 +103,7 @@ mod tests {
         assert!(p.contains("corpus-grounded investment research partner"));
         assert!(p.contains("# Discipline"));
         assert!(p.contains("# Corpus Orientation"));
+        assert!(p.contains("stable operating logic"));
         assert!(p.contains("Principles Runtime Kernel"));
         assert!(p.contains("Buffett, Munger, Dalio, and Duan Yongping"));
         assert!(p.contains("Output And Citation"));
@@ -116,26 +111,16 @@ mod tests {
     }
 
     #[test]
-    fn read_corpus_prompt_ignores_placeholder() {
-        let tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp");
-        std::fs::create_dir_all(&tmp).unwrap();
-        let path = tmp.join(format!("leek-placeholder-{}.md", std::process::id()));
-        std::fs::write(&path, "<!-- placeholder corpus_distilled.md -->\n").unwrap();
-        assert!(read_corpus_prompt(&path).is_none());
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn read_corpus_prompt_returns_trimmed_text() {
-        let tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp");
-        std::fs::create_dir_all(&tmp).unwrap();
-        let path = tmp.join(format!("leek-corpus-prompt-{}.md", std::process::id()));
-        std::fs::write(&path, "\n# Corpus mind\n\nprinciples\n\n").unwrap();
-        assert_eq!(
-            read_corpus_prompt(&path).as_deref(),
-            Some("# Corpus mind\n\nprinciples")
-        );
-        let _ = std::fs::remove_file(path);
+    fn corpus_prompt_loads_runtime_kernel_from_embedded_corpus() {
+        let p =
+            load_corpus_prompt().expect("runtime kernel page should load from the embedded corpus");
+        // Preamble framing is present.
+        assert!(p.contains("Principles runtime kernel (your default mind)"));
+        // Kernel body made it through (中文 ladder content).
+        assert!(p.contains("看清对象") || p.contains("7 步推理阶梯"));
+        // clean_page stripped the provenance / path-list sections.
+        assert!(!p.contains("## 来源"));
+        assert!(!p.contains("## 相关概念"));
     }
 
     #[test]

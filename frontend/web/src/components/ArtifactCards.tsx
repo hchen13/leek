@@ -186,7 +186,7 @@ export function ArtifactPanel(props: {
           "border-radius": "8px",
           padding: "14px 16px",
           color: "var(--ink-3)",
-          "font-size": "12px",
+          "font-size": "13px",
         }}>
           当前轮没有新的工具或网页证据，回答沿用了前文上下文。
         </div>
@@ -282,17 +282,17 @@ function NarrationArtifact(props: { id: string; steps: NarrationStep[] }) {
       }}>
         <span style={{
           "font-family": "var(--font-mono)",
-          "font-size": "10.5px",
+          "font-size": "11.5px",
           color: "var(--clay-soft)",
           "font-weight": 700,
           "text-transform": "uppercase",
           "letter-spacing": "0.08em",
         }}>
-          reasoning trace
+          思维轨迹
         </span>
         <span style={{
           "font-family": "var(--font-mono)",
-          "font-size": "10px",
+          "font-size": "11px",
           color: "var(--ink-3)",
         }}>
           {props.steps.length} step{props.steps.length > 1 ? "s" : ""}
@@ -317,14 +317,14 @@ function NarrationArtifact(props: { id: string; steps: NarrationStep[] }) {
               background: "rgba(217,119,87,0.14)",
               color: "var(--clay-soft)",
               "font-family": "var(--font-mono)",
-              "font-size": "10px",
+              "font-size": "11px",
               "font-weight": 700,
             }}>
               {String(step.seq ?? index() + 1).padStart(2, "0")}
             </div>
             <div style={{
               color: "var(--ink-1)",
-              "font-size": "12.5px",
+              "font-size": "13.5px",
               "line-height": 1.55,
             }}>
               <SafeMarkdown source={step.text} />
@@ -343,9 +343,9 @@ function DecisionArtifact(props: { id: string; draft: DecisionDraftView }) {
     : props.draft.direction === "flat" ? "EXIT"
     : props.draft.direction.toUpperCase();
   const directionTone = () =>
-    props.draft.direction === "long" ? "#d97757"
-    : props.draft.direction === "short" ? "#6fb98a"
-    : "#e8b86c";
+    props.draft.direction === "long" ? "var(--up)"
+    : props.draft.direction === "short" ? "var(--down)"
+    : "var(--flat)";
   const stat = (label: string, value: string | number | undefined) => (
     <Show when={value != null && value !== ""}>
       <div style={{
@@ -355,12 +355,12 @@ function DecisionArtifact(props: { id: string; draft: DecisionDraftView }) {
         "border-radius": "6px",
         "min-width": 0,
       }}>
-        <div style={{ "font-family": "var(--font-mono)", "font-size": "9.5px", color: "var(--ink-3)", "margin-bottom": "3px" }}>
+        <div style={{ "font-family": "var(--font-mono)", "font-size": "10.5px", color: "var(--ink-3)", "margin-bottom": "3px" }}>
           {label}
         </div>
         <div style={{
           "font-family": "var(--font-mono)",
-          "font-size": "12px",
+          "font-size": "13px",
           color: "var(--ink-0)",
           "font-weight": 700,
           overflow: "hidden",
@@ -391,10 +391,10 @@ function DecisionArtifact(props: { id: string; draft: DecisionDraftView }) {
         "font-family": "var(--font-mono)",
         "margin-bottom": "10px",
       }}>
-        <span style={{ color: directionTone(), "font-size": "12px", "font-weight": 800, "letter-spacing": "0.08em" }}>
+        <span style={{ color: directionTone(), "font-size": "13px", "font-weight": 800, "letter-spacing": "0.08em" }}>
           ACTION · {directionLabel()}
         </span>
-        <span style={{ color: "var(--ink-2)", "font-size": "12px", "font-weight": 700 }}>
+        <span style={{ color: "var(--ink-2)", "font-size": "13px", "font-weight": 700 }}>
           {props.draft.ticker}
         </span>
       </div>
@@ -411,7 +411,7 @@ function DecisionArtifact(props: { id: string; draft: DecisionDraftView }) {
       </div>
       <div style={{
         color: "var(--ink-1)",
-        "font-size": "12.5px",
+        "font-size": "13.5px",
         "line-height": 1.55,
         display: "-webkit-box",
         "-webkit-line-clamp": "5",
@@ -477,7 +477,7 @@ function ToolStatusBadges(props: { tool?: ToolCallView }) {
               border: "1px solid rgba(158,183,143,0.18)",
               "border-radius": "999px",
               padding: "1px 6px",
-              "font-size": "9.5px",
+              "font-size": "10.5px",
               "line-height": 1.45,
               "text-transform": "uppercase",
               "letter-spacing": "0.04em",
@@ -493,7 +493,7 @@ function ToolStatusBadges(props: { tool?: ToolCallView }) {
             border: "1px solid rgba(217,112,112,0.18)",
             "border-radius": "999px",
             padding: "1px 6px",
-            "font-size": "9.5px",
+            "font-size": "10.5px",
             "line-height": 1.45,
             "text-transform": "uppercase",
             "letter-spacing": "0.04em",
@@ -511,7 +511,7 @@ function ToolStatusBadges(props: { tool?: ToolCallView }) {
             border: "1px solid rgba(217,167,108,0.18)",
             "border-radius": "999px",
             padding: "1px 6px",
-            "font-size": "9.5px",
+            "font-size": "10.5px",
             "line-height": 1.45,
             "text-transform": "uppercase",
             "letter-spacing": "0.04em",
@@ -562,7 +562,7 @@ function CardShell(props: {
         "row-gap": "5px",
         "margin-bottom": "8px",
         "font-family": "var(--font-mono)",
-        "font-size": "10.5px",
+        "font-size": "11.5px",
         color: "var(--ink-3)",
         "text-transform": "uppercase",
         "letter-spacing": "0.04em",
@@ -596,6 +596,25 @@ function ArtifactModal(props: {
   onClose: () => void;
   children: any;
 }) {
+  let dialogEl: HTMLDivElement | undefined;
+  // Esc closes; focus moves into the dialog on open and is restored to the
+  // trigger on close (WCAG 2.4.3 / 2.1.2 — a modal is a deliberate focus trap
+  // that releases on Escape, not a violation).
+  onMount(() => {
+    const prevFocus = document.activeElement as HTMLElement | null;
+    dialogEl?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        props.onClose();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    onCleanup(() => {
+      document.removeEventListener("keydown", onKey);
+      prevFocus?.focus?.();
+    });
+  });
   return (
     <Portal>
       <div
@@ -612,17 +631,23 @@ function ArtifactModal(props: {
         }}
       >
         <div
+          ref={(el) => (dialogEl = el)}
+          role="dialog"
+          aria-modal="true"
+          aria-label={props.title}
+          tabindex="-1"
           onClick={(e) => e.stopPropagation()}
           style={{
             width: "min(1320px, 96vw)",
             height: "min(900px, 92vh)",
-            background: "#050505",
-            border: "1px solid rgba(255,255,255,0.13)",
-            "border-radius": "10px",
+            background: "var(--bg-1)",
+            border: "1px solid var(--line-2)",
+            "border-radius": "var(--r-4)",
             overflow: "hidden",
             display: "flex",
             "flex-direction": "column",
-            "box-shadow": "0 30px 90px rgba(0,0,0,0.62)",
+            "box-shadow": "0 30px 90px rgba(0,0,0,0.55)",
+            outline: "none",
           }}
         >
           <div style={{
@@ -633,7 +658,7 @@ function ArtifactModal(props: {
             "border-bottom": "1px solid rgba(255,255,255,0.08)",
           }}>
             <div style={{ "min-width": 0 }}>
-              <div style={{ "font-size": "12px", color: "var(--ink-3)", "font-family": "var(--font-mono)", "margin-bottom": "3px" }}>
+              <div style={{ "font-size": "13px", color: "var(--ink-3)", "font-family": "var(--font-mono)", "margin-bottom": "3px" }}>
                 {props.subtitle}
               </div>
               <div style={{ "font-size": "20px", color: "var(--ink-0)", "font-weight": 650, "line-height": 1.15 }}>
@@ -724,7 +749,7 @@ function SearchArtifact(props: { search: SearchCallView }) {
         display: "flex",
         "align-items": "center",
         "font-family": "var(--font-mono)",
-        "font-size": "10.5px",
+        "font-size": "11.5px",
         color: "var(--ink-3)",
         "text-transform": "uppercase",
         "letter-spacing": "0.04em",
@@ -753,7 +778,7 @@ function SearchArtifact(props: { search: SearchCallView }) {
           <For each={queryBatch().slice(0, 4)}>{(q) => (
             <div style={{
               "font-family": "var(--font-mono)",
-              "font-size": "10.5px",
+              "font-size": "11.5px",
               color: "var(--ink-2)",
               padding: "4px 6px",
               background: "rgba(255,255,255,0.03)",
@@ -775,7 +800,7 @@ function SearchArtifact(props: { search: SearchCallView }) {
         }}>
           <div style={{
             "font-family": "var(--font-mono)",
-            "font-size": "10px",
+            "font-size": "11px",
             color: "var(--ink-3)",
             "text-transform": "uppercase",
             "letter-spacing": "0",
@@ -793,7 +818,7 @@ function SearchArtifact(props: { search: SearchCallView }) {
                 border: "1px solid var(--line-1)",
                 color: "var(--ink-2)",
                 "font-family": "var(--font-mono)",
-                "font-size": "10.5px",
+                "font-size": "11.5px",
                 padding: "4px 6px",
                 "border-radius": "4px",
                 overflow: "hidden",
@@ -809,7 +834,7 @@ function SearchArtifact(props: { search: SearchCallView }) {
       <Show when={isUrl}>
         <div style={{
           "font-family": "var(--font-mono)",
-          "font-size": "10.5px",
+          "font-size": "11.5px",
           color: "var(--ink-3)",
           "white-space": "nowrap",
           overflow: "hidden",
@@ -1088,7 +1113,7 @@ function CorpusSearchCard(props: { tool: ToolCallView; callbacks?: ArtifactCallb
       <Show
         when={hits.length > 0}
         fallback={
-          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+          <div style={{ color: "var(--ink-3)", "font-size": "12.5px" }}>
             <Show when={props.tool.status === "in_progress"} fallback="No hits.">
               Searching the corpus…
             </Show>
@@ -1128,7 +1153,7 @@ function CorpusReadCard(props: { tool: ToolCallView; callbacks?: ArtifactCallbac
       <Show
         when={doc().title || doc().body}
         fallback={
-          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+          <div style={{ color: "var(--ink-3)", "font-size": "12.5px" }}>
             <Show when={props.tool.status === "in_progress"} fallback="未读取到智库页面。">
               正在读取投研智库页面…
             </Show>
@@ -1150,7 +1175,7 @@ function CorpusReadCard(props: { tool: ToolCallView; callbacks?: ArtifactCallbac
             <Show when={doc().tier || doc().layer}>
               <div style={{
                 "font-family": "var(--font-mono)",
-                "font-size": "10px",
+                "font-size": "11px",
                 color: "var(--ink-3)",
                 "white-space": "nowrap",
               }}>
@@ -1163,7 +1188,7 @@ function CorpusReadCard(props: { tool: ToolCallView; callbacks?: ArtifactCallbac
               <For each={doc().tags.slice(0, 6)}>{(tag) => (
                 <span style={{
                   "font-family": "var(--font-mono)",
-                  "font-size": "10px",
+                  "font-size": "11px",
                   color: "var(--clay-soft)",
                   background: "rgba(217,119,87,0.08)",
                   border: "1px solid rgba(217,119,87,0.14)",
@@ -1178,14 +1203,14 @@ function CorpusReadCard(props: { tool: ToolCallView; callbacks?: ArtifactCallbac
             style={{
             "max-height": "230px",
             overflow: "hidden",
-            "font-size": "12px",
+            "font-size": "13px",
             color: "var(--ink-2)",
             "line-height": 1.55,
           }}>
             <SafeMarkdown source={doc().body} onWikiOpen={(id) => props.callbacks?.onOpenDoc?.(id, id)} />
           </div>
           <Show when={doc().id}>
-            <div style={{ "font-family": "var(--font-mono)", "font-size": "10px", color: "var(--clay-soft)" }}>
+            <div style={{ "font-family": "var(--font-mono)", "font-size": "11px", color: "var(--clay-soft)" }}>
               点击查看完整智库页面
             </div>
           </Show>
@@ -1214,7 +1239,7 @@ function CorpusHitTile(props: { hit: CorpusHit; onOpen: () => void }) {
       }}
     >
       <span style={{
-        "font-size": "12px",
+        "font-size": "13px",
         color: "var(--ink-0)",
         flex: 1,
         overflow: "hidden",
@@ -1223,7 +1248,7 @@ function CorpusHitTile(props: { hit: CorpusHit; onOpen: () => void }) {
       }}>{props.hit.title}</span>
       <span style={{
         "font-family": "var(--font-mono)",
-        "font-size": "9.5px",
+        "font-size": "10.5px",
         color: "var(--ink-3)",
         "flex-shrink": 0,
       }}>{tierLabel()}</span>
@@ -1343,7 +1368,7 @@ function WebFetchCard(props: { tool: ToolCallView }) {
           "align-items": "center",
           gap: "6px",
           "font-family": "var(--font-mono)",
-          "font-size": "10.5px",
+          "font-size": "11.5px",
           color: "var(--ink-3)",
           "text-transform": "uppercase",
           "letter-spacing": "0.04em",
@@ -1367,7 +1392,7 @@ function WebFetchCard(props: { tool: ToolCallView }) {
         <Show
           when={meta().title || meta().description}
           fallback={
-            <div style={{ color: "var(--ink-3)", "font-size": "12px" }}>
+            <div style={{ color: "var(--ink-3)", "font-size": "13px" }}>
               <Show when={props.tool.status === "in_progress"} fallback="No content.">
                 Fetching…
               </Show>
@@ -1388,7 +1413,7 @@ function WebFetchCard(props: { tool: ToolCallView }) {
           </Show>
           <Show when={meta().description}>
             <div style={{
-              "font-size": "12px",
+              "font-size": "13px",
               color: "var(--ink-2)",
               "line-height": 1.5,
               display: "-webkit-box",
@@ -1472,7 +1497,7 @@ function CompanyInfoCard(props: { tool: ToolCallView }) {
         <Show
           when={info().title || selectedBasics().length || selectedMetrics().length}
           fallback={
-            <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+            <div style={{ color: "var(--ink-3)", "font-size": "12.5px" }}>
               <Show when={props.tool.status === "in_progress"} fallback="No company profile.">
                 Fetching company profile…
               </Show>
@@ -1497,8 +1522,8 @@ function CompanyInfoCard(props: { tool: ToolCallView }) {
                     "border-radius": "6px",
                     "min-width": 0,
                   }}>
-                    <div style={{ "font-family": "var(--font-mono)", "font-size": "9.5px", color: "var(--ink-3)" }}>{k}</div>
-                    <div style={{ "font-size": "11.5px", color: "var(--ink-1)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{v}</div>
+                    <div style={{ "font-family": "var(--font-mono)", "font-size": "10.5px", color: "var(--ink-3)" }}>{k}</div>
+                    <div style={{ "font-size": "12.5px", color: "var(--ink-1)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{v}</div>
                   </div>
                 )}</For>
               </div>
@@ -1509,7 +1534,7 @@ function CompanyInfoCard(props: { tool: ToolCallView }) {
                   border: "1px solid var(--line-1)",
                   "border-radius": "6px",
                   color: "var(--ink-2)",
-                  "font-size": "12px",
+                  "font-size": "13px",
                   "line-height": 1.5,
                   display: "-webkit-box",
                   "-webkit-line-clamp": "2",
@@ -1519,7 +1544,7 @@ function CompanyInfoCard(props: { tool: ToolCallView }) {
               </Show>
               <Show when={info().intro}>
                 <div style={{
-                  "font-size": "12px",
+                  "font-size": "13px",
                   color: "var(--ink-2)",
                   "line-height": 1.55,
                   display: "-webkit-box",
@@ -1528,7 +1553,7 @@ function CompanyInfoCard(props: { tool: ToolCallView }) {
                   overflow: "hidden",
                 }}>{info().intro}</div>
               </Show>
-              <div style={{ "font-family": "var(--font-mono)", "font-size": "10px", color: "var(--clay-soft)" }}>
+              <div style={{ "font-family": "var(--font-mono)", "font-size": "11px", color: "var(--clay-soft)" }}>
                 点击查看完整公司资料
               </div>
             </div>
@@ -1546,7 +1571,7 @@ function CompanyInfoCard(props: { tool: ToolCallView }) {
                     border: "1px solid rgba(217,119,87,0.14)",
                     "border-radius": "6px",
                   }}>
-                    <div style={{ "font-family": "var(--font-mono)", "font-size": "9.5px", color: "var(--ink-3)" }}>{k}</div>
+                    <div style={{ "font-family": "var(--font-mono)", "font-size": "10.5px", color: "var(--ink-3)" }}>{k}</div>
                     <div style={{ "font-family": "var(--font-mono)", "font-size": "13px", color: "var(--ink-0)", "font-weight": 650 }}>{v}</div>
                   </div>
                 )}</For>
@@ -1570,7 +1595,7 @@ function CompanyInfoCard(props: { tool: ToolCallView }) {
                   border: "1px solid var(--line-1)",
                   "border-radius": "6px",
                 }}>
-                  <div style={{ "font-family": "var(--font-mono)", "font-size": "10px", color: "var(--ink-3)", "margin-bottom": "3px" }}>{k}</div>
+                  <div style={{ "font-family": "var(--font-mono)", "font-size": "11px", color: "var(--ink-3)", "margin-bottom": "3px" }}>{k}</div>
                   <div style={{ "font-size": "13px", color: "var(--ink-1)", "line-height": 1.35 }}>{v}</div>
                 </div>
               )}</For>
@@ -1591,7 +1616,7 @@ function CompanyInfoCard(props: { tool: ToolCallView }) {
                       border: "1px solid rgba(255,255,255,0.10)",
                       "border-radius": "8px",
                     }}>
-                      <div style={{ "font-family": "var(--font-mono)", "font-size": "10px", color: "var(--ink-3)", "margin-bottom": "4px" }}>{k}</div>
+                      <div style={{ "font-family": "var(--font-mono)", "font-size": "11px", color: "var(--ink-3)", "margin-bottom": "4px" }}>{k}</div>
                       <div style={{ "font-family": "var(--font-mono)", "font-size": "15px", color: "var(--ink-0)", "font-weight": 700 }}>{v}</div>
                     </div>
                   )}</For>
@@ -1644,6 +1669,7 @@ function FinancialsCard(props: { tool: ToolCallView }) {
   const balanceTable = () => findFinancialTable(tables(), ["资产负债表", "Balance"]);
   const cashflowTable = () => findFinancialTable(tables(), ["现金流", "Cash Flow"]);
   const ratioTable = () => findFinancialTable(tables(), ["财务指标", "Ratios"]);
+  const dividendTable = () => findFinancialTable(tables(), ["分红", "Dividend"]);
   const facts = createMemo(() => financialFacts(tables()));
   const activeStatementTable = () =>
     statementTab() === "income" ? incomeTable()
@@ -1685,6 +1711,17 @@ function FinancialsCard(props: { tool: ToolCallView }) {
     }
   });
 
+  // The card's mini-charts are fine on the cached tool output, but the detail
+  // modal should show the full current statements — the agent's cached call may
+  // predate newer line items. Fetch once the first time the modal opens.
+  let loadedFreshOnOpen = false;
+  createEffect(() => {
+    if (open() && !loadedFreshOnOpen && props.tool.status === "completed" && ticker && market) {
+      loadedFreshOnOpen = true;
+      void load(periods());
+    }
+  });
+
   return (
     <>
       <CardShell
@@ -1699,12 +1736,12 @@ function FinancialsCard(props: { tool: ToolCallView }) {
         <div style={{ display: "flex", "align-items": "center", gap: "8px", "margin-bottom": "10px" }}>
           <PeriodButtons value={periods()} onPick={load} />
           <Show when={loading()}>
-            <span style={{ "font-family": "var(--font-mono)", "font-size": "10.5px", color: "var(--ink-3)" }}>
+            <span style={{ "font-family": "var(--font-mono)", "font-size": "11.5px", color: "var(--ink-3)" }}>
               loading statements…
             </span>
           </Show>
           <Show when={error()}>
-            <span style={{ "font-family": "var(--font-mono)", "font-size": "10.5px", color: "#d97070", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
+            <span style={{ "font-family": "var(--font-mono)", "font-size": "11.5px", color: "#d97070", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
               {error()}
             </span>
           </Show>
@@ -1712,7 +1749,7 @@ function FinancialsCard(props: { tool: ToolCallView }) {
         <Show
           when={tables().length > 0}
           fallback={
-            <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+            <div style={{ color: "var(--ink-3)", "font-size": "12.5px" }}>
               <Show when={props.tool.status === "in_progress"} fallback="No financial tables.">
                 Fetching financials…
               </Show>
@@ -1726,16 +1763,16 @@ function FinancialsCard(props: { tool: ToolCallView }) {
           }}>
             <FinancialFactGrid facts={facts()} />
             <div style={{ display: "grid", "grid-template-columns": "repeat(auto-fit, minmax(135px, 1fr))", gap: "10px" }}>
-              <FinancialMiniChart title="营业总收入" table={incomeTable()} columnHints={["营业总收入", "Total Revenue"]} color="#3f82f6" />
-              <FinancialMiniChart title="ROE" table={ratioTable()} columnHints={["ROE"]} color="#d9a76c" />
-              <FinancialMiniChart title="经营现金流" table={cashflowTable()} columnHints={["经营活动", "Operating CF"]} color="#35b7b5" />
-              <FinancialMiniChart title="资产负债率" table={ratioTable()} columnHints={["资产负债率", "Debt"]} color="#e05288" />
+              <FinancialMiniChart title="营业总收入" table={incomeTable()} columnHints={["营业总收入", "Total Revenue"]} color="var(--chart-2)" />
+              <FinancialMiniChart title="ROE" table={ratioTable()} columnHints={["ROE"]} color="var(--chart-1)" />
+              <FinancialMiniChart title="经营现金流" table={cashflowTable()} columnHints={["经营活动", "Operating CF"]} color="var(--chart-3)" />
+              <FinancialMiniChart title="资产负债率" table={ratioTable()} columnHints={["资产负债率", "Debt"]} color="var(--chart-4)" />
             </div>
           </div>
           <div style={{
             "margin-top": "10px",
             "font-family": "var(--font-mono)",
-            "font-size": "10px",
+            "font-size": "11px",
             color: "var(--clay-soft)",
           }}>
             点击查看完整财务面板
@@ -1777,6 +1814,7 @@ function FinancialsCard(props: { tool: ToolCallView }) {
                 cashflow={cashflowTable()}
                 ratios={ratioTable()}
                 mode={periodMode()}
+                periods={periods()}
               />
             </Show>
 
@@ -1801,7 +1839,7 @@ function FinancialsCard(props: { tool: ToolCallView }) {
             </Show>
 
             <Show when={tab() === "dividends"}>
-              <FinancialDividendsView table={ratioTable()} mode={periodMode()} periods={periods()} />
+              <FinancialDividendsView table={dividendTable()} mode={periodMode()} periods={periods()} />
             </Show>
 
             <Show when={tab() === "earnings"}>
@@ -1843,7 +1881,7 @@ function PeriodButtons(props: { value: number; onPick: (periods: number) => void
             background: props.value === n ? "rgba(217,119,87,0.18)" : "transparent",
             color: props.value === n ? "var(--clay-soft)" : "var(--ink-3)",
             "font-family": "var(--font-mono)",
-            "font-size": "10.5px",
+            "font-size": "11.5px",
             padding: "4px 8px",
             "border-radius": "4px",
             cursor: "pointer",
@@ -1870,6 +1908,7 @@ function FinancialOverview(props: {
   cashflow?: MarkdownTable;
   ratios?: MarkdownTable;
   mode: PeriodMode;
+  periods: number;
 }) {
   return (
     <div class="lk-fin-tab-body">
@@ -1886,39 +1925,43 @@ function FinancialOverview(props: {
           title="增长与盈利"
           table={props.income}
           mode={props.mode}
+          periods={props.periods}
           series={[
-            { label: "营业总收入", hints: ["营业总收入", "Total Revenue"], color: "#3f82f6" },
-            { label: "归母净利", hints: ["归母净利", "Net Income"], color: "#35c4d3" },
+            { label: "营业总收入", hints: ["营业总收入", "Total Revenue"], color: "var(--chart-2)" },
+            { label: "归母净利", hints: ["归母净利", "Net Income"], color: "var(--chart-3)" },
           ]}
         />
         <FinancialSeriesChart
           title="收入到利润"
           table={props.income}
           mode={props.mode}
+          periods={props.periods}
           series={[
-            { label: "营业总收入", hints: ["营业总收入", "Total Revenue"], color: "#35c4d3" },
-            { label: "营业利润", hints: ["营业利润", "Operating Income"], color: "#3f82f6" },
-            { label: "归母净利", hints: ["归母净利", "Net Income"], color: "#ff4f8b" },
+            { label: "营业总收入", hints: ["营业总收入", "Total Revenue"], color: "var(--chart-3)" },
+            { label: "营业利润", hints: ["营业利润", "Operating Income"], color: "var(--chart-2)" },
+            { label: "归母净利", hints: ["归母净利", "Net Income"], color: "var(--chart-4)" },
           ]}
         />
         <FinancialSeriesChart
           title="资产负债"
           table={props.balance}
           mode={props.mode}
+          periods={props.periods}
           series={[
-            { label: "总资产", hints: ["总资产", "Total Assets"], color: "#3f82f6" },
-            { label: "总负债", hints: ["总负债", "Total Liabilities"], color: "#35c4d3" },
-            { label: "总债务", hints: ["总债务", "Total Debt"], color: "#ff4f8b" },
+            { label: "总资产", hints: ["总资产", "Total Assets"], color: "var(--chart-2)" },
+            { label: "总负债", hints: ["总负债", "Total Liabilities"], color: "var(--chart-3)" },
+            { label: "总债务", hints: ["总债务", "Total Debt"], color: "var(--chart-4)" },
           ]}
         />
         <FinancialSeriesChart
           title="质量指标"
           table={props.ratios}
           mode={props.mode}
+          periods={props.periods}
           series={[
-            { label: "ROE", hints: ["ROE"], color: "#ff9d00" },
-            { label: "毛利率", hints: ["毛利率", "Gross Margin"], color: "#43d7c4" },
-            { label: "资产负债率", hints: ["资产负债率", "Debt"], color: "#ff4f8b" },
+            { label: "ROE", hints: ["ROE"], color: "var(--chart-1)" },
+            { label: "毛利率", hints: ["毛利率", "Gross Margin"], color: "var(--chart-3)" },
+            { label: "资产负债率", hints: ["资产负债率", "Debt"], color: "var(--chart-4)" },
           ]}
         />
       </div>
@@ -1932,69 +1975,47 @@ function FinancialStatementView(props: {
   mode: PeriodMode;
   periods: number;
 }) {
-  const chartSeries = () => {
-    if (props.statement === "balance") {
-      return [
-        { label: "总资产", hints: ["总资产", "Total Assets"], color: "#3f82f6" },
-        { label: "总负债", hints: ["总负债", "Total Liabilities"], color: "#35c4d3" },
-      ];
-    }
-    if (props.statement === "cashflow") {
-      return [
-        { label: "经营现金流", hints: ["经营活动", "Operating CF"], color: "#35c4d3" },
-        { label: "投资现金流", hints: ["投资活动", "Investing CF"], color: "#ff9d00" },
-        { label: "筹资现金流", hints: ["筹资活动", "Financing CF"], color: "#ff4f8b" },
-      ];
-    }
-    return [
-      { label: "营业总收入", hints: ["营业总收入", "Total Revenue"], color: "#3f82f6" },
-      { label: "营业利润", hints: ["营业利润", "Operating Income"], color: "#35c4d3" },
-      { label: "归母净利", hints: ["归母净利", "Net Income"], color: "#ff9d00" },
-    ];
-  };
+  const defaults = () =>
+    props.statement === "balance" ? ["总资产", "总负债"]
+    : props.statement === "cashflow" ? ["经营活动", "投资活动", "筹资活动"]
+    : ["营业总收入", "营业利润", "归母净利"];
   return (
-    <div class="lk-fin-tab-body">
-      <FinancialSeriesChart title="报表趋势" table={props.table} mode={props.mode} series={chartSeries()} height={210} />
-      <FinancialMatrixTable table={props.table} mode={props.mode} periods={props.periods} />
-    </div>
+    <FinancialLinkedView
+      title="报表趋势"
+      table={props.table}
+      mode={props.mode}
+      periods={props.periods}
+      defaults={defaults()}
+      height={210}
+    />
   );
 }
 
 function FinancialStatisticsView(props: { table?: MarkdownTable; mode: PeriodMode; periods: number }) {
   return (
-    <div class="lk-fin-tab-body">
-      <FinancialSeriesChart
-        title="盈利能力"
-        table={props.table}
-        mode={props.mode}
-        series={[
-          { label: "ROE", hints: ["ROE"], color: "#3f82f6" },
-          { label: "毛利率", hints: ["毛利率", "Gross Margin"], color: "#35c4d3" },
-          { label: "净利率", hints: ["净利率", "Net Margin"], color: "#ff9d00" },
-        ]}
-        height={210}
-      />
-      <FinancialMatrixTable table={props.table} mode={props.mode} periods={props.periods} grouped />
-    </div>
+    <FinancialLinkedView
+      title="盈利能力"
+      table={props.table}
+      mode={props.mode}
+      periods={props.periods}
+      defaults={["ROE", "毛利率", "净利率"]}
+      grouped
+      height={210}
+    />
   );
 }
 
 function FinancialDividendsView(props: { table?: MarkdownTable; mode: PeriodMode; periods: number }) {
-  const dividendHints = ["每股股利", "Dividend"];
   return (
-    <div class="lk-fin-tab-body">
-      <FinancialSeriesChart
-        title="分红历史"
-        table={props.table}
-        mode={props.mode}
-        series={[
-          { label: "每股股利", hints: dividendHints, color: "#3f82f6" },
-          { label: "派息率", hints: ["派息率", "Payout"], color: "#35c4d3" },
-        ]}
-        height={210}
-      />
-      <FinancialMatrixTable table={props.table} mode={props.mode} periods={props.periods} rowHints={[...dividendHints, "Payout"]} />
-    </div>
+    <FinancialLinkedView
+      title="分红历史"
+      table={props.table}
+      mode={props.mode}
+      periods={props.periods}
+      defaults={["每股现金分红税前", "每股现金分红税后"]}
+      ignoreMode
+      height={210}
+    />
   );
 }
 
@@ -2005,46 +2026,29 @@ function FinancialEarningsView(props: {
   periods: number;
 }) {
   return (
-    <div class="lk-fin-tab-body">
-      <FinancialSeriesChart
-        title="EPS"
-        table={props.ratios}
-        mode={props.mode}
-        series={[{ label: "Reported EPS", hints: ["EPS"], color: "#3f82f6" }]}
-        height={210}
-      />
-      <FinancialSeriesChart
-        title="盈利"
-        table={props.income}
-        mode={props.mode}
-        series={[
-          { label: "营业收入", hints: ["营业收入", "Revenue"], color: "#ff9d00" },
-          { label: "归母净利", hints: ["归母净利", "Net Income"], color: "#3f82f6" },
-        ]}
-        height={210}
-      />
-      <FinancialMatrixTable table={props.ratios} mode={props.mode} periods={props.periods} rowHints={["EPS", "ROE", "每股", "Per Share"]} />
-    </div>
+    <FinancialLinkedView
+      title="盈利质量"
+      table={props.ratios}
+      mode={props.mode}
+      periods={props.periods}
+      defaults={["EPS", "ROE", "净利率"]}
+      rowHints={["EPS", "BPS", "ROE", "ROA", "净利率", "毛利率", "每股", "Per Share", "Margin"]}
+      height={230}
+    />
   );
 }
 
 function FinancialRevenueView(props: { table?: MarkdownTable; mode: PeriodMode; periods: number }) {
   return (
-    <div class="lk-fin-tab-body">
-      <FinancialSeriesChart
-        title="收入与利润"
-        table={props.table}
-        mode={props.mode}
-        series={[
-          { label: "营业总收入", hints: ["营业总收入", "Total Revenue"], color: "#3f82f6" },
-          { label: "营业收入", hints: ["营业收入", "Revenue"], color: "#8fa8ff" },
-          { label: "毛利", hints: ["毛利", "Gross Profit"], color: "#35c4d3" },
-          { label: "归母净利", hints: ["归母净利", "Net Income"], color: "#ff9d00" },
-        ]}
-        height={230}
-      />
-      <FinancialMatrixTable table={props.table} mode={props.mode} periods={props.periods} rowHints={["营业总收入", "营业收入", "Revenue", "毛利", "Gross"]} />
-    </div>
+    <FinancialLinkedView
+      title="收入与利润"
+      table={props.table}
+      mode={props.mode}
+      periods={props.periods}
+      defaults={["营业总收入", "营业收入", "毛利", "归母净利"]}
+      rowHints={["营业总收入", "营业收入", "Revenue", "毛利", "Gross"]}
+      height={230}
+    />
   );
 }
 
@@ -2109,7 +2113,7 @@ function MetricTile(props: { label: string; value: string }) {
       "border-radius": "7px",
       "min-width": 0,
     }}>
-      <div style={{ "font-family": "var(--font-mono)", "font-size": "10px", color: "var(--ink-3)", "margin-bottom": "4px" }}>
+      <div style={{ "font-family": "var(--font-mono)", "font-size": "11px", color: "var(--ink-3)", "margin-bottom": "4px" }}>
         {props.label}
       </div>
       <div style={{
@@ -2168,18 +2172,23 @@ function FinancialSeriesChart(props: {
   mode: PeriodMode;
   series: FinancialSeriesSpec[];
   height?: number;
+  periods?: number;
+  ignoreMode?: boolean;
 }) {
   const plot = () => {
-    const table = tableForMode(props.table, props.mode);
+    const table = props.ignoreMode ? props.table : tableForMode(props.table, props.mode);
     if (!table) return { rows: [], series: [] as Array<FinancialSeriesSpec & { idx: number }> };
     const series = props.series
       .map((s) => ({ ...s, idx: columnIndex(table, s.hints) }))
       .filter((s) => s.idx >= 0);
+    // Match the period count chosen in the toolbar so the chart and the table
+    // below it always show the same number of periods.
     const rows = table.rows
-      .slice(0, 8)
+      .slice(0, props.periods ?? 12)
       .map((row) => ({
         label: row[0] ?? "",
         values: series.map((s) => financialNumber(row[s.idx] ?? "")),
+        raw: series.map((s) => (row[s.idx] ?? "—").trim() || "—"),
       }))
       .filter((row) => row.values.some((v) => Number.isFinite(v)))
       .reverse();
@@ -2196,8 +2205,12 @@ function FinancialSeriesChart(props: {
     const plotH = h - pad.t - pad.b;
     return { rows, max, w, h, pad, plotW, plotH };
   };
+  let cardEl: HTMLElement | undefined;
+  const [tip, setTip] = createSignal<
+    { x: number; y: number; period: string; label: string; value: string; color: string } | null
+  >(null);
   return (
-    <section class="lk-fin-chart-card">
+    <section class="lk-fin-chart-card" ref={(el) => (cardEl = el)}>
       <div class="lk-fin-section-head">
         <span>{props.title}</span>
 	        <em>{props.mode === "annual" ? "年报" : "季报"}</em>
@@ -2225,13 +2238,27 @@ function FinancialSeriesChart(props: {
                   const y = c.pad.t + c.plotH - barH;
                   return (
                     <rect
+                      class="lk-fin-bar"
                       x={x0 + sIndex() * barW}
                       y={y}
                       width={barW * 0.74}
                       height={barH}
                       rx="2"
-                      fill={s.color}
+                      style={{ fill: s.color }}
                       opacity="0.88"
+                      onMouseMove={(e) => {
+                        if (!cardEl) return;
+                        const r = cardEl.getBoundingClientRect();
+                        setTip({
+                          x: e.clientX - r.left,
+                          y: e.clientY - r.top,
+                          period: row.label,
+                          label: s.label,
+                          value: row.raw[sIndex()],
+                          color: s.color,
+                        });
+                      }}
+                      onMouseLeave={() => setTip(null)}
                     />
                   );
                 }}</For>
@@ -2247,6 +2274,15 @@ function FinancialSeriesChart(props: {
             <span><i style={{ background: s.color }} />{s.label}</span>
           )}</For>
         </div>
+        <Show when={tip()}>
+          {(t) => (
+            <div class="lk-fin-tip" style={{ left: `${t().x}px`, top: `${t().y}px` }}>
+              <span class="tip-period">{t().period}</span>
+              <span class="tip-metric"><i style={{ background: t().color }} />{t().label}</span>
+              <b>{t().value}</b>
+            </div>
+          )}
+        </Show>
       </Show>
     </section>
   );
@@ -2267,31 +2303,41 @@ function FinancialMatrixTable(props: {
   periods: number;
   rowHints?: string[];
   grouped?: boolean;
+  /** Interactive mode: when set, rows toggle chart series. `colorOf` returns
+   *  the row's plotted color (or null when not plotted); `onToggle` flips it. */
+  colorOf?: (header: string) => string | null;
+  onToggle?: (header: string) => void;
+  ignoreMode?: boolean;
 }) {
+  const fallbackColors = ["var(--chart-2)", "var(--chart-3)", "var(--chart-1)", "var(--chart-4)"];
   const view = () => {
-    const table = tableForMode(props.table, props.mode);
-    if (!table) return { periods: [] as string[], metrics: [] as Array<{ label: string; values: string[]; color: string }> };
+    const table = props.ignoreMode ? props.table : tableForMode(props.table, props.mode);
+    if (!table) return { periods: [] as string[], metrics: [] as Array<{ label: string; header: string; values: string[]; color: string | null }> };
     const rows = table.rows.slice(0, props.periods).reverse();
     const metricHeaders = table.headers.slice(1);
     const filtered = props.rowHints?.length
       ? metricHeaders.filter((h) => props.rowHints!.some((hint) => h.toLowerCase().includes(hint.toLowerCase())))
       : metricHeaders;
-    const colors = ["#3f82f6", "#35c4d3", "#ff9d00", "#ff4f8b", "#9b7cff", "#43d7c4"];
     return {
       periods: rows.map((row) => row[0] ?? ""),
-      metrics: filtered.slice(0, props.grouped ? 28 : 18).map((header, i) => {
+      metrics: filtered.slice(0, props.grouped ? 48 : 40).map((header, i) => {
         const idx = table.headers.indexOf(header);
         return {
           label: header,
+          header,
           values: rows.map((row) => row[idx] ?? "—"),
-          color: colors[i % colors.length],
+          color: props.colorOf ? props.colorOf(header) : fallbackColors[i % fallbackColors.length],
         };
       }),
     };
   };
+  const interactive = () => !!props.onToggle;
   return (
     <section class="lk-fin-table-card">
 	      <Show when={view().metrics.length > 0} fallback={<FinancialEmpty label="暂无表格数据" />}>
+        <Show when={interactive()}>
+          <div class="lk-fin-matrix-hint">点击指标行可切换是否绘制到上方图表（最多 4 项）</div>
+        </Show>
         <div class="lk-fin-matrix">
           <table>
             <thead>
@@ -2302,8 +2348,19 @@ function FinancialMatrixTable(props: {
             </thead>
             <tbody>
               <For each={view().metrics}>{(metric) => (
-                <tr>
-                  <td><i style={{ background: metric.color }} />{metric.label}</td>
+                <tr
+                  class={interactive() ? "is-toggleable" : ""}
+                  data-on={interactive() ? (metric.color != null ? "true" : "false") : undefined}
+                  onClick={props.onToggle ? () => props.onToggle!(metric.header) : undefined}
+                  title={interactive() ? (metric.color != null ? "点击从图表移除" : "点击绘制到图表") : undefined}
+                >
+                  <td>
+                    <i
+                      class="lk-fin-mark"
+                      style={metric.color ? { background: metric.color, "border-color": metric.color } : { background: "transparent" }}
+                    />
+                    {metric.label}
+                  </td>
                   <For each={metric.values}>{(value) => <td>{value}</td>}</For>
                 </tr>
               )}</For>
@@ -2315,8 +2372,139 @@ function FinancialMatrixTable(props: {
   );
 }
 
+function stripUnit(header: string): string {
+  const s = header.replace(/（[^）]*）/g, "").replace(/\([^)]*\)/g, "").replace(/%$/, "").trim();
+  return s || header;
+}
+
+// Fixed per-row palette: a metric's colour is decided by its position in the
+// table, NOT by selection order, so toggling one row never recolours another.
+const LINKED_PALETTE = ["var(--chart-2)", "var(--chart-3)", "var(--chart-1)", "var(--chart-4)", "#c98ab8", "#6fb0b5"];
+const LINKED_MAX_SERIES = 4;
+
+/** Chart + table where the table rows drive which series the chart plots.
+ *  Starts on `defaults`, caps at 4 series, and keeps each row's marker color in
+ *  sync with its bar color. */
+function FinancialLinkedView(props: {
+  title: string;
+  table?: MarkdownTable;
+  mode: PeriodMode;
+  periods: number;
+  defaults: string[];
+  rowHints?: string[];
+  grouped?: boolean;
+  height?: number;
+  ignoreMode?: boolean;
+}) {
+  const metricHeaders = createMemo(() => {
+    const t = props.ignoreMode ? props.table : tableForMode(props.table, props.mode);
+    if (!t) return [] as string[];
+    const hs = t.headers.slice(1);
+    return props.rowHints?.length
+      ? hs.filter((h) => props.rowHints!.some((hint) => h.toLowerCase().includes(hint.toLowerCase())))
+      : hs;
+  });
+  const defaultSelection = createMemo(() => {
+    const hs = metricHeaders();
+    const sel: string[] = [];
+    for (const d of props.defaults) {
+      const match = hs.find((h) => h.toLowerCase().includes(d.toLowerCase()));
+      if (match && !sel.includes(match)) sel.push(match);
+      if (sel.length >= LINKED_MAX_SERIES) break;
+    }
+    if (sel.length === 0 && hs.length > 0) sel.push(hs[0]);
+    return sel;
+  });
+  const [touched, setTouched] = createSignal(false);
+  const [selected, setSelected] = createSignal<string[]>([]);
+  // Track defaults until the user picks. When the underlying metric set changes
+  // (e.g. switching statement sub-tabs), the default selection changes too —
+  // reset to it and forget the user's prior picks, which no longer apply.
+  let prevDefaultsKey = "";
+  createEffect(() => {
+    const defaults = defaultSelection();
+    const key = defaults.join("|");
+    if (key !== prevDefaultsKey) {
+      prevDefaultsKey = key;
+      setTouched(false);
+      setSelected(defaults);
+    } else if (!touched()) {
+      setSelected(defaults);
+    }
+  });
+  // Colour is fixed by the metric's row index (stable across toggles) and only
+  // shown once the row is selected/plotted.
+  const colorOf = (header: string): string | null => {
+    if (!selected().includes(header)) return null;
+    const i = metricHeaders().indexOf(header);
+    return LINKED_PALETTE[(i >= 0 ? i : 0) % LINKED_PALETTE.length];
+  };
+  function toggle(header: string) {
+    setTouched(true);
+    setSelected((prev) => {
+      if (prev.includes(header)) return prev.filter((h) => h !== header);
+      if (prev.length >= LINKED_MAX_SERIES) return prev;
+      return [...prev, header];
+    });
+  }
+  const series = () =>
+    selected().map((h) => ({ label: stripUnit(h), hints: [h], color: colorOf(h) ?? "var(--chart-2)" }));
+  return (
+    <div class="lk-fin-tab-body">
+      <FinancialSeriesChart
+        title={props.title}
+        table={props.table}
+        mode={props.mode}
+        periods={props.periods}
+        series={series()}
+        height={props.height}
+        ignoreMode={props.ignoreMode}
+      />
+      <FinancialMatrixTable
+        table={props.table}
+        mode={props.mode}
+        periods={props.periods}
+        rowHints={props.rowHints}
+        grouped={props.grouped}
+        colorOf={colorOf}
+        onToggle={toggle}
+        ignoreMode={props.ignoreMode}
+      />
+    </div>
+  );
+}
+
 function FinancialEmpty(props: { label: string }) {
-  return <div class="lk-fin-empty">{props.label}</div>;
+  return <div class="lk-fin-empty"><EmptyHint text={props.label} /></div>;
+}
+
+/** Shared inline empty state — a quiet monoline mark + one explanation line.
+ *  Sized for an in-card section, not a page (state-coverage.md). */
+function EmptyHint(props: { text: string; sub?: string }) {
+  return (
+    <div class="lk-empty-hint">
+      <svg class="ic" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+        <path d="M5 5.5h14M5 11h9M5 16.5h5" />
+      </svg>
+      <div class="lk-empty-hint-text">{props.text}</div>
+      <Show when={props.sub}>
+        <div class="lk-empty-hint-sub">{props.sub}</div>
+      </Show>
+    </div>
+  );
+}
+
+/** A table the backend returned with no usable rows — either truly empty, or a
+ *  single placeholder row whose cells are all dashes / "无返回记录" / "unavailable"
+ *  markers. Routes those to the empty state instead of a hollow table. */
+function tableIsEffectivelyEmpty(table?: MarkdownTable): boolean {
+  if (!table || table.rows.length === 0) return true;
+  const blank = (c: string) => {
+    const v = (c ?? "").trim();
+    return v === "" || /^[-—–·.]+$/.test(v) ||
+      /无返回记录|无数据|暂无|不可用|unavailable|no data|n\/a/i.test(v);
+  };
+  return table.rows.every((row) => row.every(blank));
 }
 
 function FinancialMiniChart(props: {
@@ -2350,14 +2538,14 @@ function FinancialMiniChart(props: {
           {props.title}
         </div>
         <Show when={rows().length > 0}>
-          <div style={{ "margin-left": "auto", "font-family": "var(--font-mono)", "font-size": "10px", color: "var(--ink-3)" }}>
+          <div style={{ "margin-left": "auto", "font-family": "var(--font-mono)", "font-size": "11px", color: "var(--ink-3)" }}>
             {rows()[rows().length - 1]?.label}
           </div>
         </Show>
       </div>
       <Show
         when={rows().length > 0}
-	        fallback={<div style={{ height: props.large ? "120px" : "68px", color: "var(--ink-3)", "font-size": "11px" }}>暂无序列</div>}
+	        fallback={<div style={{ height: props.large ? "120px" : "68px", display: "grid", "place-items": "center" }}><EmptyHint text="暂无序列" /></div>}
       >
         <div style={{
           height: props.large ? "130px" : "76px",
@@ -2370,7 +2558,7 @@ function FinancialMiniChart(props: {
         }}>
           <For each={rows()}>{(row) => {
             const height = Math.max(4, Math.round(Math.abs(row.value) / maxAbs() * (props.large ? 112 : 62)));
-            const color = row.value >= 0 ? props.color : "#6fb98a";
+            const color = row.value >= 0 ? props.color : "var(--down)";
             return (
               <div title={`${row.label}: ${row.value}`} style={{ display: "flex", "align-items": "end", height: "100%" }}>
                 <div style={{
@@ -2406,7 +2594,7 @@ function FinancialTablePane(props: {
       overflow: "auto",
     }}>
       <div style={{
-        "font-size": "12px",
+        "font-size": "13px",
         color: "var(--ink-0)",
         "font-weight": 650,
         "margin-bottom": "7px",
@@ -2420,7 +2608,7 @@ function FinancialTablePane(props: {
         width: "100%",
         "border-collapse": "collapse",
         "font-family": "var(--font-mono)",
-        "font-size": "10px",
+        "font-size": "11px",
         "min-width": cols().length > 5 ? "720px" : "0",
       }}>
         <thead>
@@ -2490,7 +2678,7 @@ function MarkdownContextCards(props: { tool: ToolCallView; badge: string }) {
           >
             <Show
               when={overviewRows().length > 0}
-              fallback={<div style={{ color: "var(--ink-2)", "font-size": "12px" }}>{title()}</div>}
+              fallback={<div style={{ color: "var(--ink-2)", "font-size": "13px" }}>{title()}</div>}
             >
               <MarkdownBulletList rows={overviewRows()} limit={6} />
             </Show>
@@ -2546,7 +2734,7 @@ function MarkdownBulletList(props: { rows: string[]; limit: number }) {
       <For each={props.rows.slice(0, props.limit)}>{(row) => (
         <div style={{
           color: row.includes("Source unavailable") || row.includes("unavailable") || row.includes("来源不可用") ? "#d97070" : "var(--ink-2)",
-          "font-size": "11.5px",
+          "font-size": "12.5px",
           "line-height": 1.45,
           overflow: "hidden",
           "text-overflow": "ellipsis",
@@ -2659,7 +2847,7 @@ function AShareIndustryContextCards(props: { tool: ToolCallView }) {
           <Show
             when={summaryItems().length > 0}
             fallback={
-              <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+              <div style={{ color: "var(--ink-3)", "font-size": "12.5px" }}>
                 <Show when={props.tool.status === "in_progress"} fallback="暂无行业上下文摘要。">
                   正在获取行业上下文…
                 </Show>
@@ -2739,14 +2927,14 @@ function MarkdownTableCard(props: {
     <CardShell
       status={props.tool.status}
       badge={props.badge}
-      detail={props.detail}
+      detail={tableIsEffectivelyEmpty(props.table) ? undefined : props.detail}
       tool={props.tool}
       callId={props.callId}
       size={props.size ?? "normal"}
     >
       <Show
-        when={props.table && props.table.rows.length > 0}
-        fallback={<div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>{props.emptyText}</div>}
+        when={!tableIsEffectivelyEmpty(props.table)}
+        fallback={<EmptyHint text={props.emptyText} />}
       >
         <FinancialTablePane table={props.table!} rowsLimit={props.rowsLimit} colsLimit={props.colsLimit} />
       </Show>
@@ -2766,7 +2954,7 @@ function IndustrySummaryTile(props: { item: string }) {
     }}>
       <div style={{
         "font-family": "var(--font-mono)",
-        "font-size": "10px",
+        "font-size": "11px",
         color: "var(--ink-3)",
         "margin-bottom": "4px",
       }}>
@@ -2774,7 +2962,7 @@ function IndustrySummaryTile(props: { item: string }) {
       </div>
       <div style={{
         color: "var(--ink-0)",
-        "font-size": "12px",
+        "font-size": "13px",
         "line-height": 1.45,
         overflow: "hidden",
         "text-overflow": "ellipsis",
@@ -2850,7 +3038,7 @@ function CapitalFlowCard(props: { tool: ToolCallView }) {
       <Show
         when={hasStockRows() || hasNorthRows() || hasGenericRows() || northUnavailable()}
         fallback={
-          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+          <div style={{ color: "var(--ink-3)", "font-size": "12.5px" }}>
             <Show when={props.tool.status === "in_progress"} fallback="No capital-flow data.">
               Fetching capital flow…
             </Show>
@@ -2892,7 +3080,7 @@ function FlowNoticePane() {
       border: "1px solid rgba(217,119,87,0.18)",
       "border-radius": "7px",
       color: "var(--ink-2)",
-      "font-size": "11.5px",
+      "font-size": "12.5px",
       "line-height": 1.55,
     }}>
       <div style={{ color: "var(--ink-0)", "font-weight": 700, "margin-bottom": "4px" }}>
@@ -2913,7 +3101,7 @@ function FlowPane(props: {
   netIndex: number;
 }) {
   const maxAbs = () => Math.max(1, ...props.rows.map((row) => Math.abs(numericCell(row[props.netIndex] ?? "0"))));
-  const netColor = () => props.net >= 0 ? "#d97757" : "#6fb98a";
+  const netColor = () => props.net >= 0 ? "var(--up)" : "var(--down)";
   return (
     <div style={{
       padding: "9px 10px",
@@ -2923,7 +3111,7 @@ function FlowPane(props: {
       "min-width": 0,
     }}>
       <div style={{ display: "flex", "align-items": "baseline", gap: "8px", "margin-bottom": "8px" }}>
-        <div style={{ "font-size": "12.5px", color: "var(--ink-0)", "font-weight": 650, overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
+        <div style={{ "font-size": "13.5px", color: "var(--ink-0)", "font-weight": 650, overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
           {props.title}
         </div>
         <div style={{ "margin-left": "auto", "font-family": "var(--font-mono)", "font-size": "11px", color: netColor(), "font-weight": 700 }}>
@@ -2934,14 +3122,14 @@ function FlowPane(props: {
         <For each={props.rows}>{(row) => {
           const net = numericCell(row[props.netIndex] ?? "0");
           const width = Math.max(5, Math.min(100, Math.abs(net) / maxAbs() * 100));
-          const color = net >= 0 ? "#d97757" : "#6fb98a";
+          const color = net >= 0 ? "var(--up)" : "var(--down)";
           return (
             <div style={{ display: "grid", "grid-template-columns": "72px minmax(0, 1fr) 74px", gap: "7px", "align-items": "center" }}>
-              <span style={{ "font-family": "var(--font-mono)", "font-size": "10px", color: "var(--ink-3)" }}>{row[0]}</span>
+              <span style={{ "font-family": "var(--font-mono)", "font-size": "11px", color: "var(--ink-3)" }}>{row[0]}</span>
               <span style={{ height: "6px", background: "rgba(255,255,255,0.035)", "border-radius": "99px", overflow: "hidden" }}>
                 <span style={{ display: "block", height: "100%", width: `${width}%`, background: color, opacity: 0.72, "margin-left": net >= 0 ? "0" : "auto" }} />
               </span>
-              <span style={{ "font-family": "var(--font-mono)", "font-size": "10.5px", color, "text-align": "right" }}>
+              <span style={{ "font-family": "var(--font-mono)", "font-size": "11.5px", color, "text-align": "right" }}>
                 {net >= 0 ? "+" : ""}{net.toFixed(1)} {props.unit}
               </span>
             </div>
@@ -2972,7 +3160,7 @@ function AShareMarketSnapshotCard(props: { tool: ToolCallView }) {
       <Show
         when={table()?.rows.length}
         fallback={
-          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+          <div style={{ color: "var(--ink-3)", "font-size": "12.5px" }}>
             <Show when={props.tool.status === "in_progress"} fallback="No market snapshot.">
               Fetching market snapshot…
             </Show>
@@ -2986,7 +3174,7 @@ function AShareMarketSnapshotCard(props: { tool: ToolCallView }) {
         }}>
           <MarketSnapshotGrid table={table()!} />
         </div>
-        <div style={{ "margin-top": "8px", "font-size": "10.5px", color: "var(--ink-3)" }}>
+        <div style={{ "margin-top": "8px", "font-size": "11.5px", color: "var(--ink-3)" }}>
           {marketSnapshotFootnote(table()!)}
         </div>
         <Show when={extraTables().length > 0}>
@@ -3059,7 +3247,7 @@ function MarketSnapshotGrid(props: { table: MarkdownTable }) {
       <For each={props.table.rows}>{(row) => {
         const pctColumn = columns().find((column) => column.pct);
         const pct = parseFloat(pctColumn ? row[pctColumn.index] ?? "" : "");
-        const pctColor = Number.isFinite(pct) ? pct >= 0 ? "#d97757" : "#6fb98a" : "var(--ink-3)";
+        const pctColor = Number.isFinite(pct) ? pct >= 0 ? "var(--up)" : "var(--down)" : "var(--ink-3)";
         return (
           <>
             <For each={columns()}>{(column) => {
@@ -3134,7 +3322,7 @@ function AShareResearchSourcesCard(props: { tool: ToolCallView }) {
       <Show
         when={sections().length > 0}
         fallback={
-          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+          <div style={{ color: "var(--ink-3)", "font-size": "12.5px" }}>
             <Show when={props.tool.status === "in_progress"} fallback="No structured source sections.">
               Fetching source material…
             </Show>
@@ -3165,10 +3353,10 @@ function ResearchSourceSectionTile(props: { section: ResearchSourceSection }) {
       "min-width": 0,
     }}>
       <div style={{ display: "flex", gap: "8px", "align-items": "baseline", "margin-bottom": "7px" }}>
-        <div style={{ color: "var(--ink-0)", "font-weight": 650, "font-size": "12px" }}>{props.section.title}</div>
+        <div style={{ color: "var(--ink-0)", "font-weight": 650, "font-size": "13px" }}>{props.section.title}</div>
         <div style={{
           "font-family": "var(--font-mono)",
-          "font-size": "9.5px",
+          "font-size": "10.5px",
           color: props.section.unavailable ? "#d97070" : "var(--ink-3)",
           "margin-left": "auto",
         }}>
@@ -3213,7 +3401,7 @@ function ResearchSourceRow(props: { row: string; unavailable: boolean }) {
           style={{
             color: "var(--clay-soft)",
             "font-family": "var(--font-mono)",
-            "font-size": "9.5px",
+            "font-size": "10.5px",
             "text-decoration": "none",
             "flex-shrink": 0,
           }}
@@ -3273,7 +3461,7 @@ function MarketQuoteCard(props: { tool: ToolCallView }) {
       <Show
         when={rows().length > 0}
         fallback={
-          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+          <div style={{ color: "var(--ink-3)", "font-size": "12.5px" }}>
             <Show when={props.tool.status === "in_progress"} fallback="No quotes.">
               Fetching quotes…
             </Show>
@@ -3337,7 +3525,7 @@ function QuoteHeader(props: { text: string; align?: "left" | "right" }) {
 function QuoteMatrixRow(props: { row: TVQuoteRow }) {
   const pctNum = parseFloat(props.row.pct);
   const up = !Number.isFinite(pctNum) ? null : pctNum >= 0;
-  const color = up == null ? "var(--ink-3)" : up ? "#d97757" : "#6fb98a";
+  const color = up == null ? "var(--ink-3)" : up ? "var(--up)" : "var(--down)";
   return (
     <>
       <QuoteCell mono strong>{props.row.symbol}</QuoteCell>
@@ -3382,7 +3570,7 @@ function QuoteCell(props: {
 function QuoteChip(props: { row: TVQuoteRow }) {
   const pctNum = parseFloat(props.row.pct);
   const up = !Number.isFinite(pctNum) ? null : pctNum >= 0;
-  const color = up == null ? "var(--ink-3)" : up ? "#d97757" : "#6fb98a";
+  const color = up == null ? "var(--ink-3)" : up ? "var(--up)" : "var(--down)";
   return (
     <div style={{
       display: "flex",
@@ -3398,7 +3586,7 @@ function QuoteChip(props: { row: TVQuoteRow }) {
         <div style={{ "min-width": 0 }}>
           <div style={{
             "font-family": "var(--font-mono)",
-            "font-size": "12px",
+            "font-size": "13px",
             color: "var(--ink-0)",
             "font-weight": 750,
             "line-height": 1.2,
@@ -3442,12 +3630,12 @@ function QuoteStat(props: { label: string; value: string }) {
       "border-radius": "6px",
       "min-width": 0,
     }}>
-      <div style={{ "font-family": "var(--font-mono)", "font-size": "9.5px", color: "var(--ink-3)", "margin-bottom": "3px" }}>
+      <div style={{ "font-family": "var(--font-mono)", "font-size": "10.5px", color: "var(--ink-3)", "margin-bottom": "3px" }}>
         {props.label}
       </div>
       <div style={{
         "font-family": "var(--font-mono)",
-        "font-size": "11.5px",
+        "font-size": "12.5px",
         color: "var(--ink-1)",
         "font-weight": 650,
         overflow: "hidden",
@@ -3581,14 +3769,17 @@ function Candlestick(props: { data: OhlcvRow[]; height: number }) {
       handleScroll: true,
       handleScale: true,
     });
+    // Read the resolved --up / --down tokens so the candles follow the user's
+    // 涨跌配色 setting (default 红涨绿跌). lightweight-charts needs concrete hex.
+    const cs = getComputedStyle(document.documentElement);
+    const upHex = cs.getPropertyValue("--up").trim() || "#e35b4e";
+    const downHex = cs.getPropertyValue("--down").trim() || "#5fb98f";
     series = chart.addSeries(CandlestickSeries, {
-      // Red-up / green-down — Chinese A-share convention since this card
-      // is primarily for tushare CN equities.
-      upColor: "#d97757",
-      downColor: "#6fb98a",
+      upColor: upHex,
+      downColor: downHex,
       borderVisible: false,
-      wickUpColor: "#d97757",
-      wickDownColor: "#6fb98a",
+      wickUpColor: upHex,
+      wickDownColor: downHex,
     });
     series.setData(toSeriesData());
     showLatestWindow();
@@ -3697,7 +3888,7 @@ function CandlestickToolCard(props: { tool: ToolCallView }) {
                   background: interval() === value ? "rgba(217,119,87,0.18)" : "transparent",
                   color: disabled ? "rgba(160,145,130,0.35)" : interval() === value ? "var(--clay-soft)" : "var(--ink-3)",
                   "font-family": "var(--font-mono)",
-                  "font-size": "10.5px",
+                  "font-size": "11.5px",
                   padding: "4px 8px",
                   "border-radius": "4px",
                   cursor: disabled ? "not-allowed" : "pointer",
@@ -3707,17 +3898,17 @@ function CandlestickToolCard(props: { tool: ToolCallView }) {
           }}</For>
         </div>
         <Show when={isAshare}>
-          <span style={{ "font-family": "var(--font-mono)", "font-size": "10.5px", color: "var(--ink-3)" }}>
+          <span style={{ "font-family": "var(--font-mono)", "font-size": "11.5px", color: "var(--ink-3)" }}>
             15m 等 pytdx 接入
           </span>
         </Show>
         <Show when={loading()}>
-          <span style={{ "font-family": "var(--font-mono)", "font-size": "10.5px", color: "var(--ink-3)" }}>
+          <span style={{ "font-family": "var(--font-mono)", "font-size": "11.5px", color: "var(--ink-3)" }}>
             loading candles…
           </span>
         </Show>
         <Show when={error()}>
-          <span style={{ "font-family": "var(--font-mono)", "font-size": "10.5px", color: "#d97070", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
+          <span style={{ "font-family": "var(--font-mono)", "font-size": "11.5px", color: "#d97070", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
             {error()}
           </span>
         </Show>
@@ -3725,7 +3916,7 @@ function CandlestickToolCard(props: { tool: ToolCallView }) {
       <Show
         when={rows().length > 0}
         fallback={
-          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+          <div style={{ color: "var(--ink-3)", "font-size": "12.5px" }}>
             <Show when={props.tool.status === "in_progress"} fallback="No candles.">
               Fetching candlesticks…
             </Show>
@@ -3735,7 +3926,7 @@ function CandlestickToolCard(props: { tool: ToolCallView }) {
         <Show when={summary()}>
           <div style={{
             "font-family": "var(--font-mono)",
-            "font-size": "10.5px",
+            "font-size": "11.5px",
             color: "var(--ink-2)",
             "line-height": 1.45,
             "margin-bottom": "8px",
@@ -3746,7 +3937,7 @@ function CandlestickToolCard(props: { tool: ToolCallView }) {
         <Candlestick data={rows()} height={260} />
         <div style={{
           "font-family": "var(--font-mono)",
-          "font-size": "10px",
+          "font-size": "11px",
           color: "var(--ink-3)",
           "margin-top": "8px",
         }}>
@@ -3786,7 +3977,7 @@ function SecFilingCard(props: { tool: ToolCallView }) {
       <Show
         when={filings.length > 0}
         fallback={
-          <div style={{ color: "var(--ink-3)", "font-size": "11.5px" }}>
+          <div style={{ color: "var(--ink-3)", "font-size": "12.5px" }}>
             <Show when={props.tool.status === "in_progress"} fallback="No filings.">
               Fetching filings…
             </Show>
@@ -3841,7 +4032,7 @@ function GenericToolCard(props: { tool: ToolCallView }) {
     <CardShell status={props.tool.status} badge={toolDisplayName(props.tool.name)} detail={summary} tool={props.tool} callId={props.tool.call_id} size="compact">
       <Show when={toolOutput(props.tool)}>
         <div style={{
-          "font-size": "11.5px",
+          "font-size": "12.5px",
           color: "var(--ink-2)",
           "line-height": 1.45,
           "max-height": "180px",

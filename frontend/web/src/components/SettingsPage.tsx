@@ -15,6 +15,8 @@ interface SettingsResponse {
   data_providers: DataProviderStatus[];
 }
 
+type UpDownScheme = "cn" | "intl";
+
 export function SettingsPage() {
   const [status, setStatus] = createSignal<DataProviderStatus | null>(null);
   const [token, setToken] = createSignal("");
@@ -22,6 +24,18 @@ export function SettingsPage() {
   const [busy, setBusy] = createSignal(false);
   const [message, setMessage] = createSignal("");
   const [error, setError] = createSignal("");
+  const [scheme, setSchemeSignal] = createSignal<UpDownScheme>(
+    localStorage.getItem("lk-updown") === "intl" ? "intl" : "cn",
+  );
+
+  // Applies instantly (no save button) — pure client preference. Flips the
+  // --up / --down tokens app-wide via the documentElement attribute.
+  function setScheme(next: UpDownScheme) {
+    setSchemeSignal(next);
+    localStorage.setItem("lk-updown", next);
+    if (next === "intl") document.documentElement.dataset.updown = "intl";
+    else delete document.documentElement.dataset.updown;
+  }
 
   async function load() {
     setError("");
@@ -70,12 +84,43 @@ export function SettingsPage() {
       <div class="lk-settings-head">
         <div>
           <div class="lk-settings-kicker">SETTINGS</div>
-          <h1>数据源</h1>
+          <h1>设置</h1>
         </div>
         <button class="lk-settings-refresh" onClick={() => void load()} disabled={busy()}>
           refresh
         </button>
       </div>
+
+      <section class="lk-settings-card">
+        <div class="lk-settings-card-head">
+          <div>
+            <div class="lk-settings-title">涨跌配色</div>
+            <div class="lk-settings-sub">行情涨跌的红绿习惯,即时生效</div>
+          </div>
+        </div>
+        <div class="lk-settings-segment" role="radiogroup" aria-label="涨跌配色">
+          <button
+            type="button"
+            role="radio"
+            aria-checked={scheme() === "cn"}
+            class={scheme() === "cn" ? "active" : ""}
+            onClick={() => setScheme("cn")}
+          >
+            <span class="lk-seg-swatch"><i style={{ background: "#e35b4e" }} /><i style={{ background: "#5fb98f" }} /></span>
+            红涨绿跌 · 中国大陆
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={scheme() === "intl"}
+            class={scheme() === "intl" ? "active" : ""}
+            onClick={() => setScheme("intl")}
+          >
+            <span class="lk-seg-swatch"><i style={{ background: "#5fb98f" }} /><i style={{ background: "#e35b4e" }} /></span>
+            绿涨红跌 · 国际惯例
+          </button>
+        </div>
+      </section>
 
       <section class="lk-settings-card">
         <div class="lk-settings-card-head">

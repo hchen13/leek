@@ -116,13 +116,14 @@ function ModCandles(props: { w: number; h: number; seed?: number; base?: number;
     <div class="lk-mod lk-mod-chart">
       <svg width={W} height={H} style={{ display: "block" }}>
         <defs>
+          {/* 红涨绿跌 — up candles red, down candles green (China convention) */}
           <linearGradient id={`cup-${seed}`} x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stop-color="#6fb98a" stop-opacity="1" />
-            <stop offset="100%" stop-color="#6fb98a" stop-opacity="0.85" />
+            <stop offset="0%" stop-color="#e35b4e" stop-opacity="1" />
+            <stop offset="100%" stop-color="#e35b4e" stop-opacity="0.85" />
           </linearGradient>
           <linearGradient id={`cdn-${seed}`} x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stop-color="#d97070" stop-opacity="1" />
-            <stop offset="100%" stop-color="#d97070" stop-opacity="0.85" />
+            <stop offset="0%" stop-color="#5fb98f" stop-opacity="1" />
+            <stop offset="100%" stop-color="#5fb98f" stop-opacity="0.85" />
           </linearGradient>
         </defs>
 
@@ -144,7 +145,7 @@ function ModCandles(props: { w: number; h: number; seed?: number; base?: number;
           const yH = layout().yScale(c.hi);
           const yL = layout().yScale(c.lo);
           const fill = up ? `url(#cup-${seed})` : `url(#cdn-${seed})`;
-          const stroke = up ? "#6fb98a" : "#d97070";
+          const stroke = up ? "#e35b4e" : "#5fb98f";
           return (
             <g>
               <line x1={cx} x2={cx} y1={yH} y2={yL} stroke={stroke} stroke-width="0.7" />
@@ -282,7 +283,7 @@ function ModRows(props: { rows: WatchRow[] }) {
             <span class="sym">{r.sym}</span>
             <span class="name">{r.name}</span>
             <svg class="spark" width={w} height={h}>
-              <path d={path} fill="none" stroke={r.ch >= 0 ? "#6fb98a" : "#d97070"} stroke-width="1" />
+              <path d={path} fill="none" stroke={r.ch >= 0 ? "#e35b4e" : "#5fb98f"} stroke-width="1" />
             </svg>
             <span class="px">{r.px.toFixed(2)}</span>
             <span class={"ch " + (r.ch >= 0 ? "up" : "dn")}>{r.ch >= 0 ? "+" : ""}{r.ch.toFixed(2)}%</span>

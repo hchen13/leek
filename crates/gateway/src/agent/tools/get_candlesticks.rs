@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use chrono::DateTime;
 use reqwest::Client;
@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::llm::ToolSpec;
 
-use super::{ToolContext, ToolHandler, data_provider_tokens};
+use super::{data_provider_tokens, ToolContext, ToolHandler};
 
 const TOOL_NAME: &str = "get_candlesticks";
 const TUSHARE_ENDPOINT: &str = "https://api.tushare.pro";
@@ -318,11 +318,13 @@ impl GetCandlesticksTool {
                     price_basis = "前复权";
                 }
                 Ok(_) => {
+                    price_basis = "不复权（前复权不可用）";
                     basis_note =
                         "\n_复权说明: 已请求前复权，但未匹配到足够 adj_factor；本次返回不复权价格。_"
                             .to_string();
                 }
                 Err(err) => {
+                    price_basis = "不复权（前复权失败）";
                     basis_note = format!(
                         "\n_复权说明: 已请求前复权，但 adj_factor 获取失败；本次返回不复权价格。错误: {}_",
                         preview_err(&err.to_string())

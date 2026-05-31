@@ -13,7 +13,7 @@ export function CanvasIdle() {
   return (
     <div class="lk-canvas-empty">
       <div class="label">CANVAS · IDLE</div>
-      <div class="sub">Reasoning artifacts will materialize here.</div>
+      <div class="sub">推理产物会在这里逐步浮现。</div>
     </div>
   );
 }

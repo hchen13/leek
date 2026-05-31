@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
@@ -10,7 +10,7 @@ use crate::{
     tushare::{TushareClient, TushareResponse},
 };
 
-use super::{ToolContext, ToolHandler, data_provider_tokens};
+use super::{data_provider_tokens, ToolContext, ToolHandler};
 
 const TOOL_NAME: &str = "get_a_share_ownership_and_leverage";
 const REQUEST_TIMEOUT_SECS: u64 = 30;

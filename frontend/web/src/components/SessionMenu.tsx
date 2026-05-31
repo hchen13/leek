@@ -10,6 +10,8 @@ export interface SessionRow {
   pinned: number;
   created_at: string;
   last_active_at: string;
+  /** Live runtime flag from the gateway — an agent reply is in flight. */
+  running?: boolean;
 }
 
 export function SessionMenu(props: {
@@ -73,6 +75,9 @@ export function SessionMenu(props: {
           gap: "6px",
         }}
       >
+        <Show when={current()?.running}>
+          <span class="lk-live-dot" title="该会话正在生成" />
+        </Show>
         <span>{display()}</span>
         <span style={{ color: "var(--ink-3)", "font-size": "9px" }}>▾</span>
       </button>
@@ -134,6 +139,9 @@ export function SessionMenu(props: {
                 props.onSelect(s.id);
                 setOpen(false);
               }}>
+                <Show when={s.running}>
+                  <span class="lk-live-dot" title="正在生成" />
+                </Show>
                 <Show
                   when={renamingThis()}
                   fallback={

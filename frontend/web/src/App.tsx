@@ -33,6 +33,11 @@ export function App() {
   const [page, setPage] = createSignal<Page>("chat");
 
   onMount(() => {
+    // Apply the saved 涨跌配色 preference (default = China red-up/green-down,
+    // which lives in :root; "intl" flips it via the data-updown attribute).
+    const scheme = localStorage.getItem("lk-updown");
+    if (scheme === "intl") document.documentElement.dataset.updown = "intl";
+
     const handler = () => setView(readViewFromHash());
     window.addEventListener("hashchange", handler);
     onCleanup(() => window.removeEventListener("hashchange", handler));

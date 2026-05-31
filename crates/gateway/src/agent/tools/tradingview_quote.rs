@@ -11,10 +11,10 @@
 
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE};
 use reqwest::Client;
-use reqwest::header::{ACCEPT_LANGUAGE, HeaderMap, HeaderValue};
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::ToolSpec;

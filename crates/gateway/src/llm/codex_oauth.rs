@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
@@ -95,26 +95,83 @@ impl LlmProvider for CodexOauthProvider {
 
     async fn chat(&self, req: ChatRequest) -> Result<BoxStream<'static, Result<LlmEvent>>> {
         let access_token = self.ensure_fresh_token().await?;
-        let body = openai_responses::build_request_body(&req);
+        let mut body = openai_responses::build_request_body(&req);
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("prompt_cache_retention");
+        }
         let url = format!("{BASE_URL}/responses");
 
-        let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {access_token}"))
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .context("POST /responses to codex backend")?;
+        let mut resp = post_responses(&self.http, &url, &access_token, &body).await?;
 
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
+            if prompt_cache_retention_is_unsupported(status, &body_text)
+                && body.get("prompt_cache_retention").is_some()
+            {
+                tracing::warn!(
+                    "codex backend rejected prompt_cache_retention; retrying without retention"
+                );
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("prompt_cache_retention");
+                }
+                resp = post_responses(&self.http, &url, &access_token, &body).await?;
+                let status = resp.status();
+                if status.is_success() {
+                    return Ok(openai_responses::parse_sse_stream(resp));
+                }
+                let body_text = resp.text().await.unwrap_or_default();
+                bail!("codex /responses returned {status}: {body_text}");
+            }
             bail!("codex /responses returned {status}: {body_text}");
         }
 
         Ok(openai_responses::parse_sse_stream(resp))
+    }
+}
+
+async fn post_responses(
+    http: &reqwest::Client,
+    url: &str,
+    access_token: &str,
+    body: &serde_json::Value,
+) -> Result<reqwest::Response> {
+    http.post(url)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream")
+        .json(body)
+        .send()
+        .await
+        .context("POST /responses to codex backend")
+}
+
+fn prompt_cache_retention_is_unsupported(status: reqwest::StatusCode, body_text: &str) -> bool {
+    status == reqwest::StatusCode::BAD_REQUEST
+        && body_text.contains("prompt_cache_retention")
+        && (body_text.contains("Unsupported")
+            || body_text.contains("unsupported")
+            || body_text.contains("unknown")
+            || body_text.contains("unrecognized"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_cache_retention_error_is_retryable_only_for_400_unsupported() {
+        assert!(prompt_cache_retention_is_unsupported(
+            reqwest::StatusCode::BAD_REQUEST,
+            "Unsupported parameter: prompt_cache_retention"
+        ));
+        assert!(!prompt_cache_retention_is_unsupported(
+            reqwest::StatusCode::BAD_REQUEST,
+            "invalid model"
+        ));
+        assert!(!prompt_cache_retention_is_unsupported(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "Unsupported parameter: prompt_cache_retention"
+        ));
     }
 }

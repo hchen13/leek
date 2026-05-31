@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset};
 use reqwest::Client;
@@ -12,7 +12,7 @@ use crate::{
     tushare::{TushareClient, TushareResponse},
 };
 
-use super::{ToolContext, ToolHandler, data_provider_tokens};
+use super::{data_provider_tokens, ToolContext, ToolHandler};
 
 const TOOL_NAME: &str = "get_a_share_market_snapshot";
 const REQUEST_TIMEOUT_SECS: u64 = 20;

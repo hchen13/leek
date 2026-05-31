@@ -3,15 +3,16 @@
 //! Used by `codex_oauth` (talking to chatgpt.com/backend-api/codex/responses)
 //! and will be reused by `openai_api_key` (api.openai.com/v1/responses) later.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use async_stream::try_stream;
-use futures::{StreamExt, stream::BoxStream};
+use futures::{stream::BoxStream, StreamExt};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use super::{ChatRequest, LlmEvent, Role, StopReason, ToolSpec, Usage, WebSearchAction};
 // `ReasoningEffort` is stringified at the call site (`effort.as_str()`),
 // so no direct import here.
+
+const DEFAULT_TEXT_VERBOSITY: &str = "low";
 
 pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
     let mut input = Vec::new();
@@ -40,7 +41,7 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
         .iter()
         .any(|t| matches!(t, ToolSpec::WebSearch { .. }));
     let tools_json = serialize_tools(&req.tools);
-    let prompt_cache_key = prompt_cache_key(req, &instructions, &tools_json);
+    let prompt_cache_key = prompt_cache_key(req);
 
     let mut body = serde_json::json!({
         "model": req.model,
@@ -52,6 +53,10 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
         // history in vault.messages, so this is what we want anyway.
         "store": false,
     });
+
+    if let Some(retention) = prompt_cache_retention(&req.model) {
+        body["prompt_cache_retention"] = serde_json::Value::String(retention.to_string());
+    }
 
     if !tools_json.is_empty() {
         body["tools"] = serde_json::Value::Array(tools_json);
@@ -72,7 +77,7 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
     // Verbosity hint: only gpt-5.x (Responses API, codex backend) supports
     // this field. "low" suppresses padding without changing reasoning budget.
     if req.model.starts_with("gpt-5") {
-        body["text"] = serde_json::json!({ "verbosity": "low" });
+        body["text"] = serde_json::json!({ "verbosity": DEFAULT_TEXT_VERBOSITY });
     }
 
     // Reasoning effort for gpt-5/gpt-5.5-style models. Omit when caller
@@ -116,27 +121,7 @@ fn serialize_tools(tools: &[ToolSpec]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn prompt_cache_key(
-    req: &ChatRequest,
-    instructions: &str,
-    tools_json: &[serde_json::Value],
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(req.model.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(instructions.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(
-        serde_json::to_string(tools_json)
-            .unwrap_or_default()
-            .as_bytes(),
-    );
-    let digest = hasher.finalize();
-    let short_hash = digest
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+fn prompt_cache_key(req: &ChatRequest) -> String {
     let model = req
         .model
         .chars()
@@ -149,7 +134,15 @@ fn prompt_cache_key(
         })
         .take(40)
         .collect::<String>();
-    format!("leek:{model}:{short_hash}")
+    format!("leek:{model}:main-agent")
+}
+
+fn prompt_cache_retention(model: &str) -> Option<&'static str> {
+    if model.starts_with("gpt-5") || model.starts_with("gpt-4.1") {
+        Some("24h")
+    } else {
+        None
+    }
 }
 
 /// Parse an OpenAI Responses SSE stream into our normalized `LlmEvent` flow.
@@ -637,13 +630,8 @@ mod tests {
             body["include"],
             serde_json::json!(["web_search_call.action.sources"])
         );
-        assert!(
-            body["prompt_cache_key"]
-                .as_str()
-                .unwrap()
-                .starts_with("leek:gpt-5.5:")
-        );
-        assert!(body.get("prompt_cache_retention").is_none());
+        assert_eq!(body["prompt_cache_key"], "leek:gpt-5.5:main-agent");
+        assert_eq!(body["prompt_cache_retention"], "24h");
     }
 
     #[test]
@@ -798,6 +786,44 @@ mod tests {
     }
 
     #[test]
+    fn build_request_body_defaults_text_verbosity_to_low_for_gpt5() {
+        use super::super::{ChatMessage, ChatRequest, Role};
+        let req = ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "briefly explain".into(),
+            }],
+            system: None,
+            model: "gpt-5.5".into(),
+            max_output_tokens: None,
+            tools: Vec::new(),
+            additional_inputs: Vec::new(),
+            reasoning_effort: None,
+        };
+        let body = build_request_body(&req);
+        assert_eq!(body["text"]["verbosity"], DEFAULT_TEXT_VERBOSITY);
+    }
+
+    #[test]
+    fn build_request_body_omits_text_verbosity_for_non_gpt5() {
+        use super::super::{ChatMessage, ChatRequest, Role};
+        let req = ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "hi".into(),
+            }],
+            system: None,
+            model: "gpt-4o".into(),
+            max_output_tokens: None,
+            tools: Vec::new(),
+            additional_inputs: Vec::new(),
+            reasoning_effort: None,
+        };
+        let body = build_request_body(&req);
+        assert!(body.get("text").is_none());
+    }
+
+    #[test]
     fn build_request_body_cache_key_ignores_chat_history() {
         use super::super::{ChatMessage, ChatRequest, Role, ToolSpec};
         let mk = |content: &str| ChatRequest {
@@ -823,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn build_request_body_cache_key_tracks_static_prefix_changes() {
+    fn build_request_body_cache_key_is_stable_across_static_prefix_changes() {
         use super::super::{ChatMessage, ChatRequest, Role};
         let mk = |system: &str| ChatRequest {
             messages: vec![ChatMessage {
@@ -840,7 +866,26 @@ mod tests {
         let first = build_request_body(&mk("stable instructions"));
         let second = build_request_body(&mk("changed instructions"));
 
-        assert_ne!(first["prompt_cache_key"], second["prompt_cache_key"]);
+        assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+    }
+
+    #[test]
+    fn build_request_body_omits_24h_cache_retention_for_unsupported_model_family() {
+        use super::super::{ChatMessage, ChatRequest, Role};
+        let req = ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "hi".into(),
+            }],
+            system: None,
+            model: "gpt-4o".into(),
+            max_output_tokens: None,
+            tools: Vec::new(),
+            additional_inputs: Vec::new(),
+            reasoning_effort: None,
+        };
+        let body = build_request_body(&req);
+        assert!(body.get("prompt_cache_retention").is_none());
     }
 
     #[test]

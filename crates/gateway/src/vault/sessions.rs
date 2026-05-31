@@ -71,6 +71,41 @@ pub async fn rename(
     Ok(())
 }
 
+pub async fn rename_if_untitled(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    new_title: &str,
+) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE sessions \
+         SET title = ?, last_active_at = ? \
+         WHERE user_id = ? AND id = ? \
+           AND (title IS NULL OR trim(title) = '' OR lower(trim(title)) = 'untitled session')",
+    )
+    .bind(new_title)
+    .bind(&now)
+    .bind(user_id)
+    .bind(session_id)
+    .execute(pool)
+    .await
+    .context("auto-renaming untitled session")?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn touch(pool: &SqlitePool, user_id: &str, session_id: &str) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query("UPDATE sessions SET last_active_at = ? WHERE user_id = ? AND id = ?")
+        .bind(&now)
+        .bind(user_id)
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .context("touching session last_active_at")?;
+    Ok(())
+}
+
 /// Hard-delete a session and every row it owns. The vault has no foreign-key
 /// cascades, so deletion fans out explicitly inside one transaction.
 pub async fn hard_delete(pool: &SqlitePool, user_id: &str, session_id: &str) -> Result<()> {

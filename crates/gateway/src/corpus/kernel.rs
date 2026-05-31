@@ -1,26 +1,23 @@
-//! Distill the runtime principles kernel into a single markdown blob suitable
-//! for system-prompt injection.
+//! Runtime kernel page cleanup.
+//!
+//! leek's "default mind" is the corpus `principles-runtime-kernel` wiki page.
+//! It is no longer pre-distilled into a separate artifact: `build_system_prompt`
+//! reads it live from the embedded corpus and cleans it here, so updating the
+//! corpus repo (then rebuilding) is the only step needed to refresh it.
 //!
 //! Cleaning rules:
-//! - strip YAML frontmatter
-//! - drop `## 来源 / ## Sources / ## 相关概念 / ## Related Concepts /
-//!   ## Related` sections (path lists the LLM doesn't need)
-//! - simplify wikilinks `[[wikis/.../slug]]` → `slug` (with hyphens →
-//!   spaces); the corpus convention forbids `|alias` form so we don't honor
-//!   it but defensively strip it if present
-//! - keep everything else verbatim (definitions, tenets, applications,
-//!   misconceptions, evolution of thought, canonical cases, open questions)
-//!
-//! Output gets a per-page H2 wrapper (`## <slug as title>`) and pages are
-//! separated by horizontal rules. The whole blob is wrapped in a top-level
-//! H1 with a metadata comment carrying the input hash for drift detection.
+//! - strip YAML frontmatter (already gone from `lookup_doc` bodies; kept for
+//!   safety and any direct-file caller)
+//! - drop `## 来源 / ## Sources / ## 相关概念 / ## Related / ## 思想演变 /
+//!   ## 典型案例 / ## 开放问题` sections — provenance and path lists the
+//!   prompt doesn't need (`corpus_search` is the retrieval entry point)
+//! - simplify wikilinks `[[wikis/.../slug]]` → `slug` (with hyphens → spaces);
+//!   the corpus forbids the `|alias` form but we defensively strip it if present
+//! - keep everything else verbatim
 
-use std::fs;
-use std::path::Path;
-
-use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
-const RUNTIME_KERNEL_PAGES: &[&str] = &["wikis/principles/concepts/principles-runtime-kernel.md"];
+/// Corpus id (no `.md`) of the runtime kernel page injected into the system
+/// prompt as leek's default reasoning mind. Read via `corpus_search::lookup_doc`.
+pub const RUNTIME_KERNEL_ID: &str = "wikis/principles/concepts/principles-runtime-kernel";
 
 /// Strip the leading YAML frontmatter block `---\n...\n---\n?` if present.
 fn strip_frontmatter(text: &str) -> &str {
@@ -74,7 +71,7 @@ fn simplify_wikilinks(text: &str) -> String {
     .to_string()
 }
 
-fn clean_page(raw: &str) -> String {
+pub fn clean_page(raw: &str) -> String {
     let mut text = strip_frontmatter(raw).trim_start().to_string();
     for heading in [
         // path-only scaffolding (no semantic content for the LLM)
@@ -93,85 +90,6 @@ fn clean_page(raw: &str) -> String {
         text = strip_section(&text, heading);
     }
     simplify_wikilinks(&text).trim().to_string()
-}
-
-/// Stable content hash over the selected runtime-kernel pages. Used to detect
-/// drift between distilled output and the corpus it was distilled from.
-fn input_hash(corpus_root: &Path) -> Result<String> {
-    let mut hasher = Sha256::new();
-    for rel in RUNTIME_KERNEL_PAGES {
-        hasher.update(rel.as_bytes());
-        hasher.update(b"\0");
-        let path = corpus_root.join(rel);
-        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        hasher.update(&bytes);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-#[derive(Debug)]
-pub struct DistillReport {
-    pub pages_in: usize,
-    pub bytes_out: usize,
-    pub input_hash: String,
-}
-
-/// Distill the corpus runtime kernel into a single embeddable markdown blob.
-pub fn distill(corpus_root: &Path) -> Result<(String, DistillReport)> {
-    for rel in RUNTIME_KERNEL_PAGES {
-        let path = corpus_root.join(rel);
-        if !path.exists() {
-            anyhow::bail!("expected runtime kernel page at {}", path.display());
-        }
-    }
-
-    let hash = input_hash(corpus_root)?;
-
-    let mut pages = Vec::new();
-    for rel in RUNTIME_KERNEL_PAGES {
-        let path = corpus_root.join(rel);
-        let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let cleaned = clean_page(&raw);
-        if cleaned.is_empty() {
-            continue;
-        }
-        let slug = Path::new(rel)
-            .file_stem()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        pages.push((slug, cleaned));
-    }
-    let pages_in = pages.len();
-
-    let mut out = String::with_capacity(64_000);
-    out.push_str("# Principles runtime kernel (your default mind)\n\n");
-    out.push_str(&format!(
-        "<!-- distilled from {pages_in} pages | input_hash={hash} -->\n\n"
-    ));
-    out.push_str(
-        "This is the compact operating kernel you start every investment \
-         conversation with. It is distilled from the corpus runtime kernel: \
-         the 7-step reasoning ladder, Core propositions, and productive \
-         tensions shared by Buffett, Munger, Dalio, and Duan Yongping. Use it \
-         as an orientation layer; use `corpus_search` and `corpus_read` when \
-         the task needs a specific concept page, source quote, knowledge page, \
-         company fact, or current-world evidence.\n\n---\n\n",
-    );
-    for (slug, body) in &pages {
-        let title = slug.replace('-', " ");
-        out.push_str(&format!("## {title}\n\n{body}\n\n---\n\n"));
-    }
-
-    let bytes_out = out.len();
-    Ok((
-        out,
-        DistillReport {
-            pages_in,
-            bytes_out,
-            input_hash: hash,
-        },
-    ))
 }
 
 #[cfg(test)]

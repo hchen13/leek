@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::Serialize;
 use sqlx::SqlitePool;

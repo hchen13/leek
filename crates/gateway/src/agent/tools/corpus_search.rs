@@ -14,7 +14,7 @@
 
 use std::sync::OnceLock;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use rust_embed::RustEmbed;
 use tokio_util::sync::CancellationToken;
@@ -181,9 +181,10 @@ impl ToolHandler for CorpusSearchTool {
                  tier, layer, usage_role, tags, and a snippet around the first match. Use \
                  `corpus_read` with a returned id when the snippet is not enough. Use \
                  `web_fetch` only for external URLs, not corpus ids. If hits are empty for a company, industry, or macro \
-                 topic, treat it as a corpus coverage gap, not as an answer: build a session-only \
-                 working model from external company/industry/macro facts and do not write it \
-                 into corpus."
+                 topic, treat it as an internal provenance gap, not as an answer: use \
+                 external company/industry/macro facts to build the needed working model, \
+                 but do not make corpus coverage itself part of the user-facing answer \
+                 unless the user asks about coverage or it materially changes confidence."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -323,7 +324,7 @@ impl ToolHandler for CorpusSearchTool {
             .collect();
 
         let guidance = if hits.is_empty() {
-            "No corpus hit found. Treat this as a corpus coverage gap, not a stopping condition: build a session-only working model from external company/industry/macro facts, label it as session facts/inference, and do not write it into corpus."
+            "No corpus hit found. Treat this as an internal provenance gap, not a stopping condition: build the needed working model from external company/industry/macro facts. Do not make corpus coverage itself user-facing unless the user asked about coverage or it materially changes confidence."
         } else {
             "Treat wiki hits as active reasoning lenses. Treat source hits as supporting evidence candidates; open/use them only when the snippet directly affects the task or primary-source grounding is required."
         };

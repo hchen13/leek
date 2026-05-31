@@ -19,12 +19,12 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use dom_smoothie::{Config, Readability, TextMode};
 use lru::LruCache;
-use reqwest::Client;
 use reqwest::redirect::{Action, Attempt};
+use reqwest::Client;
 use std::num::NonZeroUsize;
 use tokio_util::sync::CancellationToken;
 use url::Url;

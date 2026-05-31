@@ -91,15 +91,15 @@ export interface AgentPlanView {
 }
 
 const sceneMeta = (s: Scene) =>
-  s === "deep" || s === "thinking-shallow" ? "reasoning · live"
-  : s === "delivered" ? "reasoning · cached"
-  : "waiting";
+  s === "deep" || s === "thinking-shallow" ? "检索中 · 实时"
+  : s === "delivered" ? "检索完成"
+  : "待命";
 
 const CLUSTERS: Record<string, { label: string; color: string; cx: number; cy: number }> = {
-  "principles-wikis": { label: "principles · wiki", color: "#d97757", cx: 0.25, cy: 0.29 },
-  "principles-sources": { label: "principles · source", color: "#a85636", cx: 0.27, cy: 0.73 },
-  "knowledge-wikis": { label: "knowledge · wiki", color: "#e8b86c", cx: 0.76, cy: 0.31 },
-  "knowledge-sources": { label: "knowledge · source", color: "#b88842", cx: 0.74, cy: 0.74 },
+  "principles-wikis": { label: "原则 · 概念", color: "#d97757", cx: 0.25, cy: 0.29 },
+  "principles-sources": { label: "原则 · 源材料", color: "#a85636", cx: 0.27, cy: 0.73 },
+  "knowledge-wikis": { label: "知识 · 概念", color: "#e8b86c", cx: 0.76, cy: 0.31 },
+  "knowledge-sources": { label: "知识 · 源材料", color: "#b88842", cx: 0.74, cy: 0.74 },
 };
 
 const BOOTSTRAP_ACTIVE_IDS = [
@@ -671,7 +671,7 @@ export function BrainWidget(props: {
   return (
     <div class="lk-brain-widget">
       <div class="lk-brain-head">
-        <span class="label"><b>CORPUS</b> · BRAIN</span>
+        <span class="label"><b>CORPUS</b> · 大脑</span>
         <span class="meta">{sceneMeta(props.scene)}</span>
       </div>
       <div class="lk-brain-body">
@@ -705,6 +705,17 @@ export function InsightSidebar(props: {
   );
 }
 
+function planStatusLabel(status: string): string {
+  switch (status) {
+    case "pending": return "待办";
+    case "in_progress": return "进行中";
+    case "completed": return "已完成";
+    case "blocked": return "受阻";
+    case "skipped": return "已跳过";
+    default: return status.replace("_", " ");
+  }
+}
+
 function AgentPlanWidget(props: { plan: AgentPlanView }) {
   const completed = createMemo(() =>
     props.plan.items.filter((item) => item.status === "completed").length
@@ -714,15 +725,15 @@ function AgentPlanWidget(props: { plan: AgentPlanView }) {
   );
   const meta = createMemo(() => {
     const total = props.plan.items.length;
-    if (completed() === total) return "complete";
-    if (active()) return "in progress";
-    return "pending";
+    if (completed() === total) return "已完成";
+    if (active()) return "进行中";
+    return "待开始";
   });
 
   return (
     <div class="lk-plan-widget">
       <div class="lk-plan-head">
-        <span class="label"><b>AGENT</b> · PLAN</span>
+        <span class="label"><b>团队</b> · 计划</span>
         <span class="meta">{completed()}/{props.plan.items.length} · {meta()}</span>
       </div>
       <div class="lk-plan-body">
@@ -736,7 +747,7 @@ function AgentPlanWidget(props: { plan: AgentPlanView }) {
               <div class="lk-plan-copy">
                 <div class="lk-plan-step">{item.step}</div>
                 <div class="lk-plan-meta">
-                  <span>{item.status.replace("_", " ")}</span>
+                  <span>{planStatusLabel(item.status)}</span>
                   <Show when={item.evidence}>
                     <span title={item.evidence ?? ""}>{item.evidence}</span>
                   </Show>

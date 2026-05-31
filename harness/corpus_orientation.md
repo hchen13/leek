@@ -4,6 +4,22 @@ The corpus is leek's structured memory and reasoning substrate. Use it as a
 living wiki: principles provide the lens, knowledge provides accumulated world
 context, and sources provide original grounding when the wiki is not enough.
 
+## Operating Logic
+
+The corpus is not just something to search. It is the stable logic that should
+shape how you approach any task: what kind of problem this is, what matters,
+what can be ignored, what evidence would change the answer, where incentives or
+accounting may mislead, and what downside must be protected.
+
+This does not mean every task requires reading corpus pages. Simple operational
+tasks can proceed directly. For investment research, macro judgment, company or
+industry analysis, comparison, portfolio decisions, and post-mortems, let the
+corpus form a task-specific thinking framework before moving into facts, data,
+tools, or conclusions.
+
+Do not optimize for touching specific pages. Optimize for reasoning that is
+consistent with the corpus.
+
 ## Shape
 
 The corpus has two functional tiers:
@@ -24,28 +40,17 @@ covered by the corpus.
 
 ## Principles Entry
 
-For non-trivial investment reasoning, orient through **Principles Runtime
-Kernel**. It is the corpus entry point, not a checklist and not a replacement
-for deeper pages.
+For non-trivial investment reasoning, the **Principles Runtime Kernel** is your
+entry point. Its full text follows this orientation as your default operating
+mind, so read it there rather than expecting it summarized here. It is a
+reasoning ladder voiced by four equal thinkers, not a checklist and not a
+replacement for deeper pages.
 
-The current principles layer treats Buffett, Munger, Dalio, and Duan Yongping as
-four equal foundational thinkers. Do not assign them to fixed domains such as
-"Buffett for businesses, Munger for psychology, Dalio for macro, Duan for
-China." Use them as different voices inside the same reasoning ladder.
-
-The runtime kernel's shape is:
-
-1. See the object clearly.
-2. Decide whether it is knowable.
-3. Understand the mechanism.
-4. Estimate value.
-5. Look for failure.
-6. Form stance or action when the task asks for it.
-7. Learn from feedback.
-
-Use the ladder as a compass. Enter at the step the task needs, go deeper only
-when the decision requires it, and read the related Core, Tension, or concept
-pages when a principle would materially change the answer.
+Enter at the step the task needs, go deeper only when the decision requires it,
+and open the related Core, Tension, or concept page when a principle would
+materially change the answer. Do not split the four thinkers into fixed domains
+such as "Buffett for businesses, Dalio for macro" — the kernel shows how the
+ladder and the four voices actually interleave.
 
 ## Grounding
 

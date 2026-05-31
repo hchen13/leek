@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
@@ -10,7 +10,7 @@ use crate::{
     tushare::{TushareClient, TushareResponse},
 };
 
-use super::{ToolContext, ToolHandler, data_provider_tokens};
+use super::{data_provider_tokens, ToolContext, ToolHandler};
 
 const TOOL_NAME: &str = "get_china_fund_context";
 const REQUEST_TIMEOUT_SECS: u64 = 30;

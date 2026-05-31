@@ -34,7 +34,7 @@ pub mod web_fetch;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
@@ -85,7 +85,9 @@ impl ToolRegistry {
 
     /// All advertised tool specs (passed verbatim to `ChatRequest.tools`).
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.handlers.values().map(|h| h.spec()).collect()
+        let mut handlers = self.handlers.values().collect::<Vec<_>>();
+        handlers.sort_by(|a, b| a.name().cmp(b.name()));
+        handlers.into_iter().map(|h| h.spec()).collect()
     }
 
     /// Look up + invoke a tool by name. Errors propagate as `Err`; handler-
@@ -135,6 +137,7 @@ mod tests {
     use super::*;
 
     struct EchoTool;
+    struct AlphaTool;
 
     #[async_trait]
     impl ToolHandler for EchoTool {
@@ -166,6 +169,28 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ToolHandler for AlphaTool {
+        fn name(&self) -> &str {
+            "alpha"
+        }
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::Function {
+                name: "alpha".into(),
+                description: "Alpha.".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn call(
+            &self,
+            _args: serde_json::Value,
+            _cancel: CancellationToken,
+            _ctx: &ToolContext,
+        ) -> Result<String> {
+            Ok("alpha".into())
+        }
+    }
+
     async fn make_ctx() -> ToolContext {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .connect("sqlite::memory:")
@@ -189,6 +214,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, "hi");
+    }
+
+    #[test]
+    fn specs_are_sorted_for_stable_prompt_prefix() {
+        let reg = ToolRegistry::builder()
+            .register(Arc::new(EchoTool))
+            .register(Arc::new(AlphaTool))
+            .build();
+        let names = reg
+            .specs()
+            .into_iter()
+            .filter_map(|spec| match spec {
+                ToolSpec::Function { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["alpha", "echo"]);
     }
 
     #[tokio::test]

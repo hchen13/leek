@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::{Datelike, Utc};
 use reqwest::Client;
@@ -12,7 +12,7 @@ use crate::{
     tushare::{TushareClient, TushareResponse},
 };
 
-use super::{ToolContext, ToolHandler, data_provider_tokens};
+use super::{data_provider_tokens, ToolContext, ToolHandler};
 
 const TOOL_NAME: &str = "get_a_share_research_sources";
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -1146,11 +1146,8 @@ mod tests {
         let line = eastmoney_report_line(&row, EastmoneyReportScope::Stock).unwrap();
         assert!(line.contains("标的:贵州茅台(600519)"));
         assert!(line.contains("评级:买入"));
-        assert!(
-            line.contains(
-                "详情页 https://data.eastmoney.com/report/info/AP202605051821970230.html"
-            )
-        );
+        assert!(line
+            .contains("详情页 https://data.eastmoney.com/report/info/AP202605051821970230.html"));
         assert!(line.contains("PDF https://pdf.dfcfw.com/pdf/H3_AP202605051821970230_1.pdf"));
     }
 

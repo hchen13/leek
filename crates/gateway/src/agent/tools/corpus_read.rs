@@ -1,12 +1,12 @@
 //! `corpus_read` — read a full local corpus wiki/source document by id.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::ToolSpec;
 
-use super::{ToolContext, ToolHandler, corpus_search};
+use super::{corpus_search, ToolContext, ToolHandler};
 
 pub const TOOL_NAME: &str = "corpus_read";
 const DEFAULT_MAX_CHARS: usize = 20_000;
