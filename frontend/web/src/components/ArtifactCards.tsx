@@ -167,6 +167,28 @@ export function ArtifactPanel(props: {
     return groupedEvents().filter((event) => event.turn === latest);
   });
 
+  // `<For>` reconciles by object identity, but every streaming tick rebuilds the
+  // event objects from scratch (messages() → sessionArtifactEvents() → events()
+  // all spread copies). Without identity stability the card rows get torn down
+  // and recreated on each delta, resetting card-local state — open modals,
+  // selected tab/periods. Reuse the previous object for any event whose content
+  // is unchanged so `<For>` keeps the live row, and its state, intact.
+  const stableCache = new Map<string, { sig: string; value: ArtifactEventView }>();
+  const stableEvents = createMemo(() => {
+    const next = visibleEvents();
+    const live = new Set<string>();
+    const out = next.map((event) => {
+      live.add(event.id);
+      const sig = JSON.stringify(event);
+      const cached = stableCache.get(event.id);
+      if (cached && cached.sig === sig) return cached.value;
+      stableCache.set(event.id, { sig, value: event });
+      return event;
+    });
+    for (const key of stableCache.keys()) if (!live.has(key)) stableCache.delete(key);
+    return out;
+  });
+
   return (
     <div class="lk-artifact-grid">
       <Show when={latestTurn() > 0}>
@@ -176,7 +198,7 @@ export function ArtifactPanel(props: {
           <button type="button" class={showAllTurns() ? "active" : ""} onClick={() => setShowAllTurns(true)}>全部</button>
         </div>
       </Show>
-      <For each={visibleEvents()}>{(event) => (
+      <For each={stableEvents()}>{(event) => (
         <ArtifactEventCard event={event} callbacks={props.callbacks} />
       )}</For>
       <Show when={!showAllTurns() && latestTurn() > 0 && visibleEvents().length === 0}>
@@ -1012,6 +1034,12 @@ function firstHeading(md: string): string {
   return md.match(/^##?\s+(.+)$/m)?.[1]?.trim() ?? "";
 }
 
+function securityLabel(text: string): string {
+  const heading = text.match(/^##\s+(.+)$/m)?.[1];
+  if (!heading) return "";
+  return heading.split(" · ")[0]?.trim() ?? "";
+}
+
 interface MarkdownTable {
   title: string;
   headers: string[];
@@ -1665,6 +1693,7 @@ function FinancialsCard(props: { tool: ToolCallView }) {
   const [loading, setLoading] = createSignal(false);
   const [error, setError] = createSignal("");
   const tables = createMemo(() => parseMarkdownTables(preview()));
+  const displayLabel = createMemo(() => securityLabel(preview()) || ticker);
   const incomeTable = () => findFinancialTable(tables(), ["利润表", "Income"]);
   const balanceTable = () => findFinancialTable(tables(), ["资产负债表", "Balance"]);
   const cashflowTable = () => findFinancialTable(tables(), ["现金流", "Cash Flow"]);
@@ -1727,7 +1756,7 @@ function FinancialsCard(props: { tool: ToolCallView }) {
       <CardShell
         status={props.tool.status}
         badge={toolDisplayName(props.tool.name)}
-        detail={ticker}
+        detail={displayLabel()}
         tool={props.tool}
         callId={props.tool.call_id}
         size="wide"
@@ -1781,7 +1810,7 @@ function FinancialsCard(props: { tool: ToolCallView }) {
       </CardShell>
       <Show when={open()}>
         <ArtifactModal
-          title={ticker}
+          title={displayLabel()}
           subtitle={`财务 · ${periods()} 期`}
           onClose={() => setOpen(false)}
         >
@@ -2147,10 +2176,18 @@ function isAnnualPeriod(label: string): boolean {
   return /^\d{4}$/.test(s) || /^\d{4}[-/]?12$/.test(s) || /\bFY\b/i.test(s);
 }
 
+// A-share Q4 closes on 12-31, so its report period (yyyy-12) is simultaneously the
+// fourth quarter and the annual figure. Annual mode wants only the year-end snapshot,
+// but quarterly mode must keep every quarter end — including 12 — rather than excluding
+// annuals, otherwise Q4 silently vanishes from the quarterly series.
+function isQuarterlyPeriod(label: string): boolean {
+  return /^\d{4}[-/](0?3|0?6|0?9|12)\b/.test(label.trim());
+}
+
 function tableForMode(table: MarkdownTable | undefined, mode: PeriodMode): MarkdownTable | undefined {
   if (!table) return undefined;
   const filtered = table.rows.filter((row) =>
-    mode === "annual" ? isAnnualPeriod(row[0] ?? "") : !isAnnualPeriod(row[0] ?? "")
+    mode === "annual" ? isAnnualPeriod(row[0] ?? "") : isQuarterlyPeriod(row[0] ?? "")
   );
   return { ...table, rows: filtered.length > 0 ? filtered : table.rows };
 }
@@ -3012,6 +3049,7 @@ function numericCell(raw: string): number {
 function CapitalFlowCard(props: { tool: ToolCallView }) {
   const args = parseArgs(props.tool);
   const tsCode = String(args.ts_code ?? "");
+  const displayLabel = createMemo(() => securityLabel(toolOutput(props.tool)) || tsCode);
   const tables = createMemo(() => parseMarkdownTables(toolOutput(props.tool)));
   const stockTable = () => tables().find((t) => t.headers.some((h) => h.includes("净流入额")));
   const northTable = () => tables().find((t) => t.headers.some((h) => h.includes("北向")));
@@ -3030,7 +3068,7 @@ function CapitalFlowCard(props: { tool: ToolCallView }) {
     <CardShell
       status={props.tool.status}
       badge={toolDisplayName(props.tool.name)}
-      detail={tsCode || "northbound"}
+      detail={displayLabel() || "northbound"}
       tool={props.tool}
       callId={props.tool.call_id}
       size="wide"
@@ -3051,7 +3089,7 @@ function CapitalFlowCard(props: { tool: ToolCallView }) {
           gap: "12px",
         }}>
           <Show when={hasStockRows()}>
-            <FlowPane title={stockTable()?.title || `${tsCode} 资金流向`} unit="万元" rows={recentStock()} net={stockNetSum()} netIndex={5} />
+            <FlowPane title={stockTable()?.title || `${displayLabel()} 资金流向`} unit="万元" rows={recentStock()} net={stockNetSum()} netIndex={5} />
           </Show>
           <Show when={hasNorthRows()}>
             <FlowPane title={northTable()?.title || "北向资金"} unit="亿" rows={recentNorth()} net={northNetSum()} netIndex={1} />
@@ -3093,6 +3131,20 @@ function FlowNoticePane() {
   );
 }
 
+// Capital-flow amounts arrive in 万元 (个股 net flow) or 亿 (北向). Render them in
+// finance style: thousands separators, and a unit that adapts to magnitude — 万
+// rolls up to 亿 once the value crosses 1 亿 (= 10,000 万) so large figures stay
+// readable, and each row picks its own unit independently.
+function formatFlowAmount(value: number, inputUnit: string): { text: string; unit: string } {
+  const wan = inputUnit.includes("亿") ? value * 10000 : value;
+  const abs = Math.abs(wan);
+  const sign = wan > 0 ? "+" : wan < 0 ? "−" : "";
+  const grouped = (n: number, digits: number) =>
+    n.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  if (abs >= 10000) return { text: `${sign}${grouped(abs / 10000, 2)}`, unit: "亿" };
+  return { text: `${sign}${grouped(abs, 1)}`, unit: "万" };
+}
+
 function FlowPane(props: {
   title: string;
   unit: string;
@@ -3102,6 +3154,7 @@ function FlowPane(props: {
 }) {
   const maxAbs = () => Math.max(1, ...props.rows.map((row) => Math.abs(numericCell(row[props.netIndex] ?? "0"))));
   const netColor = () => props.net >= 0 ? "var(--up)" : "var(--down)";
+  const netAmount = () => formatFlowAmount(props.net, props.unit);
   return (
     <div style={{
       padding: "9px 10px",
@@ -3114,23 +3167,37 @@ function FlowPane(props: {
         <div style={{ "font-size": "13.5px", color: "var(--ink-0)", "font-weight": 650, overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
           {props.title}
         </div>
-        <div style={{ "margin-left": "auto", "font-family": "var(--font-mono)", "font-size": "11px", color: netColor(), "font-weight": 700 }}>
-          {props.net >= 0 ? "+" : ""}{props.net.toFixed(1)}
+        <div style={{ "margin-left": "auto", "font-family": "var(--font-mono)", "font-size": "11px", color: netColor(), "font-weight": 700, "white-space": "nowrap" }}>
+          {netAmount().text} {netAmount().unit}
         </div>
       </div>
       <div style={{ display: "flex", "flex-direction": "column", gap: "5px" }}>
         <For each={props.rows}>{(row) => {
           const net = numericCell(row[props.netIndex] ?? "0");
-          const width = Math.max(5, Math.min(100, Math.abs(net) / maxAbs() * 100));
-          const color = net >= 0 ? "var(--up)" : "var(--down)";
+          const positive = net >= 0;
+          // Diverging bar: a fixed centre axis with inflow growing right and
+          // outflow growing left, so magnitude reads on a shared baseline.
+          const halfWidth = Math.max(1.5, Math.min(50, Math.abs(net) / maxAbs() * 50));
+          const color = positive ? "var(--up)" : "var(--down)";
+          const amount = formatFlowAmount(net, props.unit);
           return (
-            <div style={{ display: "grid", "grid-template-columns": "72px minmax(0, 1fr) 74px", gap: "7px", "align-items": "center" }}>
+            <div style={{ display: "grid", "grid-template-columns": "60px minmax(0, 1fr) 104px", gap: "8px", "align-items": "center" }}>
               <span style={{ "font-family": "var(--font-mono)", "font-size": "11px", color: "var(--ink-3)" }}>{row[0]}</span>
-              <span style={{ height: "6px", background: "rgba(255,255,255,0.035)", "border-radius": "99px", overflow: "hidden" }}>
-                <span style={{ display: "block", height: "100%", width: `${width}%`, background: color, opacity: 0.72, "margin-left": net >= 0 ? "0" : "auto" }} />
+              <span style={{ position: "relative", height: "8px", background: "rgba(255,255,255,0.03)", "border-radius": "99px" }}>
+                <span style={{ position: "absolute", left: "calc(50% - 0.5px)", top: "-1px", bottom: "-1px", width: "1px", background: "rgba(255,255,255,0.22)" }} />
+                <span style={{
+                  position: "absolute",
+                  top: 0,
+                  height: "100%",
+                  width: `${halfWidth}%`,
+                  ...(positive ? { left: "50%" } : { right: "50%" }),
+                  background: color,
+                  opacity: 0.8,
+                  "border-radius": positive ? "0 99px 99px 0" : "99px 0 0 99px",
+                }} />
               </span>
-              <span style={{ "font-family": "var(--font-mono)", "font-size": "11.5px", color, "text-align": "right" }}>
-                {net >= 0 ? "+" : ""}{net.toFixed(1)} {props.unit}
+              <span style={{ "font-family": "var(--font-mono)", "font-size": "11px", color, "text-align": "right", "white-space": "nowrap" }}>
+                {amount.text} {amount.unit}
               </span>
             </div>
           );
@@ -3824,10 +3891,11 @@ function CandlestickToolCard(props: { tool: ToolCallView }) {
   const summary = createMemo(() => candlestickSummary(preview()));
   const last = () => rows().length > 0 ? rows()[rows().length - 1] : null;
   const detail = () => {
+    const label = securityLabel(preview()) || ticker;
     const r = last();
-    if (!r) return [ticker, market].filter(Boolean).join(" · ");
+    if (!r) return [label, market].filter(Boolean).join(" · ");
     const sign = r.pctChg >= 0 ? "+" : "";
-    return `${ticker} · ${r.close.toFixed(2)} (${sign}${r.pctChg.toFixed(2)}%)`;
+    return `${label} · ${r.close.toFixed(2)} (${sign}${r.pctChg.toFixed(2)}%)`;
   };
   const load = async (nextInterval: string) => {
     if (!ticker || !market) return;

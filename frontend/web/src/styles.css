@@ -84,6 +84,11 @@
   --up-soft:   #f08a80;
   --down:      #5fb98f;       /* falling 跌 — sage green */
   --down-soft: #94cba6;
+  /* completion / success green — semantic "done", deliberately NOT tied to the
+     涨跌 palette so a completed plan step stays green under both 红涨绿跌 and
+     绿涨红跌. Never swap these in the [data-updown] override. */
+  --ok:        #6fb98a;
+  --ok-soft:   #8fd0a8;
   --neutral:   #a89e8c;
   --flat:      #c7a06a;       /* unchanged 平 — muted amber */
 
@@ -1298,7 +1303,7 @@ a, button, [role="button"], [tabindex] { outline-color: var(--clay-soft); }
   top: 1px;
   width: 5px;
   height: 8px;
-  border: solid var(--up-soft);
+  border: solid var(--ok-soft);
   border-width: 0 2px 2px 0;
   transform: rotate(42deg);
 }
@@ -1331,7 +1336,7 @@ a, button, [role="button"], [tabindex] { outline-color: var(--clay-soft); }
   color: var(--amber-soft);
 }
 .lk-plan-item.is-completed .lk-plan-meta span:first-child {
-  color: var(--up-soft);
+  color: var(--ok-soft);
 }
 
 /* ---------- panels (composable) ---------- */

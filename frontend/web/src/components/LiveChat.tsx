@@ -778,7 +778,8 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
 
   let evtSrc: EventSource | undefined;
   let agentBuffer = "";
-  let deltaFlushTimer: number | undefined;
+  let displayedLen = 0;
+  let typewriterTimer: number | undefined;
   let providerRecoveryTimer: number | undefined;
   let chatScrollEl: HTMLDivElement | undefined;
   let agentStartTs = 0;
@@ -912,25 +913,51 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
     }
   });
 
-  function flushAgentBuffer() {
-    if (deltaFlushTimer) {
-      clearTimeout(deltaFlushTimer);
-      deltaFlushTimer = undefined;
-    }
+  // Typewriter: the backend now streams small deltas, but an upstream chunk can
+  // still arrive as one burst. Reveal the buffer character-by-character on a
+  // ~30fps cadence so chat reads smoothly regardless of arrival jitter. The
+  // reveal step scales with how far behind we are (≈ backlog / 8 per frame), so
+  // we always catch up within a few frames without snapping the whole buffer in.
+  function writeDisplayed(text: string) {
     setMessages((prev) => {
       const out = [...prev];
       const last = out[out.length - 1];
       if (last && last.role === "agent" && last.streaming) {
-        out[out.length - 1] = { ...last, text: agentBuffer };
+        out[out.length - 1] = { ...last, text };
       }
       return out;
     });
   }
 
+  function stopTypewriter() {
+    if (typewriterTimer) {
+      clearInterval(typewriterTimer);
+      typewriterTimer = undefined;
+    }
+  }
+
+  function advanceTypewriter() {
+    const target = agentBuffer.length;
+    if (displayedLen >= target) {
+      stopTypewriter();
+      return;
+    }
+    const step = Math.max(2, Math.ceil((target - displayedLen) / 8));
+    displayedLen = Math.min(target, displayedLen + step);
+    writeDisplayed(agentBuffer.slice(0, displayedLen));
+  }
+
+  // Snap to the complete buffer and stop animating — used at turn end so the
+  // final text is whole even if the typewriter was still mid-reveal.
+  function flushAgentBuffer() {
+    stopTypewriter();
+    displayedLen = agentBuffer.length;
+    writeDisplayed(agentBuffer);
+  }
+
   function appendDelta(text: string) {
     agentBuffer += text;
-    if (deltaFlushTimer) return;
-    deltaFlushTimer = window.setTimeout(flushAgentBuffer, 120);
+    if (!typewriterTimer) typewriterTimer = window.setInterval(advanceTypewriter, 33);
   }
 
   async function connect(id: string) {
@@ -938,11 +965,9 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
     //    (text, role, ts); events give us the tool_call / web_search /
     //    narration trail we want to keep visible across reloads.
     setMessages([]);
-    if (deltaFlushTimer) {
-      clearTimeout(deltaFlushTimer);
-      deltaFlushTimer = undefined;
-    }
+    stopTypewriter();
     agentBuffer = "";
+    displayedLen = 0;
     setUsage(null);
     setPending(false);
     setAgentPlan(null);
@@ -1193,6 +1218,7 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
             if (out[i].role === "agent") {
               out[i] = { ...out[i], streaming: true };
               agentBuffer = out[i].text ?? "";
+              displayedLen = agentBuffer.length;
               break;
             }
           }
@@ -1262,10 +1288,8 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
 
     evtSrc.addEventListener("agent_message_start", (e: MessageEvent) => {
       agentBuffer = "";
-      if (deltaFlushTimer) {
-        clearTimeout(deltaFlushTimer);
-        deltaFlushTimer = undefined;
-      }
+      displayedLen = 0;
+      stopTypewriter();
       setPending(true);
       setStopping(false);
       // send() already inserted a streaming placeholder when the user hit
@@ -1363,10 +1387,8 @@ export function LiveChat(props: { onNavigate?: (page: "chat" | "portfolio" | "se
 
     evtSrc.addEventListener("agent_message_reset", (e: MessageEvent) => {
       agentBuffer = "";
-      if (deltaFlushTimer) {
-        clearTimeout(deltaFlushTimer);
-        deltaFlushTimer = undefined;
-      }
+      displayedLen = 0;
+      stopTypewriter();
       setMessages((prev) => {
         const out = [...prev];
         const last = out[out.length - 1];
