@@ -12,33 +12,37 @@ pub mod tools;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
 use sqlx::SqlitePool;
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{sleep, timeout, Duration};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::events::{EventBus, EventEnvelope};
 use crate::llm::{
-    ChatMessage, ChatRequest, LlmEvent, LlmProvider, Role, StopReason, ToolSpec, WebSearchAction,
+    ChatMessage, ChatRequest, LlmEvent, LlmProvider, Role, StopReason, ToolSpec, Usage,
+    WebSearchAction,
 };
 use crate::vault::{
     events as vault_events, messages as vault_messages, plans as vault_plans,
-    tool_runs as vault_tool_runs,
+    sessions as vault_sessions, tool_runs as vault_tool_runs,
 };
 
 use tools::{ToolContext, ToolRegistry};
 
-const DEFAULT_MODEL: &str = "gpt-5.5";
+pub(crate) const DEFAULT_MODEL: &str = "gpt-5.5";
 
-/// Hard cap on tool-call rounds within a single user turn.
-const MAX_TOOL_TURNS: usize = 24;
+/// Hard cap on tool-call iterations within a single turn (one agent loop).
+const MAX_TOOL_ITERATIONS: usize = 24;
 const MAX_PROVIDER_RETRIES: usize = 10;
 const PROVIDER_RETRY_BASE_MS: u64 = 1_000;
 const PROVIDER_RETRY_MAX_MS: u64 = 30_000;
 const PROVIDER_STREAM_IDLE_TIMEOUT_MS: u64 = 90_000;
 const PROVIDER_SYNTHESIS_TIMEOUT_MS: u64 = 90_000;
-const PLAN_REMINDER_INTERVAL_TURNS: usize = 4;
+const PLAN_REMINDER_INTERVAL_ITERATIONS: usize = 4;
+const AGENT_DELTA_FLUSH_CHARS: usize = 1200;
+const AGENT_DELTA_FLUSH_MS: u64 = 800;
 
 struct PendingCall {
     call_id: String,
@@ -104,48 +108,22 @@ pub async fn run_chat_reply(
     cancel: CancellationToken,
     tools: ToolRegistry,
 ) -> Result<()> {
-    let all_history = vault_messages::list(&pool, &user_id, &session_id, None, 1000).await?;
+    // Rebuild the append-only conversation queue: the compaction-summary
+    // boundary plus every user/agent/tool row after it, expanded into raw
+    // Responses API items. This `replay_inputs` is the stable prefix — within a
+    // turn it only grows at the tail (echoed function_call + function_call_output
+    // after each tool), so the provider's prompt cache hits byte-for-byte.
+    let (mut replay_inputs, handoff_summaries) =
+        rebuild_replay(&pool, &user_id, &session_id).await?;
 
-    // Split at the last compaction_summary boundary. Pre-compaction rows stay
-    // in the DB (shown read-only in the UI) but never enter LLM context.
-    // The summary itself is prepended to input messages as runtime context.
-    let mut handoff_summaries: Vec<String> = Vec::new();
-    let tail_start = all_history
-        .iter()
-        .rposition(|r| r.role == "compaction_summary")
-        .map(|i| {
-            if let Ok(c) = serde_json::from_str::<serde_json::Value>(&all_history[i].content_json) {
-                if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
-                    handoff_summaries.push(t.to_string());
-                }
-            }
-            i + 1
-        })
-        .unwrap_or(0);
-
-    let tail_messages: Vec<ChatMessage> = all_history[tail_start..]
-        .iter()
-        .filter_map(|row| {
-            let content: serde_json::Value = serde_json::from_str(&row.content_json).ok()?;
-            let text = content.get("text")?.as_str()?.to_string();
-            let role = match row.role.as_str() {
-                "user" => Role::User,
-                "agent" => Role::Assistant,
-                _ => return None,
-            };
-            Some(ChatMessage {
-                role,
-                content: text,
-            })
-        })
-        .collect();
-
-    if tail_messages.is_empty() && handoff_summaries.is_empty() {
-        anyhow::bail!("run_chat_reply called with no user messages in session");
+    if replay_inputs.is_empty() && handoff_summaries.is_empty() {
+        anyhow::bail!("run_chat_reply called with no replayable history in session");
     }
 
+    // Only the compaction summary rides in `messages` (prepended as runtime
+    // context); the full user/agent/tool transcript replays via replay_inputs.
+    // `mut` because a mid-turn compaction swaps in a fresh summary.
     let mut messages = runtime_context_messages(&handoff_summaries);
-    messages.extend(tail_messages);
     let system_prompt = harness::build_system_prompt();
 
     let ctx = ToolContext {
@@ -170,15 +148,14 @@ pub async fn run_chat_reply(
         }]
     };
     tool_specs.extend(tools.specs());
-    let session_state_inputs = build_session_state_inputs(&pool, &user_id, &session_id).await?;
 
     let mut full_text = String::new();
     let mut final_text = String::new();
     let mut stop_reason = "end_turn".to_string();
-    let mut additional_inputs: Vec<serde_json::Value> = Vec::new();
-    let mut plan_last_update_turn = 0usize;
-    let mut plan_last_reminder_turn: Option<usize> = None;
-    let mut turn = 0usize;
+    let mut plan_last_update_iteration = 0usize;
+    let mut plan_last_reminder_iteration: Option<usize> = None;
+    let mut iteration = 0usize;
+    let mut last_input_tokens: i64 = 0;
     let mut fatal_error: Option<String> = None;
     let mut completed_message_seq: Option<i64> = None;
 
@@ -194,8 +171,23 @@ pub async fn run_chat_reply(
         )
         .await?;
 
-        'turns: loop {
-        if turn >= MAX_TOOL_TURNS {
+        'iterations: loop {
+        // Mid-turn auto-compaction (codex parity): one long turn can blow the
+        // context window on tool outputs alone, between two user messages.
+        // When the last provider call already reported input_tokens past the
+        // model's threshold, compact the queue in-place and rebuild the replay.
+        // This MUST take the internal path — the in-flight reply already holds
+        // the active_replies slot, so going through start_compaction would
+        // self-deadlock on that lock.
+        if last_input_tokens >= crate::llm::model_limits::auto_compact_threshold(DEFAULT_MODEL) {
+            compact_session_tail(&pool, &user_id, &session_id, &event_bus, provider.clone()).await?;
+            let (rebuilt, summaries) = rebuild_replay(&pool, &user_id, &session_id).await?;
+            replay_inputs = rebuilt;
+            messages = runtime_context_messages(&summaries);
+            last_input_tokens = 0;
+        }
+
+        if iteration >= MAX_TOOL_ITERATIONS {
             stop_reason = "max_tool_turns_finalized".to_string();
             match finalize_after_tool_budget(
                 &pool,
@@ -205,8 +197,7 @@ pub async fn run_chat_reply(
                 provider.clone(),
                 &messages,
                 &system_prompt,
-                &session_state_inputs,
-                &additional_inputs,
+                &replay_inputs,
                 cancel.clone(),
             )
             .await
@@ -216,7 +207,7 @@ pub async fn run_chat_reply(
                 }
                 Ok(_) | Err(_) => {
                     final_text = format!(
-                        "我已经达到本轮工具调用上限（{MAX_TOOL_TURNS} 轮），先交付当前阶段性结果：{}\n\n后续需要继续补齐尚未验证的证据，再形成最终判断。",
+                        "我已经达到本轮工具调用上限（{MAX_TOOL_ITERATIONS} 轮），先交付当前阶段性结果：{}\n\n后续需要继续补齐尚未验证的证据，再形成最终判断。",
                         preview(full_text.trim(), 1200)
                     );
                     publish_and_persist(
@@ -231,41 +222,44 @@ pub async fn run_chat_reply(
                     .await?;
                 }
             }
-            break 'turns;
+            break 'iterations;
         }
 
         let mut pending_calls: Vec<PendingCall> = Vec::new();
         let mut turn_text = String::new();
         let mut narration_buffer = String::new();
+        let mut delta_buffer = String::new();
         let mut provider_retries = 0usize;
 
         loop {
             pending_calls.clear();
             turn_text.clear();
             narration_buffer.clear();
-            let mut request_inputs = session_state_inputs.clone();
-            request_inputs.extend(additional_inputs.clone());
+            delta_buffer.clear();
+            let mut last_delta_flush = Instant::now();
+            // Stable prefix: the append-only replay. The only thing that may be
+            // appended at the tail is a (throttled) plan reminder, kept last so
+            // the cached prefix never shifts.
+            let mut request_inputs = replay_inputs.clone();
             if let Some(plan_input) = active_plan_reminder_input(
                 &pool,
                 &user_id,
                 &session_id,
-                turn,
-                plan_last_update_turn,
-                &mut plan_last_reminder_turn,
+                iteration,
+                plan_last_update_iteration,
+                &mut plan_last_reminder_iteration,
             )
             .await?
             {
                 request_inputs.push(plan_input);
             }
-            if let Some(web_guard) =
-                build_recent_web_search_guard_input(&pool, &user_id, &session_id).await?
-            {
-                request_inputs.push(web_guard);
-            }
+            let request_model = DEFAULT_MODEL.to_string();
+            let request_started_at = chrono::Utc::now();
+            let request_started = Instant::now();
             let req = ChatRequest {
                 messages: messages.clone(),
                 system: Some(system_prompt.clone()),
-                model: DEFAULT_MODEL.to_string(),
+                model: request_model.clone(),
                 max_output_tokens: None,
                 tools: tool_specs.clone(),
                 additional_inputs: request_inputs,
@@ -298,7 +292,7 @@ pub async fn run_chat_reply(
                         if !wait_retry(delay_ms, &cancel).await {
                             stop_reason = "user_aborted".to_string();
                             fatal_error = Some("user_aborted".to_string());
-                            break 'turns;
+                            break 'iterations;
                         }
                         continue;
                     }
@@ -338,7 +332,7 @@ pub async fn run_chat_reply(
                         if !wait_retry(delay_ms, &cancel).await {
                             stop_reason = "user_aborted".to_string();
                             fatal_error = Some("user_aborted".to_string());
-                            break 'turns;
+                            break 'iterations;
                         }
                         continue;
                     }
@@ -356,6 +350,18 @@ pub async fn run_chat_reply(
                     return Err(e);
                 }
             };
+            if provider_retries > 0 {
+                publish_provider_recovered(
+                    &pool,
+                    &user_id,
+                    &session_id,
+                    None,
+                    &event_bus,
+                    provider.name(),
+                    provider_retries,
+                )
+                .await?;
+            }
 
             let full_text_len_before_attempt = full_text.len();
             let mut stream_error: Option<anyhow::Error> = None;
@@ -366,7 +372,7 @@ pub async fn run_chat_reply(
                     _ = cancel.cancelled() => {
                         stop_reason = "user_aborted".to_string();
                         fatal_error = Some("user_aborted".to_string());
-                        break 'turns;
+                        break 'iterations;
                     }
                     _ = sleep(Duration::from_millis(PROVIDER_STREAM_IDLE_TIMEOUT_MS)) => {
                         stop_reason = "provider_stream_idle_timeout".to_string();
@@ -389,16 +395,21 @@ pub async fn run_chat_reply(
                                 full_text.push_str(&text);
                                 turn_text.push_str(&text);
                                 narration_buffer.push_str(&text);
-                                publish_and_persist(
-                                    &pool,
-                                    &user_id,
-                                    &session_id,
-                                    None,
-                                    &event_bus,
-                                    "agent_message_delta",
-                                    serde_json::json!({ "text": text }),
-                                )
-                                .await?;
+                                delta_buffer.push_str(&text);
+                                if delta_buffer.len() >= AGENT_DELTA_FLUSH_CHARS ||
+                                    last_delta_flush.elapsed() >= Duration::from_millis(AGENT_DELTA_FLUSH_MS)
+                                {
+                                    publish_agent_message_delta(
+                                        &pool,
+                                        &user_id,
+                                        &session_id,
+                                        None,
+                                        &event_bus,
+                                        &mut delta_buffer,
+                                    )
+                                    .await?;
+                                    last_delta_flush = Instant::now();
+                                }
                             }
                             Ok(LlmEvent::WebSearchCall { status, action }) => {
                                 reset_agent_message_candidate(
@@ -416,7 +427,7 @@ pub async fn run_chat_reply(
                                     &session_id,
                                     None,
                                     &event_bus,
-                                    turn,
+                                    iteration,
                                     &mut narration_buffer,
                                 )
                                 .await?;
@@ -454,6 +465,20 @@ pub async fn run_chat_reply(
                                 pending_calls.push(PendingCall { call_id, name, arguments });
                             }
                             Ok(LlmEvent::Usage(u)) => {
+                                // Feeds the mid-turn auto-compaction check at the
+                                // top of the next iteration.
+                                last_input_tokens = i64::from(u.input_tokens);
+                                record_llm_usage(
+                                    &pool,
+                                    &user_id,
+                                    &session_id,
+                                    provider.name(),
+                                    &request_model,
+                                    &u,
+                                    request_started.elapsed(),
+                                    &request_started_at.to_rfc3339(),
+                                )
+                                .await?;
                                 publish_and_persist(
                                     &pool,
                                     &user_id,
@@ -483,6 +508,16 @@ pub async fn run_chat_reply(
                     }
                 }
             }
+
+            publish_agent_message_delta(
+                &pool,
+                &user_id,
+                &session_id,
+                None,
+                &event_bus,
+                &mut delta_buffer,
+            )
+            .await?;
 
             let Some(e) = stream_error else {
                 break;
@@ -516,7 +551,7 @@ pub async fn run_chat_reply(
                 if !wait_retry(delay_ms, &cancel).await {
                     stop_reason = "user_aborted".to_string();
                     fatal_error = Some("user_aborted".to_string());
-                    break 'turns;
+                    break 'iterations;
                 }
                 continue;
             }
@@ -540,7 +575,7 @@ pub async fn run_chat_reply(
         // No tool calls this turn → model is done.
         if pending_calls.is_empty() {
             final_text = turn_text.clone();
-            break 'turns;
+            break 'iterations;
         }
 
         reset_agent_message_candidate(&pool, &user_id, &session_id, None, &event_bus, &turn_text)
@@ -551,8 +586,19 @@ pub async fn run_chat_reply(
             &session_id,
             None,
             &event_bus,
-            turn,
+            iteration,
             &mut narration_buffer,
+        )
+        .await?;
+
+        publish_agent_trace_note(
+            &pool,
+            &user_id,
+            &session_id,
+            None,
+            &event_bus,
+            iteration,
+            &format_tool_batch_trace(&pending_calls),
         )
         .await?;
 
@@ -574,11 +620,25 @@ pub async fn run_chat_reply(
             .await?;
         }
 
+        // Persist this iteration's whole batch of function_calls as one
+        // append-only `assistant_tool_calls` row, and mirror them onto the
+        // replay tail so the codex-required "call precedes output" ordering is
+        // preserved (all calls, then all outputs).
+        persist_tool_calls(&pool, &user_id, &session_id, &pending_calls).await?;
+        for call in &pending_calls {
+            replay_inputs.push(serde_json::json!({
+                "type": "function_call",
+                "call_id": call.call_id,
+                "name": call.name,
+                "arguments": call.arguments,
+            }));
+        }
+
         // Execute pending tools sequentially (parallelism can come later;
         // most tools we'll ship are I/O bound so order rarely matters but
         // serializing keeps the audit trail simple).
         let mut user_question: Option<serde_json::Value> = None;
-        for call in pending_calls {
+        for call in &pending_calls {
             let tool_started = Instant::now();
             vault_tool_runs::start(
                 &pool,
@@ -648,8 +708,8 @@ pub async fn run_chat_reply(
                 user_question = parse_user_question_output(&output_str);
             }
             if call.name == tools::update_plan::TOOL_NAME && error.is_none() {
-                plan_last_update_turn = turn + 1;
-                plan_last_reminder_turn = None;
+                plan_last_update_iteration = iteration + 1;
+                plan_last_reminder_iteration = None;
             }
             let duration_ms = tool_started
                 .elapsed()
@@ -657,13 +717,14 @@ pub async fn run_chat_reply(
                 .try_into()
                 .unwrap_or(i64::MAX);
             let partial_status = classify_tool_partial_status(&call.name, &output_str);
-            let model_output = compact_tool_output_for_model(&call.name, &output_str);
+            // What the model sees on replay == what we persist into the queue:
+            // the raw tool output, only ever byte-capped (never semantically
+            // rewritten). The full untruncated output stays in tool_call_runs.
+            let queue_output = cap_tool_output(&output_str);
             let ui_artifact = build_tool_ui_artifact(&call.name, &call.arguments, &output_str);
             let result_json = serde_json::json!({
                 "output": output_str,
                 "output_bytes": output_str.len(),
-                "model_output": model_output.clone(),
-                "model_output_bytes": model_output.len(),
                 "ui_artifact": ui_artifact.clone(),
                 "format": "text",
                 "cached_from": cached_from.clone(),
@@ -707,20 +768,14 @@ pub async fn run_chat_reply(
             )
             .await?;
 
-            // Echo the assistant's function_call back into the input stream
-            // (codex requires this for the model to "see" its own call), then
-            // append our function_call_output. Order matters: the call must
-            // precede its output.
-            additional_inputs.push(serde_json::json!({
-                "type": "function_call",
-                "call_id": call.call_id,
-                "name": call.name,
-                "arguments": call.arguments,
-            }));
-            additional_inputs.push(serde_json::json!({
+            // Persist the function_call_output (capped raw) as an append-only
+            // `tool_result` row and mirror it onto the replay tail. The matching
+            // function_call was already echoed before the dispatch loop.
+            persist_tool_result(&pool, &user_id, &session_id, &call.call_id, &queue_output).await?;
+            replay_inputs.push(serde_json::json!({
                 "type": "function_call_output",
                 "call_id": call.call_id,
-                "output": model_output,
+                "output": queue_output,
             }));
         }
 
@@ -755,10 +810,10 @@ pub async fn run_chat_reply(
                 serde_json::json!({ "text": final_text.clone() }),
             )
             .await?;
-            break 'turns;
+            break 'iterations;
         }
 
-        turn += 1;
+        iteration += 1;
     }
 
         if let Some(error) = fatal_error.take() {
@@ -796,6 +851,7 @@ pub async fn run_chat_reply(
             }),
         )
         .await?;
+        touch_session_best_effort(&pool, &user_id, &session_id).await;
 
         Ok(())
     }
@@ -829,6 +885,211 @@ pub async fn run_chat_reply(
     Ok(())
 }
 
+/// Read the session's append-only queue and rebuild the Responses API replay:
+/// the compaction-summary boundary (returned separately for runtime-context
+/// injection) plus every user/agent/tool row after it, expanded into raw items,
+/// with orphan function_calls dropped.
+async fn rebuild_replay(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+) -> Result<(Vec<serde_json::Value>, Vec<String>)> {
+    let all_history = vault_messages::list(pool, user_id, session_id, None, 1000).await?;
+
+    // Pre-compaction rows stay in the DB (read-only in the UI) but never enter
+    // LLM context; the latest summary is injected separately as runtime context.
+    let mut handoff_summaries: Vec<String> = Vec::new();
+    let tail_start = all_history
+        .iter()
+        .rposition(|r| r.role == "compaction_summary")
+        .map(|i| {
+            if let Ok(c) = serde_json::from_str::<serde_json::Value>(&all_history[i].content_json) {
+                if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
+                    handoff_summaries.push(t.to_string());
+                }
+            }
+            i + 1
+        })
+        .unwrap_or(0);
+
+    let mut replay_inputs: Vec<serde_json::Value> = Vec::new();
+    for row in &all_history[tail_start..] {
+        replay_inputs.extend(vault_messages::row_to_input_items(
+            &row.role,
+            &row.content_json,
+        ));
+    }
+    drop_orphan_function_calls(&mut replay_inputs);
+    Ok((replay_inputs, handoff_summaries))
+}
+
+/// Drop any `function_call` whose `function_call_output` is missing (e.g. a
+/// crash between persisting the call batch and its results). The codex backend
+/// rejects orphan call_ids, so we never replay them.
+fn drop_orphan_function_calls(replay_inputs: &mut Vec<serde_json::Value>) {
+    let answered: std::collections::HashSet<String> = replay_inputs
+        .iter()
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("function_call_output"))
+        .filter_map(|v| v.get("call_id").and_then(|c| c.as_str()).map(String::from))
+        .collect();
+    replay_inputs.retain(|v| {
+        if v.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+            v.get("call_id")
+                .and_then(|c| c.as_str())
+                .map(|id| answered.contains(id))
+                .unwrap_or(false)
+        } else {
+            true
+        }
+    });
+}
+
+/// Persist one iteration's batch of function_calls as a single
+/// `assistant_tool_calls` queue row. Stores the model's raw `arguments` string
+/// verbatim (no re-serialization) so the replay is byte-identical.
+async fn persist_tool_calls(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    calls: &[PendingCall],
+) -> Result<i64> {
+    let items: Vec<serde_json::Value> = calls
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "type": "function_call",
+                "call_id": c.call_id,
+                "name": c.name,
+                "arguments": c.arguments,
+            })
+        })
+        .collect();
+    vault_messages::insert(
+        pool,
+        user_id,
+        session_id,
+        "assistant_tool_calls",
+        &serde_json::json!({ "type": "tool_calls", "items": items }),
+        None,
+    )
+    .await
+}
+
+/// Persist one function_call_output as a `tool_result` queue row. `output` is
+/// the byte-capped raw tool output (see `cap_tool_output`).
+async fn persist_tool_result(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    call_id: &str,
+    output: &str,
+) -> Result<i64> {
+    vault_messages::insert(
+        pool,
+        user_id,
+        session_id,
+        "tool_result",
+        &serde_json::json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output,
+        }),
+        None,
+    )
+    .await
+}
+
+const TOOL_OUTPUT_BYTE_LIMIT_DEFAULT: usize = 24_000;
+
+fn tool_output_byte_limit() -> usize {
+    std::env::var("LEEK_TOOL_OUTPUT_BYTE_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(TOOL_OUTPUT_BYTE_LIMIT_DEFAULT)
+}
+
+/// codex-style backstop: cap a single tool output before it enters context.
+/// This is a byte truncation (keeps the head verbatim, flags the cut), never a
+/// semantic rewrite — the model knows there is more and how to get it. Per-tool
+/// "return the right amount" logic lives in each tool's implementation; this
+/// only guards against a tool that forgot to bound itself.
+fn cap_tool_output(output: &str) -> String {
+    let limit = tool_output_byte_limit();
+    if output.len() <= limit {
+        return output.to_string();
+    }
+    format!(
+        "{}\n\n[输出已截断至 {} 字节；完整版在 vault.tool_call_runs / 前端卡片，或用更窄的参数重新查询。]",
+        preview(output, limit),
+        limit
+    )
+}
+
+/// Internal mid-turn compaction: summarize the live queue tail and append a
+/// `compaction_summary` row, WITHOUT going through `active_replies` (the calling
+/// reply already holds that slot). Emits compaction.started/completed so the UI
+/// reflects it.
+async fn compact_session_tail(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    event_bus: &EventBus,
+    provider: Arc<dyn LlmProvider>,
+) -> Result<()> {
+    publish_and_persist(
+        pool,
+        user_id,
+        session_id,
+        None,
+        event_bus,
+        "compaction.started",
+        serde_json::json!({ "trigger": "auto_mid_turn", "focus": serde_json::Value::Null }),
+    )
+    .await?;
+
+    let all_history = vault_messages::list(pool, user_id, session_id, None, 1000).await?;
+    let start_idx = all_history
+        .iter()
+        .rposition(|r| r.role == "compaction_summary")
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let history = &all_history[start_idx..];
+    if history.is_empty() {
+        anyhow::bail!("mid-turn compaction: no messages since last compaction");
+    }
+    let messages_removed = history.len() as i64;
+
+    let summary =
+        compact::summarize_session(provider, history, None, CancellationToken::new()).await?;
+
+    vault_messages::insert(
+        pool,
+        user_id,
+        session_id,
+        "compaction_summary",
+        &serde_json::json!({ "type": "text", "text": summary.clone() }),
+        None,
+    )
+    .await?;
+
+    publish_and_persist(
+        pool,
+        user_id,
+        session_id,
+        None,
+        event_bus,
+        "compaction.completed",
+        serde_json::json!({
+            "summary_md": summary,
+            "messages_removed": messages_removed,
+            "messages_retained": 1,
+            "trigger": "auto_mid_turn",
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
 fn provider_retry_delay_ms(retry: usize) -> u64 {
     let exponent = retry.saturating_sub(1).min(5);
     (PROVIDER_RETRY_BASE_MS * (1_u64 << exponent)).min(PROVIDER_RETRY_MAX_MS)
@@ -852,259 +1113,6 @@ fn parse_user_question_output(output: &str) -> Option<serde_json::Value> {
         return None;
     }
     Some(value)
-}
-
-async fn build_session_state_inputs(
-    pool: &SqlitePool,
-    user_id: &str,
-    session_id: &str,
-) -> Result<Vec<serde_json::Value>> {
-    let plan_items = vault_plans::list_current(pool, user_id, session_id, None).await?;
-    let tool_runs = vault_tool_runs::list_recent_for_session(pool, user_id, session_id, 12).await?;
-    let events = vault_events::list_for_session(pool, user_id, session_id, None, None).await?;
-
-    let mut sections = Vec::new();
-    if !plan_items.is_empty() {
-        sections.push(format!(
-            "## Current active plan\n{}\n{}",
-            format_plan_items(&plan_items),
-            format_active_plan_state_guidance(&plan_items)
-        ));
-    }
-
-    let tool_lines = tool_runs
-        .iter()
-        .rev()
-        .filter_map(format_tool_run_for_state)
-        .collect::<Vec<_>>();
-    if !tool_lines.is_empty() {
-        sections.push(format!(
-            "## Recent tool evidence\n{}\n{}",
-            tool_evidence_guidance(),
-            tool_lines.join("\n")
-        ));
-    }
-
-    let web_lines = events
-        .iter()
-        .filter(|event| event.kind == "web_search_call")
-        .rev()
-        .take(12)
-        .filter_map(format_web_search_for_state)
-        .collect::<Vec<_>>();
-    if !web_lines.is_empty() {
-        let mut web_lines = web_lines;
-        web_lines.reverse();
-        sections.push(format!(
-            "## Recent web search activity\nThese are activity/source hints only, not fetched evidence. Treat web_fetch/tool outputs and prior final answers as evidence.\n{}\n{}",
-            web_search_budget_guidance(),
-            web_lines.join("\n")
-        ));
-    }
-
-    if sections.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    Ok(vec![serde_json::json!({
-        "role": "user",
-        "content": format!(
-            "SESSION STATE (read-only runtime context)\n\
-             These are durable facts from earlier work in this same session. \
-             Use them to avoid losing context or repeating identical data pulls. \
-             Re-call a tool only when the prior result is stale, insufficient, \
-             failed, or the new arguments are materially different. If you repeat \
-             an exact non-cached tool call, state the refresh purpose before \
-             relying on the new result. Web search activity is not evidence \
-             unless a fetched result or final answer captured the relevant \
-             facts.\n\n{}",
-            sections.join("\n\n")
-        ),
-    })])
-}
-
-fn format_tool_run_for_state(row: &vault_tool_runs::ToolRunRow) -> Option<String> {
-    let completed_at = row.completed_at.as_deref().unwrap_or("unknown-time");
-    let args = preview(&row.arguments_json, 360);
-    let policy = tool_evidence_policy(row.tool_name.as_str());
-    let output = row
-        .error
-        .as_deref()
-        .map(|e| format!("ERROR {}", preview(e, 320)))
-        .or_else(|| tool_output_from_run(row).map(|s| preview(&s, 800)))?;
-    Some(format!(
-        "- {completed_at} `{}` ({policy}) run_id={} args={} => {}",
-        row.tool_name, row.id, args, output
-    ))
-}
-
-fn tool_evidence_guidance() -> &'static str {
-    "Evidence policy: reusable=low-recency knowledge, prefer reusing it for the same question; refresh-sensitive=market/quote/capital data, reuse as prior evidence but refresh when the answer depends on current price/flow; stateful=do not treat as external evidence."
-}
-
-fn web_search_budget_guidance() -> &'static str {
-    "Search budget: prefer high-quality primary or authoritative sources, avoid reopening the same URL/PDF unless you need a different section, and stop once the evidence is enough for the user's question."
-}
-
-async fn build_recent_web_search_guard_input(
-    pool: &SqlitePool,
-    user_id: &str,
-    session_id: &str,
-) -> Result<Option<serde_json::Value>> {
-    let events = vault_events::list_for_session(pool, user_id, session_id, None, None).await?;
-    Ok(recent_web_search_guard_input_from_events(&events))
-}
-
-fn recent_web_search_guard_input_from_events(
-    events: &[vault_events::EventRow],
-) -> Option<serde_json::Value> {
-    let mut lines = events
-        .iter()
-        .filter(|event| event.kind == "web_search_call")
-        .rev()
-        .filter_map(format_web_search_for_guard)
-        .take(10)
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        return None;
-    }
-    lines.reverse();
-    Some(serde_json::json!({
-        "role": "user",
-        "content": format!(
-            "WEB SEARCH GUARD (runtime hint for this iteration)\n\
-             The URLs, PDFs, and searches below were already attempted in this session, \
-             including the current reply if a provider retry happened. Do not reopen \
-             the same URL/PDF or repeat the same semantic search unless you need a \
-             specific new section; prefer find-in-page on an already opened source, \
-             a narrower query, or synthesize from the evidence already captured.\n{}",
-            lines.join("\n")
-        ),
-    }))
-}
-
-fn format_web_search_for_guard(row: &vault_events::EventRow) -> Option<String> {
-    let payload: serde_json::Value = serde_json::from_str(&row.payload_json).ok()?;
-    if payload.get("status").and_then(|v| v.as_str()) != Some("completed") {
-        return None;
-    }
-    let action = payload
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let detail = payload
-        .get("detail")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            payload
-                .get("queries")
-                .and_then(|v| v.as_array())
-                .and_then(|items| items.first())
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("")
-        .trim();
-    if detail.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "- {} `{}` {}",
-        row.ts,
-        action,
-        preview(detail, 180)
-    ))
-}
-
-fn tool_evidence_policy(name: &str) -> &'static str {
-    if is_cacheable_tool(name) {
-        return "reusable";
-    }
-    if is_refresh_sensitive_tool(name) {
-        return "refresh-sensitive";
-    }
-    if is_stateful_tool(name) {
-        return "stateful";
-    }
-    "prior-evidence"
-}
-
-fn is_refresh_sensitive_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "market_quote"
-            | "tradingview_quote"
-            | "get_a_share_market_snapshot"
-            | "get_candlesticks"
-            | "get_crypto_market"
-            | "get_funding_rate"
-            | "get_capital_flow"
-    )
-}
-
-fn is_stateful_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "ask_user_question" | "update_plan" | "delegate_research"
-    )
-}
-
-fn format_web_search_for_state(row: &vault_events::EventRow) -> Option<String> {
-    let payload: serde_json::Value = serde_json::from_str(&row.payload_json).ok()?;
-    let action = payload
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let detail = payload
-        .get("detail")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            payload
-                .get("queries")
-                .and_then(|v| v.as_array())
-                .and_then(|items| items.first())
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("");
-    if detail.trim().is_empty() {
-        return None;
-    }
-    let sources = payload
-        .get("sources")
-        .and_then(|v| v.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|v| v.as_str())
-                .take(4)
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .filter(|s| !s.is_empty())
-        .map(|s| format!(" sources={s}"))
-        .unwrap_or_default();
-    Some(format!(
-        "- {} `{}` {}{}",
-        row.ts,
-        action,
-        preview(detail, 220),
-        sources
-    ))
-}
-
-fn tool_output_from_run(row: &vault_tool_runs::ToolRunRow) -> Option<String> {
-    let raw = row.result_json.as_deref()?;
-    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
-    value
-        .get("model_output")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| {
-            value
-                .get("output")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .or_else(|| Some(raw.to_string()))
 }
 
 fn build_tool_ui_artifact(name: &str, arguments_json: &str, output: &str) -> serde_json::Value {
@@ -1151,271 +1159,11 @@ fn looks_like_markdown(output: &str) -> bool {
     })
 }
 
-fn compact_tool_output_for_model(name: &str, output: &str) -> String {
-    match name {
-        "get_company_info" => compact_company_info_for_model(output),
-        "get_a_share_research_sources" => compact_research_sources_for_model(output),
-        "get_financials" => compact_financials_for_model(output),
-        "get_a_share_industry_context" => compact_industry_context_for_model(output),
-        "get_candlesticks"
-        | "get_a_share_market_snapshot"
-        | "get_capital_flow"
-        | "get_a_share_ownership_and_leverage"
-        | "get_china_macro_context"
-        | "get_china_fund_context"
-        | "get_china_index_context"
-        | "get_crypto_market"
-        | "get_funding_rate" => compact_markdown_context_for_model(output),
-        _ => output.to_string(),
-    }
-}
-
 fn tool_output_preview_limit(name: &str) -> usize {
     match name {
         "get_a_share_industry_context" => 6000,
         _ => 2000,
     }
-}
-
-fn compact_company_info_for_model(output: &str) -> String {
-    let mut out = String::new();
-    let mut section = "";
-    let mut intro_lines = 0usize;
-    for line in output.lines() {
-        if line.starts_with("## ") {
-            push_line(&mut out, line, 180);
-            continue;
-        }
-        if line.starts_with("**") {
-            section = line.trim_matches('*').trim();
-            if matches!(section, "基本信息" | "银行资产质量缺口")
-                || section.starts_with("最新财务指标")
-            {
-                push_line(&mut out, line, 160);
-            }
-            continue;
-        }
-        if section == "基本信息" && line.starts_with("- ") {
-            if line.starts_with("- 公司名")
-                || line.starts_with("- 成立日期")
-                || line.starts_with("- 所在地")
-                || line.starts_with("- 主营业务")
-            {
-                push_line(&mut out, line, 320);
-            }
-            continue;
-        }
-        if section == "公司简介" && !line.trim().is_empty() && intro_lines < 1 {
-            push_line(&mut out, line, 360);
-            intro_lines += 1;
-            continue;
-        }
-        if section.starts_with("最新财务指标") && line.starts_with('|') {
-            push_line(&mut out, line, 220);
-            continue;
-        }
-        if section == "银行资产质量缺口" && line.starts_with("- ") {
-            push_line(&mut out, line, 320);
-        }
-    }
-    out.push_str("\n_Note: company profile compacted for model context; full company profile remains in tool_call_runs/UI card._");
-    preview(out.trim(), 2200)
-}
-
-fn compact_research_sources_for_model(output: &str) -> String {
-    let mut out = String::new();
-    for line in output.lines() {
-        if line.starts_with("## ") || line.starts_with("窗口：") {
-            push_line(&mut out, line, 240);
-        }
-    }
-
-    let mut current_section_count = 0usize;
-    for line in output.lines() {
-        if line.starts_with("### ") {
-            current_section_count = 0;
-            push_line(&mut out, line, 200);
-            continue;
-        }
-        if !line.starts_with("- ") {
-            continue;
-        }
-        if current_section_count >= 2 {
-            continue;
-        }
-        current_section_count += 1;
-        let compact = strip_urls_for_model(line);
-        push_line(&mut out, &compact, 260);
-    }
-
-    out.push_str("\n_Note: source result compacted for model context; full source rows remain in tool_call_runs/UI card._");
-    preview(out.trim(), 2200)
-}
-
-fn compact_financials_for_model(output: &str) -> String {
-    let mut out = String::new();
-    let mut in_table = false;
-    let mut table_rows = 0usize;
-    for line in output.lines() {
-        if line.starts_with("## ") {
-            in_table = false;
-            table_rows = 0;
-            push_line(&mut out, line, 200);
-            continue;
-        }
-        if line.starts_with('|') {
-            if line.contains("---") {
-                push_line(&mut out, line, 260);
-                in_table = true;
-                continue;
-            }
-            if !in_table {
-                push_line(&mut out, line, 260);
-                continue;
-            }
-            if table_rows < 2 {
-                push_line(&mut out, line, 260);
-                table_rows += 1;
-            }
-            continue;
-        }
-        if line.starts_with("_字段口径:") {
-            push_line(&mut out, line, 360);
-        } else if line.starts_with("_来源:") {
-            push_line(&mut out, line, 180);
-        }
-    }
-    out.push_str("\n_Note: financial tables compacted to latest 2 rows per section for model context; full table remains in tool_call_runs/UI card._");
-    preview(out.trim(), 2200)
-}
-
-fn compact_industry_context_for_model(output: &str) -> String {
-    let mut out = String::new();
-    let mut section = "";
-    let mut seen_separator = false;
-    let mut data_rows = 0usize;
-    for line in output.lines() {
-        if line.starts_with("## ") {
-            push_line(&mut out, line, 200);
-            continue;
-        }
-        if let Some(title) = line.strip_prefix("### ") {
-            section = title.trim();
-            seen_separator = false;
-            data_rows = 0;
-            if industry_context_section_limit(section).is_some() || section == "任务摘要" {
-                push_line(&mut out, line, 160);
-            }
-            continue;
-        }
-        if section == "任务摘要" && line.starts_with("- ") {
-            push_line(&mut out, line, 280);
-            continue;
-        }
-        if let Some(limit) = industry_context_section_limit(section) {
-            if line.starts_with('|') {
-                if !seen_separator {
-                    push_line(&mut out, line, 260);
-                    if line.contains("---") {
-                        seen_separator = true;
-                    }
-                    continue;
-                }
-                if data_rows < limit {
-                    push_line(&mut out, line, 260);
-                    data_rows += 1;
-                }
-                continue;
-            }
-            if line.starts_with("_来源:") {
-                push_line(&mut out, line, 180);
-            }
-        }
-        if line.starts_with("_Caveat:") {
-            push_line(&mut out, line, 300);
-        }
-    }
-    out.push_str("\n_Note: industry-context tables compacted for model context; full table remains in tool_call_runs/UI card._");
-    preview(out.trim(), 2400)
-}
-
-fn compact_markdown_context_for_model(output: &str) -> String {
-    let mut out = String::new();
-    let mut bullets_in_section = 0usize;
-    let mut table_rows_in_section = 0usize;
-    let mut in_table = false;
-    for line in output.lines() {
-        if line.starts_with("## ") || line.starts_with("### ") {
-            bullets_in_section = 0;
-            table_rows_in_section = 0;
-            in_table = false;
-            push_line(&mut out, line, 220);
-            continue;
-        }
-        if line.starts_with("- ") {
-            in_table = false;
-            if bullets_in_section < 4 {
-                push_line(&mut out, line, 300);
-                bullets_in_section += 1;
-            }
-            continue;
-        }
-        if line.starts_with('|') {
-            if line.contains("---") {
-                push_line(&mut out, line, 260);
-                in_table = true;
-                table_rows_in_section = 0;
-                continue;
-            }
-            if !in_table {
-                push_line(&mut out, line, 260);
-                continue;
-            }
-            if table_rows_in_section < 4 {
-                push_line(&mut out, line, 300);
-                table_rows_in_section += 1;
-            }
-            continue;
-        }
-        if line.starts_with("_来源:")
-            || line.starts_with("_Source:")
-            || line.starts_with("_Caveat:")
-            || line.starts_with("_Limit note:")
-        {
-            in_table = false;
-            push_line(&mut out, line, 300);
-        }
-    }
-    out.push_str("\n_Note: markdown context compacted for model context; full output remains in tool_call_runs/UI card._");
-    preview(out.trim(), 2600)
-}
-
-fn industry_context_section_limit(section: &str) -> Option<usize> {
-    if section.contains("申万分类") {
-        Some(3)
-    } else if section.contains("行业指数") {
-        Some(3)
-    } else if section.contains("同业样本") {
-        Some(6)
-    } else if section.contains("行业资金面") {
-        Some(2)
-    } else {
-        None
-    }
-}
-
-fn push_line(out: &mut String, line: &str, max_bytes: usize) {
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(&preview(line, max_bytes));
-}
-
-fn strip_urls_for_model(line: &str) -> String {
-    line.split_whitespace()
-        .filter(|part| !part.starts_with("http://") && !part.starts_with("https://"))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn tool_full_output_from_run(row: &vault_tool_runs::ToolRunRow) -> Option<String> {
@@ -1533,16 +1281,14 @@ async fn finalize_after_tool_budget(
     provider: Arc<dyn LlmProvider>,
     messages: &[ChatMessage],
     system_prompt: &str,
-    session_state_inputs: &[serde_json::Value],
-    additional_inputs: &[serde_json::Value],
+    replay_inputs: &[serde_json::Value],
     cancel: CancellationToken,
 ) -> Result<String> {
-    let mut request_inputs = session_state_inputs.to_vec();
-    request_inputs.extend(additional_inputs.iter().cloned());
+    let mut request_inputs = replay_inputs.to_vec();
     request_inputs.push(serde_json::json!({
         "role": "user",
         "content": format!(
-            "Runtime note: this turn reached the tool-call budget ({MAX_TOOL_TURNS}). \
+            "Runtime note: this turn reached the tool-call budget ({MAX_TOOL_ITERATIONS}). \
              Do not call more tools. Give a concise Chinese partial answer using \
              only evidence already in context: what is established, what is still \
              missing, and what should happen next."
@@ -1559,6 +1305,8 @@ async fn finalize_after_tool_budget(
     };
     let mut stream = provider.chat(req).await?;
     let mut text_out = String::new();
+    let mut delta_buffer = String::new();
+    let mut last_delta_flush = Instant::now();
     while let Some(evt) = stream.next().await {
         if cancel.is_cancelled() {
             anyhow::bail!("user_aborted");
@@ -1566,21 +1314,35 @@ async fn finalize_after_tool_budget(
         match evt? {
             LlmEvent::TextDelta { text } => {
                 text_out.push_str(&text);
-                publish_and_persist(
-                    pool,
-                    user_id,
-                    session_id,
-                    None,
-                    event_bus,
-                    "agent_message_delta",
-                    serde_json::json!({ "text": text }),
-                )
-                .await?;
+                delta_buffer.push_str(&text);
+                if delta_buffer.len() >= AGENT_DELTA_FLUSH_CHARS
+                    || last_delta_flush.elapsed() >= Duration::from_millis(AGENT_DELTA_FLUSH_MS)
+                {
+                    publish_agent_message_delta(
+                        pool,
+                        user_id,
+                        session_id,
+                        None,
+                        event_bus,
+                        &mut delta_buffer,
+                    )
+                    .await?;
+                    last_delta_flush = Instant::now();
+                }
             }
             LlmEvent::MessageEnd { .. } => break,
             _ => {}
         }
     }
+    publish_agent_message_delta(
+        pool,
+        user_id,
+        session_id,
+        None,
+        event_bus,
+        &mut delta_buffer,
+    )
+    .await?;
     Ok(text_out)
 }
 
@@ -1595,12 +1357,15 @@ async fn active_plan_reminder_input(
     pool: &SqlitePool,
     user_id: &str,
     session_id: &str,
-    turn: usize,
-    plan_last_update_turn: usize,
-    plan_last_reminder_turn: &mut Option<usize>,
+    iteration: usize,
+    plan_last_update_iteration: usize,
+    plan_last_reminder_iteration: &mut Option<usize>,
 ) -> Result<Option<serde_json::Value>> {
-    let Some(tone) = plan_reminder_tone(turn, plan_last_update_turn, *plan_last_reminder_turn)
-    else {
+    let Some(tone) = plan_reminder_tone(
+        iteration,
+        plan_last_update_iteration,
+        *plan_last_reminder_iteration,
+    ) else {
         return Ok(None);
     };
     let items = vault_plans::list_current(pool, user_id, session_id, None).await?;
@@ -1610,7 +1375,7 @@ async fn active_plan_reminder_input(
     if items.iter().all(|item| item.status == "completed") {
         return Ok(None);
     }
-    *plan_last_reminder_turn = Some(turn);
+    *plan_last_reminder_iteration = Some(iteration);
     Ok(Some(serde_json::json!({
         "role": "user",
         "content": format_plan_reminder(tone, &items),
@@ -1618,18 +1383,20 @@ async fn active_plan_reminder_input(
 }
 
 fn plan_reminder_tone(
-    turn: usize,
-    plan_last_update_turn: usize,
-    plan_last_reminder_turn: Option<usize>,
+    iteration: usize,
+    plan_last_update_iteration: usize,
+    plan_last_reminder_iteration: Option<usize>,
 ) -> Option<PlanReminderTone> {
-    if turn <= plan_last_update_turn {
+    if iteration <= plan_last_update_iteration {
         return None;
     }
-    let elapsed = turn - plan_last_update_turn;
-    if elapsed < PLAN_REMINDER_INTERVAL_TURNS || elapsed % PLAN_REMINDER_INTERVAL_TURNS != 0 {
+    let elapsed = iteration - plan_last_update_iteration;
+    if elapsed < PLAN_REMINDER_INTERVAL_ITERATIONS
+        || elapsed % PLAN_REMINDER_INTERVAL_ITERATIONS != 0
+    {
         return None;
     }
-    if plan_last_reminder_turn == Some(turn) {
+    if plan_last_reminder_iteration == Some(iteration) {
         return None;
     }
     Some(match elapsed {
@@ -1654,14 +1421,6 @@ fn format_plan_reminder(tone: PlanReminderTone, items: &[vault_plans::PlanItemRo
     format!("{message}\n\n{}", format_plan_items(items))
 }
 
-fn format_active_plan_state_guidance(items: &[vault_plans::PlanItemRow]) -> &'static str {
-    if items.iter().all(|item| item.status == "completed") {
-        "Plan guidance: all items are completed; synthesize the answer if the task is otherwise done."
-    } else {
-        "Plan guidance: before a final/closing answer, call update_plan to mark real completions or revise/abandon stale items; do not leave fake in_progress/pending state."
-    }
-}
-
 fn format_plan_items(items: &[vault_plans::PlanItemRow]) -> String {
     if items.is_empty() {
         return "(no active plan)".to_string();
@@ -1682,6 +1441,85 @@ fn format_plan_items(items: &[vault_plans::PlanItemRow]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_tool_batch_trace(calls: &[PendingCall]) -> String {
+    let mut names = calls
+        .iter()
+        .map(|call| call.name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    let shown = names.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+    if names.len() > 5 {
+        format!("准备调用 {} 个工具补齐证据：{} 等。", calls.len(), shown)
+    } else {
+        format!("准备调用 {} 个工具补齐证据：{}。", calls.len(), shown)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_agent_trace_note(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    task_id: Option<&str>,
+    event_bus: &EventBus,
+    iteration: usize,
+    text: &str,
+) -> Result<()> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    publish_and_persist(
+        pool,
+        user_id,
+        session_id,
+        task_id,
+        event_bus,
+        "agent_narration",
+        // Payload key stays "turn" to preserve the SSE contract the frontend
+        // matches on; the value is the iteration counter.
+        serde_json::json!({
+            "turn": iteration,
+            "text": text,
+            "source": "runtime_trace",
+        }),
+    )
+    .await
+}
+
+async fn record_llm_usage(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    provider_name: &str,
+    model: &str,
+    usage: &Usage,
+    duration: Duration,
+    started_at: &str,
+) -> Result<()> {
+    let duration_ms = duration.as_millis().try_into().unwrap_or(i64::MAX);
+    sqlx::query(
+        "INSERT INTO llm_usage_log \
+         (user_id, id, provider_name, model, invoker, session_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms, success, started_at) \
+         VALUES (?, ?, ?, ?, 'main_agent', ?, ?, ?, ?, ?, ?, 1, ?)",
+    )
+    .bind(user_id)
+    .bind(Uuid::now_v7().to_string())
+    .bind(provider_name)
+    .bind(model)
+    .bind(session_id)
+    .bind(i64::from(usage.input_tokens))
+    .bind(i64::from(usage.output_tokens))
+    .bind(i64::from(usage.cache_read_tokens))
+    .bind(i64::from(usage.cache_write_tokens))
+    .bind(duration_ms)
+    .bind(started_at)
+    .execute(pool)
+    .await
+    .context("recording llm usage")?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1709,6 +1547,32 @@ async fn publish_provider_retry(
             "max_retries": MAX_PROVIDER_RETRIES,
             "delay_ms": delay_ms,
             "message": error,
+        }),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_provider_recovered(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    task_id: Option<&str>,
+    event_bus: &EventBus,
+    provider: &str,
+    retries: usize,
+) -> Result<()> {
+    publish_and_persist(
+        pool,
+        user_id,
+        session_id,
+        task_id,
+        event_bus,
+        "provider_recovered",
+        serde_json::json!({
+            "provider": provider,
+            "retries": retries,
+            "message": "provider recovered; continuing current turn",
         }),
     )
     .await
@@ -1881,6 +1745,12 @@ async fn publish_best_effort(
     }
 }
 
+async fn touch_session_best_effort(pool: &SqlitePool, user_id: &str, session_id: &str) {
+    if let Err(e) = vault_sessions::touch(pool, user_id, session_id).await {
+        tracing::warn!(session_id, error = %e, "failed to touch session after agent reply");
+    }
+}
+
 pub async fn publish_and_persist(
     pool: &SqlitePool,
     user_id: &str,
@@ -1939,7 +1809,7 @@ async fn flush_agent_narration(
     session_id: &str,
     task_id: Option<&str>,
     event_bus: &EventBus,
-    turn: usize,
+    iteration: usize,
     buffer: &mut String,
 ) -> Result<()> {
     let text = buffer.trim().to_string();
@@ -1954,8 +1824,9 @@ async fn flush_agent_narration(
         task_id,
         event_bus,
         "agent_narration",
+        // Payload key stays "turn" for the SSE contract; value is the iteration.
         serde_json::json!({
-            "turn": turn,
+            "turn": iteration,
             "text": text,
         }),
     )
@@ -1985,6 +1856,30 @@ async fn reset_agent_message_candidate(
     .await
 }
 
+async fn publish_agent_message_delta(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    task_id: Option<&str>,
+    event_bus: &EventBus,
+    buffer: &mut String,
+) -> Result<()> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+    let text = std::mem::take(buffer);
+    publish_and_persist(
+        pool,
+        user_id,
+        session_id,
+        task_id,
+        event_bus,
+        "agent_message_delta",
+        serde_json::json!({ "text": text }),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1999,11 +1894,9 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert!(matches!(messages[0].role, Role::User));
-        assert!(
-            messages[0]
-                .content
-                .contains("COMPACTED PRIOR SESSION HISTORY")
-        );
+        assert!(messages[0]
+            .content
+            .contains("COMPACTED PRIOR SESSION HISTORY"));
         assert!(messages[0].content.contains("旧对话摘要"));
     }
 
@@ -2116,53 +2009,6 @@ mod tests {
     }
 
     #[test]
-    fn compact_research_sources_keeps_sections_but_drops_urls() {
-        let output = "## 600519.SH · A股研究源材料\n\n窗口：2025-11-24 → 2026-05-24\n\n### 公告 · `anns_d` · 77 rows\n- 2026-05-22 · 600519.SH · 标题一 · http://example.com/a\n- 2026-05-21 · 600519.SH · 标题二 · https://example.com/b\n- 2026-05-20 · 600519.SH · 标题三 · https://example.com/c\n";
-        let compact = compact_tool_output_for_model("get_a_share_research_sources", output);
-        assert!(compact.contains("## 600519.SH"));
-        assert!(compact.contains("### 公告"));
-        assert!(compact.contains("标题一"));
-        assert!(compact.contains("标题二"));
-        assert!(!compact.contains("标题三"));
-        assert!(!compact.contains("http://example.com"));
-        assert!(compact.contains("full source rows remain"));
-    }
-
-    #[test]
-    fn compact_financials_keeps_latest_rows_and_field_metadata() {
-        let output = "## 600519.SH · 利润表（近4期）\n\n| 报告期 | 营业总收入（亿） | 营业收入（亿） |\n|---|---:|---:|\n| 2026-03 | 547.03 | 539.09 |\n| 2025-12 | 1720.54 | 1688.38 |\n| 2025-09 | 1309.04 | 1284.54 |\n\n_字段口径: total_revenue=营业总收入；revenue=营业收入。_\n";
-        let compact = compact_tool_output_for_model("get_financials", output);
-        assert!(compact.contains("2026-03"));
-        assert!(compact.contains("2025-12"));
-        assert!(!compact.contains("2025-09"));
-        assert!(compact.contains("total_revenue=营业总收入"));
-        assert!(compact.contains("latest 2 rows"));
-    }
-
-    #[test]
-    fn compact_industry_context_keeps_summary_and_limits_tables() {
-        let output = "## A股行业上下文 · 600519.SH\n\n### 任务摘要\n- 标的：600519.SH\n- 主行业：L2 白酒 · 801123.SI\n- 行业指数近期表现：最新 2026-05-22 close=100 pct=1%\n- 资金面：东方财富盘中板块资金 2026-05-25 14:00 白酒 主力净流入=100 涨跌幅=1%\n\n### 申万分类\n| 层级 | 代码 | 名称 |\n|---|---|---|\n| L1 | 801120.SI | 食品饮料 |\n| L2 | 801123.SI | 白酒 |\n| L3 | 80112301.SI | 白酒III |\n\n### 同业样本\n| 代码 | 名称 |\n|---|---|\n| a | A |\n| b | B |\n| c | C |\n| d | D |\n| e | E |\n| f | F |\n| g | G |\n\n### 行业资金面\n| 来源 | 时间/日期 | 行业 | 代码 | 点位/收盘 | 涨跌幅% | 主力净流入 | 领涨股 | 说明 |\n|---|---|---|---|---:|---:|---:|---|---|\n| 东方财富盘中板块资金 | 2026-05-25 14:00 | 白酒 | BK0896 | 100 | 1 | 100 | A | 盘中 |\n| Tushare 日频行业资金 | 2026-05-22 | 白酒 | 801123.SI | 99 | 0.5 | 50 | B | 日频 |\n| extra | x | x | x | x | x | x | x | x |\n\n_Caveat: 行业分类和板块资金是 working model 的上下文，不是买卖信号。_";
-        let compact = compact_tool_output_for_model("get_a_share_industry_context", output);
-        assert!(compact.contains("主行业：L2 白酒"));
-        assert!(compact.contains("东方财富盘中板块资金"));
-        assert!(compact.contains("| f | F |"));
-        assert!(!compact.contains("| g | G |"));
-        assert!(!compact.contains("| extra |"));
-        assert!(compact.contains("industry-context tables compacted"));
-    }
-
-    #[test]
-    fn compact_generic_markdown_context_limits_bullets_and_tables() {
-        let output = "## 中国宏观上下文\n\n### GDP · `cn_gdp` · 9 rows\n- q1\n- q2\n- q3\n- q4\n- q5\n\n### PMI\n| 月份 | PMI |\n|---|---:|\n| 1 | 50 |\n| 2 | 51 |\n| 3 | 52 |\n| 4 | 53 |\n| 5 | 54 |\n\n_Caveat: 宏观数据必须通过传导链连接到标的。_";
-        let compact = compact_tool_output_for_model("get_china_macro_context", output);
-        assert!(compact.contains("q4"));
-        assert!(!compact.contains("q5"));
-        assert!(compact.contains("| 4 | 53 |"));
-        assert!(!compact.contains("| 5 | 54 |"));
-        assert!(compact.contains("markdown context compacted"));
-    }
-
-    #[test]
     fn partial_agent_message_content_marks_incomplete_failure() {
         let content = partial_agent_message_content(
             "阶段性输出",
@@ -2267,6 +2113,7 @@ mod tests {
             .await
             .unwrap();
         assert!(rows.iter().any(|row| row.kind == "provider_retry"));
+        assert!(rows.iter().any(|row| row.kind == "provider_recovered"));
         assert!(rows.iter().any(|row| row.kind == "agent_message_reset"));
         let end = rows
             .iter()
@@ -2305,6 +2152,249 @@ mod tests {
                 }),
             ])))
         }
+    }
+
+    #[test]
+    fn drop_orphan_function_calls_removes_unanswered_calls() {
+        let mut inputs = vec![
+            serde_json::json!({"role":"user","content":"q"}),
+            serde_json::json!({"type":"function_call","call_id":"c1","name":"t","arguments":"{}"}),
+            serde_json::json!({"type":"function_call","call_id":"c2","name":"t","arguments":"{}"}),
+            serde_json::json!({"type":"function_call_output","call_id":"c1","output":"ok"}),
+        ];
+        drop_orphan_function_calls(&mut inputs);
+        // c2 has no matching output → dropped; c1 (answered) and the user msg stay.
+        assert_eq!(inputs.len(), 3);
+        assert!(inputs
+            .iter()
+            .any(|v| v.get("call_id").and_then(|c| c.as_str()) == Some("c1")
+                && v.get("type").and_then(|t| t.as_str()) == Some("function_call")));
+        assert!(!inputs
+            .iter()
+            .any(|v| v.get("call_id").and_then(|c| c.as_str()) == Some("c2")));
+    }
+
+    #[derive(Default)]
+    struct ToolThenAnswerProvider {
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ToolThenAnswerProvider {
+        fn name(&self) -> &str {
+            "tool-then-answer"
+        }
+
+        async fn chat(&self, _req: ChatRequest) -> Result<BoxStream<'static, Result<LlmEvent>>> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(LlmEvent::FunctionCall {
+                        call_id: "c1".to_string(),
+                        name: "get_financials".to_string(),
+                        arguments: "{\"ts_code\":\"600519\"}".to_string(),
+                    }),
+                    Ok(LlmEvent::MessageEnd {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ])));
+            }
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LlmEvent::TextDelta {
+                    text: "最终答案".to_string(),
+                }),
+                Ok(LlmEvent::MessageEnd {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_persists_tool_trace_and_replays_append_only() {
+        let pool = create_agent_test_pool().await;
+        vault_messages::insert(
+            &pool,
+            "u1",
+            "s1",
+            "user",
+            &serde_json::json!({ "type": "text", "text": "查茅台财报" }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        run_chat_reply(
+            pool.clone(),
+            "u1".to_string(),
+            "s1".to_string(),
+            Arc::new(ToolThenAnswerProvider::default()),
+            EventBus::new(),
+            CancellationToken::new(),
+            ToolRegistry::empty(),
+        )
+        .await
+        .unwrap();
+
+        let rows = vault_messages::list(&pool, "u1", "s1", None, 100)
+            .await
+            .unwrap();
+        let roles: Vec<&str> = rows.iter().map(|r| r.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant_tool_calls", "tool_result", "agent"]
+        );
+
+        let calls_row = rows
+            .iter()
+            .find(|r| r.role == "assistant_tool_calls")
+            .unwrap();
+        let calls_json: serde_json::Value = serde_json::from_str(&calls_row.content_json).unwrap();
+        assert_eq!(calls_json["items"][0]["call_id"], "c1");
+        assert_eq!(calls_json["items"][0]["name"], "get_financials");
+        assert_eq!(
+            calls_json["items"][0]["arguments"],
+            "{\"ts_code\":\"600519\"}"
+        );
+
+        let result_row = rows.iter().find(|r| r.role == "tool_result").unwrap();
+        let result_json: serde_json::Value =
+            serde_json::from_str(&result_row.content_json).unwrap();
+        assert_eq!(result_json["call_id"], "c1");
+        assert!(result_row.seq > calls_row.seq);
+
+        let agent_row = rows.iter().find(|r| r.role == "agent").unwrap();
+        let agent_json: serde_json::Value = serde_json::from_str(&agent_row.content_json).unwrap();
+        assert_eq!(agent_json["text"], "最终答案");
+
+        // Replay rebuild keeps the paired call+output (no orphan), in order.
+        let (replay, _summaries) = rebuild_replay(&pool, "u1", "s1").await.unwrap();
+        let kinds: Vec<&str> = replay
+            .iter()
+            .map(|v| {
+                v.get("type")
+                    .and_then(|t| t.as_str())
+                    .or_else(|| v.get("role").and_then(|r| r.as_str()))
+                    .unwrap_or("?")
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["user", "function_call", "function_call_output", "assistant"]
+        );
+    }
+
+    #[derive(Default)]
+    struct ToolThenCompactThenAnswerProvider {
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ToolThenCompactThenAnswerProvider {
+        fn name(&self) -> &str {
+            "tool-compact-answer"
+        }
+
+        async fn chat(&self, _req: ChatRequest) -> Result<BoxStream<'static, Result<LlmEvent>>> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            match *calls {
+                // Iteration 0: a tool call + a Usage report above the real
+                // gpt-5.5 threshold (244.8K), so the next iteration must compact.
+                1 => Ok(Box::pin(stream::iter(vec![
+                    Ok(LlmEvent::FunctionCall {
+                        call_id: "c1".to_string(),
+                        name: "get_financials".to_string(),
+                        arguments: "{}".to_string(),
+                    }),
+                    Ok(LlmEvent::Usage(Usage {
+                        input_tokens: 300_000,
+                        output_tokens: 10,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                    })),
+                    Ok(LlmEvent::MessageEnd {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ]))),
+                // Call 2 is the summarizer invoked by compact_session_tail.
+                2 => Ok(Box::pin(stream::iter(vec![
+                    Ok(LlmEvent::TextDelta {
+                        text: "会话摘要".to_string(),
+                    }),
+                    Ok(LlmEvent::MessageEnd {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ]))),
+                // Call 3: the main loop resumes from the summary and answers.
+                _ => Ok(Box::pin(stream::iter(vec![
+                    Ok(LlmEvent::TextDelta {
+                        text: "压缩后的最终回答".to_string(),
+                    }),
+                    Ok(LlmEvent::MessageEnd {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ]))),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_turn_compaction_triggers_on_token_pressure_and_continues() {
+        let pool = create_agent_test_pool().await;
+        vault_messages::insert(
+            &pool,
+            "u1",
+            "s1",
+            "user",
+            &serde_json::json!({ "type": "text", "text": "做一次深入分析" }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        run_chat_reply(
+            pool.clone(),
+            "u1".to_string(),
+            "s1".to_string(),
+            Arc::new(ToolThenCompactThenAnswerProvider::default()),
+            EventBus::new(),
+            CancellationToken::new(),
+            ToolRegistry::empty(),
+        )
+        .await
+        .unwrap();
+
+        let rows = vault_messages::list(&pool, "u1", "s1", None, 100)
+            .await
+            .unwrap();
+        let roles: Vec<&str> = rows.iter().map(|r| r.role.as_str()).collect();
+        // The long turn compacted mid-flight, then finished from the summary.
+        assert_eq!(
+            roles,
+            vec![
+                "user",
+                "assistant_tool_calls",
+                "tool_result",
+                "compaction_summary",
+                "agent"
+            ]
+        );
+
+        let summary_row = rows.iter().find(|r| r.role == "compaction_summary").unwrap();
+        let summary_json: serde_json::Value =
+            serde_json::from_str(&summary_row.content_json).unwrap();
+        assert_eq!(summary_json["text"], "会话摘要");
+
+        let agent_row = rows.iter().find(|r| r.role == "agent").unwrap();
+        let agent_json: serde_json::Value = serde_json::from_str(&agent_row.content_json).unwrap();
+        assert_eq!(agent_json["text"], "压缩后的最终回答");
+
+        // The next turn replays only the summary (tool trace is pre-boundary).
+        let (replay, summaries) = rebuild_replay(&pool, "u1", "s1").await.unwrap();
+        assert_eq!(summaries, vec!["会话摘要".to_string()]);
+        assert_eq!(replay.last().unwrap()["content"], "压缩后的最终回答");
     }
 
     async fn create_agent_test_pool() -> SqlitePool {
@@ -2365,6 +2455,24 @@ mod tests {
                 completed_at TEXT,
                 PRIMARY KEY (user_id, id)
             )",
+            "CREATE TABLE llm_usage_log (
+                user_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                provider_name TEXT NOT NULL,
+                model TEXT NOT NULL,
+                invoker TEXT NOT NULL,
+                session_id TEXT,
+                task_id TEXT,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER NOT NULL,
+                success INTEGER NOT NULL,
+                error TEXT,
+                started_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, id)
+            )",
         ] {
             sqlx::query(statement).execute(&pool).await.unwrap();
         }
@@ -2372,182 +2480,22 @@ mod tests {
     }
 
     #[test]
-    fn tool_run_state_line_prefers_output_and_truncates_args() {
-        let row = vault_tool_runs::ToolRunRow {
-            id: "run-1".to_string(),
-            tool_name: "corpus_search".to_string(),
-            arguments_json: serde_json::json!({"query": "margin of safety"}).to_string(),
-            result_json: Some(serde_json::json!({"output": "Buffett evidence"}).to_string()),
-            error: None,
-            completed_at: Some("2026-05-20T01:02:03Z".to_string()),
-        };
-
-        let line = format_tool_run_for_state(&row).unwrap();
-        assert!(line.contains("`corpus_search`"));
-        assert!(line.contains("(reusable)"));
-        assert!(line.contains("margin of safety"));
-        assert!(line.contains("Buffett evidence"));
-    }
-
-    #[test]
-    fn tool_run_state_line_marks_market_quote_as_refresh_sensitive() {
-        let row = vault_tool_runs::ToolRunRow {
-            id: "run-quote".to_string(),
-            tool_name: "market_quote".to_string(),
-            arguments_json: serde_json::json!({"symbols": ["NVDA"], "market": "US"}).to_string(),
-            result_json: Some(serde_json::json!({"output": "NVDA 133.70"}).to_string()),
-            error: None,
-            completed_at: Some("2026-05-20T01:02:03Z".to_string()),
-        };
-
-        let line = format_tool_run_for_state(&row).unwrap();
-        assert!(line.contains("`market_quote`"));
-        assert!(line.contains("(refresh-sensitive)"));
-        assert!(line.contains("NVDA 133.70"));
-    }
-
-    #[test]
-    fn tool_evidence_policy_separates_reusable_refresh_and_stateful_tools() {
-        assert_eq!(tool_evidence_policy("get_financials"), "reusable");
-        assert_eq!(tool_evidence_policy("market_quote"), "refresh-sensitive");
-        assert_eq!(
-            tool_evidence_policy("get_a_share_market_snapshot"),
-            "refresh-sensitive"
-        );
-        assert_eq!(
-            tool_evidence_policy("get_capital_flow"),
-            "refresh-sensitive"
-        );
-        assert_eq!(
-            tool_evidence_policy("get_crypto_market"),
-            "refresh-sensitive"
-        );
-        assert_eq!(tool_evidence_policy("update_plan"), "stateful");
-        assert_eq!(tool_evidence_policy("web_fetch"), "prior-evidence");
-    }
-
-    #[test]
-    fn session_state_guidance_mentions_reuse_refresh_duplicate_and_search_budget() {
-        assert!(tool_evidence_guidance().contains("reusable=low-recency"));
-        assert!(tool_evidence_guidance().contains("refresh-sensitive=market/quote/capital"));
-        assert!(web_search_budget_guidance().contains("avoid reopening the same URL/PDF"));
-        assert!(web_search_budget_guidance().contains("stop once the evidence is enough"));
-    }
-
-    #[test]
-    fn tool_run_state_line_shows_error_when_present() {
-        let row = vault_tool_runs::ToolRunRow {
-            id: "run-2".to_string(),
-            tool_name: "web_fetch".to_string(),
-            arguments_json: "{}".to_string(),
-            result_json: Some(serde_json::json!({"output": "ignored"}).to_string()),
-            error: Some("permission denied".to_string()),
-            completed_at: None,
-        };
-
-        let line = format_tool_run_for_state(&row).unwrap();
-        assert!(line.contains("unknown-time"));
-        assert!(line.contains("ERROR permission denied"));
-        assert!(!line.contains("ignored"));
-    }
-
-    #[test]
-    fn web_search_state_line_uses_detail_and_sources() {
-        let row = vault_events::EventRow {
-            seq: 7,
-            task_id: None,
-            kind: "web_search_call".to_string(),
-            payload_json: serde_json::json!({
-                "action": "search",
-                "detail": "OpenAI latest filings",
-                "sources": ["https://example.com/a", "https://example.com/b"]
-            })
-            .to_string(),
-            source: Some("main_agent".to_string()),
-            ts: "2026-05-20T01:02:03Z".to_string(),
-        };
-
-        let line = format_web_search_for_state(&row).unwrap();
-        assert!(line.contains("`search`"));
-        assert!(line.contains("OpenAI latest filings"));
-        assert!(line.contains("https://example.com/a"));
-    }
-
-    #[test]
-    fn recent_web_search_guard_mentions_reuse_and_existing_pdf() {
-        let rows = vec![
-            vault_events::EventRow {
-                seq: 7,
-                task_id: None,
-                kind: "web_search_call".to_string(),
-                payload_json: serde_json::json!({
-                    "status": "completed",
-                    "action": "open_page",
-                    "detail": "https://example.com/report.pdf",
-                })
-                .to_string(),
-                source: Some("main_agent".to_string()),
-                ts: "2026-05-20T01:02:03Z".to_string(),
+    fn tool_batch_trace_summarizes_unique_tool_names() {
+        let trace = format_tool_batch_trace(&[
+            PendingCall {
+                call_id: "a".into(),
+                name: "get_financials".into(),
+                arguments: "{}".into(),
             },
-            vault_events::EventRow {
-                seq: 8,
-                task_id: None,
-                kind: "web_search_call".to_string(),
-                payload_json: serde_json::json!({
-                    "status": "in_progress",
-                    "action": "open_page",
-                    "detail": "https://example.com/ignored.pdf",
-                })
-                .to_string(),
-                source: Some("main_agent".to_string()),
-                ts: "2026-05-20T01:02:04Z".to_string(),
+            PendingCall {
+                call_id: "b".into(),
+                name: "get_company_info".into(),
+                arguments: "{}".into(),
             },
-        ];
-
-        let input = recent_web_search_guard_input_from_events(&rows).unwrap();
-        let content = input["content"].as_str().unwrap();
-        assert!(content.contains("Do not reopen"));
-        assert!(content.contains("https://example.com/report.pdf"));
-        assert!(!content.contains("ignored.pdf"));
-    }
-
-    #[test]
-    fn active_plan_state_guidance_warns_before_closing_with_open_items() {
-        let items = vec![
-            vault_plans::PlanItemRow {
-                item_id: "p1".to_string(),
-                seq: 1,
-                step: "collect evidence".to_string(),
-                status: "completed".to_string(),
-                evidence: None,
-            },
-            vault_plans::PlanItemRow {
-                item_id: "p2".to_string(),
-                seq: 2,
-                step: "finalize answer".to_string(),
-                status: "in_progress".to_string(),
-                evidence: None,
-            },
-        ];
-
-        let guidance = format_active_plan_state_guidance(&items);
-        assert!(guidance.contains("before a final/closing answer"));
-        assert!(guidance.contains("do not leave fake in_progress/pending"));
-    }
-
-    #[test]
-    fn active_plan_state_guidance_allows_completed_plan_to_close() {
-        let items = vec![vault_plans::PlanItemRow {
-            item_id: "p1".to_string(),
-            seq: 1,
-            step: "collect evidence".to_string(),
-            status: "completed".to_string(),
-            evidence: None,
-        }];
-
-        let guidance = format_active_plan_state_guidance(&items);
-        assert!(guidance.contains("all items are completed"));
-        assert!(guidance.contains("synthesize the answer"));
+        ]);
+        assert!(trace.contains("2 个工具"));
+        assert!(trace.contains("get_company_info"));
+        assert!(trace.contains("get_financials"));
     }
 
     #[test]

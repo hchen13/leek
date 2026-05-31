@@ -3,7 +3,7 @@
 //!
 //! Pipeline (P1, simple cut):
 //!   1. Render messages → plain transcript text (role-prefixed)
-//!   2. Send to LLM with structured-summary prompt + reasoning_effort=Minimal
+//!   2. Send to LLM with structured-summary prompt + reasoning_effort=Low
 //!   3. Collect text deltas, return as one Markdown blob
 //!
 //! Future iterations (not yet wired):
@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
@@ -21,28 +21,18 @@ use crate::llm::{ChatMessage, ChatRequest, LlmEvent, LlmProvider, ReasoningEffor
 use crate::vault::messages::MessageRow;
 
 const COMPACT_MODEL: &str = "gpt-5.5";
-const MAX_TOOL_EVIDENCE: usize = 24;
-const MAX_WEB_SEARCH_ACTIVITY: usize = 24;
 
-#[derive(Debug, Default, Clone)]
-pub struct CompactSupportingContext {
-    pub tool_runs: Vec<CompactToolEvidence>,
-    pub web_searches: Vec<CompactWebSearchActivity>,
-}
+/// Tool calls within the last N turns render with full detail; older ones
+/// degrade to a `name(args)` index line (output dropped) so a long session
+/// doesn't pay tokens for stale tool data verbatim. A new turn begins at each
+/// `user` row. Override via `LEEK_TOOL_KEEP_TURNS`.
+const TOOL_KEEP_TURNS_DEFAULT: usize = 6;
 
-#[derive(Debug, Clone)]
-pub struct CompactToolEvidence {
-    pub tool_name: String,
-    pub arguments_json: String,
-    pub result_json: Option<String>,
-    pub error: Option<String>,
-    pub completed_at: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CompactWebSearchActivity {
-    pub ts: String,
-    pub payload_json: String,
+fn tool_keep_turns() -> usize {
+    std::env::var("LEEK_TOOL_KEEP_TURNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(TOOL_KEEP_TURNS_DEFAULT)
 }
 
 /// Investment-research-flavored summary template. The agent must produce
@@ -85,140 +75,74 @@ the agent committed to>
 behavioral preferences that surfaced — only if explicit; do not invent>
 ";
 
-/// Render a vault message list into a plain transcript suitable for LLM
-/// consumption.
-fn render_transcript(
-    history: &[MessageRow],
-    supporting_context: Option<&CompactSupportingContext>,
-) -> String {
-    let mut out = String::new();
+/// Render the append-only conversation-queue tail into a plain transcript for
+/// the summarizer. User/agent text renders verbatim; tool rows render inline so
+/// the summary captures real tool evidence with no side channel. Tool calls
+/// older than `tool_keep_turns()` turns drop their output and collapse to a
+/// one-line `name(args)` index.
+fn render_transcript(history: &[MessageRow]) -> String {
+    // Assign a turn index to each row: a new turn starts at every user row.
+    let mut turn_of = Vec::with_capacity(history.len());
+    let mut turn = 0usize;
     for row in history {
+        if row.role == "user" {
+            turn += 1;
+        }
+        turn_of.push(turn);
+    }
+    let total_turns = turn;
+    let keep = tool_keep_turns();
+
+    let mut out = String::new();
+    for (i, row) in history.iter().enumerate() {
+        let recent = total_turns.saturating_sub(turn_of[i]) < keep;
         let content: serde_json::Value = match serde_json::from_str(&row.content_json) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let text = match content.get("text").and_then(|t| t.as_str()) {
-            Some(t) => t,
-            None => continue,
-        };
-        let role_label = match row.role.as_str() {
-            "user" => "USER",
-            "agent" => "LEEK",
+        match row.role.as_str() {
+            "user" | "agent" => {
+                let Some(text) = content.get("text").and_then(|t| t.as_str()) else {
+                    continue;
+                };
+                let role_label = if row.role == "user" { "USER" } else { "LEEK" };
+                out.push_str(&format!(
+                    "--- [{role_label} · seq={} · {}]\n{}\n\n",
+                    row.seq, row.created_at, text
+                ));
+            }
+            "assistant_tool_calls" => {
+                let Some(items) = content.get("items").and_then(|i| i.as_array()) else {
+                    continue;
+                };
+                for it in items {
+                    let name = it.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                    let args = it.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
+                    if recent {
+                        out.push_str(&format!(
+                            "--- [TOOL CALL · {name}]\nargs={}\n\n",
+                            preview(args, 400)
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "--- [earlier tool: {name}({})]\n\n",
+                            preview(args, 200)
+                        ));
+                    }
+                }
+            }
+            "tool_result" => {
+                // Older tool output is dropped; the name(args) index is enough.
+                if !recent {
+                    continue;
+                }
+                let output = content.get("output").and_then(|o| o.as_str()).unwrap_or("");
+                out.push_str(&format!("--- [TOOL RESULT]\n{}\n\n", preview(output, 1200)));
+            }
             _ => continue,
-        };
-        out.push_str(&format!(
-            "--- [{role_label} · seq={} · {}]\n{}\n\n",
-            row.seq, row.created_at, text
-        ));
-    }
-    if let Some(supporting_context) = supporting_context {
-        let context_text = render_supporting_context(supporting_context);
-        if !context_text.is_empty() {
-            out.push_str(&format!(
-                "--- [COMPACT RANGE SUPPORTING CONTEXT]\n{context_text}\n\n"
-            ));
         }
     }
     out
-}
-
-fn render_supporting_context(context: &CompactSupportingContext) -> String {
-    let mut sections = Vec::new();
-
-    let tool_lines = context
-        .tool_runs
-        .iter()
-        .take(MAX_TOOL_EVIDENCE)
-        .filter_map(format_tool_evidence)
-        .collect::<Vec<_>>();
-    if !tool_lines.is_empty() {
-        sections.push(format!(
-            "## Durable tool evidence\n{}",
-            tool_lines.join("\n")
-        ));
-    }
-
-    let web_lines = context
-        .web_searches
-        .iter()
-        .take(MAX_WEB_SEARCH_ACTIVITY)
-        .filter_map(format_web_search_activity)
-        .collect::<Vec<_>>();
-    if !web_lines.is_empty() {
-        sections.push(format!(
-            "## Web search activity/source hints only\nThese rows record web_search_call activity and source hints. They do not contain fetched page content and must not be used as evidence or confirmed facts.\n{}",
-            web_lines.join("\n")
-        ));
-    }
-
-    sections.join("\n\n")
-}
-
-fn format_tool_evidence(row: &CompactToolEvidence) -> Option<String> {
-    let completed_at = row.completed_at.as_deref().unwrap_or("unknown-time");
-    let args = preview(&row.arguments_json, 220);
-    let output = row
-        .error
-        .as_deref()
-        .map(|e| format!("ERROR {}", preview(e, 260)))
-        .or_else(|| tool_output(row).map(|s| preview(&s, 520)))?;
-    Some(format!(
-        "- {completed_at} `{}` args={} => {}",
-        row.tool_name, args, output
-    ))
-}
-
-fn format_web_search_activity(row: &CompactWebSearchActivity) -> Option<String> {
-    let payload: serde_json::Value = serde_json::from_str(&row.payload_json).ok()?;
-    let action = payload
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let detail = payload
-        .get("detail")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            payload
-                .get("queries")
-                .and_then(|v| v.as_array())
-                .and_then(|items| items.first())
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("");
-    if detail.trim().is_empty() {
-        return None;
-    }
-    let sources = payload
-        .get("sources")
-        .and_then(|v| v.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|v| v.as_str())
-                .take(4)
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .filter(|s| !s.is_empty())
-        .map(|s| format!(" sources={s}"))
-        .unwrap_or_default();
-    Some(format!(
-        "- {} `{}` {}{}",
-        row.ts,
-        action,
-        preview(detail, 260),
-        sources
-    ))
-}
-
-fn tool_output(row: &CompactToolEvidence) -> Option<String> {
-    let raw = row.result_json.as_deref()?;
-    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
-    value
-        .get("output")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| Some(raw.to_string()))
 }
 
 fn preview(s: &str, max_chars: usize) -> String {
@@ -242,7 +166,6 @@ fn preview(s: &str, max_chars: usize) -> String {
 pub async fn summarize_session(
     provider: Arc<dyn LlmProvider>,
     history: &[MessageRow],
-    supporting_context: Option<&CompactSupportingContext>,
     focus: Option<&str>,
     cancel: CancellationToken,
 ) -> Result<String> {
@@ -250,7 +173,7 @@ pub async fn summarize_session(
         return Err(anyhow!("compact: refusing to summarize empty history"));
     }
 
-    let transcript = render_transcript(history, supporting_context);
+    let transcript = render_transcript(history);
     let mut user_msg = format!(
         "Below is the transcript from one leek session. Produce the structured \
          summary as instructed.\n\n{transcript}"
@@ -272,10 +195,11 @@ pub async fn summarize_session(
         max_output_tokens: None,
         tools: Vec::new(),
         additional_inputs: Vec::new(),
-        // gpt-5.5 doesn't accept `minimal`; `low` is the lightest level it
-        // supports and is enough for a structured summary without burning
-        // thinking tokens.
-        reasoning_effort: Some(ReasoningEffort::Minimal),
+        // gpt-5.5 rejects `minimal` (400: "Unsupported value … Supported
+        // values are: none, low, medium, high, xhigh"). `low` is the lightest
+        // level it accepts and is enough for a structured summary without
+        // burning thinking tokens.
+        reasoning_effort: Some(ReasoningEffort::Low),
     };
 
     let mut stream = provider.chat(req).await.context("compact: chat call")?;
@@ -312,6 +236,31 @@ mod tests {
         }
     }
 
+    fn mk_tool_calls(seq: i64, items: serde_json::Value) -> MessageRow {
+        MessageRow {
+            seq,
+            task_id: None,
+            role: "assistant_tool_calls".into(),
+            content_json: serde_json::json!({ "type": "tool_calls", "items": items }).to_string(),
+            created_at: "2026-05-03T00:00:00Z".into(),
+        }
+    }
+
+    fn mk_tool_result(seq: i64, call_id: &str, output: &str) -> MessageRow {
+        MessageRow {
+            seq,
+            task_id: None,
+            role: "tool_result".into(),
+            content_json: serde_json::json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            })
+            .to_string(),
+            created_at: "2026-05-03T00:00:00Z".into(),
+        }
+    }
+
     #[test]
     fn render_transcript_includes_user_and_agent_rows() {
         let rows = vec![
@@ -319,7 +268,7 @@ mod tests {
             mk_row(2, "agent", "近 60 个交易日宽幅震荡，回到 1400 附近。"),
             mk_row(3, "user", "估值合理吗？"),
         ];
-        let t = render_transcript(&rows, None);
+        let t = render_transcript(&rows);
         assert!(t.contains("USER"));
         assert!(t.contains("LEEK"));
         assert!(t.contains("贵州茅台"));
@@ -334,7 +283,7 @@ mod tests {
             mk_row(2, "system", "diagnostic"),
             mk_row(3, "agent", "hello"),
         ];
-        let t = render_transcript(&rows, None);
+        let t = render_transcript(&rows);
         assert!(!t.contains("diagnostic"));
         assert!(t.contains("hi"));
         assert!(t.contains("hello"));
@@ -345,47 +294,50 @@ mod tests {
         let mut bad = mk_row(1, "user", "ok");
         bad.content_json = "not-json".into();
         let good = mk_row(2, "user", "good");
-        let t = render_transcript(&[bad, good], None);
+        let t = render_transcript(&[bad, good]);
         assert!(!t.contains("not-json"));
         assert!(t.contains("good"));
     }
 
     #[test]
-    fn render_transcript_includes_tool_evidence_and_web_activity_hints() {
-        let rows = vec![mk_row(1, "user", "查一下 NVDA")];
-        let supporting_context = CompactSupportingContext {
-            tool_runs: vec![CompactToolEvidence {
-                tool_name: "web_fetch".into(),
-                arguments_json: r#"{"url":"https://example.com"}"#.into(),
-                result_json: Some(
-                    serde_json::json!({
-                        "output": "NVIDIA reported data center revenue growth.",
-                    })
-                    .to_string(),
-                ),
-                error: None,
-                completed_at: Some("2026-05-20T01:00:00Z".into()),
-            }],
-            web_searches: vec![CompactWebSearchActivity {
-                ts: "2026-05-20T01:00:01Z".into(),
-                payload_json: serde_json::json!({
-                    "action": "search",
-                    "detail": "NVDA latest earnings",
-                    "sources": ["https://example.com/earnings"]
-                })
-                .to_string(),
-            }],
-        };
-        let t = render_transcript(&rows, Some(&supporting_context));
-        assert!(t.contains("COMPACT RANGE SUPPORTING CONTEXT"));
-        assert!(t.contains("Durable tool evidence"));
-        assert!(t.contains("Web search activity/source hints only"));
-        assert!(t.contains("They do not contain fetched page content"));
-        assert!(!t.contains(concat!("Web search ", "evidence")));
-        assert!(!t.contains(concat!("DURABLE TOOL / WEB ", "EVIDENCE")));
-        assert!(t.contains("web_fetch"));
+    fn render_transcript_renders_tool_rows_inline() {
+        let rows = vec![
+            mk_row(1, "user", "查一下 NVDA"),
+            mk_tool_calls(
+                2,
+                serde_json::json!([
+                    {"type":"function_call","call_id":"c1","name":"web_fetch","arguments":"{\"url\":\"https://x\"}"}
+                ]),
+            ),
+            mk_tool_result(3, "c1", "NVIDIA reported data center revenue growth."),
+            mk_row(4, "agent", "数据中心营收高增。"),
+        ];
+        let t = render_transcript(&rows);
+        assert!(t.contains("TOOL CALL · web_fetch"));
+        assert!(t.contains("TOOL RESULT"));
         assert!(t.contains("data center revenue"));
-        assert!(t.contains("NVDA latest earnings"));
-        assert!(t.contains("https://example.com/earnings"));
+    }
+
+    #[test]
+    fn render_transcript_degrades_old_tool_calls_to_name_args() {
+        std::env::set_var("LEEK_TOOL_KEEP_TURNS", "1");
+        // Turn 1's tool output should be dropped; only its name(args) index kept.
+        let rows = vec![
+            mk_row(1, "user", "第一问"),
+            mk_tool_calls(
+                2,
+                serde_json::json!([
+                    {"type":"function_call","call_id":"c1","name":"get_financials","arguments":"{\"ts_code\":\"600519\"}"}
+                ]),
+            ),
+            mk_tool_result(3, "c1", "OLD_OUTPUT_SHOULD_BE_DROPPED 营收 1700 亿"),
+            mk_row(4, "user", "第二问"),
+            mk_row(5, "agent", "答案。"),
+        ];
+        let t = render_transcript(&rows);
+        std::env::remove_var("LEEK_TOOL_KEEP_TURNS");
+        assert!(t.contains("earlier tool: get_financials("));
+        assert!(t.contains("600519"));
+        assert!(!t.contains("OLD_OUTPUT_SHOULD_BE_DROPPED"));
     }
 }

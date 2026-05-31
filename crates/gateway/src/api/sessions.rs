@@ -4,23 +4,18 @@
 //! token is signalled, the reply pipeline graceful-exits at the next
 //! `select!` point and commits whatever partial text it has accumulated.
 
-use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::Json;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use super::{ActiveTask, AppError, AppState};
 use crate::agent;
-use crate::agent::compact::{
-    CompactSupportingContext, CompactToolEvidence, CompactWebSearchActivity,
-};
 use crate::vault::{
     compactions as vault_compactions, events as vault_events, messages as vault_messages,
-    sessions as vault_sessions, tool_runs as vault_tool_runs,
+    sessions as vault_sessions,
 };
-
-const COMPACTION_CONTEXT_SQL_LIMIT: i64 = 24;
 
 pub async fn abort_handler(
     State(state): State<AppState>,
@@ -73,15 +68,39 @@ pub async fn events_handler(
     Ok(Json(EventsResponse { items: rows }))
 }
 
+/// A session row plus its live runtime state. `running` is true while an
+/// agent reply (or compaction) is in flight for the session — derived from
+/// `active_replies`, the same map `abort_handler` consults. The frontend uses
+/// it to (a) show a live dot in the session list and (b) re-attach the
+/// "thinking…" UI when you switch back into a session whose reply is still
+/// streaming.
+#[derive(serde::Serialize)]
+pub struct SessionListItem {
+    #[serde(flatten)]
+    pub row: vault_sessions::SessionRow,
+    pub running: bool,
+}
+
 #[derive(serde::Serialize)]
 pub struct ListSessionsResponse {
-    pub items: Vec<vault_sessions::SessionRow>,
+    pub items: Vec<SessionListItem>,
 }
 
 pub async fn list_handler(
     State(state): State<AppState>,
 ) -> Result<Json<ListSessionsResponse>, AppError> {
-    let items = vault_sessions::list(&state.pool, &state.user_id).await?;
+    let rows = vault_sessions::list(&state.pool, &state.user_id).await?;
+    let active = state.active_replies.lock().await;
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            let running = active
+                .get(&row.id)
+                .map(|task| !task.token.is_cancelled())
+                .unwrap_or(false);
+            SessionListItem { row, running }
+        })
+        .collect();
     Ok(Json(ListSessionsResponse { items }))
 }
 
@@ -314,17 +333,11 @@ async fn run_compaction(
         anyhow::bail!("no new messages since last compaction");
     }
     let messages_removed = history.len() as i64;
-    let supporting_context =
-        load_compaction_supporting_context(&pool, &user_id, &source_session, history).await?;
 
-    let summary = agent::compact::summarize_session(
-        provider,
-        history,
-        Some(&supporting_context),
-        focus,
-        cancel,
-    )
-    .await?;
+    // Tool evidence now lives inline in the queue (assistant_tool_calls /
+    // tool_result rows), which render_transcript renders directly — no separate
+    // supporting-context side channel needed.
+    let summary = agent::compact::summarize_session(provider, history, focus, cancel).await?;
 
     // Write the summary into the same session as a compaction_summary message.
     vault_messages::insert(
@@ -357,199 +370,4 @@ async fn run_compaction(
         messages_removed,
         messages_retained: 1,
     })
-}
-
-async fn load_compaction_supporting_context(
-    pool: &sqlx::SqlitePool,
-    user_id: &str,
-    session_id: &str,
-    history: &[vault_messages::MessageRow],
-) -> anyhow::Result<CompactSupportingContext> {
-    let Some(first) = history.first() else {
-        return Ok(CompactSupportingContext::default());
-    };
-    let Some(last) = history.last() else {
-        return Ok(CompactSupportingContext::default());
-    };
-
-    let mut tool_rows: Vec<vault_tool_runs::ToolRunRow> = sqlx::query_as(
-        r#"
-        SELECT id, tool_name, arguments_json, result_json, error, completed_at
-        FROM tool_call_runs
-        WHERE user_id = ?
-          AND session_id = ?
-          AND completed_at IS NOT NULL
-          AND completed_at >= ?
-          AND completed_at <= ?
-        ORDER BY completed_at DESC
-        LIMIT ?
-        "#,
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(&first.created_at)
-    .bind(&last.created_at)
-    .bind(COMPACTION_CONTEXT_SQL_LIMIT)
-    .fetch_all(pool)
-    .await?;
-    tool_rows.reverse();
-
-    let mut web_rows: Vec<vault_events::EventRow> = sqlx::query_as(
-        r#"
-        SELECT seq, task_id, kind, payload_json, source, ts
-        FROM events
-        WHERE user_id = ?
-          AND session_id = ?
-          AND kind = 'web_search_call'
-          AND ts >= ?
-          AND ts <= ?
-        ORDER BY ts DESC, seq DESC
-        LIMIT ?
-        "#,
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(&first.created_at)
-    .bind(&last.created_at)
-    .bind(COMPACTION_CONTEXT_SQL_LIMIT)
-    .fetch_all(pool)
-    .await?;
-    web_rows.reverse();
-
-    Ok(CompactSupportingContext {
-        tool_runs: tool_rows
-            .into_iter()
-            .map(|row| CompactToolEvidence {
-                tool_name: row.tool_name,
-                arguments_json: row.arguments_json,
-                result_json: row.result_json,
-                error: row.error,
-                completed_at: row.completed_at,
-            })
-            .collect(),
-        web_searches: web_rows
-            .into_iter()
-            .map(|row| CompactWebSearchActivity {
-                ts: row.ts,
-                payload_json: row.payload_json,
-            })
-            .collect(),
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
-
-    #[tokio::test]
-    async fn load_compaction_supporting_context_keeps_latest_rows_in_chronological_order() {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::query(
-            "CREATE TABLE tool_call_runs (
-                user_id TEXT NOT NULL,
-                id TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                tool_name TEXT NOT NULL,
-                arguments_json TEXT NOT NULL,
-                result_json TEXT,
-                error TEXT,
-                completed_at TEXT
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE TABLE events (
-                user_id TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                seq INTEGER NOT NULL,
-                task_id TEXT,
-                kind TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                source TEXT,
-                ts TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        for i in 0..30 {
-            let ts = format!("2026-05-20T00:00:{i:02}Z");
-            sqlx::query(
-                "INSERT INTO tool_call_runs
-                 (user_id, id, session_id, tool_name, arguments_json, result_json, completed_at)
-                 VALUES ('u1', ?, 's1', 'web_fetch', ?, ?, ?)",
-            )
-            .bind(format!("tool-{i}"))
-            .bind(serde_json::json!({ "i": i }).to_string())
-            .bind(serde_json::json!({ "output": format!("tool output {i}") }).to_string())
-            .bind(&ts)
-            .execute(&pool)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO events
-                 (user_id, session_id, seq, kind, payload_json, ts)
-                 VALUES ('u1', 's1', ?, 'web_search_call', ?, ?)",
-            )
-            .bind(i + 1)
-            .bind(
-                serde_json::json!({
-                    "action": "search",
-                    "detail": format!("query {i}")
-                })
-                .to_string(),
-            )
-            .bind(&ts)
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
-
-        let history = vec![
-            vault_messages::MessageRow {
-                seq: 1,
-                task_id: None,
-                role: "user".into(),
-                content_json: serde_json::json!({ "text": "start" }).to_string(),
-                created_at: "2026-05-20T00:00:00Z".into(),
-            },
-            vault_messages::MessageRow {
-                seq: 2,
-                task_id: None,
-                role: "agent".into(),
-                content_json: serde_json::json!({ "text": "end" }).to_string(),
-                created_at: "2026-05-20T00:00:59Z".into(),
-            },
-        ];
-
-        let supporting_context = load_compaction_supporting_context(&pool, "u1", "s1", &history)
-            .await
-            .unwrap();
-
-        assert_eq!(supporting_context.tool_runs.len(), 24);
-        assert_eq!(supporting_context.web_searches.len(), 24);
-        assert_eq!(supporting_context.tool_runs[0].arguments_json, r#"{"i":6}"#);
-        assert_eq!(
-            supporting_context.tool_runs[23].arguments_json,
-            r#"{"i":29}"#
-        );
-        assert!(
-            supporting_context.web_searches[0]
-                .payload_json
-                .contains("query 6")
-        );
-        assert!(
-            supporting_context.web_searches[23]
-                .payload_json
-                .contains("query 29")
-        );
-    }
 }

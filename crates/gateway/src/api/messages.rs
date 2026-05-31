@@ -1,6 +1,6 @@
-use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -11,23 +11,6 @@ use crate::events::EventEnvelope;
 use crate::vault::{
     events as vault_events, messages as vault_messages, sessions as vault_sessions,
 };
-
-/// Auto-compaction threshold. When the session's last `llm_usage` event
-/// reports `input_tokens` ≥ this value, the next user message triggers a
-/// in-place compaction *before* the LLM is called again — otherwise the next
-/// turn would push the request over the model's context window.
-///
-/// Trigger at 95% of the 400K context window (= 380K), leaving ~20K for the
-/// working turn's user message, system prompt delta, and tool outputs.
-/// Override via `LEEK_AUTO_COMPACT_THRESHOLD` for tests / low-budget tiers.
-const AUTO_COMPACT_THRESHOLD_DEFAULT: i64 = 380_000;
-
-fn auto_compact_threshold() -> i64 {
-    std::env::var("LEEK_AUTO_COMPACT_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(AUTO_COMPACT_THRESHOLD_DEFAULT)
-}
 
 #[derive(Deserialize)]
 pub struct PostMessageBody {
@@ -70,8 +53,9 @@ pub async fn post_handler(
     // Pre-turn auto-compaction: if the most recent LLM call on this session
     // already saw input_tokens ≥ threshold, reject this user message and
     // start compaction. Frontend queues the message and re-POSTs it to this
-    // same session after `compaction.completed`.
-    let threshold = auto_compact_threshold();
+    // same session after `compaction.completed`. The threshold tracks the
+    // model's real context window (gpt-5.5 = 272K), not an absolute number.
+    let threshold = crate::llm::model_limits::auto_compact_threshold(crate::agent::DEFAULT_MODEL);
     if let Some(latest) =
         vault_events::latest_input_tokens(&state.pool, &state.user_id, &session_id).await?
     {
@@ -125,6 +109,33 @@ pub async fn post_handler(
             EventEnvelope::new(evt_seq, "user_message", payload),
         )
         .await;
+
+    if let Some(title) = auto_session_title(&user_text) {
+        if vault_sessions::rename_if_untitled(&state.pool, &state.user_id, &session_id, &title)
+            .await?
+        {
+            let payload = serde_json::json!({ "title": title });
+            let ts = chrono::Utc::now();
+            let evt_seq = vault_events::insert(
+                &state.pool,
+                &state.user_id,
+                &session_id,
+                None,
+                "session_renamed",
+                &payload,
+                Some("main_agent"),
+                ts,
+            )
+            .await?;
+            state
+                .event_bus
+                .publish(
+                    &session_id,
+                    EventEnvelope::new(evt_seq, "session_renamed", payload),
+                )
+                .await;
+        }
+    }
 
     // Each session has at most one in-flight reply. New POST cancels the previous.
     let cancel = CancellationToken::new();
@@ -236,7 +247,26 @@ async fn handle_user_message(
         }
     }
 
+    if let Err(e) = vault_sessions::touch(&pool, &user_id, &session_id).await {
+        tracing::warn!(session_id, error = %e, "failed to touch session after message handling");
+    }
+
     result
+}
+
+fn auto_session_title(text: &str) -> Option<String> {
+    let cleaned = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cleaned = cleaned
+        .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace())
+        .trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let mut title = cleaned.chars().take(28).collect::<String>();
+    if cleaned.chars().count() > 28 {
+        title.push('…');
+    }
+    Some(title)
 }
 
 async fn latest_agent_event_is_terminal(
@@ -267,7 +297,10 @@ pub async fn list_handler(
     Path(session_id): Path<String>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let rows = vault_messages::list(
+    // Append-only tool-trace rows (assistant_tool_calls / tool_result) are
+    // hidden from the chat transcript — the frontend would render unknown roles
+    // as blank user bubbles. Tool activity surfaces via the events stream.
+    let rows = vault_messages::list_for_ui(
         &state.pool,
         &state.user_id,
         &session_id,
@@ -276,4 +309,21 @@ pub async fn list_handler(
     )
     .await?;
     Ok(Json(serde_json::json!({ "items": rows })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_session_title_collapses_whitespace_and_truncates() {
+        let title = auto_session_title(
+            "  以你的认知形成一套思维框架，并用这套框架做一次长电科技的深入投研分析  ",
+        )
+        .unwrap();
+        assert!(title.starts_with("以你的认知形成一套思维框架"));
+        assert!(title.ends_with('…'));
+        assert_eq!(title.chars().count(), 29);
+        assert_eq!(auto_session_title("\n\n"), None);
+    }
 }

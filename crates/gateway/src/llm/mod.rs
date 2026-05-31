@@ -5,6 +5,7 @@
 //! `anthropic_api_key` and `openai_api_key` will land later.
 
 pub mod codex_oauth;
+pub mod model_limits;
 pub mod openai_responses;
 
 use anyhow::Result;

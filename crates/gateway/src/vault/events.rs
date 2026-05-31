@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use sqlx::{FromRow, SqlitePool};
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 
 const INSERT_MAX_ATTEMPTS: usize = 6;
 const INSERT_RETRY_BASE_MS: u64 = 10;
@@ -62,16 +62,36 @@ pub async fn list_for_session(
     Ok(rows)
 }
 
-/// Most recent `input_tokens` reported by the LLM provider for this session.
-/// Used by the auto-compaction trigger: when the session's last LLM call
-/// already saw > N tokens of input, the next turn would exceed the budget,
-/// so compact before sending it. Returns `None` for fresh sessions with no
-/// `llm_usage` events yet.
+/// Most recent `input_tokens` reported by the LLM provider for this session,
+/// counting only calls AFTER the most recent compaction. Used by the pre-turn
+/// auto-compaction trigger: when the session's last real LLM call already saw
+/// > N tokens of input, the next turn would exceed the budget, so compact
+/// before sending it.
+///
+/// The post-compaction filter is essential: a compaction resets the context,
+/// so the pre-compaction input size no longer reflects what the next turn will
+/// send. Without it the trigger loops forever — compact, still read the stale
+/// over-threshold figure, compact again — and no user message ever gets in.
+/// Returns `None` for fresh sessions, or right after a compaction (let the next
+/// turn run and report a fresh, smaller figure).
 pub async fn latest_input_tokens(
     pool: &SqlitePool,
     user_id: &str,
     session_id: &str,
 ) -> Result<Option<i64>> {
+    let boundary_seq: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(MAX(seq), 0)
+        FROM events
+        WHERE user_id = ? AND session_id = ? AND kind = 'compaction.completed'
+        "#,
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_one(pool)
+    .await
+    .context("reading latest compaction boundary")?;
+
     let row: Option<(String,)> = sqlx::query_as(
         r#"
         SELECT payload_json
@@ -79,12 +99,14 @@ pub async fn latest_input_tokens(
         WHERE user_id = ?
           AND session_id = ?
           AND kind = 'llm_usage'
+          AND seq > ?
         ORDER BY seq DESC
         LIMIT 1
         "#,
     )
     .bind(user_id)
     .bind(session_id)
+    .bind(boundary_seq)
     .fetch_optional(pool)
     .await
     .context("reading latest llm_usage event")?;
@@ -279,6 +301,45 @@ mod tests {
         .unwrap();
 
         assert_eq!(seqs, (1..=40).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn latest_input_tokens_ignores_pre_compaction_calls() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE events (
+                user_id TEXT NOT NULL, session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+                task_id TEXT, kind TEXT NOT NULL, payload_json TEXT NOT NULL,
+                source TEXT, ts TEXT NOT NULL, persisted_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, session_id, seq)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let ev = |k: &str, p: serde_json::Value| {
+            let pool = pool.clone();
+            let k = k.to_string();
+            async move { insert(&pool, "u", "s", None, &k, &p, Some("t"), now).await.unwrap() }
+        };
+
+        // A heavy call, then a compaction → the stale pre-compaction figure must
+        // not be returned (else the pre-turn trigger loops).
+        ev("llm_usage", serde_json::json!({ "input_tokens": 240_000 })).await;
+        ev("compaction.completed", serde_json::json!({ "trigger": "auto_pre_turn" })).await;
+        assert_eq!(latest_input_tokens(&pool, "u", "s").await.unwrap(), None);
+
+        // A fresh, smaller call after the boundary is what counts.
+        ev("llm_usage", serde_json::json!({ "input_tokens": 15_000 })).await;
+        assert_eq!(
+            latest_input_tokens(&pool, "u", "s").await.unwrap(),
+            Some(15_000)
+        );
     }
 
     #[test]

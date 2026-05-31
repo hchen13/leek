@@ -2,14 +2,12 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use sqlx::SqlitePool;
 
+/// A prior successful run, used only for in-session tool-result reuse: the
+/// caller keys off `id` (as `cached_from`) and replays `result_json`.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ToolRunRow {
     pub id: String,
-    pub tool_name: String,
-    pub arguments_json: String,
     pub result_json: Option<String>,
-    pub error: Option<String>,
-    pub completed_at: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -76,30 +74,6 @@ pub async fn finish(
     Ok(())
 }
 
-pub async fn list_recent_for_session(
-    pool: &SqlitePool,
-    user_id: &str,
-    session_id: &str,
-    limit: i64,
-) -> Result<Vec<ToolRunRow>> {
-    let rows = sqlx::query_as(
-        r#"
-        SELECT id, tool_name, arguments_json, result_json, error, completed_at
-        FROM tool_call_runs
-        WHERE user_id = ? AND session_id = ? AND completed_at IS NOT NULL
-        ORDER BY completed_at DESC
-        LIMIT ?
-        "#,
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .context("listing recent tool runs for session")?;
-    Ok(rows)
-}
-
 pub async fn find_successful_for_session(
     pool: &SqlitePool,
     user_id: &str,
@@ -110,7 +84,7 @@ pub async fn find_successful_for_session(
     let arguments_json = canonicalize_arguments(arguments_json);
     let row = sqlx::query_as(
         r#"
-        SELECT id, tool_name, arguments_json, result_json, error, completed_at
+        SELECT id, result_json
         FROM tool_call_runs
         WHERE user_id = ?
           AND session_id = ?
