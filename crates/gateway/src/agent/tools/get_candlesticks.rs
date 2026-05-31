@@ -211,6 +211,10 @@ impl GetCandlesticksTool {
         }
 
         let token = data_provider_tokens::tushare_token(ctx).await?;
+        let name = super::ashare_security_name(&self.http, &token, ticker, &cancel).await;
+        let label = name
+            .map(|n| format!("{n}（{ticker}）"))
+            .unwrap_or_else(|| ticker.to_string());
 
         let payload = serde_json::json!({
             "api_name": interval.tushare_api(),
@@ -334,7 +338,7 @@ impl GetCandlesticksTool {
         }
 
         let mut out = format!(
-            "## {ticker} · {} · {price_basis} ({limit})\n\n",
+            "## {label} · {} · {price_basis} ({limit})\n\n",
             interval.label_cn()
         );
         out.push_str(&render_candle_summary(&rows, interval.label_cn()));
@@ -493,6 +497,15 @@ impl GetCandlesticksTool {
             .pointer("/meta/symbol")
             .and_then(|v| v.as_str())
             .unwrap_or(ticker);
+        let yahoo_name = result
+            .pointer("/meta/shortName")
+            .or_else(|| result.pointer("/meta/longName"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let label = yahoo_name
+            .map(|n| format!("{n}（{symbol}）"))
+            .unwrap_or_else(|| symbol.to_string());
 
         let timestamps = result
             .pointer("/timestamp")
@@ -574,7 +587,7 @@ impl GetCandlesticksTool {
 
         let adj_label = if adjusted { "Adj" } else { "Raw" };
         let mut out = format!(
-            "## {symbol} · {} · {adj_label} ({limit})\n\n",
+            "## {label} · {} · {adj_label} ({limit})\n\n",
             interval.label()
         );
         let date_head = if matches!(interval, Interval::Minute15) {

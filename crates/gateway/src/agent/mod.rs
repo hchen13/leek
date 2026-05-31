@@ -41,8 +41,14 @@ const PROVIDER_RETRY_MAX_MS: u64 = 30_000;
 const PROVIDER_STREAM_IDLE_TIMEOUT_MS: u64 = 90_000;
 const PROVIDER_SYNTHESIS_TIMEOUT_MS: u64 = 90_000;
 const PLAN_REMINDER_INTERVAL_ITERATIONS: usize = 4;
-const AGENT_DELTA_FLUSH_CHARS: usize = 1200;
-const AGENT_DELTA_FLUSH_MS: u64 = 800;
+// Streaming deltas are broadcast to subscribers as they arrive (coalescing only
+// sub-frame bursts) so chat reads token-by-token. They are never persisted —
+// history replay rebuilds the bubble from the final messages row, not delta
+// events — so the prior per-flush SQLite write was pure churn. The window caps
+// the SSE frame rate (~25fps) to keep the broadcast channel from lagging while
+// still feeling continuous; the frontend typewriter smooths the rest.
+const AGENT_DELTA_STREAM_CHARS: usize = 240;
+const AGENT_DELTA_STREAM_MS: u64 = 40;
 
 struct PendingCall {
     call_id: String,
@@ -190,8 +196,6 @@ pub async fn run_chat_reply(
         if iteration >= MAX_TOOL_ITERATIONS {
             stop_reason = "max_tool_turns_finalized".to_string();
             match finalize_after_tool_budget(
-                &pool,
-                &user_id,
                 &session_id,
                 &event_bus,
                 provider.clone(),
@@ -396,18 +400,10 @@ pub async fn run_chat_reply(
                                 turn_text.push_str(&text);
                                 narration_buffer.push_str(&text);
                                 delta_buffer.push_str(&text);
-                                if delta_buffer.len() >= AGENT_DELTA_FLUSH_CHARS ||
-                                    last_delta_flush.elapsed() >= Duration::from_millis(AGENT_DELTA_FLUSH_MS)
+                                if delta_buffer.len() >= AGENT_DELTA_STREAM_CHARS ||
+                                    last_delta_flush.elapsed() >= Duration::from_millis(AGENT_DELTA_STREAM_MS)
                                 {
-                                    publish_agent_message_delta(
-                                        &pool,
-                                        &user_id,
-                                        &session_id,
-                                        None,
-                                        &event_bus,
-                                        &mut delta_buffer,
-                                    )
-                                    .await?;
+                                    broadcast_agent_message_delta(&session_id, &event_bus, &mut delta_buffer).await;
                                     last_delta_flush = Instant::now();
                                 }
                             }
@@ -509,15 +505,7 @@ pub async fn run_chat_reply(
                 }
             }
 
-            publish_agent_message_delta(
-                &pool,
-                &user_id,
-                &session_id,
-                None,
-                &event_bus,
-                &mut delta_buffer,
-            )
-            .await?;
+            broadcast_agent_message_delta(&session_id, &event_bus, &mut delta_buffer).await;
 
             let Some(e) = stream_error else {
                 break;
@@ -800,16 +788,8 @@ pub async fn run_chat_reply(
             )
             .await?;
             final_text = question_text;
-            publish_and_persist(
-                &pool,
-                &user_id,
-                &session_id,
-                None,
-                &event_bus,
-                "agent_message_delta",
-                serde_json::json!({ "text": final_text.clone() }),
-            )
-            .await?;
+            let mut clarification_delta = final_text.clone();
+            broadcast_agent_message_delta(&session_id, &event_bus, &mut clarification_delta).await;
             break 'iterations;
         }
 
@@ -1263,19 +1243,12 @@ fn classify_tool_partial_status(name: &str, output: &str) -> Option<&'static str
         {
             Some("partial_with_unavailable_source")
         }
-        "get_capital_flow"
-            if output.contains("[get_capital_flow: northbound disclosure unavailable") =>
-        {
-            Some("partial_with_unavailable_source")
-        }
         _ => None,
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn finalize_after_tool_budget(
-    pool: &SqlitePool,
-    user_id: &str,
     session_id: &str,
     event_bus: &EventBus,
     provider: Arc<dyn LlmProvider>,
@@ -1315,18 +1288,10 @@ async fn finalize_after_tool_budget(
             LlmEvent::TextDelta { text } => {
                 text_out.push_str(&text);
                 delta_buffer.push_str(&text);
-                if delta_buffer.len() >= AGENT_DELTA_FLUSH_CHARS
-                    || last_delta_flush.elapsed() >= Duration::from_millis(AGENT_DELTA_FLUSH_MS)
+                if delta_buffer.len() >= AGENT_DELTA_STREAM_CHARS
+                    || last_delta_flush.elapsed() >= Duration::from_millis(AGENT_DELTA_STREAM_MS)
                 {
-                    publish_agent_message_delta(
-                        pool,
-                        user_id,
-                        session_id,
-                        None,
-                        event_bus,
-                        &mut delta_buffer,
-                    )
-                    .await?;
+                    broadcast_agent_message_delta(session_id, event_bus, &mut delta_buffer).await;
                     last_delta_flush = Instant::now();
                 }
             }
@@ -1334,15 +1299,7 @@ async fn finalize_after_tool_budget(
             _ => {}
         }
     }
-    publish_agent_message_delta(
-        pool,
-        user_id,
-        session_id,
-        None,
-        event_bus,
-        &mut delta_buffer,
-    )
-    .await?;
+    broadcast_agent_message_delta(session_id, event_bus, &mut delta_buffer).await;
     Ok(text_out)
 }
 
@@ -1856,28 +1813,30 @@ async fn reset_agent_message_candidate(
     .await
 }
 
-async fn publish_agent_message_delta(
-    pool: &SqlitePool,
-    user_id: &str,
+// Broadcast-only: a streaming delta goes straight to subscribers and is never
+// written to vault.events. seq is -1 because the frontend ignores the SSE id for
+// deltas — they merge by append, not by seq — and the authoritative text is the
+// final messages row persisted at turn end.
+async fn broadcast_agent_message_delta(
     session_id: &str,
-    task_id: Option<&str>,
     event_bus: &EventBus,
     buffer: &mut String,
-) -> Result<()> {
+) {
     if buffer.is_empty() {
-        return Ok(());
+        return;
     }
     let text = std::mem::take(buffer);
-    publish_and_persist(
-        pool,
-        user_id,
-        session_id,
-        task_id,
-        event_bus,
-        "agent_message_delta",
-        serde_json::json!({ "text": text }),
-    )
-    .await
+    event_bus
+        .publish(
+            session_id,
+            EventEnvelope {
+                seq: -1,
+                kind: "agent_message_delta".to_string(),
+                payload: serde_json::json!({ "text": text }),
+                ts: chrono::Utc::now(),
+            },
+        )
+        .await;
 }
 
 #[cfg(test)]
@@ -1962,13 +1921,6 @@ mod tests {
         assert_eq!(
             classify_tool_partial_status("market_quote", "unavailable"),
             None
-        );
-        assert_eq!(
-            classify_tool_partial_status(
-                "get_capital_flow",
-                "[get_capital_flow: northbound disclosure unavailable after 2024-08-19]"
-            ),
-            Some("partial_with_unavailable_source")
         );
         assert_eq!(
             classify_tool_partial_status(

@@ -18,8 +18,6 @@ const DEFAULT_DAYS: i64 = 10;
 const MAX_DAYS: i64 = 30;
 const DEFAULT_BLOCK_LIMIT: usize = 5;
 const MAX_BLOCK_LIMIT: usize = 10;
-const NORTHBOUND_DISCLOSURE_NOTICE: &str =
-    "[get_capital_flow: northbound disclosure unavailable after 2024-08-19]";
 const EASTMONEY_UT: &str = "b2884a393a59ad64002292a3e90d46a5";
 const EASTMONEY_FLOW_FIELDS: &str =
     "f12,f14,f2,f3,f6,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f124";
@@ -84,6 +82,10 @@ impl GetCapitalFlowTool {
         days: i64,
         cancel: &CancellationToken,
     ) -> Result<String> {
+        let name = super::ashare_security_name(&self.http, token, ts_code, cancel).await;
+        let label = name
+            .map(|n| format!("{n}（{ts_code}）"))
+            .unwrap_or_else(|| ts_code.to_string());
         let payload = serde_json::json!({
             "api_name": "moneyflow",
             "token": token,
@@ -112,7 +114,7 @@ impl GetCapitalFlowTool {
 
         if items.is_empty() {
             return Ok(format!(
-                "## {ts_code} · 日频资金流向\n\n\
+                "## {label} · 日频资金流向\n\n\
                  - 当前日频资金流来源没有返回记录。这是所选来源和参数下的有效空结果，不代表资金流为零；使用前需核验代码与来源覆盖。\n"
             ));
         }
@@ -163,7 +165,7 @@ impl GetCapitalFlowTool {
             .collect();
         rows.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let mut out = format!("## {ts_code} · 日频资金流向（近{}日）\n\n", rows.len());
+        let mut out = format!("## {label} · 日频资金流向（近{}日）\n\n", rows.len());
         out.push_str("| 日期       | 超大单净流入 | 大单净流入  | 中单净流入  | 小单净流入  | 净流入额    |\n");
         out.push_str(
             "|-----------|------------|-----------|-----------|-----------|------------|\n",
@@ -510,14 +512,42 @@ impl GetCapitalFlowTool {
         Ok(body.data.and_then(|data| data.diff).unwrap_or_default())
     }
 
-    async fn fetch_northbound(&self, _days: i64, _cancel: &CancellationToken) -> Result<String> {
-        Ok(format!(
-            "## 北向资金 · 披露口径不可用\n\n{NORTHBOUND_DISCLOSURE_NOTICE}\n\n\
-             沪深港通交易信息披露机制已调整，近期北向净买入/净流入口径不再稳定披露。\
-             不要把旧口径字段的空值、零值或历史披露当成最新外资流入结论。\n\n\
-             可替代资金面证据：个股资金流向、成交额/换手率、行业资金流、两融余额、\
-             沪深股通成交活跃股、季度外资持股或公司基本面验证。\n"
-        ))
+    /// Northbound now has exactly one surviving caliber: the daily 沪深股通
+    /// top-10 most-traded stocks with turnover. The 2024-08-18 Stock Connect
+    /// change stopped buy/sell/net disclosure (and silently turned the old
+    /// `moneyflow_hsgt` net-flow fields into always-positive turnover), so this
+    /// returns activity only — explicitly labeled as not net inflow.
+    async fn fetch_northbound(&self, token: &str, cancel: &CancellationToken) -> Result<String> {
+        let tz = FixedOffset::east_opt(8 * 3600).expect("UTC+8 offset is valid");
+        let now = chrono::Utc::now().with_timezone(&tz);
+        let end_date = now.format("%Y%m%d").to_string();
+        let start_date = (now - chrono::Duration::days(14)).format("%Y%m%d").to_string();
+
+        let payload = serde_json::json!({
+            "api_name": "hsgt_top10",
+            "token": token,
+            "params": {"start_date": start_date, "end_date": end_date},
+            "fields": "trade_date,ts_code,name,market_type,amount"
+        });
+        let body = self.tushare_post(payload, cancel).await?;
+        let data = body
+            .get("data")
+            .ok_or_else(|| anyhow!("missing data in hsgt_top10 response"))?;
+        let fields: Vec<String> = data
+            .get("fields")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let items: Vec<Vec<serde_json::Value>> = data
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|row| row.as_array().cloned()).collect())
+            .unwrap_or_default();
+        Ok(render_northbound_top10(&fields, &items))
     }
 }
 
@@ -534,10 +564,10 @@ impl ToolHandler for GetCapitalFlowTool {
                 `stock_flow` uses the configured official daily historical moneyflow source for an individual stock after market data is updated. \
                 `realtime_stock_flow` uses public intraday/main-force flow snapshots for the current trading session. \
                 `market_block_flow` uses public market/sector flow rankings for today’s broad-market and sector-mainline read. \
-                `both` returns official daily history plus current public snapshot when ts_code is provided, market/sector flow, and northbound disclosure caveats. \
-                - Recent north-bound net-flow disclosure is unavailable after the 2024 Stock Connect disclosure adjustment; \
-                  treat it as a data gap and use alternative money-flow evidence, not as zero flow. \
-                Preserve source, freshness, and units: official rows are daily/万元; public snapshot rows are intraday/元."
+                `northbound` returns the 沪深股通 top-10 most-traded A-shares with daily turnover, split 沪股通/深股通. \
+                `both` returns official daily history plus current public snapshot when ts_code is provided, market/sector flow, and the northbound active-stock list. \
+                - Northbound is turnover/activity only: after the 2024-08-18 Stock Connect change, buy/sell/net-flow stopped being disclosed, so do NOT read the active-stock turnover as net inflow, and do not add it to per-stock net flow. \
+                Preserve source, freshness, and units: official rows are daily/万元; public snapshot rows are intraday/元; northbound turnover is 亿."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -545,7 +575,7 @@ impl ToolHandler for GetCapitalFlowTool {
                     "data_type": {
                         "type": "string",
                         "enum": ["stock_flow", "realtime_stock_flow", "market_block_flow", "northbound", "both"],
-                        "description": "Default: both. With ts_code it returns stock_flow + realtime_stock_flow + market_block_flow + northbound caveat; without ts_code it returns market_block_flow + northbound caveat."
+                        "description": "Default: both. With ts_code it returns stock_flow + realtime_stock_flow + market_block_flow + northbound active stocks; without ts_code it returns market_block_flow + northbound active stocks."
                     },
                     "ts_code": {
                         "type": "string",
@@ -603,7 +633,10 @@ impl ToolHandler for GetCapitalFlowTool {
                 self.fetch_eastmoney_realtime_flow(&code, &cancel).await
             }
             "market_block_flow" => self.fetch_market_block_flow(limit, &cancel).await,
-            "northbound" => self.fetch_northbound(days, &cancel).await,
+            "northbound" => {
+                let token = data_provider_tokens::tushare_token(ctx).await?;
+                self.fetch_northbound(&token, &cancel).await
+            }
             "both" => {
                 let mut out = String::new();
                 if let Some(code) = ts_code {
@@ -635,7 +668,17 @@ impl ToolHandler for GetCapitalFlowTool {
                     market_block_flow,
                     &cancel,
                 )?;
-                out.push_str(&self.fetch_northbound(days, &cancel).await?);
+                let northbound = match data_provider_tokens::tushare_token(ctx).await {
+                    Ok(token) => self.fetch_northbound(&token, &cancel).await,
+                    Err(err) => Err(err),
+                };
+                push_section_result(
+                    &mut out,
+                    "北向成交活跃股",
+                    "tushare_hsgt_top10",
+                    northbound,
+                    &cancel,
+                )?;
                 Ok(out)
             }
             other => bail!("unsupported data_type: {other}"),
@@ -774,6 +817,7 @@ fn capital_flow_source_label(source: &str) -> &'static str {
         "tushare_moneyflow" => "日频资金流",
         "eastmoney_realtime_flow" => "盘中资金流",
         "eastmoney_market_block_flow" => "市场/板块资金流",
+        "tushare_hsgt_top10" => "北向成交活跃股",
         _ => "资金流来源",
     }
 }
@@ -874,21 +918,143 @@ fn compact_text(s: &str, max_chars: usize) -> String {
     format!("{prefix}...")
 }
 
+/// Render the only surviving northbound caliber — 沪深股通十大成交活跃股 + 当日成交额
+/// — from a raw `hsgt_top10` response. Picks the latest trade_date present (the
+/// window may span several days), splits 沪股通 (market_type 1) from 深股通
+/// (market_type 3), and labels the caliber honestly: turnover/activity only,
+/// because buy/sell/net stopped at 2024-08-18.
+fn render_northbound_top10(fields: &[String], items: &[Vec<serde_json::Value>]) -> String {
+    let idx = |name: &str| -> Option<usize> { fields.iter().position(|f| f == name) };
+    let (i_date, i_code, i_name, i_mkt, i_amount) = (
+        idx("trade_date"),
+        idx("ts_code"),
+        idx("name"),
+        idx("market_type"),
+        idx("amount"),
+    );
+    fn cell(row: &[serde_json::Value], i: Option<usize>) -> Option<&serde_json::Value> {
+        i.and_then(|j| row.get(j))
+    }
+
+    let latest = items
+        .iter()
+        .filter_map(|row| cell(row, i_date).map(value_text))
+        .filter(|s| !s.is_empty())
+        .max();
+    let Some(latest) = latest else {
+        return "## 北向成交活跃股（沪深股通）\n\n\
+                - 互联互通成交活跃股来源近 14 日没有返回记录。这是有效空结果或来源覆盖缺口，不代表北向无成交。\n"
+            .to_string();
+    };
+
+    // (amount, name, code)
+    let mut hu: Vec<(f64, String, String)> = Vec::new();
+    let mut shen: Vec<(f64, String, String)> = Vec::new();
+    for row in items {
+        if cell(row, i_date).map(value_text).as_deref() != Some(latest.as_str()) {
+            continue;
+        }
+        let entry = (
+            value_f64(cell(row, i_amount)),
+            value_text_opt(cell(row, i_name)),
+            value_text_opt(cell(row, i_code)),
+        );
+        match cell(row, i_mkt).and_then(value_i64) {
+            Some(1) => hu.push(entry),
+            Some(3) => shen.push(entry),
+            _ => {}
+        }
+    }
+
+    let date_fmt = if latest.len() == 8 {
+        format!("{}-{}-{}", &latest[..4], &latest[4..6], &latest[6..])
+    } else {
+        latest.clone()
+    };
+    let mut out = format!("## 北向成交活跃股（沪深股通 · {date_fmt}）\n\n");
+    out.push_str(
+        "口径说明：2024-08-18 起沪深港通不再披露北向买入/卖出/净额，仅保留十大成交活跃股的当日成交额。\
+         以下是活跃度/拥挤度信号，不是净流入；成交额含买卖双边，不要与个股资金流的净额相加。\n\n",
+    );
+    render_northbound_market(&mut out, "沪股通", &mut hu);
+    render_northbound_market(&mut out, "深股通", &mut shen);
+    out.push_str(
+        "\n_来源: 沪深证券交易所互联互通披露（沪深股通十大成交活跃股）。仅成交额口径，买卖净额自 2024-08-18 起停止披露。_\n",
+    );
+    out
+}
+
+fn render_northbound_market(out: &mut String, label: &str, rows: &mut [(f64, String, String)]) {
+    out.push_str(&format!("### {label}十大成交活跃股（按成交额）\n\n"));
+    if rows.is_empty() {
+        out.push_str("- 当日无该市场成交活跃股记录。\n\n");
+        return;
+    }
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    out.push_str("| 名称 | 代码 | 成交额(亿) |\n|------|------|-----------|\n");
+    let mut total = 0.0;
+    for (amount, name, code) in rows.iter() {
+        total += *amount;
+        out.push_str(&format!("| {} | {} | {:.2} |\n", name, code, amount / 1e8));
+    }
+    out.push_str(&format!(
+        "\n{label}十大合计成交额 {:.2} 亿。\n\n",
+        total / 1e8
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn northbound_returns_disclosure_notice_without_calling_provider() {
-        let tool = GetCapitalFlowTool::new().unwrap();
-        let out = tool
-            .fetch_northbound(5, &CancellationToken::new())
-            .await
-            .unwrap();
+    #[test]
+    fn northbound_renders_latest_day_top10_by_market() {
+        let fields: Vec<String> = ["trade_date", "ts_code", "name", "market_type", "amount"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let items = vec![
+            // Older day — must be excluded once a newer day is present.
+            json_row(&["20260528", "600000.SH", "浦发银行", "1", "1.0e8"]),
+            // Latest day: two 沪股通 (market_type 1) + one 深股通 (market_type 3).
+            json_row(&["20260529", "600519.SH", "贵州茅台", "1", "5.0e8"]),
+            json_row(&["20260529", "601318.SH", "中国平安", "1", "8.0e8"]),
+            json_row(&["20260529", "000333.SZ", "美的集团", "3", "3.0e8"]),
+        ];
+        let out = render_northbound_top10(&fields, &items);
 
-        assert!(out.contains(NORTHBOUND_DISCLOSURE_NOTICE));
-        assert!(out.contains("不要把旧口径字段"));
-        assert!(out.contains("可替代资金面证据"));
+        assert!(out.contains("2026-05-29"));
+        assert!(!out.contains("浦发银行"), "older trade day must be dropped");
+        assert!(out.contains("### 沪股通十大成交活跃股"));
+        assert!(out.contains("### 深股通十大成交活跃股"));
+        // Sorted by amount desc within 沪股通: 中国平安(8亿) before 贵州茅台(5亿).
+        let ping_an = out.find("中国平安").unwrap();
+        let mao_tai = out.find("贵州茅台").unwrap();
+        assert!(ping_an < mao_tai);
+        assert!(out.contains("沪股通十大合计成交额 13.00 亿"));
+        assert!(out.contains("美的集团"));
+        assert!(out.contains("买卖净额自 2024-08-18 起停止披露"));
+    }
+
+    #[test]
+    fn northbound_reports_empty_window_as_coverage_gap() {
+        let fields: Vec<String> = ["trade_date", "ts_code", "name", "market_type", "amount"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let out = render_northbound_top10(&fields, &[]);
+        assert!(out.contains("没有返回记录"));
+        assert!(!out.contains("不可用"));
+    }
+
+    fn json_row(cells: &[&str; 5]) -> Vec<serde_json::Value> {
+        vec![
+            serde_json::Value::String(cells[0].to_string()),
+            serde_json::Value::String(cells[1].to_string()),
+            serde_json::Value::String(cells[2].to_string()),
+            serde_json::json!(cells[3].parse::<i64>().unwrap()),
+            serde_json::json!(cells[4].parse::<f64>().unwrap()),
+        ]
     }
 
     #[test]

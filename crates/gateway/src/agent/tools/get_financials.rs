@@ -125,31 +125,45 @@ async fn fetch_a_share(
     cancel: CancellationToken,
 ) -> Result<String> {
     let token = data_provider_tokens::tushare_token(ctx).await?;
+    let name = super::ashare_security_name(http, &token, ts_code, &cancel).await;
+    let label = name
+        .map(|n| format!("{n}（{ts_code}）"))
+        .unwrap_or_else(|| ts_code.to_string());
 
     let mut parts: Vec<String> = Vec::new();
 
     match report_type {
         "income" => {
-            parts.push(fetch_ashare_income(http, ts_code, periods, &token, &cancel).await?);
+            parts.push(fetch_ashare_income(http, ts_code, &label, periods, &token, &cancel).await?);
         }
         "balance" => {
-            parts.push(fetch_ashare_balance(http, ts_code, periods, &token, &cancel).await?);
+            parts
+                .push(fetch_ashare_balance(http, ts_code, &label, periods, &token, &cancel).await?);
         }
         "cashflow" => {
-            parts.push(fetch_ashare_cashflow(http, ts_code, periods, &token, &cancel).await?);
+            parts.push(
+                fetch_ashare_cashflow(http, ts_code, &label, periods, &token, &cancel).await?,
+            );
         }
         "ratios" => {
-            parts.push(fetch_ashare_ratios(http, ts_code, periods, &token, &cancel).await?);
+            parts.push(fetch_ashare_ratios(http, ts_code, &label, periods, &token, &cancel).await?);
         }
         "dividends" => {
-            parts.push(fetch_ashare_dividend(http, ts_code, periods, &token, &cancel).await?);
+            parts.push(
+                fetch_ashare_dividend(http, ts_code, &label, periods, &token, &cancel).await?,
+            );
         }
         "all" => {
-            parts.push(fetch_ashare_income(http, ts_code, periods, &token, &cancel).await?);
-            parts.push(fetch_ashare_balance(http, ts_code, periods, &token, &cancel).await?);
-            parts.push(fetch_ashare_cashflow(http, ts_code, periods, &token, &cancel).await?);
-            parts.push(fetch_ashare_ratios(http, ts_code, periods, &token, &cancel).await?);
-            parts.push(fetch_ashare_dividend(http, ts_code, periods, &token, &cancel).await?);
+            parts.push(fetch_ashare_income(http, ts_code, &label, periods, &token, &cancel).await?);
+            parts
+                .push(fetch_ashare_balance(http, ts_code, &label, periods, &token, &cancel).await?);
+            parts.push(
+                fetch_ashare_cashflow(http, ts_code, &label, periods, &token, &cancel).await?,
+            );
+            parts.push(fetch_ashare_ratios(http, ts_code, &label, periods, &token, &cancel).await?);
+            parts.push(
+                fetch_ashare_dividend(http, ts_code, &label, periods, &token, &cancel).await?,
+            );
         }
         _ => bail!("unknown report_type: {report_type}"),
     }
@@ -318,6 +332,7 @@ fn ashare_period(v: &serde_json::Value) -> String {
 async fn fetch_ashare_income(
     http: &Client,
     ts_code: &str,
+    label: &str,
     periods: usize,
     token: &str,
     cancel: &CancellationToken,
@@ -340,7 +355,7 @@ async fn fetch_ashare_income(
         return Ok(format!("[get_financials: no income data for {ts_code}]"));
     }
 
-    let mut out = format!("## {ts_code} · 利润表（近{periods}期）\n\n");
+    let mut out = format!("## {label} · 利润表（近{periods}期）\n\n");
     out.push_str("| 报告期 | 营业总收入（亿） | 营业收入（亿） | 营业成本（亿） | 营业利润（亿） | 利润总额（亿） | 净利润（亿） | 归母净利（亿） | 基本EPS | 稀释EPS | EBIT（亿） | EBITDA（亿） |\n");
     out.push_str("|--------|---------------|-------------|-------------|--------------|--------------|------------|--------------|--------|--------|----------|------------|\n");
     for row in &items {
@@ -372,6 +387,7 @@ fn append_ashare_income_metadata(out: &mut String) {
 async fn fetch_ashare_balance(
     http: &Client,
     ts_code: &str,
+    label: &str,
     periods: usize,
     token: &str,
     cancel: &CancellationToken,
@@ -396,7 +412,7 @@ async fn fetch_ashare_balance(
         ));
     }
 
-    let mut out = format!("## {ts_code} · 资产负债表（近{periods}期）\n\n");
+    let mut out = format!("## {label} · 资产负债表（近{periods}期）\n\n");
     out.push_str("| 报告期 | 总资产（亿） | 流动资产（亿） | 总负债（亿） | 流动负债（亿） | 股东权益（亿） | 货币资金（亿） | 应收账款（亿） | 存货（亿） | 固定资产（亿） | 商誉（亿） |\n");
     out.push_str("|--------|------------|-------------|------------|-------------|--------------|-------------|-------------|----------|-------------|----------|\n");
     for row in &items {
@@ -422,6 +438,7 @@ async fn fetch_ashare_balance(
 async fn fetch_ashare_cashflow(
     http: &Client,
     ts_code: &str,
+    label: &str,
     periods: usize,
     token: &str,
     cancel: &CancellationToken,
@@ -445,7 +462,7 @@ async fn fetch_ashare_cashflow(
         return Ok(format!("[get_financials: no cashflow data for {ts_code}]"));
     }
 
-    let mut out = format!("## {ts_code} · 现金流量表（近{periods}期）\n\n");
+    let mut out = format!("## {label} · 现金流量表（近{periods}期）\n\n");
     out.push_str(
         "| 报告期 | 经营活动CF（亿） | 投资活动CF（亿） | 筹资活动CF（亿） | 自由CF（亿） | 资本开支（亿） | 现金净增加（亿） |\n",
     );
@@ -469,6 +486,7 @@ async fn fetch_ashare_cashflow(
 async fn fetch_ashare_ratios(
     http: &Client,
     ts_code: &str,
+    label: &str,
     periods: usize,
     token: &str,
     cancel: &CancellationToken,
@@ -491,7 +509,7 @@ async fn fetch_ashare_ratios(
         return Ok(format!("[get_financials: no ratio data for {ts_code}]"));
     }
 
-    let mut out = format!("## {ts_code} · 财务指标（近{periods}期）\n\n");
+    let mut out = format!("## {label} · 财务指标（近{periods}期）\n\n");
     out.push_str("| 报告期 | EPS | BPS | ROE% | ROA% | 净利率% | 毛利率% | 资产负债率% | 总资产周转 | 流动比率 | 速动比率 | 营收同比% | 净利同比% |\n");
     out.push_str("|--------|-----|-----|------|------|--------|--------|-----------|----------|--------|--------|---------|---------|\n");
     for row in &items {
@@ -519,6 +537,7 @@ async fn fetch_ashare_ratios(
 async fn fetch_ashare_dividend(
     http: &Client,
     ts_code: &str,
+    label: &str,
     periods: usize,
     token: &str,
     cancel: &CancellationToken,
@@ -550,11 +569,11 @@ async fn fetch_ashare_dividend(
 
     if items.is_empty() {
         return Ok(format!(
-            "## {ts_code} · 分红\n\n[get_financials: 该标的近年无已实施分红记录（或 Tushare 无数据）]"
+            "## {label} · 分红\n\n[get_financials: 该标的近年无已实施分红记录（或 Tushare 无数据）]"
         ));
     }
 
-    let mut out = format!("## {ts_code} · 分红（近{periods}期已实施）\n\n");
+    let mut out = format!("## {label} · 分红（近{periods}期已实施）\n\n");
     out.push_str("| 报告期 | 每股现金分红税前（元） | 每股现金分红税后（元） | 每股送转（股） |\n");
     out.push_str("|--------|--------------------|--------------------|--------------|\n");
     for row in &items {

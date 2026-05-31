@@ -68,6 +68,52 @@ pub trait ToolHandler: Send + Sync {
     ) -> Result<String>;
 }
 
+/// Best-effort A-share short name (e.g. 600519.SH → "贵州茅台") via Tushare
+/// stock_basic, so cards can show a name instead of a bare code. Returns None on
+/// any failure — callers fall back to the bare code rather than blocking results.
+pub(crate) async fn ashare_security_name(
+    http: &reqwest::Client,
+    token: &str,
+    ts_code: &str,
+    cancel: &CancellationToken,
+) -> Option<String> {
+    let payload = serde_json::json!({
+        "api_name": "stock_basic",
+        "token": token,
+        "params": {"ts_code": ts_code},
+        "fields": "ts_code,name",
+    });
+    let resp = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return None,
+        r = http.post("https://api.tushare.pro").json(&payload).send() => r.ok()?,
+    };
+    let body: serde_json::Value = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return None,
+        r = resp.json() => r.ok()?,
+    };
+    let data = body.get("data")?;
+    let name_idx = data
+        .get("fields")
+        .and_then(|v| v.as_array())?
+        .iter()
+        .position(|f| f.as_str() == Some("name"))?;
+    let name = data
+        .get("items")
+        .and_then(|v| v.as_array())?
+        .first()
+        .and_then(|row| row.as_array())
+        .and_then(|row| row.get(name_idx))
+        .and_then(|v| v.as_str())?
+        .trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
     handlers: Arc<HashMap<String, Arc<dyn ToolHandler>>>,
