@@ -1,104 +1,77 @@
-# L.E.E.K (老韭菜)
+[English](README.EN.md) | [中文](README.md)
 
-**Logic-Enhanced Equity Kernel** is an early-alpha investment research operating system. It combines a long-running agent gateway, a chat-canvas web workbench, market and filing tools, and a curated investing corpus so research sessions can move from question to evidence to decision discipline.
+# L.E.E.K（老韭菜）
+
+**Logic-Enhanced Equity Kernel** 是一个独立开发的金融投研 agent 产品。它把大语言模型、投资原则语料库、市场数据工具、网页研究、画布化证据和可追踪的 agent harness 放在同一个本地工作台里，目标是让一次投资研究从“随口问问”变成“有框架、有证据、有反方、有行动约束”的完整流程。
 
 ![L.E.E.K web workbench](docs/assets/leek-workbench.png)
 
-## English
+L.E.E.K 不是普通聊天机器人。它的核心不是把工具结果拼成一段看似专业的回答，而是让 agent 在研究过程中持续暴露：它为什么这样查、查到了什么、还缺什么、如何从事实走向判断。聊天窗口保留简洁对话，画布承载工具卡片、推理轨迹、财务表格、K 线、网页证据和 corpus 激活状态。
 
-L.E.E.K is built for investors who want a research workflow that is more auditable than a plain chatbot and more decision-oriented than a static notebook. A session keeps the conversation on the left, expands tool evidence and artifacts into the center canvas, and keeps corpus context plus the agent plan visible on the right.
+当前项目仍处在早期 alpha。流程已经能跑，但还在持续加固分析质量、工具质量、前端体验和长程任务可靠性。它不是投资建议系统，也不替代个人判断、持牌投顾或正式风控流程。
 
-The project is currently an early alpha. It is useful as a local research workbench and harness-engineering playground, but it is not production investment infrastructure and it does not provide financial advice.
+## 产品目标
 
-### What It Does
+L.E.E.K 面向想严肃做投研的个人投资者和研究者。它试图解决几个普通 LLM agent 很容易失败的问题：
 
-- Runs a local gateway daemon behind multiple possible adapters.
-- Presents a web workbench with chat, canvas artifacts, market panels, plan state, and corpus context.
-- Grounds research with tool calls such as market snapshots, financial statements, filings, web search, and corpus retrieval.
-- Separates the universal corpus from user-specific vault state such as sessions, decisions, holdings, mandates, and reviews.
-- Keeps A-share research workflows first-class while preserving the broader multi-market architecture.
+- 简单汇总数据，却没有真正建立研究框架。
+- 忘记上一轮已经查过的事实，重复调用同一批工具。
+- 直接给“买/卖”结论，却没有说明永久性亏损风险、能力圈边界和反方证据。
+- 把网页搜索、财务数据、行情和投资原则割裂成互不相干的信息片段。
+- 长程任务中跑偏、过早停下，或者把未完成的问题交还给用户。
 
-### Architecture
+L.E.E.K 的目标是成为一个能持续工作的投研 harness：让模型更像研究员，而不是只会输出研报腔文字的聊天框。
 
-- **Gateway**: Rust service and CLI binary named `leek`.
-- **Web workbench**: SolidJS + Vite frontend under `frontend/web`.
-- **Vault**: local runtime state, usually a SQLite database selected with `--vault`.
-- **Corpus**: curated investing knowledge under `corpus/`, treated as read-mostly knowledge.
-- **Promotion path**: durable knowledge should move through human review before becoming part of the corpus.
+## 核心能力
 
-### Local Development
+- **本地 agent gateway**：Rust 编写的长运行服务，负责 session、事件流、工具调用、vault 状态和 LLM provider。
+- **Chat-canvas 工作台**：左侧聊天，中央画布展示证据和产物，右侧展示 corpus brain、计划和当前上下文。
+- **A 股优先的数据工具**：支持公司信息、财务、行情、K 线、资金流、行业、指数、基金、宏观等 A 股研究入口。
+- **Corpus grounding**：从 curated investing corpus 中检索原则、实体和来源材料，把 Buffett / Munger / Dalio 等底层框架转成研究约束。
+- **Reasoning trace**：把 agent 的阶段性研究意图以 UI 事件展示出来，让用户能看到它如何推进任务。
+- **Plan 与 subagent 雏形**：长程任务可以创建计划、委派子研究任务，并把进展写回 session。
+- **Append-only session vault**：对话、工具调用、计划、LLM usage 和画布事件写入本地 SQLite，便于复盘、调试和评测。
+- **Prompt cache 优化**：面向 Codex backend 的 session identity 与 cache key 已接入，长工具循环的 cache hit rate 已显著提升。
 
-Build the gateway:
-
-```bash
-cargo build -p leek-gateway
-```
-
-Start the gateway with a local development vault:
-
-```bash
-target/debug/leek --vault tmp/dev/vault.db serve --port 8964
-```
-
-In another terminal, start the web workbench:
-
-```bash
-npm --prefix frontend/web install
-npm --prefix frontend/web run dev -- --host 127.0.0.1 --port 5173
-```
-
-Then open:
+## 架构概览
 
 ```text
-http://127.0.0.1:5173
+frontend/web        SolidJS + Vite web workbench
+crates/gateway      Rust gateway, CLI, API, agent loop, tools, vault
+corpus/             投资原则与知识语料，作为 read-mostly knowledge layer
+harness/            agent identity、discipline、corpus orientation
+tests/              A 股 E2E eval cases 与测试记录
+design/             架构、决策记录和历史设计材料
 ```
 
-### Development Checks
+运行时主要由四层组成：
 
-```bash
-cargo test -p leek-gateway
-npm --prefix frontend/web run build
-```
+1. **Agent harness**：决定如何构造上下文、何时调用工具、如何追踪计划、如何恢复 provider error。
+2. **Tool layer**：把市场数据、网页、corpus、财务和研究来源包装成少数高杠杆工具。
+3. **Vault**：保存每个 session 的事件、消息、工具调用、plan 和 provider 配置。
+4. **Workbench UI**：把聊天、推理、工具证据和 corpus 状态组织成可阅读的投研界面。
 
-## 中文
+## 本地运行
 
-L.E.E.K（老韭菜）是一个早期 alpha 阶段的投研操作系统。它的目标不是做一个普通聊天机器人，而是把投研问题、工具证据、画布产物、语料库上下文和最终决策纪律放在同一条可审计链路里。
-
-当前界面采用 chat-canvas 形态：左侧是对话主轴，中间是工具证据、行情、财务和图表画布，右侧是 corpus brain 与 agent plan。这样可以同时看到“它答了什么”“依据是什么”“当前计划走到哪里”。
-
-项目目前仍在快速演进中。它可以作为本地投研工作台和 harness engineering 实验场，但不是生产级投资基础设施，也不构成任何投资建议。
-
-### 能做什么
-
-- 在本地运行一个长期存活的 gateway daemon。
-- 提供带聊天、画布、市场面板、计划状态和 corpus 上下文的 Web 工作台。
-- 通过行情快照、财务报表、公告材料、网页检索和 corpus retrieval 等工具补齐研究证据。
-- 区分通用 corpus 与用户自己的 vault 状态，例如 session、decision、holding、mandate 和 review。
-- 把 A 股研究工作流作为一等场景，同时保留未来扩展到多市场的架构边界。
-
-### 架构
-
-- **Gateway**：Rust 服务与 CLI，二进制名为 `leek`。
-- **Web 工作台**：位于 `frontend/web` 的 SolidJS + Vite 前端。
-- **Vault**：本地运行时状态，通常通过 `--vault` 指定 SQLite 数据库。
-- **Corpus**：位于 `corpus/` 的 curated investing knowledge，默认按 read-mostly 使用。
-- **Promotion path**：值得沉淀的知识先经过人工 review，再进入正式 corpus。
-
-### 本地开发
-
-构建 gateway：
+安装依赖后，先构建 gateway：
 
 ```bash
 cargo build -p leek-gateway
 ```
 
-用本地开发 vault 启动 gateway：
+首次使用需要配置 Codex provider：
 
 ```bash
-target/debug/leek --vault tmp/dev/vault.db serve --port 8964
+cargo run -p leek-gateway -- --vault tmp/dev/vault.db auth codex
 ```
 
-另开一个终端启动 Web 工作台：
+启动 gateway：
+
+```bash
+cargo run -p leek-gateway -- --vault tmp/dev/vault.db serve --port 8964
+```
+
+另开一个终端启动前端：
 
 ```bash
 npm --prefix frontend/web install
@@ -111,9 +84,61 @@ npm --prefix frontend/web run dev -- --host 127.0.0.1 --port 5173
 http://127.0.0.1:5173
 ```
 
-### 开发检查
+如果只想做一次 provider smoke test：
 
 ```bash
+cargo run -p leek-gateway -- --vault tmp/dev/vault.db chat "用一句话介绍 L.E.E.K"
+```
+
+## 数据与配置
+
+- `--vault` 指向本地 SQLite vault，保存用户运行时状态。
+- A 股数据优先使用已配置的数据源；Tushare token 等 provider 凭据应放在本地配置或应用 settings 中，不应提交到仓库。
+- `corpus/` 是通用投资知识层。agent 默认读取它，不应直接把 session 临时结论写入正式 corpus。
+- `tmp/` 用于本地临时文件、测试 vault 和实验脚本。
+
+## 开发检查
+
+```bash
+cargo check -p leek-gateway
 cargo test -p leek-gateway
 npm --prefix frontend/web run build
 ```
+
+固定 A 股 eval cases 位于：
+
+```text
+tests/a_share_e2e_cases.md
+```
+
+这些 case 用来观察三类问题：harness 是否可靠、agent 表现是否成熟、前端是否正确展示工具证据与时序。
+
+## 当前状态
+
+已经具备的基础：
+
+- session / event log / SSE / canvas 基本跑通。
+- agent loop 能调用工具，并保留工具卡片与 tool_call_runs。
+- plan、subagent、provider retry、prompt cache、corpus brain 均已有可运行版本。
+- A 股公司、财务、行情、K 线、资金、行业、宏观等工具已有第一版。
+- 前端可以展示 reasoning trace、工具卡片、plan、corpus brain 和 settings。
+
+仍在重点打磨：
+
+- 分析质量还需要从“工具结果汇总”升级到真正稳定的投研方法论。
+- subagent 还不是成熟可靠的 worker 系统。
+- A 股数据层仍需继续补齐分钟线、实时行情、研报、公告、行业和替代资金面。
+- 前端卡片、财务详情、K 线交互、画布布局和性能还在持续迭代。
+- E2E eval 需要长期跑通、记录问题、批量修复并回归。
+
+## 项目原则
+
+- L.E.E.K 不预定义机械输出模板；输出应由任务、证据和用户约束自然决定。
+- 简单问题不强制 plan；复杂长程任务才使用 plan 来防止跑偏。
+- 工具应少而高杠杆，从 agent 视角设计输入、输出和错误反馈。
+- Corpus 是思维框架，不是答案库；没有命中 knowledge 时，agent 仍应通过研究建立本轮 working model。
+- 任何最终动作都必须尊重用户的仓位、风险偏好和“永久性亏损”约束。
+
+## 免责声明
+
+L.E.E.K 是研究工具，不提供投资建议。所有输出都可能出错，所有市场数据都可能延迟、不完整或来自第三方。任何投资决策都应由用户自行判断并承担风险。
