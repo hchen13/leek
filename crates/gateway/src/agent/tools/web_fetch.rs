@@ -36,6 +36,13 @@ use super::ToolHandler;
 const TOOL_NAME: &str = "web_fetch";
 const MAX_BODY_BYTES: u64 = 10 * 1024 * 1024;
 const FETCH_TIMEOUT_SECS: u64 = 60;
+/// Transient network failures (connection reset/closed before response, connect
+/// timeouts) are common against flaky CDNs and proxy routes — e.g. eastmoney
+/// hosts behind clash TUN fake-IPs that reset for tens of seconds then recover.
+/// One bare `send()` turned such a blip into a hard tool failure the agent
+/// abandoned, so we retry transient transport errors a few times with backoff.
+const MAX_FETCH_ATTEMPTS: usize = 3;
+const FETCH_RETRY_BASE_MS: u64 = 400;
 const MAX_REDIRECTS: usize = 10;
 const DEFAULT_MAX_CHARS: usize = 50_000;
 const HARD_CAP_MAX_CHARS: usize = 100_000;
@@ -113,6 +120,52 @@ impl WebFetchTool {
                 },
             );
         }
+    }
+
+    /// GET with bounded retry on transient transport failures. Returns the
+    /// first successful `Response`; on a non-transient error (or after the
+    /// retry budget) returns a classified network error so the card says *why*
+    /// (reset vs timeout vs connect) instead of a bare "error sending request".
+    async fn send_with_retry(
+        &self,
+        url: &str,
+        cancel: &CancellationToken,
+    ) -> Result<reqwest::Response> {
+        let mut last_err: Option<reqwest::Error> = None;
+        for attempt in 0..MAX_FETCH_ATTEMPTS {
+            if cancel.is_cancelled() {
+                bail!("aborted before fetch");
+            }
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("aborted during fetch"),
+                r = self.http.get(url).send() => r,
+            };
+            match result {
+                Ok(resp) => return Ok(resp),
+                Err(e) if is_transient_transport_error(&e) && attempt + 1 < MAX_FETCH_ATTEMPTS => {
+                    let delay = fetch_retry_delay(attempt);
+                    tracing::warn!(
+                        url,
+                        attempt = attempt + 1,
+                        delay_ms = delay.as_millis(),
+                        error = %e,
+                        "web_fetch transient network error; retrying"
+                    );
+                    last_err = Some(e);
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => bail!("aborted during fetch backoff"),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+                Err(e) => return Err(classify_transport_error(url, &e)),
+            }
+        }
+        Err(classify_transport_error(
+            url,
+            &last_err.expect("retry loop recorded no error"),
+        ))
     }
 
     /// Tier 2 — Jina Reader. Hits `https://r.jina.ai/<url>`, which proxies
@@ -219,11 +272,7 @@ impl ToolHandler for WebFetchTool {
             bail!("aborted before fetch");
         }
 
-        let resp = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => bail!("aborted during fetch"),
-            r = self.http.get(&final_url).send() => r?,
-        };
+        let resp = self.send_with_retry(&final_url, &cancel).await?;
 
         let status = resp.status();
 
@@ -395,6 +444,34 @@ fn parse_and_validate_url(s: &str) -> Result<Url> {
         }
     }
     Ok(url)
+}
+
+/// Worth retrying: the request never got a response — connect/TLS failure,
+/// timeout, or the connection was reset/closed mid-send (reqwest `is_request`).
+/// HTTP status errors are NOT here; those come back as a `Response` we handle.
+fn is_transient_transport_error(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect() || e.is_request()
+}
+
+fn fetch_retry_delay(attempt: usize) -> Duration {
+    let factor = 1_u64 << attempt.min(3);
+    Duration::from_millis(FETCH_RETRY_BASE_MS * factor)
+}
+
+/// Turn a bare reqwest transport error into a cause-bearing message so the
+/// failure card distinguishes a flaky network/proxy reset (retryable) from a
+/// timeout or a connect failure.
+fn classify_transport_error(url: &str, e: &reqwest::Error) -> anyhow::Error {
+    let cause = if e.is_timeout() {
+        "request timed out"
+    } else if e.is_connect() {
+        "connect failed (DNS/TLS/connection setup)"
+    } else if e.is_request() {
+        "connection reset or closed before response (flaky network/proxy or upstream)"
+    } else {
+        "request failed"
+    };
+    anyhow!("network error fetching {url}: {cause} ({e})")
 }
 
 fn unusable_source_message(reason: &str, detail: &str) -> String {
@@ -661,6 +738,15 @@ mod tests {
         let a = Url::parse("https://example.com/a").unwrap();
         let b = Url::parse("https://other.com/a").unwrap();
         assert!(!same_origin_modulo_www(&a, &b));
+    }
+
+    #[test]
+    fn fetch_retry_delay_grows_and_is_bounded() {
+        assert_eq!(fetch_retry_delay(0), Duration::from_millis(400));
+        assert_eq!(fetch_retry_delay(1), Duration::from_millis(800));
+        assert_eq!(fetch_retry_delay(2), Duration::from_millis(1600));
+        // Shift is capped so a stray large attempt index can't overflow.
+        assert_eq!(fetch_retry_delay(9), fetch_retry_delay(3));
     }
 
     #[test]

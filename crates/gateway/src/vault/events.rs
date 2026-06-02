@@ -10,7 +10,7 @@ use serde::Serialize;
 use sqlx::{FromRow, SqlitePool};
 use tokio::time::{sleep, Duration};
 
-const INSERT_MAX_ATTEMPTS: usize = 6;
+pub(crate) const INSERT_MAX_ATTEMPTS: usize = 6;
 const INSERT_RETRY_BASE_MS: u64 = 10;
 
 static EVENT_SEQ_LOCKS: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
@@ -219,12 +219,16 @@ async fn event_seq_lock(user_id: &str, session_id: &str) -> Arc<tokio::sync::Mut
         .clone()
 }
 
-fn insert_retry_delay(attempt: usize) -> Duration {
+pub(crate) fn insert_retry_delay(attempt: usize) -> Duration {
     let multiplier = 1_u64 << attempt.min(5);
     Duration::from_millis((INSERT_RETRY_BASE_MS * multiplier).min(250))
 }
 
-fn is_retryable_insert_error(err: &sqlx::Error) -> bool {
+/// A SQLite write that failed on lock/busy/snapshot contention or a PK-seq race
+/// — safe to retry by re-running the whole `BEGIN … SELECT MAX(seq) … INSERT`
+/// transaction (which recomputes the seq). Shared by the events and messages
+/// append-only writers, both of which compute their next seq the same way.
+pub(crate) fn is_retryable_insert_error(err: &sqlx::Error) -> bool {
     let message = err.to_string().to_lowercase();
     message.contains("database is locked")
         || message.contains("database table is locked")
@@ -325,13 +329,21 @@ mod tests {
         let ev = |k: &str, p: serde_json::Value| {
             let pool = pool.clone();
             let k = k.to_string();
-            async move { insert(&pool, "u", "s", None, &k, &p, Some("t"), now).await.unwrap() }
+            async move {
+                insert(&pool, "u", "s", None, &k, &p, Some("t"), now)
+                    .await
+                    .unwrap()
+            }
         };
 
         // A heavy call, then a compaction → the stale pre-compaction figure must
         // not be returned (else the pre-turn trigger loops).
         ev("llm_usage", serde_json::json!({ "input_tokens": 240_000 })).await;
-        ev("compaction.completed", serde_json::json!({ "trigger": "auto_pre_turn" })).await;
+        ev(
+            "compaction.completed",
+            serde_json::json!({ "trigger": "auto_pre_turn" }),
+        )
+        .await;
         assert_eq!(latest_input_tokens(&pool, "u", "s").await.unwrap(), None);
 
         // A fresh, smaller call after the boundary is what counts.

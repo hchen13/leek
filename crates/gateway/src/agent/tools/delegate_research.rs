@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{harness, preview};
+use crate::agent::{harness, preview, prompt_cache_key_for};
 use crate::events::EventEnvelope;
 use crate::llm::{
     ChatMessage, ChatRequest, LlmEvent, LlmProvider, ReasoningEffort, Role, ToolSpec,
@@ -146,6 +146,12 @@ impl ToolHandler for DelegateResearchTool {
             }],
             system: Some(system),
             model: SUBAGENT_MODEL.to_string(),
+            session_id: Some(ctx.session_id.clone()),
+            prompt_cache_key: Some(prompt_cache_key_for(
+                SUBAGENT_MODEL,
+                &ctx.session_id,
+                &format!("subagent:{run_id}"),
+            )),
             max_output_tokens: Some(2400),
             tools: Vec::new(),
             additional_inputs: Vec::new(),
@@ -176,7 +182,11 @@ impl ToolHandler for DelegateResearchTool {
                             tokens_used += i64::from(u.input_tokens) + i64::from(u.output_tokens);
                         }
                         Ok(LlmEvent::MessageEnd { .. }) => {}
-                        Ok(LlmEvent::WebSearchCall { .. } | LlmEvent::FunctionCall { .. }) => {}
+                        Ok(
+                            LlmEvent::WebSearchCall { .. }
+                            | LlmEvent::FunctionCall { .. }
+                            | LlmEvent::Reasoning { .. },
+                        ) => {}
                         Err(err) => {
                             finish_failed(ctx, &run_id, started, &err.to_string()).await?;
                             return Err(err);

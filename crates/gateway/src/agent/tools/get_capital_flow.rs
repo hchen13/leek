@@ -512,17 +512,87 @@ impl GetCapitalFlowTool {
         Ok(body.data.and_then(|data| data.diff).unwrap_or_default())
     }
 
+    /// 大盘资金流 — 东方财富 `moneyflow_mkt_dc`, last `days` trading days. Net
+    /// amounts arrive in 元 and are rendered in 亿. Queries a calendar window
+    /// wide enough to cover `days` trading days across weekends/holidays.
+    async fn fetch_market_flow(
+        &self,
+        token: &str,
+        days: i64,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
+        let (start_date, end_date) = recent_window(days * 2 + 12);
+        let payload = serde_json::json!({
+            "api_name": "moneyflow_mkt_dc",
+            "token": token,
+            "params": {"start_date": start_date, "end_date": end_date},
+            "fields": "trade_date,close_sh,pct_change_sh,close_sz,pct_change_sz,net_amount,buy_elg_amount,buy_lg_amount,buy_md_amount,buy_sm_amount"
+        });
+        let body = self.tushare_post(payload, cancel).await?;
+        let (fields, items) = tushare_data(&body)?;
+        Ok(render_market_flow(&fields, &items, days.max(1) as usize))
+    }
+
+    /// 行业/概念板块资金流 — 东方财富 `moneyflow_ind_dc`. Resolves the latest
+    /// trading day from 大盘 flow (cheap, bounded), then pulls that day's board
+    /// ranking. `content_type` is the Chinese vendor enum (行业/概念/地域); the
+    /// English values in the published doc return zero rows.
+    async fn fetch_board_flow(
+        &self,
+        token: &str,
+        content_type: &str,
+        label: &str,
+        limit: usize,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
+        let Some(date) = self.latest_trade_date(token, cancel).await? else {
+            return Ok(format!(
+                "## {label}资金流\n\n- 板块资金流来源近期没有返回交易日。这是来源覆盖缺口，不代表无资金流。\n"
+            ));
+        };
+        let payload = serde_json::json!({
+            "api_name": "moneyflow_ind_dc",
+            "token": token,
+            "params": {"trade_date": date, "content_type": content_type},
+            "fields": "trade_date,name,pct_change,net_amount,buy_sm_amount_stock"
+        });
+        let body = self.tushare_post(payload, cancel).await?;
+        let (fields, items) = tushare_data(&body)?;
+        Ok(render_board_flow(&fields, &items, label, &date, limit))
+    }
+
+    /// Latest trading day with 东财 flow data, via a small `moneyflow_mkt_dc`
+    /// window (≤ ~20 rows) so it survives long holidays without risking the
+    /// per-request row cap that a wide board query would hit.
+    async fn latest_trade_date(
+        &self,
+        token: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>> {
+        let (start_date, end_date) = recent_window(20);
+        let payload = serde_json::json!({
+            "api_name": "moneyflow_mkt_dc",
+            "token": token,
+            "params": {"start_date": start_date, "end_date": end_date},
+            "fields": "trade_date"
+        });
+        let body = self.tushare_post(payload, cancel).await?;
+        let (fields, items) = tushare_data(&body)?;
+        let i_date = fields.iter().position(|f| f == "trade_date");
+        Ok(items
+            .iter()
+            .filter_map(|row| i_date.and_then(|j| row.get(j)).map(value_text))
+            .filter(|s| !s.is_empty())
+            .max())
+    }
+
     /// Northbound now has exactly one surviving caliber: the daily 沪深股通
     /// top-10 most-traded stocks with turnover. The 2024-08-18 Stock Connect
     /// change stopped buy/sell/net disclosure (and silently turned the old
     /// `moneyflow_hsgt` net-flow fields into always-positive turnover), so this
     /// returns activity only — explicitly labeled as not net inflow.
     async fn fetch_northbound(&self, token: &str, cancel: &CancellationToken) -> Result<String> {
-        let tz = FixedOffset::east_opt(8 * 3600).expect("UTC+8 offset is valid");
-        let now = chrono::Utc::now().with_timezone(&tz);
-        let end_date = now.format("%Y%m%d").to_string();
-        let start_date = (now - chrono::Duration::days(14)).format("%Y%m%d").to_string();
-
+        let (start_date, end_date) = recent_window(14);
         let payload = serde_json::json!({
             "api_name": "hsgt_top10",
             "token": token,
@@ -545,7 +615,11 @@ impl GetCapitalFlowTool {
         let items: Vec<Vec<serde_json::Value>> = data
             .get("items")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|row| row.as_array().cloned()).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|row| row.as_array().cloned())
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(render_northbound_top10(&fields, &items))
     }
@@ -561,33 +635,33 @@ impl ToolHandler for GetCapitalFlowTool {
         ToolSpec::Function {
             name: TOOL_NAME.into(),
             description: "Fetch A-share capital-flow evidence at task level, not raw endpoint dumps. \
-                `stock_flow` uses the configured official daily historical moneyflow source for an individual stock after market data is updated. \
-                `realtime_stock_flow` uses public intraday/main-force flow snapshots for the current trading session. \
-                `market_block_flow` uses public market/sector flow rankings for today’s broad-market and sector-mainline read. \
+                Stock level: `stock_flow` (official daily historical moneyflow for one stock), `realtime_stock_flow` (public intraday/main-force snapshot). \
+                Market & board level (no ts_code, latest trading day, structured — use these instead of scraping data-vendor URLs): `market_flow` (大盘 daily main-force net flow), `industry_flow` (行业板块 net-flow ranking), `concept_flow` (概念板块 net-flow ranking). \
+                `market_block_flow` is a public intraday market/sector snapshot. \
                 `northbound` returns the 沪深股通 top-10 most-traded A-shares with daily turnover, split 沪股通/深股通. \
-                `both` returns official daily history plus current public snapshot when ts_code is provided, market/sector flow, and the northbound active-stock list. \
-                - Northbound is turnover/activity only: after the 2024-08-18 Stock Connect change, buy/sell/net-flow stopped being disclosed, so do NOT read the active-stock turnover as net inflow, and do not add it to per-stock net flow. \
-                Preserve source, freshness, and units: official rows are daily/万元; public snapshot rows are intraday/元; northbound turnover is 亿."
+                `both` returns stock-level history + snapshot when ts_code is provided, plus the market/sector snapshot and the northbound active-stock list. \
+                - Northbound is turnover/activity only: after the 2024-08-18 Stock Connect change, buy/sell/net-flow stopped being disclosed, so do NOT read it as net inflow. \
+                Preserve source and units: stock moneyflow is 万元; 大盘/板块 net flow is rendered in 亿元; intraday snapshot rows are 元. Main-force (主力) = 超大单 + 大单."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "data_type": {
                         "type": "string",
-                        "enum": ["stock_flow", "realtime_stock_flow", "market_block_flow", "northbound", "both"],
-                        "description": "Default: both. With ts_code it returns stock_flow + realtime_stock_flow + market_block_flow + northbound active stocks; without ts_code it returns market_block_flow + northbound active stocks."
+                        "enum": ["stock_flow", "realtime_stock_flow", "market_flow", "industry_flow", "concept_flow", "market_block_flow", "northbound", "both"],
+                        "description": "Default: both. market_flow/industry_flow/concept_flow give structured 大盘/行业/概念 daily net flow and need no ts_code. With ts_code, both returns stock_flow + realtime_stock_flow + market_block_flow + northbound; without ts_code, both returns market_block_flow + northbound."
                     },
                     "ts_code": {
                         "type": "string",
-                        "description": "Required for stock_flow and realtime_stock_flow; omit for northbound-only. e.g. '600519.SH'"
+                        "description": "Required for stock_flow and realtime_stock_flow; omit for market_flow/industry_flow/concept_flow/northbound. e.g. '600519.SH'"
                     },
                     "days": {
                         "type": "integer",
-                        "description": "Number of trading days (default 10, max 30)"
+                        "description": "Trading days for stock_flow / market_flow (default 10, max 30)"
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Rows per market/sector flow ranking section, default 5, max 10"
+                        "description": "Rows per ranking section — market/sector snapshot, and each of the industry/concept inflow & outflow lists. Default 5, max 10."
                     }
                 }
             }),
@@ -633,6 +707,20 @@ impl ToolHandler for GetCapitalFlowTool {
                 self.fetch_eastmoney_realtime_flow(&code, &cancel).await
             }
             "market_block_flow" => self.fetch_market_block_flow(limit, &cancel).await,
+            "market_flow" => {
+                let token = data_provider_tokens::tushare_token(ctx).await?;
+                self.fetch_market_flow(&token, days, &cancel).await
+            }
+            "industry_flow" => {
+                let token = data_provider_tokens::tushare_token(ctx).await?;
+                self.fetch_board_flow(&token, "行业", "行业板块", limit, &cancel)
+                    .await
+            }
+            "concept_flow" => {
+                let token = data_provider_tokens::tushare_token(ctx).await?;
+                self.fetch_board_flow(&token, "概念", "概念板块", limit, &cancel)
+                    .await
+            }
             "northbound" => {
                 let token = data_provider_tokens::tushare_token(ctx).await?;
                 self.fetch_northbound(&token, &cancel).await
@@ -1003,6 +1091,182 @@ fn render_northbound_market(out: &mut String, label: &str, rows: &mut [(f64, Str
     ));
 }
 
+/// (start_date, end_date) as YYYYMMDD for a Beijing-time window ending today.
+fn recent_window(days_back: i64) -> (String, String) {
+    let tz = FixedOffset::east_opt(8 * 3600).expect("UTC+8 offset is valid");
+    let now = chrono::Utc::now().with_timezone(&tz);
+    let end = now.format("%Y%m%d").to_string();
+    let start = (now - chrono::Duration::days(days_back.max(1)))
+        .format("%Y%m%d")
+        .to_string();
+    (start, end)
+}
+
+/// Pull `(fields, items)` out of a tushare response body.
+fn tushare_data(body: &serde_json::Value) -> Result<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
+    let data = body
+        .get("data")
+        .ok_or_else(|| anyhow!("missing data in tushare response"))?;
+    let fields = data
+        .get("fields")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let items = data
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|r| r.as_array().cloned()).collect())
+        .unwrap_or_default();
+    Ok((fields, items))
+}
+
+/// One 大盘 row: (date, 上证%, 深成%, 主力净流入, 超大单, 大单, 中单, 小单).
+type MarketFlowRow = (String, f64, f64, f64, f64, f64, f64, f64);
+
+/// Render 大盘资金流 (moneyflow_mkt_dc) — last `days` trading days. Net amounts
+/// arrive in 元 and are shown in 亿. 主力净流入 = 超大单 + 大单.
+fn render_market_flow(fields: &[String], items: &[Vec<serde_json::Value>], days: usize) -> String {
+    fn cell(row: &[serde_json::Value], i: Option<usize>) -> Option<&serde_json::Value> {
+        i.and_then(|j| row.get(j))
+    }
+    let idx = |name: &str| fields.iter().position(|f| f == name);
+    let (i_date, i_psh, i_psz, i_net, i_elg, i_lg, i_md, i_sm) = (
+        idx("trade_date"),
+        idx("pct_change_sh"),
+        idx("pct_change_sz"),
+        idx("net_amount"),
+        idx("buy_elg_amount"),
+        idx("buy_lg_amount"),
+        idx("buy_md_amount"),
+        idx("buy_sm_amount"),
+    );
+    if items.is_empty() {
+        return "## 大盘资金流\n\n- 大盘资金流来源近期没有返回记录。这是来源覆盖缺口，不代表无资金流。\n"
+            .to_string();
+    }
+    // (date, pct_sh, pct_sz, net, elg, lg, md, sm)
+    let mut rows: Vec<MarketFlowRow> = items
+        .iter()
+        .map(|r| {
+            (
+                cell(r, i_date).map(value_text).unwrap_or_default(),
+                value_f64(cell(r, i_psh)),
+                value_f64(cell(r, i_psz)),
+                value_f64(cell(r, i_net)),
+                value_f64(cell(r, i_elg)),
+                value_f64(cell(r, i_lg)),
+                value_f64(cell(r, i_md)),
+                value_f64(cell(r, i_sm)),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let rows = &rows[rows.len().saturating_sub(days)..];
+
+    let mut out = format!("## 大盘资金流（近{}个交易日）\n\n", rows.len());
+    out.push_str(
+        "| 日期 | 上证涨跌% | 深成涨跌% | 主力净流入(亿) | 超大单(亿) | 大单(亿) | 中单(亿) | 小单(亿) |\n",
+    );
+    out.push_str(
+        "|------|----------|----------|--------------|-----------|---------|---------|---------|\n",
+    );
+    for (date, psh, psz, net, elg, lg, md, sm) in rows {
+        let d = if date.len() == 8 {
+            format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..])
+        } else {
+            date.clone()
+        };
+        out.push_str(&format!(
+            "| {} | {:+.2} | {:+.2} | {:+.1} | {:+.1} | {:+.1} | {:+.1} | {:+.1} |\n",
+            d,
+            psh,
+            psz,
+            net / 1e8,
+            elg / 1e8,
+            lg / 1e8,
+            md / 1e8,
+            sm / 1e8
+        ));
+    }
+    out.push_str("\n_来源: 东方财富大盘资金流。单位亿元；主力净流入=超大单+大单，正为净流入。_\n");
+    out
+}
+
+/// Render 行业/概念板块资金流 (moneyflow_ind_dc) for one day — top inflows and
+/// top outflows by 主力净流入. Net amounts arrive in 元, shown in 亿.
+fn render_board_flow(
+    fields: &[String],
+    items: &[Vec<serde_json::Value>],
+    label: &str,
+    date: &str,
+    limit: usize,
+) -> String {
+    fn cell(row: &[serde_json::Value], i: Option<usize>) -> Option<&serde_json::Value> {
+        i.and_then(|j| row.get(j))
+    }
+    let idx = |name: &str| fields.iter().position(|f| f == name);
+    let (i_name, i_pct, i_net, i_lead) = (
+        idx("name"),
+        idx("pct_change"),
+        idx("net_amount"),
+        idx("buy_sm_amount_stock"),
+    );
+    let date_fmt = if date.len() == 8 {
+        format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..])
+    } else {
+        date.to_string()
+    };
+    if items.is_empty() {
+        return format!(
+            "## {label}资金流（{date_fmt}）\n\n- 当日该板块来源没有返回记录。这是有效空结果或来源覆盖缺口。\n"
+        );
+    }
+    // (net, name, pct, lead)
+    let mut rows: Vec<(f64, String, f64, String)> = items
+        .iter()
+        .map(|r| {
+            (
+                value_f64(cell(r, i_net)),
+                value_text_opt(cell(r, i_name)),
+                value_f64(cell(r, i_pct)),
+                value_text_opt(cell(r, i_lead)),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut out = format!(
+        "## {label}资金流（{date_fmt}）\n\n口径：东方财富主力净流入（超大单+大单），单位亿元。\n\n"
+    );
+    let top = &rows[..rows.len().min(limit)];
+    push_board_table(&mut out, &format!("净流入 Top{}", top.len()), top);
+    let mut bottom = rows[rows.len().saturating_sub(limit)..].to_vec();
+    bottom.reverse();
+    push_board_table(&mut out, &format!("净流出 Top{}", bottom.len()), &bottom);
+    out.push_str("\n_来源: 东方财富板块资金流。单位亿元。_\n");
+    out
+}
+
+fn push_board_table(out: &mut String, title: &str, rows: &[(f64, String, f64, String)]) {
+    out.push_str(&format!(
+        "### {title}\n\n| 板块 | 涨跌% | 主力净流入(亿) | 龙头 |\n|------|------|--------------|------|\n"
+    ));
+    for (net, name, pct, lead) in rows {
+        out.push_str(&format!(
+            "| {} | {:+.2} | {:+.1} | {} |\n",
+            name,
+            pct,
+            net / 1e8,
+            lead
+        ));
+    }
+    out.push('\n');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,6 +1298,81 @@ mod tests {
         assert!(out.contains("沪股通十大合计成交额 13.00 亿"));
         assert!(out.contains("美的集团"));
         assert!(out.contains("买卖净额自 2024-08-18 起停止披露"));
+    }
+
+    #[test]
+    fn market_flow_renders_last_n_days_in_yi() {
+        let fields: Vec<String> = [
+            "trade_date",
+            "pct_change_sh",
+            "pct_change_sz",
+            "net_amount",
+            "buy_elg_amount",
+            "buy_lg_amount",
+            "buy_md_amount",
+            "buy_sm_amount",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let row = |d: &str, net: f64| {
+            vec![
+                serde_json::Value::String(d.to_string()),
+                serde_json::json!(-0.7),
+                serde_json::json!(-1.8),
+                serde_json::json!(net),
+                serde_json::json!(net * 0.6),
+                serde_json::json!(net * 0.4),
+                serde_json::json!(0.0),
+                serde_json::json!(0.0),
+            ]
+        };
+        let items = vec![
+            row("20260527", -10e8),
+            row("20260528", -123333111808.0),
+            row("20260529", 5e8),
+        ];
+        let out = render_market_flow(&fields, &items, 2);
+        // Only the latest 2 days, latest last.
+        assert!(!out.contains("2026-05-27"));
+        assert!(out.contains("2026-05-28"));
+        assert!(out.contains("2026-05-29"));
+        // -123,333,111,808 元 -> -1233.3 亿
+        assert!(out.contains("-1233.3"), "net should render in 亿: {out}");
+        assert!(out.contains("东方财富大盘资金流"));
+    }
+
+    #[test]
+    fn board_flow_splits_inflow_and_outflow_by_net() {
+        let fields: Vec<String> = ["name", "pct_change", "net_amount", "buy_sm_amount_stock"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let row = |name: &str, pct: f64, net: f64, lead: &str| {
+            vec![
+                serde_json::Value::String(name.to_string()),
+                serde_json::json!(pct),
+                serde_json::json!(net),
+                serde_json::Value::String(lead.to_string()),
+            ]
+        };
+        let items = vec![
+            row("通信设备", 3.07, 10.1e9, "中兴通讯"),
+            row("白酒", 1.0, 2.0e9, "贵州茅台"),
+            row("银行", -0.5, -3.0e9, "招商银行"),
+            row("地产", -2.0, -8.0e9, "万科A"),
+        ];
+        let out = render_board_flow(&fields, &items, "行业板块", "20260529", 1);
+        assert!(out.contains("行业板块资金流（2026-05-29）"));
+        // Top inflow = 通信设备 (10.1e9 元 -> 101.0 亿); top outflow = 地产 (-80.0 亿).
+        assert!(out.contains("通信设备"));
+        assert!(out.contains("101.0"));
+        assert!(out.contains("净流出 Top1"));
+        assert!(out.contains("地产"));
+        assert!(out.contains("-80.0"));
+        // limit=1 must exclude the runner-up on each side.
+        assert!(!out.contains("白酒"));
+        assert!(!out.contains("银行"));
     }
 
     #[test]

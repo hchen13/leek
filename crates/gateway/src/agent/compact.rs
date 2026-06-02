@@ -192,6 +192,12 @@ pub async fn summarize_session(
         }],
         system: Some(COMPACT_SYSTEM_PROMPT.to_string()),
         model: COMPACT_MODEL.to_string(),
+        session_id: None,
+        prompt_cache_key: Some(super::prompt_cache_key_for(
+            COMPACT_MODEL,
+            "global",
+            "compact",
+        )),
         max_output_tokens: None,
         tools: Vec::new(),
         additional_inputs: Vec::new(),

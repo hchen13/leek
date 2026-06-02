@@ -17,6 +17,8 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub system: Option<String>,
     pub model: String,
+    pub session_id: Option<String>,
+    pub prompt_cache_key: Option<String>,
     pub max_output_tokens: Option<u32>,
     pub tools: Vec<ToolSpec>,
     /// Raw input items appended after `messages` — used by the agent loop to
@@ -26,17 +28,13 @@ pub struct ChatRequest {
     /// codex-rs/protocol/src/models.rs ResponseItem).
     pub additional_inputs: Vec<serde_json::Value>,
     /// Reasoning effort for models that support it (gpt-5/gpt-5.5/...).
-    /// `None` means use the model's backend default. Compaction passes
-    /// `Some(Minimal)` so summaries don't burn thinking tokens.
+    /// `None` means use the model's backend default.
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
-/// Mirrors codex-rs `ReasoningEffort`. We omit XHigh / None — leek only
-/// needs the four levels users would actually pick.
+/// Mirrors the gpt-5.5 reasoning effort values leek uses today.
 #[derive(Debug, Clone, Copy)]
 pub enum ReasoningEffort {
-    Minimal,
-    #[allow(dead_code)]
     Low,
     #[allow(dead_code)]
     Medium,
@@ -47,7 +45,6 @@ pub enum ReasoningEffort {
 impl ReasoningEffort {
     pub fn as_str(self) -> &'static str {
         match self {
-            ReasoningEffort::Minimal => "minimal",
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
@@ -135,6 +132,19 @@ pub enum LlmEvent {
         /// Already-complete arguments JSON (string form, as the codex
         /// backend ships it). Caller must `serde_json::from_str` to use.
         arguments: String,
+    },
+    /// Encrypted reasoning item from a reasoning model (gpt-5.x). The agent loop
+    /// must round-trip it verbatim into the next request's input — placed before
+    /// that iteration's `function_call` — so the codex backend's prompt cache
+    /// keeps the chain-of-thought prefix across the tool loop. Dropping it
+    /// breaks the cache on every post-reasoning tool step (OpenAI: round-tripping
+    /// gives 40-80% better cache utilization). `summary` is the raw summary array
+    /// the backend shipped; the item `id` is intentionally absent — codex omits
+    /// it on replay since it references a server-side item that does not exist
+    /// under `store:false`.
+    Reasoning {
+        encrypted_content: String,
+        summary: serde_json::Value,
     },
     Usage(Usage),
     MessageEnd {

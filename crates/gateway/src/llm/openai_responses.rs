@@ -62,8 +62,22 @@ pub fn build_request_body(req: &ChatRequest) -> serde_json::Value {
         body["tools"] = serde_json::Value::Array(tools_json);
     }
 
+    // `include` carries optional response extras. web_search sources let us show
+    // what the model searched. Encrypted reasoning can be requested for cache
+    // experiments, but is off by default because long tool-loop probes showed
+    // better cache hit rates when replay excludes reasoning items.
+    let mut include: Vec<serde_json::Value> = Vec::new();
     if uses_web_search {
-        body["include"] = serde_json::json!(["web_search_call.action.sources"]);
+        include.push(serde_json::json!("web_search_call.action.sources"));
+    }
+    let include_reasoning = std::env::var("LEEK_INCLUDE_REASONING")
+        .map(|v| v != "0")
+        .unwrap_or(false);
+    if include_reasoning && req.model.starts_with("gpt-5") {
+        include.push(serde_json::json!("reasoning.encrypted_content"));
+    }
+    if !include.is_empty() {
+        body["include"] = serde_json::Value::Array(include);
     }
 
     // Append raw input items after messages (function_call / function_call_output
@@ -122,19 +136,29 @@ fn serialize_tools(tools: &[ToolSpec]) -> Vec<serde_json::Value> {
 }
 
 fn prompt_cache_key(req: &ChatRequest) -> String {
-    let model = req
-        .model
+    match req.prompt_cache_key.as_deref() {
+        Some(key) => sanitize_prompt_cache_key(key),
+        None => sanitize_prompt_cache_key(&format!("leek:{}:default", req.model)),
+    }
+}
+
+fn sanitize_prompt_cache_key(raw: &str) -> String {
+    let key = raw
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':') {
                 c
             } else {
                 '-'
             }
         })
-        .take(40)
+        .take(120)
         .collect::<String>();
-    format!("leek:{model}:main-agent")
+    if key.is_empty() {
+        "leek:default".to_string()
+    } else {
+        key
+    }
 }
 
 fn prompt_cache_retention(model: &str) -> Option<&'static str> {
@@ -242,6 +266,11 @@ struct ItemObject {
     /// Wire form is a string containing JSON (per codex-rs ResponseItem doc).
     #[serde(default)]
     arguments: Option<String>,
+    // reasoning fields — present only when type="reasoning"
+    #[serde(default)]
+    encrypted_content: Option<String>,
+    #[serde(default)]
+    summary: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -286,8 +315,12 @@ fn parse_one_event(raw: &str) -> Result<Vec<LlmEvent>> {
         return Ok(Vec::new());
     }
 
-    let env: DataEnvelope = serde_json::from_str(&data)
-        .with_context(|| format!("parsing SSE data line as JSON: {}", truncate(&data, 200)))?;
+    parse_json_event(&data)
+}
+
+pub(crate) fn parse_json_event(data: &str) -> Result<Vec<LlmEvent>> {
+    let env: DataEnvelope = serde_json::from_str(data)
+        .with_context(|| format!("parsing response event as JSON: {}", truncate(data, 200)))?;
 
     match env.type_.as_deref() {
         Some("response.output_text.delta") => {
@@ -328,6 +361,19 @@ fn parse_one_event(raw: &str) -> Result<Vec<LlmEvent>> {
                         arguments,
                     }])
                 }
+                // Encrypted reasoning item (gpt-5.x). Only meaningful with
+                // `include: ["reasoning.encrypted_content"]`; without it the
+                // backend still ships a reasoning item but with empty content,
+                // which we drop (nothing to round-trip).
+                Some("reasoning") if is_done => match item.encrypted_content {
+                    Some(enc) if !enc.is_empty() => Ok(vec![LlmEvent::Reasoning {
+                        encrypted_content: enc,
+                        summary: item
+                            .summary
+                            .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+                    }]),
+                    _ => Ok(Vec::new()),
+                },
                 _ => Ok(Vec::new()),
             }
         }
@@ -614,6 +660,8 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
+            session_id: None,
+            prompt_cache_key: Some("leek:gpt-5.5:session:s1:main_agent".into()),
             max_output_tokens: None,
             tools: vec![ToolSpec::WebSearch {
                 external_web_access: true,
@@ -630,7 +678,10 @@ mod tests {
             body["include"],
             serde_json::json!(["web_search_call.action.sources"])
         );
-        assert_eq!(body["prompt_cache_key"], "leek:gpt-5.5:main-agent");
+        assert_eq!(
+            body["prompt_cache_key"],
+            "leek:gpt-5.5:session:s1:main_agent"
+        );
         assert_eq!(body["prompt_cache_retention"], "24h");
     }
 
@@ -644,6 +695,8 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
+            session_id: None,
+            prompt_cache_key: None,
             max_output_tokens: None,
             tools: Vec::new(),
             additional_inputs: Vec::new(),
@@ -686,6 +739,57 @@ mod tests {
     }
 
     #[test]
+    fn parses_reasoning_done_with_encrypted_content() {
+        let raw = "data: {\"type\":\"response.output_item.done\",\"item\":{\
+                       \"id\":\"rs_1\",\"type\":\"reasoning\",\
+                       \"summary\":[{\"type\":\"summary_text\",\"text\":\"weigh it\"}],\
+                       \"encrypted_content\":\"ENC_BLOB\"}}";
+        let evts = parse_one_event(raw).unwrap();
+        assert_eq!(evts.len(), 1);
+        match &evts[0] {
+            LlmEvent::Reasoning {
+                encrypted_content,
+                summary,
+            } => {
+                assert_eq!(encrypted_content, "ENC_BLOB");
+                assert_eq!(summary[0]["text"], "weigh it");
+            }
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reasoning_without_encrypted_content_is_dropped() {
+        // Without `include: reasoning.encrypted_content` the backend still ships
+        // a reasoning item, but empty — there is nothing to round-trip.
+        let raw = "data: {\"type\":\"response.output_item.done\",\"item\":{\
+                       \"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[]}}";
+        assert!(parse_one_event(raw).unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_request_body_omits_reasoning_include_for_non_gpt5() {
+        use super::super::{ChatMessage, ChatRequest, Role};
+        let req = ChatRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "hi".into(),
+            }],
+            system: None,
+            model: "claude-opus-4-8".into(),
+            session_id: None,
+            prompt_cache_key: None,
+            max_output_tokens: None,
+            tools: Vec::new(),
+            additional_inputs: Vec::new(),
+            reasoning_effort: None,
+        };
+        let body = build_request_body(&req);
+        // No web_search, non-gpt5 → no `include` at all.
+        assert!(body.get("include").is_none());
+    }
+
+    #[test]
     fn function_call_arguments_delta_silent() {
         let raw = "data: {\"type\":\"response.function_call_arguments.delta\",\
                        \"item_id\":\"fc_1\",\"delta\":\"{\\\"u\"}";
@@ -702,6 +806,8 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
+            session_id: None,
+            prompt_cache_key: None,
             max_output_tokens: None,
             tools: vec![ToolSpec::Function {
                 name: "web_fetch".into(),
@@ -756,13 +862,15 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
+            session_id: None,
+            prompt_cache_key: None,
             max_output_tokens: None,
             tools: Vec::new(),
             additional_inputs: Vec::new(),
-            reasoning_effort: Some(ReasoningEffort::Minimal),
+            reasoning_effort: Some(ReasoningEffort::Low),
         };
         let body = build_request_body(&req);
-        assert_eq!(body["reasoning"]["effort"], "minimal");
+        assert_eq!(body["reasoning"]["effort"], "low");
         assert!(body["reasoning"]["summary"].is_null());
     }
 
@@ -776,6 +884,8 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
+            session_id: None,
+            prompt_cache_key: None,
             max_output_tokens: None,
             tools: Vec::new(),
             additional_inputs: Vec::new(),
@@ -795,6 +905,8 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
+            session_id: None,
+            prompt_cache_key: None,
             max_output_tokens: None,
             tools: Vec::new(),
             additional_inputs: Vec::new(),
@@ -814,6 +926,8 @@ mod tests {
             }],
             system: None,
             model: "gpt-4o".into(),
+            session_id: None,
+            prompt_cache_key: None,
             max_output_tokens: None,
             tools: Vec::new(),
             additional_inputs: Vec::new(),
@@ -824,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn build_request_body_cache_key_ignores_chat_history() {
+    fn build_request_body_uses_caller_cache_key_across_chat_history() {
         use super::super::{ChatMessage, ChatRequest, Role, ToolSpec};
         let mk = |content: &str| ChatRequest {
             messages: vec![ChatMessage {
@@ -833,6 +947,8 @@ mod tests {
             }],
             system: Some("stable instructions".into()),
             model: "gpt-5.5".into(),
+            session_id: None,
+            prompt_cache_key: Some("leek:gpt-5.5:session:same:main_agent".into()),
             max_output_tokens: None,
             tools: vec![ToolSpec::Function {
                 name: "web_fetch".into(),
@@ -846,27 +962,31 @@ mod tests {
         let second = build_request_body(&mk("second question"));
 
         assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+        assert_eq!(
+            first["prompt_cache_key"],
+            "leek:gpt-5.5:session:same:main_agent"
+        );
     }
 
     #[test]
-    fn build_request_body_cache_key_is_stable_across_static_prefix_changes() {
+    fn build_request_body_sanitizes_caller_cache_key() {
         use super::super::{ChatMessage, ChatRequest, Role};
-        let mk = |system: &str| ChatRequest {
+        let req = ChatRequest {
             messages: vec![ChatMessage {
                 role: Role::User,
                 content: "same question".into(),
             }],
-            system: Some(system.into()),
+            system: Some("stable instructions".into()),
             model: "gpt-5.5".into(),
+            session_id: None,
+            prompt_cache_key: Some("leek/gpt 5.5/session/含中文".into()),
             max_output_tokens: None,
             tools: Vec::new(),
             additional_inputs: Vec::new(),
             reasoning_effort: None,
         };
-        let first = build_request_body(&mk("stable instructions"));
-        let second = build_request_body(&mk("changed instructions"));
-
-        assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+        let body = build_request_body(&req);
+        assert_eq!(body["prompt_cache_key"], "leek-gpt-5.5-session----");
     }
 
     #[test]
@@ -879,6 +999,8 @@ mod tests {
             }],
             system: None,
             model: "gpt-4o".into(),
+            session_id: None,
+            prompt_cache_key: None,
             max_output_tokens: None,
             tools: Vec::new(),
             additional_inputs: Vec::new(),
@@ -898,6 +1020,8 @@ mod tests {
             }],
             system: None,
             model: "gpt-5.5".into(),
+            session_id: None,
+            prompt_cache_key: None,
             max_output_tokens: None,
             tools: Vec::new(),
             additional_inputs: vec![

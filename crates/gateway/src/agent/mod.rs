@@ -50,6 +50,67 @@ const PLAN_REMINDER_INTERVAL_ITERATIONS: usize = 4;
 const AGENT_DELTA_STREAM_CHARS: usize = 240;
 const AGENT_DELTA_STREAM_MS: u64 = 40;
 
+pub(crate) fn prompt_cache_key_for(model: &str, session_id: &str, invoker: &str) -> String {
+    let mode = std::env::var("LEEK_PROMPT_CACHE_KEY_MODE")
+        .unwrap_or_else(|_| "session".to_string())
+        .to_ascii_lowercase();
+    if mode == "global" {
+        return format!("leek:{}:{}", cache_key_part(model), cache_key_part(invoker));
+    }
+    if mode == "legacy_global" {
+        return format!("leek:{}:main-agent", cache_key_part(model));
+    }
+    format!(
+        "leek:{}:session:{}:{}",
+        cache_key_part(model),
+        cache_key_part(session_id),
+        cache_key_part(invoker)
+    )
+}
+
+fn cache_key_part(raw: &str) -> String {
+    let part = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(80)
+        .collect::<String>();
+    if part.is_empty() {
+        "default".to_string()
+    } else {
+        part
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ReplayInputStats {
+    total_items: usize,
+    reasoning_items: usize,
+    function_call_items: usize,
+    function_output_items: usize,
+}
+
+fn replay_input_stats(items: &[serde_json::Value]) -> ReplayInputStats {
+    let mut stats = ReplayInputStats {
+        total_items: items.len(),
+        ..ReplayInputStats::default()
+    };
+    for item in items {
+        match item.get("type").and_then(|t| t.as_str()) {
+            Some("reasoning") => stats.reasoning_items += 1,
+            Some("function_call") => stats.function_call_items += 1,
+            Some("function_call_output") => stats.function_output_items += 1,
+            _ => {}
+        }
+    }
+    stats
+}
+
 struct PendingCall {
     call_id: String,
     name: String,
@@ -131,6 +192,15 @@ pub async fn run_chat_reply(
     // `mut` because a mid-turn compaction swaps in a fresh summary.
     let mut messages = runtime_context_messages(&handoff_summaries);
     let system_prompt = harness::build_system_prompt();
+    // Experimental only. On the codex backend, replaying encrypted reasoning
+    // reduced cache hit rate in long tool-loop probes versus replaying only
+    // user/function_call/function_call_output items.
+    let replay_reasoning = std::env::var("LEEK_REPLAY_REASONING")
+        .map(|v| v != "0")
+        .unwrap_or(false);
+    let persist_reasoning = std::env::var("LEEK_PERSIST_REASONING")
+        .map(|v| v != "0")
+        .unwrap_or(false);
 
     let ctx = ToolContext {
         pool: pool.clone(),
@@ -230,6 +300,7 @@ pub async fn run_chat_reply(
         }
 
         let mut pending_calls: Vec<PendingCall> = Vec::new();
+        let mut pending_reasoning: Vec<serde_json::Value> = Vec::new();
         let mut turn_text = String::new();
         let mut narration_buffer = String::new();
         let mut delta_buffer = String::new();
@@ -237,6 +308,7 @@ pub async fn run_chat_reply(
 
         loop {
             pending_calls.clear();
+            pending_reasoning.clear();
             turn_text.clear();
             narration_buffer.clear();
             delta_buffer.clear();
@@ -257,13 +329,18 @@ pub async fn run_chat_reply(
             {
                 request_inputs.push(plan_input);
             }
+            let request_input_stats = replay_input_stats(&request_inputs);
             let request_model = DEFAULT_MODEL.to_string();
+            let request_prompt_cache_key =
+                prompt_cache_key_for(&request_model, &session_id, "main_agent");
             let request_started_at = chrono::Utc::now();
             let request_started = Instant::now();
             let req = ChatRequest {
                 messages: messages.clone(),
                 system: Some(system_prompt.clone()),
                 model: request_model.clone(),
+                session_id: Some(session_id.clone()),
+                prompt_cache_key: Some(request_prompt_cache_key.clone()),
                 max_output_tokens: None,
                 tools: tool_specs.clone(),
                 additional_inputs: request_inputs,
@@ -460,10 +537,30 @@ pub async fn run_chat_reply(
                             Ok(LlmEvent::FunctionCall { call_id, name, arguments }) => {
                                 pending_calls.push(PendingCall { call_id, name, arguments });
                             }
+                            Ok(LlmEvent::Reasoning { encrypted_content, summary }) => {
+                                // Held until we know the model continued the loop
+                                // (had function_calls); then mirrored onto the
+                                // replay tail before those calls. `id` is omitted
+                                // — codex drops it on replay (it names a server
+                                // item absent under store:false).
+                                pending_reasoning.push(serde_json::json!({
+                                    "type": "reasoning",
+                                    "summary": summary,
+                                    "encrypted_content": encrypted_content,
+                                }));
+                            }
                             Ok(LlmEvent::Usage(u)) => {
                                 // Feeds the mid-turn auto-compaction check at the
                                 // top of the next iteration.
                                 last_input_tokens = i64::from(u.input_tokens);
+                                let uncached_input_tokens =
+                                    u.input_tokens.saturating_sub(u.cache_read_tokens);
+                                let cache_hit_rate = if u.input_tokens == 0 {
+                                    0.0
+                                } else {
+                                    f64::from(u.cache_read_tokens)
+                                        / f64::from(u.input_tokens)
+                                };
                                 record_llm_usage(
                                     &pool,
                                     &user_id,
@@ -487,6 +584,14 @@ pub async fn run_chat_reply(
                                         "input_tokens": u.input_tokens,
                                         "output_tokens": u.output_tokens,
                                         "cache_read_tokens": u.cache_read_tokens,
+                                        "cache_write_tokens": u.cache_write_tokens,
+                                        "uncached_input_tokens": uncached_input_tokens,
+                                        "cache_hit_rate": cache_hit_rate,
+                                        "prompt_cache_key": request_prompt_cache_key,
+                                        "input_item_count": request_input_stats.total_items,
+                                        "reasoning_item_count": request_input_stats.reasoning_items,
+                                        "function_call_item_count": request_input_stats.function_call_items,
+                                        "function_output_item_count": request_input_stats.function_output_items,
                                     }),
                                 )
                                 .await?;
@@ -562,6 +667,9 @@ pub async fn run_chat_reply(
 
         // No tool calls this turn → model is done.
         if pending_calls.is_empty() {
+            if replay_reasoning && persist_reasoning {
+                persist_reasoning_items(&pool, &user_id, &session_id, &pending_reasoning).await?;
+            }
             final_text = turn_text.clone();
             break 'iterations;
         }
@@ -612,6 +720,18 @@ pub async fn run_chat_reply(
         // append-only `assistant_tool_calls` row, and mirror them onto the
         // replay tail so the codex-required "call precedes output" ordering is
         // preserved (all calls, then all outputs).
+        if replay_reasoning && persist_reasoning {
+            persist_reasoning_items(&pool, &user_id, &session_id, &pending_reasoning).await?;
+        }
+        // This iteration's reasoning items ride the replay tail just before their
+        // function_calls (codex input ordering), so the backend's prompt cache
+        // keeps the chain-of-thought prefix across the tool loop instead of
+        // breaking at every post-reasoning step.
+        if replay_reasoning {
+            replay_inputs.append(&mut pending_reasoning);
+        } else {
+            pending_reasoning.clear();
+        }
         persist_tool_calls(&pool, &user_id, &session_id, &pending_calls).await?;
         for call in &pending_calls {
             replay_inputs.push(serde_json::json!({
@@ -955,6 +1075,27 @@ async fn persist_tool_calls(
     .await
 }
 
+async fn persist_reasoning_items(
+    pool: &SqlitePool,
+    user_id: &str,
+    session_id: &str,
+    items: &[serde_json::Value],
+) -> Result<Option<i64>> {
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let seq = vault_messages::insert(
+        pool,
+        user_id,
+        session_id,
+        "assistant_reasoning",
+        &serde_json::json!({ "type": "reasoning_items", "items": items }),
+        None,
+    )
+    .await?;
+    Ok(Some(seq))
+}
+
 /// Persist one function_call_output as a `tool_result` queue row. `output` is
 /// the byte-capped raw tool output (see `cap_tool_output`).
 async fn persist_tool_result(
@@ -1097,7 +1238,7 @@ fn parse_user_question_output(output: &str) -> Option<serde_json::Value> {
 
 fn build_tool_ui_artifact(name: &str, arguments_json: &str, output: &str) -> serde_json::Value {
     let arguments = serde_json::from_str::<serde_json::Value>(arguments_json)
-        .unwrap_or_else(|_| serde_json::Value::Null);
+        .unwrap_or(serde_json::Value::Null);
     let trimmed = output.trim_start();
     let (content_type, payload) =
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -1271,6 +1412,12 @@ async fn finalize_after_tool_budget(
         messages: messages.to_vec(),
         system: Some(system_prompt.to_string()),
         model: DEFAULT_MODEL.to_string(),
+        session_id: Some(session_id.to_string()),
+        prompt_cache_key: Some(prompt_cache_key_for(
+            DEFAULT_MODEL,
+            session_id,
+            "main_agent:finalize",
+        )),
         max_output_tokens: None,
         tools: Vec::new(),
         additional_inputs: request_inputs,
@@ -1446,6 +1593,7 @@ async fn publish_agent_trace_note(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_llm_usage(
     pool: &SqlitePool,
     user_id: &str,
@@ -2142,6 +2290,10 @@ mod tests {
             *calls += 1;
             if *calls == 1 {
                 return Ok(Box::pin(stream::iter(vec![
+                    Ok(LlmEvent::Reasoning {
+                        encrypted_content: "ENC_TOOL".to_string(),
+                        summary: serde_json::json!([]),
+                    }),
                     Ok(LlmEvent::FunctionCall {
                         call_id: "c1".to_string(),
                         name: "get_financials".to_string(),
@@ -2153,6 +2305,10 @@ mod tests {
                 ])));
             }
             Ok(Box::pin(stream::iter(vec![
+                Ok(LlmEvent::Reasoning {
+                    encrypted_content: "ENC_FINAL".to_string(),
+                    summary: serde_json::json!([]),
+                }),
                 Ok(LlmEvent::TextDelta {
                     text: "最终答案".to_string(),
                 }),
@@ -2334,7 +2490,10 @@ mod tests {
             ]
         );
 
-        let summary_row = rows.iter().find(|r| r.role == "compaction_summary").unwrap();
+        let summary_row = rows
+            .iter()
+            .find(|r| r.role == "compaction_summary")
+            .unwrap();
         let summary_json: serde_json::Value =
             serde_json::from_str(&summary_row.content_json).unwrap();
         assert_eq!(summary_json["text"], "会话摘要");

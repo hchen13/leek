@@ -266,6 +266,7 @@ async fn run_chat(vault_path: &Path, prompt: String, model: String) -> Result<()
     let vault = Vault::open(vault_path).await?;
     let provider =
         llm::codex_oauth::CodexOauthProvider::new(vault.pool.clone(), vault::LOCAL_USER_ID)?;
+    let prompt_cache_key = crate::agent::prompt_cache_key_for(&model, "adhoc", "cli");
 
     let req = llm::ChatRequest {
         messages: vec![llm::ChatMessage {
@@ -274,6 +275,8 @@ async fn run_chat(vault_path: &Path, prompt: String, model: String) -> Result<()
         }],
         system: None,
         model,
+        session_id: Some("adhoc".to_string()),
+        prompt_cache_key: Some(prompt_cache_key),
         max_output_tokens: Some(2048),
         // Enable codex's built-in web_search so this CLI path doubles as a
         // smoke-test for the tool-on-request wiring (search/open_page events
@@ -323,6 +326,7 @@ async fn run_chat(vault_path: &Path, prompt: String, model: String) -> Result<()
                     arguments.chars().take(80).collect::<String>()
                 );
             }
+            llm::LlmEvent::Reasoning { .. } => {}
         }
     }
     Ok(())
